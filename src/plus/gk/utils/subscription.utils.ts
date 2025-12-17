@@ -28,58 +28,10 @@ export function compareSubscriptionPlans(
 	return getSubscriptionPlanOrder(planA) - getSubscriptionPlanOrder(planB);
 }
 
-export function computeSubscriptionState(subscription: Optional<Subscription, 'state'>): SubscriptionState {
-	const {
-		account,
-		plan: { actual, effective },
-	} = subscription;
-
-	if (account?.verified === false) return SubscriptionState.VerificationRequired;
-
-	if (actual.id === effective.id || compareSubscriptionPlans(actual.id, effective.id) > 0) {
-		switch (actual.id === effective.id ? effective.id : actual.id) {
-			case 'community':
-				return SubscriptionState.Community;
-
-			case 'community-with-account': {
-				if (effective.nextTrialOptInDate != null && new Date(effective.nextTrialOptInDate) < new Date()) {
-					return SubscriptionState.TrialReactivationEligible;
-				}
-
-				return SubscriptionState.TrialExpired;
-			}
-			case 'student':
-			case 'pro':
-			case 'advanced':
-			case 'teams':
-			case 'enterprise':
-				return SubscriptionState.Paid;
-		}
-	}
-
-	// If you have a paid license, any trial license higher tier than your paid license is considered paid
-	if (compareSubscriptionPlans(actual.id, 'community-with-account') > 0) {
-		return SubscriptionState.Paid;
-	}
-	switch (effective.id) {
-		case 'community':
-			return SubscriptionState.Community;
-
-		case 'community-with-account': {
-			if (effective.nextTrialOptInDate != null && new Date(effective.nextTrialOptInDate) < new Date()) {
-				return SubscriptionState.TrialReactivationEligible;
-			}
-
-			return SubscriptionState.TrialExpired;
-		}
-
-		case 'student':
-		case 'pro':
-		case 'advanced':
-		case 'teams':
-		case 'enterprise':
-			return SubscriptionState.Trial;
-	}
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function computeSubscriptionState(_subscription: Optional<Subscription, 'state'>): SubscriptionState {
+	// 【破解】始终返回 Paid 状态
+	return SubscriptionState.Paid;
 }
 
 export function getSubscriptionNextPaidPlanId(subscription: Optional<Subscription, 'state'>): PaidSubscriptionPlanIds {
@@ -217,12 +169,16 @@ export function getSubscriptionTimeRemaining(
 	return getTimeRemaining(subscription.plan.effective.expiresOn, unit);
 }
 
-export function isSubscriptionPaid(subscription: Optional<Subscription, 'state'>): boolean {
-	return isSubscriptionPaidPlan(subscription.plan.actual.id);
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function isSubscriptionPaid(_subscription: Optional<Subscription, 'state'>): boolean {
+	// 【破解】始终返回 true
+	return true;
 }
 
-export function isSubscriptionPaidPlan(id: SubscriptionPlanIds): id is PaidSubscriptionPlanIds {
-	return orderedPaidPlans.includes(id as PaidSubscriptionPlanIds);
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function isSubscriptionPaidPlan(_id: SubscriptionPlanIds): _id is PaidSubscriptionPlanIds {
+	// 【破解】始终返回 true
+	return true;
 }
 
 export function isSubscriptionExpired(subscription: Optional<Subscription, 'state'>): boolean {
@@ -238,8 +194,10 @@ export function isSubscriptionTrial(subscription: Optional<Subscription, 'state'
 	return subscription.plan.actual.id !== subscription.plan.effective.id;
 }
 
-export function isSubscriptionTrialOrPaidFromState(state: SubscriptionState | undefined): boolean {
-	return state != null ? state === SubscriptionState.Trial || state === SubscriptionState.Paid : false;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function isSubscriptionTrialOrPaidFromState(_state: SubscriptionState | undefined): boolean {
+	// 【破解】始终返回 true
+	return true;
 }
 
 export function assertSubscriptionState(

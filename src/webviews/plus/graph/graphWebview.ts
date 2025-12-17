@@ -3071,11 +3071,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		return [access, visibility] as const;
 	}
 
+	// eslint-disable-next-line @typescript-eslint/no-unused-vars
 	private isGraphAccessAllowed(
-		access: Awaited<ReturnType<GraphWebviewProvider['getGraphAccess']>>[0] | undefined,
-		featurePreview: FeaturePreview,
+		_access: Awaited<ReturnType<GraphWebviewProvider['getGraphAccess']>>[0] | undefined,
+		_featurePreview: FeaturePreview,
 	) {
-		return (access?.allowed ?? false) !== false || getFeaturePreviewStatus(featurePreview) === 'active';
+		// 【破解】始终允许访问 Commit Graph
+		return true;
 	}
 
 	private getGraphItemContext(context: unknown): unknown | undefined {
