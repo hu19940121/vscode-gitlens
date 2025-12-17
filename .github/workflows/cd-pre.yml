@@ -1,8 +1,6 @@
 name: Publish pre-release
 
 on:
-    schedule:
-        - cron: '0 9 * * *' # every day at 4am EST
     workflow_dispatch:
 
 jobs:
