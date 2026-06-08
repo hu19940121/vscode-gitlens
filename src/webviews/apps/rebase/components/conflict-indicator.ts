@@ -1,18 +1,14 @@
-import { consume } from '@lit/context';
 import { css, html, LitElement, nothing } from 'lit';
-import { customElement, property, state } from 'lit/decorators.js';
-import type { MergeConflict } from '../../../../git/models/mergeConflict';
-import { isSubscriptionTrialOrPaidFromState } from '../../../../plus/gk/utils/subscription.utils';
-import { pluralize } from '../../../../system/string';
-import type { State } from '../../../rebase/protocol';
-import { GetPotentialConflictsRequest } from '../../../rebase/protocol';
-import { elementBase, scrollableBase } from '../../shared/components/styles/lit/base.css';
-import { ipcContext } from '../../shared/contexts/ipc';
-import type { HostIpc } from '../../shared/ipc';
-import { stateContext } from '../context';
-import '../../shared/components/code-icon';
-import '../../shared/components/overlays/popover';
-import '../../plus/shared/components/feature-gate-plus-state';
+import { customElement, property } from 'lit/decorators.js';
+import type { ConflictDetectionResult } from '@gitlens/git/models/mergeConflicts.js';
+import { pluralize } from '@gitlens/utils/string.js';
+import type { SubscriptionState } from '../../../../constants.subscription.js';
+import { elementBase, scrollableBase } from '../../shared/components/styles/lit/base.css.js';
+import '../../shared/components/code-icon.js';
+import '../../shared/components/overlays/popover.js';
+import '../../plus/shared/components/feature-gate-plus-state.js';
+
+export type RebaseConflictIndicatorStatus = 'loading' | 'clean' | 'conflicts' | 'error' | 'upgrade';
 
 @customElement('gl-rebase-conflict-indicator')
 export class GlRebaseConflictIndicator extends LitElement {
@@ -101,6 +97,23 @@ export class GlRebaseConflictIndicator extends LitElement {
 				opacity: 0.6;
 			}
 
+			/* Error state - muted warning */
+			.indicator--error {
+				background-color: color-mix(
+					in srgb,
+					var(--vscode-editorWarning-foreground) 12%,
+					transparent
+				) !important;
+				border: 1px solid color-mix(in srgb, var(--vscode-editorWarning-foreground) 30%, transparent) !important;
+				color: var(--vscode-foreground);
+				opacity: 0.8;
+			}
+
+			.indicator--error .indicator__icon {
+				color: var(--vscode-editorWarning-foreground);
+				opacity: 0.7;
+			}
+
 			/* Popover content styles */
 			.popover {
 				padding: 1.2rem;
@@ -146,18 +159,14 @@ export class GlRebaseConflictIndicator extends LitElement {
 		`,
 	];
 
-	@consume({ context: ipcContext })
-	private _ipc!: HostIpc;
-
-	@consume({ context: stateContext, subscribe: true })
-	@state()
-	private _state!: State;
-
 	@property({ type: String })
-	branch?: string;
+	status: RebaseConflictIndicatorStatus = 'loading';
 
-	@property({ type: String })
-	onto?: string;
+	@property({ attribute: false })
+	result?: ConflictDetectionResult;
+
+	@property({ attribute: false })
+	subscriptionState?: SubscriptionState;
 
 	@property({ type: Boolean })
 	compact = false;
@@ -165,96 +174,73 @@ export class GlRebaseConflictIndicator extends LitElement {
 	@property({ type: Boolean })
 	stale = false;
 
-	@state()
-	private _conflicts?: MergeConflict;
+	/** True while a re-check is in flight. Swaps the state icon for a spinner so the box keeps its colored shell. */
+	@property({ type: Boolean })
+	checking = false;
 
-	@state()
-	private _loading = false;
-
-	@state()
-	private _loaded = false;
-
-	/** Public getter for loading state */
-	get isLoading(): boolean {
-		return this._loading;
-	}
-
-	/** Public getter for conflicts */
-	get hasConflicts(): boolean {
-		return this._conflicts != null && this._conflicts.files.length > 0;
-	}
-
-	override connectedCallback(): void {
-		super.connectedCallback?.();
-		void this.fetchConflicts();
-	}
-
-	override willUpdate(changedProperties: Map<PropertyKey, unknown>): void {
-		super.willUpdate(changedProperties);
-
-		// If subscription state changed and user is now Pro, fetch conflicts
-		if (changedProperties.has('_state')) {
-			const oldState = changedProperties.get('_state') as State | undefined;
-			const oldIsPro = isSubscriptionTrialOrPaidFromState(oldState?.subscription?.state);
-			const newIsPro = isSubscriptionTrialOrPaidFromState(this._state?.subscription?.state);
-
-			// User just upgraded to Pro - fetch conflicts
-			if (!oldIsPro && newIsPro && !this._loaded && !this._loading) {
-				void this.fetchConflicts();
-			}
+	override render(): unknown {
+		switch (this.status) {
+			case 'loading':
+				return this.renderLoading();
+			case 'upgrade':
+				return this.renderUpgrade();
+			case 'error':
+				return this.renderError();
+			case 'conflicts':
+				return this.renderConflicts();
+			case 'clean':
+			default:
+				return this.renderClean();
 		}
-	}
-
-	private async fetchConflicts(): Promise<void> {
-		if (!this.branch || !this.onto || this._loading || this._loaded) {
-			return;
-		}
-
-		this._loading = true;
-		this.requestUpdate();
-
-		try {
-			const response = await this._ipc.sendRequest(GetPotentialConflictsRequest, {
-				branch: this.branch,
-				onto: this.onto,
-			});
-			this._conflicts = response.conflicts;
-			this._loaded = true;
-		} catch (error) {
-			console.error('Failed to fetch potential conflicts:', error);
-			this._loaded = true;
-		} finally {
-			this._loading = false;
-			this.requestUpdate();
-		}
-	}
-
-	override render() {
-		if (this._loading) {
-			return this.renderLoading();
-		}
-
-		const isPro = isSubscriptionTrialOrPaidFromState(this._state?.subscription?.state);
-
-		// Show upgrade prompt for non-Pro users
-		if (!isPro) {
-			return this.renderUpgrade();
-		}
-
-		// Show results for Pro users
-		if (!this._conflicts) {
-			return this.renderClean();
-		}
-
-		return this.renderConflicts();
 	}
 
 	private renderLoading() {
 		return html`
 			<div class="indicator indicator--loading">
-				<code-icon class="indicator__icon" icon="loading~spin" size="16"></code-icon>
-				${this.compact ? nothing : html`<span class="indicator__content">Checking for conflicts...</span>`}
+				<code-icon class="indicator__icon" icon="loading" modifier="spin" size="16"></code-icon>
+				${this.compact ? nothing : html`<span class="indicator__content">Detecting Conflicts</span>`}
 			</div>
+		`;
+	}
+
+	private renderStateIcon(icon: string): unknown {
+		return this.checking
+			? html`<code-icon class="indicator__icon" icon="loading" modifier="spin" size="16"></code-icon>`
+			: html`<code-icon class="indicator__icon" icon="${icon}" size="16"></code-icon>`;
+	}
+
+	private renderError() {
+		const errorMessage = this.result?.status === 'error' ? this.result.message : 'Unable to detect conflicts';
+
+		if (this.compact) {
+			return html`
+				<gl-popover placement="top" trigger="hover click focus" hoist>
+					<div slot="anchor" class="indicator indicator--error" tabindex="0">
+						${this.renderStateIcon('error')}
+					</div>
+					<div slot="content">
+						<div class="popover">
+							<p class="popover__title">Conflict Detection Unavailable</p>
+							<p class="popover__message">${errorMessage}</p>
+						</div>
+					</div>
+				</gl-popover>
+			`;
+		}
+
+		return html`
+			<gl-popover placement="bottom" trigger="hover click focus" hoist>
+				<div slot="anchor" class="indicator indicator--error" tabindex="0">
+					${this.renderStateIcon('error')}
+					<span class="indicator__content">Conflict Detection Unavailable</span>
+				</div>
+				<div slot="content">
+					<div class="popover">
+						<p class="popover__title">Conflict Detection Unavailable</p>
+						<p class="popover__message">${errorMessage}</p>
+					</div>
+				</div>
+			</gl-popover>
 		`;
 	}
 
@@ -265,7 +251,7 @@ export class GlRebaseConflictIndicator extends LitElement {
 			return html`
 				<gl-popover placement="top" trigger="hover click focus" hoist>
 					<div slot="anchor" class="indicator indicator--clean ${staleClass}" tabindex="0">
-						<code-icon class="indicator__icon" icon="pass" size="16"></code-icon>
+						${this.renderStateIcon('pass')}
 					</div>
 					<div slot="content">
 						<div class="popover">
@@ -285,9 +271,9 @@ export class GlRebaseConflictIndicator extends LitElement {
 		return html`
 			<gl-popover placement="bottom" trigger="hover click focus" hoist>
 				<div slot="anchor" class="indicator indicator--clean ${staleClass}" tabindex="0">
-					<code-icon class="indicator__icon" icon="pass" size="16"></code-icon>
+					${this.renderStateIcon('pass')}
 					<span class="indicator__content"
-						>${this.stale ? 'No Conflicts Detected (may be stale)' : 'No Conflicts Detected'}</span
+						>${this.checking ? 'Detecting Conflicts' : 'No Conflicts Detected'}</span
 					>
 				</div>
 				<div slot="content">
@@ -306,25 +292,26 @@ export class GlRebaseConflictIndicator extends LitElement {
 	}
 
 	private renderConflicts() {
-		if (!this._conflicts) return nothing;
+		if (this.result?.status !== 'conflicts') return nothing;
 
 		const staleClass = this.stale ? 'indicator--stale' : '';
-		const conflictCount = this._conflicts.files.length;
+		const files = this.result.conflict.files;
+		const conflictCount = files.length;
 
 		if (this.compact) {
 			return html`
 				<gl-popover placement="top" trigger="hover click focus" hoist>
 					<div slot="anchor" class="indicator indicator--conflict ${staleClass}" tabindex="0">
-						<code-icon class="indicator__icon" icon="warning" size="16"></code-icon>
+						${this.renderStateIcon('warning')}
 					</div>
 					<div slot="content">
 						<div class="popover">
 							<p class="popover__title">Potential Conflicts Detected</p>
 							<p class="popover__message">
-								This rebase will cause conflicts in ${pluralize('file', this._conflicts.files.length)}:
+								This rebase will cause conflicts in ${pluralize('file', conflictCount)}:
 							</p>
 							<ul class="popover__files scrollable">
-								${this._conflicts.files.map(file => html`<li class="popover__file">${file.path}</li>`)}
+								${files.map(file => html`<li class="popover__file">${file.path}</li>`)}
 							</ul>
 							${this.stale
 								? html`<p class="popover__message popover__message--warning">
@@ -340,20 +327,21 @@ export class GlRebaseConflictIndicator extends LitElement {
 		return html`
 			<gl-popover placement="bottom" trigger="hover click focus" hoist>
 				<div slot="anchor" class="indicator indicator--conflict ${staleClass}" tabindex="0">
-					<code-icon class="indicator__icon" icon="warning" size="16"></code-icon>
+					${this.renderStateIcon('warning')}
 					<span class="indicator__content"
-						>${conflictCount} Conflict${conflictCount === 1 ? '' : 's'}
-						Detected${this.stale ? ' (may be stale)' : ''}</span
+						>${this.checking
+							? 'Detecting Conflicts'
+							: html`${conflictCount} Conflict${conflictCount === 1 ? '' : 's'} Detected`}</span
 					>
 				</div>
 				<div slot="content">
 					<div class="popover">
 						<p class="popover__title">Potential Conflicts Detected</p>
 						<p class="popover__message">
-							This rebase will cause conflicts in ${pluralize('file', this._conflicts.files.length)}:
+							This rebase will cause conflicts in ${pluralize('file', conflictCount)}:
 						</p>
 						<ul class="popover__files scrollable">
-							${this._conflicts.files.map(file => html`<li class="popover__file">${file.path}</li>`)}
+							${files.map(file => html`<li class="popover__file">${file.path}</li>`)}
 						</ul>
 						${this.stale
 							? html`<p class="popover__message popover__message--warning">
@@ -380,7 +368,7 @@ export class GlRebaseConflictIndicator extends LitElement {
 					appearance="default"
 					featureRestriction="all"
 					.source=${{ source: 'rebaseEditor', detail: 'conflict-detection' } as const}
-					.state=${this._state?.subscription?.state}
+					.state=${this.subscriptionState}
 				>
 					<p slot="feature">
 						Detect potential conflicts before starting your rebase and take action to resolve them.

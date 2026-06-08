@@ -1,8 +1,8 @@
-import { Container } from '../../container';
-import type { CommitSelectedEvent } from '../../eventBus';
-import type { Repository } from '../../git/models/repository';
-import type { WebviewViewShowOptions } from '../webviewsController';
-import type { ShowWipArgs } from './protocol';
+import { Container } from '../../container.js';
+import type { CommitSelectedEvent } from '../../eventBus.js';
+import type { GlRepository } from '../../git/models/repository.js';
+import type { WebviewViewShowOptions } from '../webviewsController.js';
+import type { ShowWipArgs } from './protocol.js';
 
 export async function showInspectView(
 	data: Partial<CommitSelectedEvent['data']> | ShowWipArgs,
@@ -12,7 +12,7 @@ export async function showInspectView(
 }
 
 export async function startCodeReview(
-	repository: Repository | undefined,
+	repository: GlRepository | undefined,
 	source: ShowWipArgs['source'],
 	showOptions?: WebviewViewShowOptions,
 ): Promise<void> {

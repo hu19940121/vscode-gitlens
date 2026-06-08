@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/require-await */
 /* eslint-disable @typescript-eslint/consistent-type-assertions */
 import * as assert from 'assert';
 import * as sinon from 'sinon';
@@ -8,9 +7,9 @@ import type {
 	ProcessedRebaseCommandEntry,
 	ProcessedRebaseCommitEntry,
 	ProcessedRebaseEntry,
-} from '../../../git/models/rebase';
-import type { MoveEntryParams } from '../protocol';
-import { RebaseTodoDocument } from '../rebaseTodoDocument';
+} from '@gitlens/git/models/rebase.js';
+import type { MoveEntryParams } from '../protocol.js';
+import { RebaseTodoDocument } from '../rebaseTodoDocument.js';
 
 /** Creates a minimal mock TextDocument for testing helper methods */
 function createMockDocument(content: string = '', version: number = 1): TextDocument {
@@ -292,7 +291,7 @@ suite('RebaseTodoDocument Test Suite', () => {
 			const insertEdit = edits.find(e => e.newText !== '');
 			assert.ok(insertEdit, 'Should have insert edit');
 			// Insert text should include both commit and update-ref
-			assert.ok(insertEdit?.newText.includes('pick 1 Commit 1'), 'Should include commit line');
+			assert.ok(insertEdit?.newText.includes('pick 1 # Commit 1'), 'Should include commit line');
 			assert.ok(insertEdit?.newText.includes('update-ref refs/heads/feature-a'), 'Should include update-ref');
 		});
 
@@ -439,7 +438,7 @@ suite('RebaseTodoDocument Test Suite', () => {
 
 			assert.strictEqual(edits.length, 1);
 			// Oldest entry should stay 'pick' even when squash requested
-			assert.strictEqual(edits[0].newText, 'pick abc Commit 1');
+			assert.strictEqual(edits[0].newText, 'pick abc # Commit 1');
 		});
 
 		test('allows changing action for non-oldest commit', async () => {

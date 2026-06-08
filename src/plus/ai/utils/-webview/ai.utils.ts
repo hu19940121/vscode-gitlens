@@ -1,24 +1,27 @@
 import type { CancellationToken, Disposable, QuickInputButton } from 'vscode';
 import { env, ThemeIcon, Uri, window } from 'vscode';
-import { Schemes } from '../../../../constants';
-import type { AIProviders } from '../../../../constants.ai';
-import type { Container } from '../../../../container';
-import type { MarkdownContentMetadata } from '../../../../documents/markdown';
-import { CancellationError } from '../../../../errors';
-import type { GitRepositoryService } from '../../../../git/gitRepositoryService';
-import { decodeGitLensRevisionUriAuthority } from '../../../../git/gitUri.authority';
-import { createDirectiveQuickPickItem, Directive } from '../../../../quickpicks/items/directive';
-import { configuration } from '../../../../system/-webview/configuration';
-import { getContext } from '../../../../system/-webview/context';
-import { openSettingsEditor } from '../../../../system/-webview/vscode/editors';
-import { formatNumeric } from '../../../../system/date';
-import { Logger } from '../../../../system/logger';
-import { getSettledValue } from '../../../../system/promise';
-import { getPossessiveForm, pluralize } from '../../../../system/string';
-import type { OrgAIConfig, OrgAIProvider } from '../../../gk/models/organization';
-import { ensureAccountQuickPick } from '../../../gk/utils/-webview/acount.utils';
-import type { AIResponse, AIResultContext } from '../../aiProviderService';
-import type { AIActionType, AIModel } from '../../models/model';
+import type { AIProviders } from '@gitlens/ai/constants.js';
+import type { AIModel } from '@gitlens/ai/models/model.js';
+import { getValidatedTemperature as _getValidatedTemperature } from '@gitlens/ai/utils/ai.utils.js';
+import { decodeGitLensRevisionUriAuthority } from '@gitlens/git/utils/uriAuthority.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { formatNumeric } from '@gitlens/utils/date.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
+import { getPossessiveForm, pluralize } from '@gitlens/utils/string.js';
+import { Schemes } from '../../../../constants.js';
+import type { Source } from '../../../../constants.telemetry.js';
+import type { Container } from '../../../../container.js';
+import type { MarkdownContentMetadata } from '../../../../documents/markdown.js';
+import type { GitRepositoryService } from '../../../../git/gitRepositoryService.js';
+import { getCommitDate } from '../../../../git/utils/-webview/commit.utils.js';
+import { createDirectiveQuickPickItem, Directive } from '../../../../quickpicks/items/directive.js';
+import { configuration } from '../../../../system/-webview/configuration.js';
+import { getContext } from '../../../../system/-webview/context.js';
+import { openSettingsEditor } from '../../../../system/-webview/vscode/editors.js';
+import type { OrgAIConfig, OrgAIProvider } from '../../../gk/models/organization.js';
+import { ensureAccountQuickPick } from '../../../gk/utils/-webview/acount.utils.js';
+import type { AIResponse, AIResultContext } from '../../aiProviderService.js';
 
 export async function ensureAccount(container: Container, silent: boolean): Promise<boolean> {
 	const result = await ensureAccountQuickPick(
@@ -31,39 +34,10 @@ export async function ensureAccount(container: Container, silent: boolean): Prom
 		silent,
 	);
 
-	if (!result && !silent) {
-		throw new CancellationError();
-	}
+	if (!result && !silent) throw new CancellationError();
 
 	return result;
 }
-
-export function getActionName(action: AIActionType): string {
-	switch (action) {
-		case 'explain-changes':
-			return 'Explain Changes';
-		case 'generate-commitMessage':
-			return 'Generate Commit Message';
-		case 'generate-stashMessage':
-			return 'Generate Stash Message';
-		case 'generate-changelog':
-			return 'Generate Changelog (Preview)';
-		case 'generate-create-cloudPatch':
-			return 'Create Cloud Patch Details';
-		case 'generate-create-codeSuggestion':
-			return 'Create Code Suggestion Details';
-		case 'generate-create-pullRequest':
-			return 'Create Pull Request Details (Preview)';
-		case 'generate-rebase':
-			return 'Generate Rebase (Preview)';
-		case 'generate-commits':
-			return 'Generate Commits (Preview)';
-		case 'generate-searchQuery':
-			return 'Generate Search Query (Preview)';
-	}
-}
-
-export const estimatedCharactersPerToken = 3.1;
 
 export async function getOrPromptApiKey(
 	container: Container,
@@ -104,6 +78,7 @@ export async function getOrPromptApiKey(
 						input.validationMessage = `Please enter a valid ${provider.name} API key`;
 						return;
 					}
+
 					input.validationMessage = undefined;
 				}),
 				input.onDidAccept(() => {
@@ -149,12 +124,7 @@ export async function getOrPromptApiKey(
 }
 
 export function getValidatedTemperature(model: AIModel, modelTemperature?: number | null): number | undefined {
-	if (modelTemperature === null) return undefined;
-	// GPT5 doesn't support anything but the default temperature
-	if (model.id.startsWith('gpt-5')) return undefined;
-
-	modelTemperature ??= Math.max(0, Math.min(configuration.get('ai.modelOptions.temperature'), 2));
-	return modelTemperature;
+	return _getValidatedTemperature(model, modelTemperature, configuration.get('ai.modelOptions.temperature'));
 }
 
 export async function showLargePromptWarning(estimatedTokens: number, threshold: number): Promise<boolean> {
@@ -186,10 +156,6 @@ export function showPromptTruncationWarning(model: AIModel): void {
 	);
 }
 
-export function isAzureUrl(url: string): boolean {
-	return url.includes('.azure.com');
-}
-
 export function getOrgAIConfig(): OrgAIConfig {
 	return {
 		aiEnabled: getContext('gitlens:gk:organization:ai:enabled', true),
@@ -209,20 +175,14 @@ export function isProviderEnabledByOrg(type: AIProviders, orgAIConfig?: OrgAICon
 	return getOrgAIProviderOfType(type, orgAIConfig).enabled;
 }
 
-/**
- * If the input value (userUrl) matches to the org configuration it returns it.
- */
-export function ensureOrgConfiguredUrl(type: AIProviders, userUrl: null | undefined | string): string | undefined {
-	const provider = getOrgAIProviderOfType(type);
-	if (!provider.enabled) return undefined;
-
-	return provider.url || userUrl || undefined;
-}
-
-export async function ensureAccess(options?: { showPicker?: boolean }): Promise<boolean> {
+export async function ensureAccess(
+	container: Container,
+	options?: { showPicker?: boolean },
+	source?: Source,
+): Promise<boolean> {
 	const showPicker = options?.showPicker ?? false;
 
-	if (!getContext('gitlens:gk:organization:ai:enabled', true)) {
+	if (!container.ai.allowed) {
 		if (showPicker) {
 			await window.showQuickPick([{ label: 'OK' }], {
 				title: 'AI is Disabled',
@@ -236,7 +196,7 @@ export async function ensureAccess(options?: { showPicker?: boolean }): Promise<
 		return false;
 	}
 
-	if (!configuration.get('ai.enabled')) {
+	if (!container.ai.enabled) {
 		let reenable = false;
 		if (showPicker) {
 			const enable = { label: 'Re-enable AI Features' };
@@ -261,7 +221,7 @@ export async function ensureAccess(options?: { showPicker?: boolean }): Promise<
 		}
 
 		if (reenable) {
-			await configuration.updateEffective('ai.enabled', true);
+			await container.ai.enable(source);
 			return true;
 		}
 
@@ -368,11 +328,13 @@ export async function prepareCompareDataForAIRequest(
 	if (cancellation?.isCancellationRequested) throw new CancellationError();
 
 	const commitMessages: string[] = [];
-	for (const commit of [...log.commits.values()].sort((a, b) => a.date.getTime() - b.date.getTime())) {
+	for (const commit of [...log.commits.values()].sort(
+		(a, b) => getCommitDate(a).getTime() - getCommitDate(b).getTime(),
+	)) {
 		const message = commit.message ?? commit.summary;
 		if (message) {
 			commitMessages.push(
-				`<commit-message ${commit.date.toISOString()}>\n${commit.message ?? commit.summary}\n<end-of-commit-message>`,
+				`<commit-message ${getCommitDate(commit).toISOString()}>\n${commit.message ?? commit.summary}\n<end-of-commit-message>`,
 			);
 		}
 	}

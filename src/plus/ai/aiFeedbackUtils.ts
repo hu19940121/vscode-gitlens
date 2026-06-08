@@ -1,9 +1,9 @@
 import type { QuickPickItem } from 'vscode';
 import { window } from 'vscode';
-import type { AIFeedbackEvent, AIFeedbackUnhelpfulReasons, Source } from '../../constants.telemetry';
-import type { Container } from '../../container';
-import { map } from '../../system/iterable';
-import type { AIResultContext } from './aiProviderService';
+import { map } from '@gitlens/utils/iterable.js';
+import type { AIFeedbackEvent, AIFeedbackUnhelpfulReasons, Source } from '../../constants.telemetry.js';
+import type { Container } from '../../container.js';
+import type { AIResultContext } from './aiProviderService.js';
 
 export interface UnhelpfulResult {
 	reasons?: AIFeedbackUnhelpfulReasons[];

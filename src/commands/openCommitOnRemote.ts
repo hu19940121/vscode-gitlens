@@ -1,24 +1,25 @@
 import type { TextEditor, Uri } from 'vscode';
-import type { Source } from '../constants.telemetry';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { RemoteResourceType } from '../git/models/remoteResource';
-import { deletedOrMissing } from '../git/models/revision';
-import { isUncommitted } from '../git/utils/revision.utils';
+import { GitCommit } from '@gitlens/git/models/commit.js';
+import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
+import { deletedOrMissing } from '@gitlens/git/models/revision.js';
+import { isUncommitted } from '@gitlens/git/utils/revision.utils.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { Source } from '../constants.telemetry.js';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
 import {
 	showCommitNotFoundWarningMessage,
 	showFileNotUnderSourceControlWarningMessage,
 	showGenericErrorMessage,
-} from '../messages';
-import { getBestRepositoryOrShowPicker } from '../quickpicks/repositoryPicker';
-import { command, executeCommand } from '../system/-webview/command';
-import { createMarkdownCommandLink } from '../system/commands';
-import { Logger } from '../system/logger';
-import { ActiveEditorCommand } from './commandBase';
-import { getCommandUri } from './commandBase.utils';
-import type { CommandContext } from './commandContext';
-import { isCommandContextGitTimelineItem, isCommandContextViewNodeHasCommit } from './commandContext.utils';
-import type { OpenOnRemoteCommandArgs } from './openOnRemote';
+} from '../messages.js';
+import { getBestRepositoryOrShowPicker } from '../quickpicks/repositoryPicker.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { createMarkdownCommandLink } from '../system/commands.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
+import { isCommandContextGitTimelineItem, isCommandContextViewNodeHasCommit } from './commandContext.utils.js';
+import type { OpenOnRemoteCommandArgs } from './openOnRemote.js';
 
 export interface OpenCommitOnRemoteCommandArgs {
 	clipboard?: boolean;
@@ -82,9 +83,7 @@ export class OpenCommitOnRemoteCommand extends ActiveEditorCommand {
 		)?.path;
 		if (!repoPath) return;
 
-		if (gitUri == null) {
-			gitUri = GitUri.fromRepoPath(repoPath);
-		}
+		gitUri ??= GitUri.fromRepoPath(repoPath);
 
 		args = { ...args };
 
@@ -106,7 +105,7 @@ export class OpenCommitOnRemoteCommand extends ActiveEditorCommand {
 
 				// If the line is uncommitted, use previous commit
 				args.sha = blame.commit.isUncommitted
-					? ((await blame.commit.getPreviousSha()) ?? deletedOrMissing)
+					? ((await GitCommit.getPreviousSha(blame.commit)) ?? deletedOrMissing)
 					: blame.commit.sha;
 			}
 

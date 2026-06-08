@@ -1,7 +1,7 @@
-import type { GKCheckInResponse, GKLicense, GKLicenseType } from '../models/checkin';
-import type { Organization } from '../models/organization';
-import type { Subscription, SubscriptionPlanIds } from '../models/subscription';
-import { compareSubscriptionPlans, getSubscriptionPlan, getSubscriptionPlanOrder } from './subscription.utils';
+import type { GKCheckInResponse, GKLicense, GKLicenseType } from '../models/checkin.js';
+import type { Organization } from '../models/organization.js';
+import type { Subscription, SubscriptionPlanIds } from '../models/subscription.js';
+import { compareSubscriptionPlans, getSubscriptionPlan, getSubscriptionPlanOrder } from './subscription.utils.js';
 
 export function getSubscriptionFromCheckIn(
 	data: GKCheckInResponse,
@@ -56,6 +56,7 @@ export function getSubscriptionFromCheckIn(
 	for (const licenseData of effectiveLicenses) {
 		const [, license] = licenseData;
 		if (license.organizationId == null) continue;
+
 		const existingLicense = effectiveLicensesByOrganizationId.get(license.organizationId);
 		if (existingLicense == null) {
 			effectiveLicensesByOrganizationId.set(license.organizationId, licenseData);
@@ -65,6 +66,7 @@ export function getSubscriptionFromCheckIn(
 	for (const licenseData of paidLicenses) {
 		const [, license] = licenseData;
 		if (license.organizationId == null) continue;
+
 		const existingLicense = paidLicensesByOrganizationId.get(license.organizationId);
 		if (existingLicense == null) {
 			paidLicensesByOrganizationId.set(license.organizationId, licenseData);
@@ -105,22 +107,20 @@ export function getSubscriptionFromCheckIn(
 		);
 	}
 
-	if (actual == null) {
-		actual = getSubscriptionPlan(
-			'community-with-account',
-			false,
-			0,
-			undefined,
-			data.user.firstGitLensCheckIn != null
-				? new Date(data.user.firstGitLensCheckIn)
-				: data.user.createdDate != null
-					? new Date(data.user.createdDate)
-					: undefined,
-			undefined,
-			undefined,
-			data.nextOptInDate,
-		);
-	}
+	actual ??= getSubscriptionPlan(
+		'community-with-account',
+		false,
+		0,
+		undefined,
+		data.user.firstGitLensCheckIn != null
+			? new Date(data.user.firstGitLensCheckIn)
+			: data.user.createdDate != null
+				? new Date(data.user.createdDate)
+				: undefined,
+		undefined,
+		undefined,
+		data.nextOptInDate,
+	);
 
 	let effective: Subscription['plan']['effective'] | undefined;
 	const chosenEffectiveLicense =

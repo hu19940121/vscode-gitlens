@@ -28,6 +28,11 @@ export const entryStyles = css`
 		}
 	}
 
+	/* Disable grab cursor when reordering is disabled (preserves merges) */
+	:host-context(.preserves-merges) {
+		cursor: default;
+	}
+
 	/* Light theme overrides */
 	:host-context(.vscode-light),
 	:host-context(.vscode-high-contrast-light) {
@@ -44,15 +49,13 @@ export const entryStyles = css`
 		--fg-muted-intensity: 70%;
 	}
 
-	/* Z-index management for overlays */
-	:host:has(sl-select[open]),
+	/* Raise z-index only when overlays are open/hovered/focused to escape row stacking contexts */
+	:host:has(gl-select[open]),
+	:host:has(gl-popover[open]),
 	:host:has(gl-tooltip:hover),
 	:host:has(gl-tooltip:focus-within),
 	:host:has(gl-avatar-list:hover),
 	:host:has(gl-avatar-list:focus-within),
-	:host:has(gl-popover:hover),
-	:host:has(gl-popover:focus-within),
-	:host:has(gl-popover[open]),
 	:host:has(gl-ref-overflow-chip:hover),
 	:host:has(gl-ref-overflow-chip:focus-within) {
 		z-index: 1000;
@@ -77,24 +80,23 @@ export const entryStyles = css`
 
 		--entry-bg: var(--color-background);
 
-		--sl-input-background-color: var(--color-background);
-		--sl-input-color: var(--color-foreground);
-		--sl-input-color-hover: var(--color-foreground);
-		--sl-input-color-disabled: var(--color-foreground);
+		--wa-form-control-background-color: var(--color-background);
+		--wa-form-control-value-color: var(--color-foreground);
+		--wa-form-control-value-color-hover: var(--color-foreground);
+		--wa-form-control-value-color-disabled: var(--color-foreground);
 
 		display: flex;
 		align-items: center;
 		gap: 1rem;
 		position: relative;
 		padding-inline: 1rem;
-		padding-block: 0.2rem;
+		padding-block: var(--gl-rebase-entry-padding-block, 0.2rem);
 		border-radius: 0.3rem;
 		box-sizing: border-box;
 		color: var(--fg);
 		width: 100%;
 
 		&:hover {
-			--fg-color: var(--vscode-list-activeSelectionForeground, var(--color-foreground));
 			--entry-bg: var(--vscode-list-hoverBackground);
 
 			background-color: var(--vscode-list-hoverBackground);
@@ -102,8 +104,6 @@ export const entryStyles = css`
 
 		&:focus,
 		&:focus-within {
-			--fg-color: var(--vscode-list-activeSelectionForeground, var(--color-foreground));
-
 			background-color: var(--vscode-list-focusBackground);
 			box-shadow: 0 0 0 1px var(--vscode-list-focusOutline) inset;
 			outline: none;
@@ -118,13 +118,13 @@ export const entryStyles = css`
 
 		&.entry--first {
 			.entry-graph::before {
-				inset-block: 50% -0.225rem;
+				inset-block: 50% var(--gl-rebase-entry-graph-offset, -0.225rem);
 			}
 		}
 
 		&.entry--last {
 			.entry-graph::before {
-				inset-block: -0.225rem 50%;
+				inset-block: var(--gl-rebase-entry-graph-offset, -0.225rem) 50%;
 			}
 		}
 
@@ -142,6 +142,7 @@ export const entryStyles = css`
 			.entry-graph::after {
 				border-color: transparent;
 				background-color: var(--action-color);
+				background-image: none;
 			}
 
 			/* Disabled select for done entries */
@@ -168,6 +169,54 @@ export const entryStyles = css`
 				opacity: 1;
 			}
 		}
+
+		/* Conflict entry - commit that will cause conflicts */
+		&.entry--conflict {
+			--fg-intensity: 100%;
+			--conflict-color: var(
+				--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor,
+				#c74e39
+			);
+
+			background-color: color-mix(in srgb, var(--conflict-color) 25%, transparent);
+			outline: 1px solid color-mix(in srgb, var(--conflict-color) 50%, transparent);
+			outline-offset: -1px;
+
+			.action-select {
+				opacity: 1;
+			}
+
+			.entry-conflict-indicator {
+				display: flex;
+			}
+		}
+	}
+
+	/* Conflict indicator - hidden by default, shown on conflict entries */
+	.entry-conflict-indicator {
+		display: none;
+		align-items: center;
+		justify-content: center;
+		flex: 0 0 auto;
+		padding-inline: 0.4rem;
+		color: var(--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor, #c74e39);
+	}
+
+	/* Conflict popover content */
+	.popover-conflict-header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.4rem;
+		color: var(--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor, #c74e39);
+		font-weight: 600;
+
+		hr {
+			width: 100%;
+			border: none;
+			border-top: 1px solid var(--color-foreground--25);
+			margin: 0.5rem 0;
+		}
 	}
 
 	/* Graph node */
@@ -178,7 +227,7 @@ export const entryStyles = css`
 		position: relative;
 		flex: 0 0 auto;
 		width: 16px;
-		height: 25px;
+		height: var(--gl-rebase-entry-graph-height, 25px);
 		z-index: 2;
 
 		/* circle for commits */
@@ -190,7 +239,11 @@ export const entryStyles = css`
 			height: 12px;
 			border-radius: 50%;
 			border: 2px solid var(--action-color);
-			background-color: var(--entry-bg);
+			/* Layer the row tint over an opaque editor base so the dot center always
+			   covers the throughline — VS Code list hover/selection tokens are
+			   semi-transparent overlays and would otherwise let the line shine through. */
+			background-color: var(--vscode-editor-background);
+			background-image: linear-gradient(var(--entry-bg), var(--entry-bg));
 		}
 
 		/* squircle for commands */
@@ -206,7 +259,7 @@ export const entryStyles = css`
 		&::before {
 			content: '';
 			position: absolute;
-			inset-block: -0.225rem;
+			inset-block: calc(-1 * var(--gl-rebase-entry-padding-block, 0.2rem));
 			width: 0;
 			border-right: 2px solid var(--action-line-color);
 			z-index: -2;
@@ -215,6 +268,8 @@ export const entryStyles = css`
 
 	/* Action dropdown container */
 	.entry-action {
+		display: flex;
+		align-items: center;
 		flex: 0 0 auto;
 	}
 
@@ -231,18 +286,33 @@ export const entryStyles = css`
 	.action-select {
 		color: var(--color-foreground);
 		min-width: 90px;
+		/* Reset WA's form-control sizing tokens. WA defaults to padding-block: 0.75em
+		   + line-height: 1.35 which produces a ~40px control height. We size the
+		   combobox to track the graph dot so the select grows with row density. */
+		--wa-form-control-padding-block: 0;
+		--wa-form-control-value-line-height: 1.2;
+
+		/* gl-select option styling overrides — wa-option lives in gl-select's shadow
+		   root and can't be targeted directly from this scope, so we pass through
+		   custom-properties exposed by gl-select itself. */
+		--gl-select-option-padding: 0.2rem 0.4rem;
+		--gl-select-option-hover-bg: var(--vscode-list-inactiveSelectionBackground);
+		--gl-select-option-hover-color: var(--vscode-list-activeSelectionForeground);
 
 		&::part(combobox) {
 			padding: 0 0.75rem;
 			outline: none;
+			height: 25px;
+			line-height: 1.2;
 		}
 
 		&::part(display-input) {
 			field-sizing: content;
+			line-height: 1.2;
 		}
 
 		&::part(expand-icon) {
-			margin-inline-start: var(--sl-spacing-x-small);
+			margin-inline-start: var(--wa-spacing-x-small);
 		}
 
 		&::part(listbox) {
@@ -253,34 +323,35 @@ export const entryStyles = css`
 			min-width: anchor-size(width, 90px);
 			width: max-content;
 		}
-
-		sl-option::part(base) {
-			padding: 0.2rem 0.4rem;
-		}
-
-		sl-option:focus::part(base) {
-			background-color: var(--vscode-list-activeSelectionBackground);
-			color: var(--vscode-list-activeSelectionForeground);
-		}
-
-		sl-option:not(:focus):hover::part(base) {
-			background-color: var(--vscode-list-inactiveSelectionBackground);
-			color: var(--vscode-list-activeSelectionForeground);
-		}
-
-		sl-option::part(checked-icon) {
-			display: none;
-		}
 	}
 
 	/* Message */
-	.entry-message {
+	gl-popover.entry-message {
+		--hide-delay: 100ms;
+		--wa-z-index-tooltip: 10000;
+
+		display: flex;
 		flex: 1 1 0;
 		align-self: stretch;
 		min-width: 0;
 		overflow: hidden;
 		color: var(--fg);
 		text-decoration: var(--action-text-decoration);
+
+		/* Tooltip-style behavior: pointer events on the rendered popup pass through,
+		   so the hover state ends as soon as the cursor leaves the anchor — matching
+		   the file tree hover-popover. The wa-popup's popup part is re-exported from
+		   gl-popover as base__popup (see popover.ts exportparts mapping). */
+		&::part(base__popup),
+		&::part(base__hover-bridge),
+		&::part(body) {
+			pointer-events: none;
+		}
+
+		&::part(body) {
+			max-height: 50vh;
+			overflow-y: auto;
+		}
 	}
 
 	.entry-message-content {
@@ -290,6 +361,11 @@ export const entryStyles = css`
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+	}
+
+	.entry-message-body {
+		color: color-mix(in srgb, var(--vscode-descriptionForeground) 75%, transparent);
+		margin-left: 1rem;
 	}
 
 	/* Update refs */
@@ -310,24 +386,33 @@ export const entryStyles = css`
 	/* Avatar */
 	.entry-avatar {
 		flex: 0 0 auto;
+		min-width: 4rem;
 		margin: 0;
 
 		gl-avatar-list& {
 			--gl-avatar-size: 2.4rem;
+
+			&::part(base) {
+				display: flex;
+				justify-content: flex-end;
+			}
 		}
 	}
 
 	/* Date */
 	.entry-date {
 		flex: 0 0 auto;
+		min-width: 11ch;
 		margin: 0;
 		color: var(--fg-muted);
+		text-align: right;
 		text-decoration: var(--action-text-decoration);
 	}
 
 	/* SHA */
 	.entry-sha {
 		flex: 0 0 auto;
+		min-width: 10ch;
 		margin: 0;
 		color: var(--fg-muted);
 		text-decoration: var(--action-text-decoration);
@@ -400,6 +485,7 @@ export const entryStyles = css`
 		.entry-graph::after {
 			border-color: transparent;
 			background-color: color-mix(in srgb, var(--color-foreground) 25%, var(--vscode-editor-background));
+			background-image: none;
 		}
 
 		gl-avatar-list::part(avatar) {
@@ -415,10 +501,9 @@ export const entryStyles = css`
 		--action-color: var(--action-edit-color);
 		--action-line-color: var(--action-edit-color);
 
-		--sl-input-background-color: var(--action-edit-bg);
-		--sl-input-border-color: var(--action-edit-color);
-		--sl-input-border-color-focus: var(--action-edit-color);
-		--sl-input-focus-ring-color: var(--action-edit-color);
+		--wa-form-control-background-color: var(--action-edit-bg);
+		--wa-form-control-border-color: var(--action-edit-color);
+		--wa-color-focus: var(--action-edit-color);
 	}
 
 	.entry[data-action='fixup'],
@@ -427,10 +512,9 @@ export const entryStyles = css`
 		--action-line-color: var(--action-squash-color);
 		--action-text-decoration: line-through;
 
-		--sl-input-background-color: var(--action-squash-bg);
-		--sl-input-border-color: var(--action-squash-color);
-		--sl-input-border-color-focus: var(--action-squash-color);
-		--sl-input-focus-ring-color: var(--action-squash-color);
+		--wa-form-control-background-color: var(--action-squash-bg);
+		--wa-form-control-border-color: var(--action-squash-color);
+		--wa-color-focus: var(--action-squash-color);
 
 		/* Muted but responds to hover/focus/selected at reduced intensity */
 		--fg-intensity: 60%;
@@ -459,10 +543,9 @@ export const entryStyles = css`
 		--action-line-color: var(--action-drop-color);
 		--action-text-decoration: line-through;
 
-		--sl-input-background-color: var(--action-drop-bg);
-		--sl-input-border-color: var(--action-drop-color);
-		--sl-input-border-color-focus: var(--action-drop-color);
-		--sl-input-focus-ring-color: var(--action-drop-color);
+		--wa-form-control-background-color: var(--action-drop-bg);
+		--wa-form-control-border-color: var(--action-drop-color);
+		--wa-color-focus: var(--action-drop-color);
 
 		/* More muted but responds to hover/focus/selected at reduced intensity */
 		--fg-intensity: 45%;

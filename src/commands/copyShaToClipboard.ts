@@ -1,23 +1,24 @@
 import type { TextEditor, Uri } from 'vscode';
 import { env } from 'vscode';
-import type { Source } from '../constants.telemetry';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { shortenRevision } from '../git/utils/revision.utils';
-import { showGenericErrorMessage } from '../messages';
-import { command } from '../system/-webview/command';
-import { configuration } from '../system/-webview/configuration';
-import { createMarkdownCommandLink } from '../system/commands';
-import { first } from '../system/iterable';
-import { Logger } from '../system/logger';
-import { ActiveEditorCommand } from './commandBase';
-import { getCommandUri } from './commandBase.utils';
-import type { CommandContext } from './commandContext';
+import { shortenRevision } from '@gitlens/git/utils/revision.utils.js';
+import { first } from '@gitlens/utils/iterable.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { Source } from '../constants.telemetry.js';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import { getCommitRepository } from '../git/utils/-webview/commit.utils.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { createMarkdownCommandLink } from '../system/commands.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
 import {
 	isCommandContextViewNodeHasBranch,
 	isCommandContextViewNodeHasCommit,
 	isCommandContextViewNodeHasTag,
-} from './commandContext.utils';
+} from './commandContext.utils.js';
 
 export interface CopyShaToClipboardCommandArgs {
 	sha?: string;
@@ -43,7 +44,7 @@ export class CopyShaToClipboardCommand extends ActiveEditorCommand {
 			args.sha = context.node.commit.sha;
 			return this.execute(
 				context.editor,
-				context.node.commit.file?.uri ?? context.node.commit.getRepository()?.uri,
+				context.node.commit.file?.uri ?? getCommitRepository(context.node.commit.repoPath)?.uri,
 				args,
 			);
 		} else if (isCommandContextViewNodeHasBranch(context)) {

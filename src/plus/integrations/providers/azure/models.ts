@@ -1,15 +1,15 @@
-import type { IssueMember } from '../../../../git/models/issue';
-import { Issue, RepositoryAccessLevel } from '../../../../git/models/issue';
-import type { IssueOrPullRequestState } from '../../../../git/models/issueOrPullRequest';
-import type { PullRequestMember, PullRequestReviewer } from '../../../../git/models/pullRequest';
+import type { IssueMember } from '@gitlens/git/models/issue.js';
+import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
+import type { IssueOrPullRequestState } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequestMember, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
 	PullRequestReviewDecision,
 	PullRequestReviewState,
-} from '../../../../git/models/pullRequest';
-import type { Provider } from '../../../../git/models/remoteProvider';
-import type { ResourceDescriptor } from '../../../../git/models/resourceDescriptor';
+} from '@gitlens/git/models/pullRequest.js';
+import type { Provider } from '@gitlens/git/models/remoteProvider.js';
+import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 
 const vstsHostnameRegex = /\.visualstudio\.com$/;
 
@@ -381,6 +381,7 @@ function parseVstsHttpsUrl(url: URL): [owner: string, project: string, repo: str
 	if (match == null) {
 		throw new Error(`Invalid VSTS URL: ${url.toString()}`);
 	}
+
 	const [, project, repo] = match;
 	return [owner, project, repo];
 }
@@ -392,6 +393,7 @@ function parseAzureNewStyleUrl(url: URL): [owner: string, project: string, repo:
 	if (match == null) {
 		throw new Error(`Invalid Azure URL: ${url.toString()}`);
 	}
+
 	const [, owner, project, repo] = match;
 	return [owner, project, repo];
 }
@@ -414,6 +416,7 @@ export function getAzurePullRequestWebUrl(pr: AzurePullRequest): string {
 	if (isVSTS) {
 		return `${baseUrl}/${repoPath}/pullrequest/${pr.pullRequestId}`;
 	}
+
 	const owner = getAzureDevOpsOwner(url);
 	return `${baseUrl}/${owner}/${repoPath}/pullrequest/${pr.pullRequestId}`;
 }

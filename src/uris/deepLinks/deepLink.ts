@@ -1,9 +1,11 @@
 import type { Uri } from 'vscode';
-import type { GlCommands } from '../../constants.commands';
-import type { GitReference } from '../../git/models/reference';
-import type { GitRemote } from '../../git/models/remote';
-import type { Repository } from '../../git/models/repository';
-import type { OpenWorkspaceLocation } from '../../system/-webview/vscode/workspaces';
+import type { IssueShape } from '@gitlens/git/models/issue.js';
+import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
+import type { GitReference } from '@gitlens/git/models/reference.js';
+import type { GitRemote } from '@gitlens/git/models/remote.js';
+import type { GlCommands } from '../../constants.commands.js';
+import type { GlRepository } from '../../git/models/repository.js';
+import type { OpenWorkspaceLocation } from '../../system/-webview/vscode/workspaces.js';
 
 export type UriTypes = 'link';
 
@@ -29,6 +31,8 @@ export enum DeepLinkCommandType {
 	Launchpad = 'launchpad',
 	Login = 'login',
 	SignUp = 'signup',
+	StartReview = 'start-review',
+	StartWork = 'start-work',
 	Walkthrough = 'walkthrough',
 	Worktrees = 'worktrees',
 }
@@ -45,6 +49,7 @@ export const DeepLinkCommandTypeToCommand = new Map<DeepLinkCommandType, GlComma
 	[DeepLinkCommandType.Launchpad, 'gitlens.showLaunchpad'],
 	[DeepLinkCommandType.Login, 'gitlens.plus.login'],
 	[DeepLinkCommandType.SignUp, 'gitlens.plus.signUp'],
+	// StartReview and StartWork are handled specially in DeepLinkService
 	[DeepLinkCommandType.Walkthrough, 'gitlens.getStarted'],
 	[DeepLinkCommandType.Worktrees, 'gitlens.showWorktreesView'],
 	[DeepLinkCommandType.InstallMCP, 'gitlens.ai.mcp.install'],
@@ -158,6 +163,7 @@ export function parseDeepLinkUri(uri: Uri): DeepLink | undefined {
 			if (target === DeepLinkType.Comparison) {
 				const split = joined.split(/(\.\.\.|\.\.)/);
 				if (split.length !== 3) return undefined;
+
 				targetId = split[0];
 				secondaryTargetId = split[2];
 				secondaryRemoteUrl = urlParams.get('prRepoUrl') ?? undefined;
@@ -195,7 +201,7 @@ export function parseDeepLinkUri(uri: Uri): DeepLink | undefined {
 			};
 		}
 		case DeepLinkType.Draft: {
-			if (mainId == null || mainId.match(/^v\d+$/)) return undefined;
+			if (mainId == null || /^v\d+$/.test(mainId)) return undefined;
 
 			let patchId = urlParams.get('patch') ?? undefined;
 			if (patchId != null) {
@@ -264,6 +270,8 @@ export const enum DeepLinkServiceState {
 	OpenAllPrChanges,
 	DeleteBranch,
 	ConnectCloudIntegrations,
+	StartReview,
+	StartWork,
 }
 
 export const enum DeepLinkServiceAction {
@@ -299,6 +307,8 @@ export const enum DeepLinkServiceAction {
 	OpenSwitch,
 	OpenAllPrChanges,
 	DeleteBranch,
+	StartReview,
+	StartWork,
 }
 
 export type DeepLinkRepoOpenType = 'clone' | 'folder' | 'workspace' | 'current';
@@ -307,7 +317,7 @@ export interface DeepLinkServiceContext {
 	state: DeepLinkServiceState;
 	url?: string | undefined;
 	mainId?: string | undefined;
-	repo?: Repository | undefined;
+	repo?: GlRepository | undefined;
 	remoteUrl?: string | undefined;
 	remote?: GitRemote | undefined;
 	secondaryRemote?: GitRemote | undefined;
@@ -324,6 +334,13 @@ export interface DeepLinkServiceContext {
 	repoOpenUri?: Uri | undefined;
 	params?: URLSearchParams | undefined;
 	currentBranch?: string | undefined;
+	prData?: PullRequestShape | undefined;
+	issueData?: IssueShape | undefined;
+	instructions?: string | undefined;
+	/** Optional agent descriptor for Start Work / Start Review with `showOpenInAgent`. */
+	agent?: import('../../plus/agents/agentDescriptor.js').AgentDescriptor | undefined;
+	/** Worktree path for CLI dispatch `cwd`. */
+	worktreePath?: string | undefined;
 }
 
 export const deepLinkStateTransitionTable: Record<string, Record<string, DeepLinkServiceState>> = {
@@ -468,6 +485,8 @@ export const deepLinkStateTransitionTable: Record<string, Record<string, DeepLin
 		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
+		[DeepLinkServiceAction.StartReview]: DeepLinkServiceState.StartReview,
+		[DeepLinkServiceAction.StartWork]: DeepLinkServiceState.StartWork,
 	},
 	[DeepLinkServiceState.DeleteBranch]: {
 		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
@@ -475,6 +494,18 @@ export const deepLinkStateTransitionTable: Record<string, Record<string, DeepLin
 		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
 	},
 	[DeepLinkServiceState.ConnectCloudIntegrations]: {
+		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
+		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
+		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
+	},
+	[DeepLinkServiceState.StartReview]: {
+		[DeepLinkServiceAction.StartReview]: DeepLinkServiceState.StartReview,
+		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
+		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
+		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
+	},
+	[DeepLinkServiceState.StartWork]: {
+		[DeepLinkServiceAction.StartWork]: DeepLinkServiceState.StartWork,
 		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
@@ -513,4 +544,6 @@ export const deepLinkStateToProgress: Record<string, DeepLinkProgress> = {
 	[DeepLinkServiceState.OpenAllPrChanges]: { message: 'Opening all PR changes...', increment: 90 },
 	[DeepLinkServiceState.DeleteBranch]: { message: 'Deleting branch...', increment: 90 },
 	[DeepLinkServiceState.ConnectCloudIntegrations]: { message: 'Connecting cloud integrations...', increment: 90 },
+	[DeepLinkServiceState.StartReview]: { message: 'Starting review...', increment: 90 },
+	[DeepLinkServiceState.StartWork]: { message: 'Starting work...', increment: 90 },
 };

@@ -1,26 +1,26 @@
 import type { Command } from 'vscode';
-import { MarkdownString, ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import type { DiffWithCommandArgs } from '../../commands/diffWith';
-import type { DiffWithPreviousCommandArgs } from '../../commands/diffWithPrevious';
-import { StatusFileFormatter } from '../../git/formatters/statusFormatter';
-import { GitUri } from '../../git/gitUri';
-import type { GitCommit } from '../../git/models/commit';
-import type { GitFileWithCommit } from '../../git/models/file';
-import { isGitFileChange } from '../../git/models/fileChange';
-import type { GitRevisionReference } from '../../git/models/reference';
-import { getGitFileStatusIcon } from '../../git/utils/fileStatus.utils';
-import { shortenRevision } from '../../git/utils/revision.utils';
-import { createCommand } from '../../system/-webview/command';
-import { relativeDir } from '../../system/-webview/path';
-import { editorLineToDiffRange } from '../../system/-webview/vscode/editors';
-import { joinPaths } from '../../system/path';
-import type { ViewsWithCommits } from '../viewBase';
-import { getFileTooltip } from './abstract/viewFileNode';
-import type { ViewNode } from './abstract/viewNode';
-import { ContextValues } from './abstract/viewNode';
-import { ViewRefFileNode } from './abstract/viewRefNode';
-import { FileRevisionAsCommitNode } from './fileRevisionAsCommitNode';
-import type { FileNode } from './folderNode';
+import { MarkdownString, ThemeIcon, TreeItem, TreeItemCollapsibleState, Uri } from 'vscode';
+import type { GitCommit } from '@gitlens/git/models/commit.js';
+import type { GitFileWithCommit } from '@gitlens/git/models/file.js';
+import { GitFileChange } from '@gitlens/git/models/fileChange.js';
+import type { GitRevisionReference } from '@gitlens/git/models/reference.js';
+import { getGitFileStatusIcon } from '@gitlens/git/utils/fileStatus.utils.js';
+import { shortenRevision } from '@gitlens/git/utils/revision.utils.js';
+import { joinPaths } from '@gitlens/utils/path.js';
+import type { DiffWithCommandArgs } from '../../commands/diffWith.js';
+import type { DiffWithPreviousCommandArgs } from '../../commands/diffWithPrevious.js';
+import { StatusFileFormatter } from '../../git/formatters/statusFormatter.js';
+import { GitUri } from '../../git/gitUri.js';
+import { createCommand } from '../../system/-webview/command.js';
+import { relativeDir } from '../../system/-webview/path.js';
+import { editorLineToDiffRange } from '../../system/-webview/vscode/range.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import { getFileTooltip } from './abstract/viewFileNode.js';
+import type { ViewNode } from './abstract/viewNode.js';
+import { ContextValues } from './abstract/viewNode.js';
+import { ViewRefFileNode } from './abstract/viewRefNode.js';
+import { FileRevisionAsCommitNode } from './fileRevisionAsCommitNode.js';
+import type { FileNode } from './folderNode.js';
 
 export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithCommits> implements FileNode {
 	private readonly _files: GitFileWithCommit[];
@@ -67,7 +67,7 @@ export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithComm
 				file = f;
 			}
 		}
-		file ??= files[files.length - 1];
+		file ??= files.at(-1)!;
 
 		super('status-file', GitUri.fromFile(file, repoPath, ref), view, parent, file);
 
@@ -159,7 +159,7 @@ export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithComm
 			.map(
 				f =>
 					`${getFileTooltip(f, getStatusSuffix(f))}${
-						isGitFileChange(f) && f.stats != null ? '\n\n' : '\\\n'
+						GitFileChange.is(f) && f.stats != null ? '\n\n' : '\\\n'
 					}`,
 			)
 			.join('')
@@ -170,7 +170,7 @@ export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithComm
 		item.tooltip = new MarkdownString(tooltip, true);
 
 		if (this._hasStagedChanges || this._hasUnstagedChanges) {
-			item.contextValue = `${ContextValues.File}${this._hasStagedChanges ? '+staged' : ''}${this._hasUnstagedChanges ? '+unstaged' : ''}`;
+			item.contextValue = `${ContextValues.File}${this._hasStagedChanges ? '+staged' : ''}${this._hasUnstagedChanges ? '+unstaged' : ''}${this.file.submodule != null ? '+submodule' : ''}`;
 
 			// Use the file icon and decorations
 			item.resourceUri = this.view.container.git.getAbsoluteUri(this.file.path, this.repoPath);
@@ -180,8 +180,8 @@ export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithComm
 
 			const icon = getGitFileStatusIcon(this.file.status);
 			item.iconPath = {
-				dark: this.view.container.context.asAbsolutePath(joinPaths('images', 'dark', icon)),
-				light: this.view.container.context.asAbsolutePath(joinPaths('images', 'light', icon)),
+				dark: Uri.file(this.view.container.context.asAbsolutePath(joinPaths('images', 'dark', icon))),
+				light: Uri.file(this.view.container.context.asAbsolutePath(joinPaths('images', 'light', icon))),
 			};
 		}
 
@@ -211,7 +211,7 @@ export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithComm
 		switch (this._type) {
 			case 'ahead':
 			case 'behind': {
-				const lhs = this._files[this._files.length - 1].commit;
+				const lhs = this._files.at(-1)!.commit;
 				const rhs = this._files[0].commit;
 
 				commandArgs = {
@@ -239,7 +239,7 @@ export class StatusFileNode extends ViewRefFileNode<'status-file', ViewsWithComm
 				break;
 			}
 			default: {
-				const commit = this._files[this._files.length - 1].commit;
+				const commit = this._files.at(-1)!.commit;
 				const file = commit.fileset?.files?.find(f => f.path === this.file.path) ?? this.file;
 				commandArgs = {
 					lhs: {

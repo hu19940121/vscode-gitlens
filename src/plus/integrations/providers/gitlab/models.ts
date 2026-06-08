@@ -1,9 +1,9 @@
-import type { PullRequestRefs, PullRequestState } from '../../../../git/models/pullRequest';
-import { PullRequest, PullRequestMergeableState } from '../../../../git/models/pullRequest';
-import type { Provider } from '../../../../git/models/remoteProvider';
-import type { Integration } from '../../models/integration';
-import type { ProviderPullRequest } from '../models';
-import { fromProviderPullRequest } from '../models';
+import type { PullRequestRefs, PullRequestState } from '@gitlens/git/models/pullRequest.js';
+import { PullRequest, PullRequestMergeableState } from '@gitlens/git/models/pullRequest.js';
+import type { Provider } from '@gitlens/git/models/remoteProvider.js';
+import type { Integration } from '../../models/integration.js';
+import type { ProviderPullRequest } from '../models.js';
+import { fromProviderPullRequest } from '../models.js';
 
 export interface GitLabUser {
 	id: number;
@@ -230,22 +230,23 @@ function fromGitLabMergeRequestRefs(pr: GitLabMergeRequestFull): PullRequestRefs
 	if (pr.sourceProject == null) {
 		return undefined;
 	}
+	// GitLab terminology: sourceBranch = branch with changes (head), targetBranch = merge target (base)
 	return {
-		base: {
+		head: {
 			owner: getRepoNamespace(pr.sourceProject.fullPath),
 			branch: pr.sourceBranch,
 			exists: true,
 			url: pr.sourceProject.webUrl,
 			repo: pr.sourceProject.fullPath,
-			sha: pr.diffRefs?.baseSha || '',
+			sha: pr.diffRefs?.headSha || '',
 		},
-		head: {
+		base: {
 			owner: getRepoNamespace(pr.project.fullPath),
 			branch: pr.targetBranch,
 			exists: true,
 			url: pr.project.webUrl,
 			repo: pr.project.fullPath,
-			sha: pr.diffRefs?.headSha || '',
+			sha: pr.diffRefs?.baseSha || '',
 		},
 		isCrossRepository: pr.sourceProject.id !== pr.project.id,
 	};

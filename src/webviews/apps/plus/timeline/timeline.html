@@ -11,7 +11,12 @@
 			@font-face {
 				font-family: 'glicons';
 				font-display: block;
-				src: url('#{root}/dist/glicons.woff2?d3b316716ee1329763a193a20834cd0a') format('woff2');
+				src: url('#{root}/dist/glicons.woff2?6d6df3d609ab75f20b22aecdd3ed6c98') format('woff2');
+			}
+			@font-face {
+				font-family: 'seti';
+				font-display: block;
+				src: url('#{webroot}/media/seti.woff') format('woff');
 			}
 		</style>
 		<script type="application/javascript" nonce="#{cspNonce}">
@@ -24,6 +29,6 @@
 		data-placement="#{placement}"
 		data-vscode-context='{ "webview": "#{webviewId}", "webviewInstance": "#{webviewInstanceId}" }'
 	>
-		<gl-timeline-app name="TimelineView" placement="#{placement}" bootstrap="#{state}"></gl-timeline-app>
+		<gl-timeline-app name="TimelineView" placement="#{placement}" context="#{state}"></gl-timeline-app>
 	</body>
 </html>

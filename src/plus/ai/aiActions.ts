@@ -1,12 +1,12 @@
-import { explainChanges, explainCommit } from './actions/explainChanges';
-import { generateChangelog } from './actions/generateChangelog';
-import { generateCommits } from './actions/generateCommits';
-import { generateCreateDraft } from './actions/generateCreateDraft';
-import { generateCreatePullRequest } from './actions/generateCreatePullRequest';
-import { generateCommitMessage, generateStashMessage } from './actions/generateMessage';
-import { generateRebase } from './actions/generateRebase';
-import { generateSearchQuery } from './actions/generateSearchQuery';
-import type { AIService } from './aiService';
+import { explainChanges, explainCommit } from './actions/explainChanges.js';
+import { generateChangelog } from './actions/generateChangelog.js';
+import { generateCommits } from './actions/generateCommits.js';
+import { generateCreateDraft } from './actions/generateCreateDraft.js';
+import { generateCreatePullRequest } from './actions/generateCreatePullRequest.js';
+import { generateCommitMessage, generateStashMessage } from './actions/generateMessage.js';
+import { generateSearchQuery } from './actions/generateSearchQuery.js';
+import { reviewChanges, reviewFocusArea, reviewOverview } from './actions/reviewChanges.js';
+import type { AIService } from './aiService.js';
 
 type RemoveFirstArg<F> = F extends (first: any, ...args: infer Rest) => infer Return
 	? (...args: Rest) => Return
@@ -20,9 +20,11 @@ export class AIActions {
 	readonly generateCommits: RemoveFirstArg<typeof generateCommits>;
 	readonly generateCreateDraft: RemoveFirstArg<typeof generateCreateDraft>;
 	readonly generateCreatePullRequest: RemoveFirstArg<typeof generateCreatePullRequest>;
-	readonly generateRebase: RemoveFirstArg<typeof generateRebase>;
 	readonly generateSearchQuery: RemoveFirstArg<typeof generateSearchQuery>;
 	readonly generateStashMessage: RemoveFirstArg<typeof generateStashMessage>;
+	readonly reviewChanges: RemoveFirstArg<typeof reviewChanges>;
+	readonly reviewFocusArea: RemoveFirstArg<typeof reviewFocusArea>;
+	readonly reviewOverview: RemoveFirstArg<typeof reviewOverview>;
 
 	constructor(service: AIService) {
 		this.explainChanges = explainChanges.bind(null, service);
@@ -32,8 +34,10 @@ export class AIActions {
 		this.generateCommits = generateCommits.bind(null, service);
 		this.generateCreateDraft = generateCreateDraft.bind(null, service);
 		this.generateCreatePullRequest = generateCreatePullRequest.bind(null, service);
-		this.generateRebase = generateRebase.bind(null, service);
 		this.generateSearchQuery = generateSearchQuery.bind(null, service);
 		this.generateStashMessage = generateStashMessage.bind(null, service);
+		this.reviewChanges = reviewChanges.bind(null, service);
+		this.reviewFocusArea = reviewFocusArea.bind(null, service);
+		this.reviewOverview = reviewOverview.bind(null, service);
 	}
 }

@@ -1,20 +1,20 @@
 import type { CancellationToken } from 'vscode';
-import type { IntegrationIds } from '../../../constants.integrations';
-import { GitCloudHostIntegrationId } from '../../../constants.integrations';
-import type { PagedResult } from '../../../git/gitProvider';
-import type { Account, UnidentifiedAuthor } from '../../../git/models/author';
-import type { DefaultBranch } from '../../../git/models/defaultBranch';
-import type { IssueOrPullRequestState as PullRequestState } from '../../../git/models/issueOrPullRequest';
-import type { PullRequest, PullRequestMergeMethod } from '../../../git/models/pullRequest';
-import type { RepositoryMetadata } from '../../../git/models/repositoryMetadata';
-import type { ResourceDescriptor } from '../../../git/models/resourceDescriptor';
-import type { PullRequestUrlIdentity } from '../../../git/utils/pullRequest.utils';
-import { gate } from '../../../system/decorators/gate';
-import { debug } from '../../../system/decorators/log';
-import { first } from '../../../system/iterable';
-import { Logger } from '../../../system/logger';
-import { getLogScope } from '../../../system/logger.scope';
-import type { ProviderAuthenticationSession } from '../authentication/models';
+import type { Account, UnidentifiedAuthor } from '@gitlens/git/models/author.js';
+import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
+import type { IssueOrPullRequestState as PullRequestState } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequest, PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
+import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
+import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import type { PullRequestUrlIdentity } from '@gitlens/git/utils/pullRequest.utils.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { first } from '@gitlens/utils/iterable.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import type { PagedResult } from '@gitlens/utils/paging.js';
+import type { IntegrationIds } from '../../../constants.integrations.js';
+import { GitCloudHostIntegrationId } from '../../../constants.integrations.js';
+import { gate } from '../../../system/decorators/gate.js';
+import type { ProviderAuthenticationSession } from '../authentication/models.js';
 import type {
 	GetIssuesOptions,
 	GetPullRequestsOptions,
@@ -26,14 +26,10 @@ import type {
 	ProviderRepoInput,
 	ProviderReposInput,
 	ProviderRepository,
-} from '../providers/models';
-import { IssueFilter, PagingMode, PullRequestFilter } from '../providers/models';
-import type { Integration, IntegrationResult, IntegrationType } from './integration';
-import { IntegrationBase } from './integration';
-
-export function isGitHostIntegration(integration: Integration): integration is GitHostIntegration {
-	return integration.type === 'git';
-}
+} from '../providers/models.js';
+import { IssueFilter, PagingMode, PullRequestFilter } from '../providers/models.js';
+import type { IntegrationResult, IntegrationType } from './integration.js';
+import { IntegrationBase } from './integration.js';
 
 export abstract class GitHostIntegration<
 	ID extends IntegrationIds = IntegrationIds,
@@ -42,9 +38,9 @@ export abstract class GitHostIntegration<
 	readonly type: IntegrationType = 'git';
 
 	@gate()
-	@debug()
+	@trace()
 	async getAccountForEmail(repo: T, email: string, options?: { avatarSize?: number }): Promise<Account | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -69,13 +65,13 @@ export abstract class GitHostIntegration<
 	): Promise<Account | undefined>;
 
 	@gate()
-	@debug()
+	@trace()
 	async getAccountForCommit(
 		repo: T,
 		rev: string,
 		options?: { avatarSize?: number },
 	): Promise<Account | UnidentifiedAuthor | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -99,12 +95,12 @@ export abstract class GitHostIntegration<
 		options?: { avatarSize?: number },
 	): Promise<Account | UnidentifiedAuthor | undefined>;
 
-	@debug()
+	@trace()
 	async getDefaultBranch(
 		repo: T,
 		options?: { cancellation?: CancellationToken; expiryOverride?: boolean | number },
 	): Promise<DefaultBranch | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -139,12 +135,12 @@ export abstract class GitHostIntegration<
 		cancellation?: CancellationToken,
 	): Promise<DefaultBranch | undefined>;
 
-	@debug()
+	@trace()
 	async getRepositoryMetadata(
 		repo: T,
 		options?: { cancellation?: CancellationToken; expiryOverride?: boolean | number },
 	): Promise<RepositoryMetadata | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -182,7 +178,7 @@ export abstract class GitHostIntegration<
 	): Promise<RepositoryMetadata | undefined>;
 
 	async mergePullRequest(pr: PullRequest, options?: { mergeMethod?: PullRequestMergeMethod }): Promise<boolean> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return false;
@@ -205,13 +201,13 @@ export abstract class GitHostIntegration<
 		options?: { mergeMethod?: PullRequestMergeMethod },
 	): Promise<boolean>;
 
-	@debug()
+	@trace()
 	async getPullRequestForBranch(
 		repo: T,
 		branch: string,
 		options?: { avatarSize?: number; expiryOverride?: boolean | number; include?: PullRequestState[] },
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -248,13 +244,13 @@ export abstract class GitHostIntegration<
 		options?: { avatarSize?: number; include?: PullRequestState[] },
 	): Promise<PullRequest | undefined>;
 
-	@debug()
+	@trace()
 	async getPullRequestForCommit(
 		repo: T,
 		rev: string,
 		options?: { expiryOverride?: boolean | number },
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -292,7 +288,7 @@ export abstract class GitHostIntegration<
 		reposOrRepoIds: ProviderReposInput,
 		options?: { filters?: IssueFilter[]; cursor?: string; customUrl?: string },
 	): Promise<PagedResult<ProviderIssue> | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const providerId = this.authProvider.id;
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -337,7 +333,7 @@ export abstract class GitHostIntegration<
 
 				let userAccount: ProviderAccount | undefined;
 				try {
-					userAccount = await api.getCurrentUserForInstance(providerId, organization);
+					userAccount = await api.getCurrentUserForInstance({ providerId: providerId }, organization);
 				} catch (ex) {
 					Logger.error(ex, 'getIssuesForRepos');
 					return undefined;
@@ -364,7 +360,7 @@ export abstract class GitHostIntegration<
 
 			const cursorInfo = JSON.parse(options?.cursor ?? '{}');
 			const cursors: PagedProjectInput[] = cursorInfo.cursors ?? [];
-			let projectInputs: PagedProjectInput[] = Array.from(projects.values()).map(project => ({
+			let projectInputs: PagedProjectInput[] = Array.from(projects.values(), project => ({
 				namespace: organization,
 				project: project,
 				cursor: undefined,
@@ -380,7 +376,7 @@ export abstract class GitHostIntegration<
 				await Promise.all(
 					projectInputs.map(async projectInput => {
 						const results = await api.getIssuesForAzureProject(
-							providerId,
+							{ providerId: providerId },
 							projectInput.namespace,
 							projectInput.project,
 							{
@@ -415,7 +411,7 @@ export abstract class GitHostIntegration<
 		if (options?.filters != null) {
 			let userAccount: ProviderAccount | undefined;
 			try {
-				userAccount = await api.getCurrentUser(providerId);
+				userAccount = await api.getCurrentUser({ providerId: providerId });
 			} catch (ex) {
 				Logger.error(ex, 'getIssuesForRepos');
 				return undefined;
@@ -453,7 +449,7 @@ export abstract class GitHostIntegration<
 				const data: ProviderIssue[] = [];
 				await Promise.all(
 					repoInputs.map(async repoInput => {
-						const results = await api.getIssuesForRepo(providerId, repoInput.repo, {
+						const results = await api.getIssuesForRepo({ providerId: providerId }, repoInput.repo, {
 							...getIssuesOptions,
 							cursor: repoInput.cursor,
 							baseUrl: options?.customUrl,
@@ -480,7 +476,7 @@ export abstract class GitHostIntegration<
 		}
 
 		try {
-			return await api.getIssuesForRepos(providerId, reposOrRepoIds, {
+			return await api.getIssuesForRepos({ providerId: providerId }, reposOrRepoIds, {
 				...getIssuesOptions,
 				cursor: options?.cursor,
 				baseUrl: options?.customUrl,
@@ -495,7 +491,7 @@ export abstract class GitHostIntegration<
 		reposOrRepoIds: ProviderReposInput,
 		options?: { filters?: PullRequestFilter[]; cursor?: string; customUrl?: string },
 	): Promise<PagedResult<ProviderPullRequest> | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const providerId = this.authProvider.id;
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -540,14 +536,14 @@ export abstract class GitHostIntegration<
 
 				const organization: string = first(organizations.values())!;
 				try {
-					userAccount = await api.getCurrentUserForInstance(providerId, organization);
+					userAccount = await api.getCurrentUserForInstance({ providerId: providerId }, organization);
 				} catch (ex) {
 					Logger.error(ex, 'getPullRequestsForRepos');
 					return undefined;
 				}
 			} else {
 				try {
-					userAccount = await api.getCurrentUser(providerId);
+					userAccount = await api.getCurrentUser({ providerId: providerId });
 				} catch (ex) {
 					Logger.error(ex, 'getPullRequestsForRepos');
 					return undefined;
@@ -602,7 +598,7 @@ export abstract class GitHostIntegration<
 				const data: ProviderPullRequest[] = [];
 				await Promise.all(
 					repoInputs.map(async repoInput => {
-						const results = await api.getPullRequestsForRepo(providerId, repoInput.repo, {
+						const results = await api.getPullRequestsForRepo({ providerId: providerId }, repoInput.repo, {
 							...getPullRequestsOptions,
 							cursor: repoInput.cursor,
 							baseUrl: options?.customUrl,
@@ -629,7 +625,7 @@ export abstract class GitHostIntegration<
 		}
 
 		try {
-			return await api.getPullRequestsForRepos(providerId, reposOrRepoIds, {
+			return await api.getPullRequestsForRepos({ providerId: providerId }, reposOrRepoIds, {
 				...getPullRequestsOptions,
 				cursor: options?.cursor,
 				baseUrl: options?.customUrl,
@@ -650,19 +646,19 @@ export abstract class GitHostIntegration<
 		cancellation?: CancellationToken,
 		silent?: boolean,
 	): Promise<IntegrationResult<PullRequest[] | undefined>>;
-	@debug()
+	@trace()
 	async searchMyPullRequests(
 		repos?: T | T[],
 		cancellation?: CancellationToken,
 		silent?: boolean,
 	): Promise<IntegrationResult<PullRequest[] | undefined>> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 
 		await this.refreshSessionIfExpired(scope);
 
-		const start = Date.now();
+		const start = performance.now();
 		try {
 			const pullRequests = await this.searchProviderMyPullRequests(
 				this._session!,
@@ -671,7 +667,7 @@ export abstract class GitHostIntegration<
 				silent,
 			);
 			this.resetRequestExceptionCount('searchMyPullRequests');
-			return { value: pullRequests, duration: Date.now() - start };
+			return { value: pullRequests, duration: performance.now() - start };
 		} catch (ex) {
 			this.handleProviderException('searchMyPullRequests', ex, {
 				scope: scope,
@@ -679,7 +675,7 @@ export abstract class GitHostIntegration<
 			});
 			return {
 				error: ex,
-				duration: Date.now() - start,
+				duration: performance.now() - start,
 			};
 		}
 	}
@@ -701,13 +697,13 @@ export abstract class GitHostIntegration<
 		repos?: T[],
 		cancellation?: CancellationToken,
 	): Promise<PullRequest[] | undefined>;
-	@debug()
+	@trace()
 	async searchPullRequests(
 		searchQuery: string,
 		repos?: T | T[],
 		cancellation?: CancellationToken,
 	): Promise<PullRequest[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 

@@ -2,9 +2,9 @@ import type { TemplateResult } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
-import type { FuzzyMatchResult } from '../../../../../system/fuzzy';
-import { scrollableBase } from '../styles/lit/base.css';
-import '../code-icon';
+import type { FuzzyMatchResult } from '@gitlens/utils/fuzzy.js';
+import { scrollableBase } from '../styles/lit/base.css.js';
+import '../code-icon.js';
 
 export interface CompletionItem<T = any> {
 	label: string;
@@ -45,7 +45,8 @@ export class GlAutocomplete extends LitElement {
 				position: absolute;
 				top: 100%;
 				left: 0;
-				right: 0;
+				min-width: min(max(100%, 30rem), var(--_max-width, 100%));
+				max-width: var(--_max-width, none);
 				margin-top: 0.2rem;
 				z-index: 1000;
 				max-height: 20rem;
@@ -55,6 +56,15 @@ export class GlAutocomplete extends LitElement {
 				border: 1px solid var(--vscode-widget-border);
 				border-radius: 0.4rem;
 				box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+			}
+
+			/* Override scrollbar thumb to not inherit the visible border-color */
+			.scrollable::-webkit-scrollbar-thumb {
+				border-color: transparent;
+			}
+			:host(:hover) .scrollable::-webkit-scrollbar-thumb,
+			:host(:focus-within) .scrollable::-webkit-scrollbar-thumb {
+				border-color: var(--vscode-scrollbarSlider-background);
 			}
 
 			.autocomplete-item {
@@ -190,11 +200,19 @@ export class GlAutocomplete extends LitElement {
 	@state()
 	private _selectedIndex = -1;
 
+	private _resizeObserver?: ResizeObserver;
+
 	/**
 	 * Gets the currently selected index (readonly from outside)
 	 */
 	get selectedIndex(): number {
 		return this._selectedIndex;
+	}
+
+	override disconnectedCallback(): void {
+		super.disconnectedCallback?.();
+		this._resizeObserver?.disconnect();
+		this._resizeObserver = undefined;
 	}
 
 	override updated(changedProperties: Map<string | number | symbol, unknown>) {
@@ -207,8 +225,26 @@ export class GlAutocomplete extends LitElement {
 			}
 		}
 
+		if (changedProperties.has('open') || changedProperties.has('items')) {
+			if (this.open) {
+				this.constrainToViewport();
+				this._resizeObserver ??= new ResizeObserver(() => this.constrainToViewport());
+				this._resizeObserver.observe(document.documentElement);
+			} else if (changedProperties.has('open')) {
+				this._resizeObserver?.disconnect();
+			}
+		}
+
 		if (changedProperties.has('_selectedIndex') && this._selectedIndex >= 0) {
 			this.scrollToSelected();
+		}
+	}
+
+	private constrainToViewport() {
+		const containerLeft = this.parentElement?.getBoundingClientRect().left ?? 0;
+		const maxWidth = document.documentElement.clientWidth - containerLeft - 8;
+		if (maxWidth > 0) {
+			this.style.setProperty('--_max-width', `${maxWidth}px`);
 		}
 	}
 

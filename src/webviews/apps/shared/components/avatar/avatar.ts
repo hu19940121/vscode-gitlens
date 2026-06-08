@@ -1,7 +1,7 @@
 import { css, html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import '../code-icon';
-import '../overlays/tooltip';
+import '../code-icon.js';
+import '../overlays/tooltip.js';
 
 @customElement('gl-avatar')
 export class GlAvatar extends LitElement {
@@ -33,7 +33,7 @@ export class GlAvatar extends LitElement {
 				line-height: 1;
 				text-transform: uppercase;
 				cursor: default;
-				color: var(--vscode-descriptionForeground);
+				color: var(--gl-avatar-text-color, var(--vscode-descriptionForeground));
 			}
 
 			.thumb--media {
@@ -42,6 +42,10 @@ export class GlAvatar extends LitElement {
 				height: auto;
 				object-fit: cover;
 				object-position: 50% 50%;
+			}
+
+			.avatar:hover {
+				transform: scale(1.2);
 			}
 		`,
 	];

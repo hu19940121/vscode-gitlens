@@ -1,7 +1,7 @@
 import type { PropertyValueMap } from 'lit';
 import { css, html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { elementBase } from '../styles/lit/base.css';
+import { elementBase } from '../styles/lit/base.css.js';
 
 @customElement('menu-item')
 export class MenuItem extends LitElement {
@@ -23,9 +23,15 @@ export class MenuItem extends LitElement {
 				border-radius: var(--menu-item-radius, 0.3rem);
 			}
 
-			:host([role='option']:hover) {
+			:host([role='option']:hover:not([aria-selected='true'])),
+			:host([role='option']:focus-visible:not([aria-selected='true'])) {
 				color: var(--vscode-menu-selectionForeground);
-				background-color: var(--vscode-menu-selectionBackground);
+				background-color: color-mix(
+					in oklch,
+					var(--vscode-menu-selectionBackground) 50%,
+					var(--vscode-menu-background)
+				);
+				outline: none;
 			}
 
 			:host([disabled]) {
@@ -37,7 +43,7 @@ export class MenuItem extends LitElement {
 			:host([aria-selected='true']) {
 				opacity: 1;
 				color: var(--vscode-menu-selectionForeground);
-				background-color: var(--vscode-menu-background);
+				background-color: var(--vscode-menu-selectionBackground);
 			}
 
 			:host([href]) {
@@ -72,6 +78,25 @@ export class MenuItem extends LitElement {
 			this.updateInteractiveState();
 		}
 	}
+
+	override connectedCallback(): void {
+		super.connectedCallback?.();
+		this.addEventListener('keydown', this.onKeydown);
+	}
+
+	override disconnectedCallback(): void {
+		this.removeEventListener('keydown', this.onKeydown);
+		super.disconnectedCallback?.();
+	}
+
+	private readonly onKeydown = (e: KeyboardEvent): void => {
+		if (this.disabled) return;
+		if (e.target !== this) return;
+		if (e.key !== 'Enter' && e.key !== ' ') return;
+
+		e.preventDefault();
+		this.click();
+	};
 
 	override render(): unknown {
 		if (this.href) {

@@ -2,20 +2,18 @@ import { consume } from '@lit/context';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { when } from 'lit/directives/when.js';
-import type { WebviewCommands } from '../../../../../constants.commands';
-import type { WebviewOrWebviewViewOrCustomEditorTypeFromId } from '../../../../../constants.views';
-import type { GitPausedOperationStatus } from '../../../../../git/models/pausedOperationStatus';
-import type { GitReference } from '../../../../../git/models/reference';
-import { pausedOperationStatusStringsByType } from '../../../../../git/utils/pausedOperationStatus.utils';
-import { createWebviewCommandLink } from '../../../../../system/webview';
-import type { ShowInCommitGraphCommandArgs } from '../../../../plus/graph/registration';
-import type { WebviewContext } from '../../../shared/contexts/webview';
-import { webviewContext } from '../../../shared/contexts/webview';
-import '../../../shared/components/actions/action-item';
-import '../../../shared/components/actions/action-nav';
-import '../../../shared/components/branch-name';
-import '../../../shared/components/commit-sha';
-import '../../../shared/components/overlays/tooltip';
+import type { GitPausedOperationStatus } from '@gitlens/git/models/pausedOperationStatus.js';
+import type { GitReference } from '@gitlens/git/models/reference.js';
+import { pausedOperationStatusStringsByType } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+import { createCommandLink } from '../../../../../system/commands.js';
+import type { ShowInCommitGraphCommandArgs } from '../../../../plus/graph/registration.js';
+import type { WebviewContext } from '../../../shared/contexts/webview.js';
+import { webviewContext } from '../../../shared/contexts/webview.js';
+import '../../../shared/components/actions/action-item.js';
+import '../../../shared/components/actions/action-nav.js';
+import '../../../shared/components/branch-name.js';
+import '../../../shared/components/commit-sha.js';
+import '../../../shared/components/overlays/tooltip.js';
 
 @customElement('gl-merge-rebase-status')
 export class GlMergeConflictWarning extends LitElement {
@@ -123,21 +121,7 @@ export class GlMergeConflictWarning extends LitElement {
 	private createPausedOperationCommandLink(
 		command: 'abort' | 'continue' | 'open' | 'showConflicts' | 'skip',
 	): string {
-		const { webviewId, webviewInstanceId } = this._webview;
-		const webviewType = webviewId.split('.').at(-1) as WebviewOrWebviewViewOrCustomEditorTypeFromId<
-			typeof webviewId
-		>;
-		if (webviewType !== 'graph' && webviewType !== 'home') {
-			debugger;
-			return '';
-		}
-
-		return createWebviewCommandLink(
-			`gitlens.pausedOperation.${command}:${webviewType}` as const,
-			webviewId,
-			webviewInstanceId,
-			this.pausedOpStatus,
-		);
+		return this._webview.createCommandLink(`gitlens.pausedOperation.${command}:`, this.pausedOpStatus);
 	}
 
 	override render(): unknown {
@@ -177,7 +161,7 @@ export class GlMergeConflictWarning extends LitElement {
 	private renderConflictsLink(label: string) {
 		if (!this.conflicts) return label;
 
-		return html`<gl-tooltip hoist content="Show Conflicts">
+		return html`<gl-tooltip content="Show Conflicts">
 			<a href="${this.onShowConflictsUrl}" class="link">${label}</a>
 		</gl-tooltip>`;
 	}
@@ -196,7 +180,7 @@ export class GlMergeConflictWarning extends LitElement {
 				: 'Open Commit in Commit Graph';
 		const jumpUrl = this.createJumpUrl(ref);
 
-		return html`<gl-tooltip hoist content=${tooltip}>
+		return html`<gl-tooltip content=${tooltip}>
 			<a href=${jumpUrl} class="ref-link">
 				${isBranch
 					? html`<gl-branch-name .name=${ref.name} .size=${12}></gl-branch-name>`
@@ -206,12 +190,10 @@ export class GlMergeConflictWarning extends LitElement {
 	}
 
 	private createJumpUrl(ref: GitReference): string {
-		return createWebviewCommandLink<ShowInCommitGraphCommandArgs>(
-			'gitlens.showInCommitGraph' as WebviewCommands,
-			this._webview.webviewId,
-			this._webview.webviewInstanceId,
-			{ ref: ref },
-		);
+		return createCommandLink<ShowInCommitGraphCommandArgs>('gitlens.showInCommitGraph', {
+			ref: ref,
+			source: { source: 'merge-target' },
+		});
 	}
 
 	private renderActions() {
@@ -232,14 +214,14 @@ export class GlMergeConflictWarning extends LitElement {
 			${when(
 				status !== 'revert' && !(status === 'rebase' && this.conflicts),
 				() => html`
-					<action-item label="Continue" icon="debug-continue" href=${this.onContinueUrl}></action-item>
+					<action-item label="Continue" icon="gl-continue" href=${this.onContinueUrl}></action-item>
 				`,
 			)}
 			${when(
 				status !== 'merge',
-				() => html`<action-item label="Skip" icon="debug-step-over" href=${this.onSkipUrl}></action-item>`,
+				() => html`<action-item label="Skip" icon="gl-skip" href=${this.onSkipUrl}></action-item>`,
 			)}
-			<action-item label="Abort" href=${this.onAbortUrl} icon="circle-slash"></action-item>
+			<action-item label="Abort" href=${this.onAbortUrl} icon="gl-abort"></action-item>
 		</action-nav>`;
 	}
 }

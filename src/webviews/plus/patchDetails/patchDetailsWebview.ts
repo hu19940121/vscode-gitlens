@@ -1,79 +1,73 @@
 import type { ConfigurationChangeEvent } from 'vscode';
 import { Disposable, env, Uri, window } from 'vscode';
-import { getAvatarUri } from '../../../avatars';
-import { GlyphChars, previewBadge } from '../../../constants';
-import type { ContextKeys } from '../../../constants.context';
-import type { Sources, WebviewTelemetryContext } from '../../../constants.telemetry';
-import type { Container } from '../../../container';
-import { CancellationError } from '../../../errors';
-import { openChanges, openChangesWithWorking, openFile } from '../../../git/actions/commit';
-import { ApplyPatchCommitError } from '../../../git/errors';
-import type { RepositoriesChangeEvent } from '../../../git/gitProviderService';
-import type { GitCommit } from '../../../git/models/commit';
-import { GitFileChange } from '../../../git/models/fileChange';
-import type { PatchRevisionRange } from '../../../git/models/patch';
-import type { Repository } from '../../../git/models/repository';
-import { isRepository } from '../../../git/models/repository';
-import type { GkRepositoryId } from '../../../git/models/repositoryIdentities';
-import { uncommitted, uncommittedStaged } from '../../../git/models/revision';
-import { createReference } from '../../../git/utils/reference.utils';
-import { shortenRevision } from '../../../git/utils/revision.utils';
-import { showGitErrorMessage } from '../../../messages';
-import { showPatchesView } from '../../../plus/drafts/actions';
-import { getDraftEntityIdentifier } from '../../../plus/drafts/draftsService';
+import { ApplyPatchCommitError } from '@gitlens/git/errors.js';
+import type { GitCommit } from '@gitlens/git/models/commit.js';
+import { GitFileChange } from '@gitlens/git/models/fileChange.js';
+import type { PatchRevisionRange } from '@gitlens/git/models/patch.js';
+import type { GkRepositoryId } from '@gitlens/git/models/repositoryIdentities.js';
+import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
+import { createReference } from '@gitlens/git/utils/reference.utils.js';
+import { shortenRevision } from '@gitlens/git/utils/revision.utils.js';
+import { CancellationError, isCancellationError } from '@gitlens/utils/cancellation.js';
+import type { Deferrable } from '@gitlens/utils/debounce.js';
+import { debounce } from '@gitlens/utils/debounce.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { find, some } from '@gitlens/utils/iterable.js';
+import { basename } from '@gitlens/utils/path.js';
+import { fileUri, joinUriPath } from '@gitlens/utils/uri.js';
+import { getAvatarUri } from '../../../avatars.js';
+import type { ContextKeys } from '../../../constants.context.js';
+import { GlyphChars, previewBadge } from '../../../constants.js';
+import type { Sources, WebviewTelemetryContext } from '../../../constants.telemetry.js';
+import type { Container } from '../../../container.js';
+import { openChanges, openChangesWithWorking, openFile } from '../../../git/actions/commit.js';
+import type { RepositoriesChangeEvent } from '../../../git/gitProviderService.js';
+import { GlRepository } from '../../../git/models/repository.js';
+import {
+	formatCurrentUserDisplayName,
+	getCommitForFile,
+	getCommitRepository,
+} from '../../../git/utils/-webview/commit.utils.js';
+import { showGitErrorMessage } from '../../../messages.js';
+import { showPatchesView } from '../../../plus/drafts/actions.js';
+import { getDraftEntityIdentifier } from '../../../plus/drafts/draftsService.js';
 import type {
 	CreateDraftChange,
 	Draft,
-	DraftArchiveReason,
 	DraftPatch,
 	DraftPatchFileChange,
 	DraftPendingUser,
 	DraftUser,
 	DraftVisibility,
 	LocalDraft,
-} from '../../../plus/drafts/models/drafts';
-import { confirmDraftStorage } from '../../../plus/drafts/utils/-webview/drafts.utils';
-import type { OrganizationMember } from '../../../plus/gk/models/organization';
-import { ensureAccount } from '../../../plus/gk/utils/-webview/acount.utils';
-import { showNewOrSelectBranchPicker } from '../../../quickpicks/branchPicker';
-import { showOrganizationMembersPicker } from '../../../quickpicks/organizationMembersPicker';
-import { showReferencePicker2 } from '../../../quickpicks/referencePicker';
-import { executeCommand, registerCommand } from '../../../system/-webview/command';
-import { configuration } from '../../../system/-webview/configuration';
-import { getContext, onDidChangeContext, setContext } from '../../../system/-webview/context';
-import { gate } from '../../../system/decorators/gate';
-import { debug } from '../../../system/decorators/log';
-import type { Deferrable } from '../../../system/function/debounce';
-import { debounce } from '../../../system/function/debounce';
-import { find, some } from '../../../system/iterable';
-import { basename } from '../../../system/path';
-import type { Serialized } from '../../../system/serialize';
-import { serialize } from '../../../system/serialize';
-import { showInspectView } from '../../commitDetails/actions';
-import type { IpcCallMessageType, IpcMessage } from '../../protocol';
-import type { WebviewHost, WebviewProvider } from '../../webviewProvider';
-import type { WebviewShowOptions } from '../../webviewsController';
-import type { ShowInCommitGraphCommandArgs } from '../graph/registration';
+} from '../../../plus/drafts/models/drafts.js';
+import { confirmDraftStorage } from '../../../plus/drafts/utils/-webview/drafts.utils.js';
+import type { OrganizationMember } from '../../../plus/gk/models/organization.js';
+import { ensureAccount } from '../../../plus/gk/utils/-webview/acount.utils.js';
+import { showNewOrSelectBranchPicker } from '../../../quickpicks/branchPicker.js';
+import { showOrganizationMembersPicker } from '../../../quickpicks/organizationMembersPicker.js';
+import { showReferencePicker2 } from '../../../quickpicks/referencePicker.js';
+import { executeCommand, registerCommand } from '../../../system/-webview/command.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import { getContext, onDidChangeContext, setContext } from '../../../system/-webview/context.js';
+import { gate } from '../../../system/decorators/gate.js';
+import type { Serialized } from '../../../system/serialize.js';
+import { serialize } from '../../../system/serialize.js';
+import { showInspectView } from '../../commitDetails/actions.js';
+import type { IpcParams, IpcResponse } from '../../ipc/handlerRegistry.js';
+import { ipcCommand, ipcRequest } from '../../ipc/handlerRegistry.js';
+import type { WebviewHost, WebviewProvider } from '../../webviewProvider.js';
+import type { WebviewShowOptions } from '../../webviewsController.js';
+import type { ShowInCommitGraphCommandArgs } from '../graph/registration.js';
 import type {
-	ApplyPatchParams,
 	Change,
 	CreateDraft,
-	CreatePatchParams,
-	DidExplainParams,
-	DidGenerateParams,
-	DraftPatchCheckedParams,
 	DraftUserSelection,
 	ExecuteFileActionParams,
 	Mode,
 	Preferences,
 	State,
-	SwitchModeParams,
-	UpdateablePreferences,
-	UpdateCreatePatchMetadataParams,
-	UpdateCreatePatchRepositoryCheckedStateParams,
-	UpdatePatchDetailsMetadataParams,
-	UpdatePatchUserSelection,
-} from './protocol';
+} from './protocol.js';
 import {
 	ApplyPatchCommand,
 	ArchiveDraftCommand,
@@ -99,10 +93,10 @@ import {
 	UpdatePatchUsersCommand,
 	UpdatePatchUserSelectionCommand,
 	UpdatePreferencesCommand,
-} from './protocol';
-import type { PatchDetailsWebviewShowingArgs } from './registration';
-import type { RepositoryChangeset } from './repositoryChangeset';
-import { RepositoryRefChangeset, RepositoryWipChangeset } from './repositoryChangeset';
+} from './protocol.js';
+import type { PatchDetailsWebviewShowingArgs } from './registration.js';
+import type { RepositoryChangeset } from './repositoryChangeset.js';
+import { RepositoryRefChangeset, RepositoryWipChangeset } from './repositoryChangeset.js';
 
 interface DraftUserState {
 	users: DraftUser[];
@@ -232,98 +226,12 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		return commands;
 	}
 
-	onMessageReceived(e: IpcMessage): void {
-		switch (true) {
-			case ApplyPatchCommand.is(e):
-				void this.applyPatch(e.params);
-				break;
-
-			case CopyCloudLinkCommand.is(e):
-				this.copyCloudLink();
-				break;
-
-			// case CreateFromLocalPatchCommandType.method:
-			// 	this.shareLocalPatch();
-			// 	break;
-
-			case CreatePatchCommand.is(e):
-				void this.createDraft(e.params);
-				break;
-
-			case ExplainRequest.is(e):
-				void this.explainRequest(ExplainRequest, e);
-				break;
-
-			case GenerateRequest.is(e):
-				void this.generateRequest(GenerateRequest, e);
-				break;
-
-			case OpenFileComparePreviousCommand.is(e):
-				void this.openFileComparisonWithPrevious(e.params);
-				break;
-
-			case OpenFileCompareWorkingCommand.is(e):
-				void this.openFileComparisonWithWorking(e.params);
-				break;
-
-			case OpenFileCommand.is(e):
-				void this.openFile(e.params);
-				break;
-
-			case OpenInCommitGraphCommand.is(e):
-				void executeCommand<ShowInCommitGraphCommandArgs>('gitlens.showInCommitGraph', {
-					ref: createReference(e.params.ref, e.params.repoPath, { refType: 'revision' }),
-				});
-				break;
-
-			// case SelectPatchBaseCommandType.is(e):
-			// 	void this.selectPatchBase();
-			// 	break;
-
-			// case SelectPatchRepoCommandType.is(e):
-			// 	void this.selectPatchRepo();
-			// 	break;
-
-			case SwitchModeCommand.is(e):
-				this.switchMode(e.params);
-				break;
-
-			case UpdateCreatePatchMetadataCommand.is(e):
-				this.updateCreateMetadata(e.params);
-				break;
-
-			case UpdatePatchDetailsMetadataCommand.is(e):
-				this.updateDraftMetadata(e.params);
-				break;
-
-			case UpdatePatchDetailsPermissionsCommand.is(e):
-				void this.updateDraftPermissions();
-				break;
-
-			case UpdateCreatePatchRepositoryCheckedStateCommand.is(e):
-				this.updateCreateCheckedState(e.params);
-				break;
-
-			case UpdatePreferencesCommand.is(e):
-				this.updatePreferences(e.params);
-				break;
-
-			case DraftPatchCheckedCommand.is(e):
-				this.onPatchChecked(e.params);
-				break;
-
-			case UpdatePatchUsersCommand.is(e):
-				void this.onInviteUsers();
-				break;
-
-			case UpdatePatchUserSelectionCommand.is(e):
-				this.onUpdatePatchUserSelection(e.params);
-				break;
-
-			case ArchiveDraftCommand.is(e):
-				void this.archiveDraft(e.params.reason);
-				break;
-		}
+	@ipcCommand(OpenInCommitGraphCommand)
+	private onOpenInCommitGraph(params: IpcParams<typeof OpenInCommitGraphCommand>) {
+		void executeCommand<ShowInCommitGraphCommandArgs>('gitlens.showInCommitGraph', {
+			ref: createReference(params.ref, params.repoPath, { refType: 'revision' }),
+			source: { source: 'patchDetails' },
+		});
 	}
 
 	onRefresh(): void {
@@ -366,7 +274,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 			files: configuration.get('views.patchDetails.files'),
 			indentGuides: configuration.getCore('workbench.tree.renderIndentGuides') ?? 'onHover',
 			indent: configuration.getCore('workbench.tree.indent'),
-			aiEnabled: configuration.get('ai.enabled'),
+			aiEnabled: this.container.ai.enabled,
 		};
 	}
 
@@ -439,7 +347,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		}
 	}
 
-	private async applyPatch(params: ApplyPatchParams) {
+	@ipcCommand(ApplyPatchCommand)
+	private async onApplyPatch(params: IpcParams<typeof ApplyPatchCommand>) {
 		// if (params.details.repoPath == null || params.details.commit == null) return;
 		// void this.container.git.applyPatchCommit(params.details.repoPath, params.details.commit, {
 		// 	branchName: params.targetRef,
@@ -472,7 +381,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 					| undefined = undefined;
 
 				if (shouldPickBranch) {
-					const repo = commit.getRepository();
+					const repo = getCommitRepository(commit.repoPath);
 					const branch = await showNewOrSelectBranchPicker(
 						`Select a Branch ${GlyphChars.Dot} ${repo?.name}`,
 						// 'Choose a branch to apply the Cloud Patch to',
@@ -493,15 +402,31 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 					};
 				}
 
-				await this.container.git
-					.getRepositoryService(commit.repoPath)
-					.patch?.applyUnreachableCommitForPatch(commit.ref, {
-						stash: 'prompt',
-						...options,
-					});
+				const svc = this.container.git.getRepositoryService(commit.repoPath);
+
+				// Check for working changes and prompt before applying
+				let shouldStash = false;
+				if (await svc.status?.hasWorkingChanges()) {
+					const confirm = { title: 'Stash Changes' };
+					const cancel = { title: 'Cancel', isCloseAffordance: true };
+					const result = await window.showWarningMessage(
+						'You have changes in your working tree.\nDo you want to stash them before applying the patch?',
+						{ modal: true },
+						confirm,
+						cancel,
+					);
+					if (result !== confirm) throw new CancellationError();
+
+					shouldStash = true;
+				}
+
+				await svc.patch?.applyUnreachableCommitForPatch(commit.ref, {
+					stash: shouldStash,
+					...options,
+				});
 				void window.showInformationMessage(`Patch applied successfully`);
 			} catch (ex) {
-				if (ex instanceof CancellationError) return;
+				if (isCancellationError(ex)) return;
 
 				if (ApplyPatchCommitError.is(ex, 'appliedWithConflicts')) {
 					void window.showWarningMessage('Patch applied with conflicts');
@@ -524,7 +449,9 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 				const repositoryOrIdentity = this._context.draft.changesets?.[0].patches[0].repository;
 				void showInspectView({
 					type: 'wip',
-					repository: isRepoLocated(repositoryOrIdentity) ? (repositoryOrIdentity as Repository) : undefined,
+					repository: isRepoLocated(repositoryOrIdentity)
+						? (repositoryOrIdentity as GlRepository)
+						: undefined,
 					source: 'patchDetails',
 				});
 			} else {
@@ -533,7 +460,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		}
 	}
 
-	private copyCloudLink() {
+	@ipcCommand(CopyCloudLinkCommand)
+	private onCopyCloudLink() {
 		if (this._context.draft?.draftType !== 'cloud') return;
 
 		void env.clipboard.writeText(this._context.draft.deepLinkUrl);
@@ -543,6 +471,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		return this.container.organizations.getMembers();
 	}
 
+	@ipcCommand(UpdatePatchUsersCommand)
 	private async onInviteUsers() {
 		let owner;
 		let ownerSelection;
@@ -603,9 +532,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 				selection.change = undefined;
 			}
 
-			updatedSelections.push(
-				selection != null ? selection : toDraftUserSelection(member, undefined, 'editor', 'add'),
-			);
+			updatedSelections.push(selection ?? toDraftUserSelection(member, undefined, 'editor', 'add'));
 		}
 
 		if (updatedSelections.length) {
@@ -614,7 +541,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		}
 	}
 
-	private onUpdatePatchUserSelection(params: UpdatePatchUserSelection) {
+	@ipcCommand(UpdatePatchUserSelectionCommand)
+	private onUpdatePatchUserSelection(params: IpcParams<typeof UpdatePatchUserSelectionCommand>) {
 		if (this.mode === 'create') {
 			const userSelections = this._context.create?.userSelections;
 			if (userSelections == null) return;
@@ -622,10 +550,12 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 			if (params.role === 'remove') {
 				const selection = userSelections.findIndex(u => u.member.id === params.selection.member.id);
 				if (selection === -1) return;
+
 				userSelections.splice(selection, 1);
 			} else {
 				const selection = userSelections.find(u => u.member.id === params.selection.member.id);
 				if (selection == null) return;
+
 				selection.pendingRole = params.role;
 			}
 
@@ -647,13 +577,14 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		void this.notifyDidChangeViewDraftState();
 	}
 
-	private async createDraft({
+	@ipcCommand(CreatePatchCommand)
+	private async onCreateDraft({
 		title,
 		changesets,
 		description,
 		visibility,
 		userSelections,
-	}: CreatePatchParams): Promise<void> {
+	}: IpcParams<typeof CreatePatchCommand>): Promise<void> {
 		if (
 			!(await ensureAccount(this.container, 'Cloud Patches are a Preview feature and require an account.', {
 				source: 'cloud-patches',
@@ -742,7 +673,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		}
 	}
 
-	private async archiveDraft(reason?: Exclude<DraftArchiveReason, 'committed'>) {
+	@ipcCommand(ArchiveDraftCommand)
+	private async onArchiveDraft({ reason }: IpcParams<typeof ArchiveDraftCommand>) {
 		if (this._context.draft?.draftType !== 'cloud') return;
 
 		const isCodeSuggestion = this._context.draft.type === 'suggested_pr_change';
@@ -798,13 +730,13 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		const patch = draft.changesets?.[0].patches.find(p => isRepoLocated(p.repository));
 
 		let repoPrivacy;
-		if (isRepository(patch?.repository)) {
+		if (GlRepository.is(patch?.repository)) {
 			repoPrivacy = await this.container.git.visibility(patch.repository.uri);
 		}
 
 		const entity = getDraftEntityIdentifier(draft, patch);
 
-		this.container.telemetry.sendEvent(
+		this.host.sendTelemetryEvent(
 			'codeSuggestionArchived',
 			{
 				provider: entity?.provider,
@@ -817,13 +749,11 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		);
 	}
 
-	private async explainRequest<T extends typeof ExplainRequest>(requestType: T, msg: IpcCallMessageType<T>) {
+	@ipcRequest(ExplainRequest)
+	private async onExplain(): Promise<IpcResponse<typeof ExplainRequest>> {
 		if (this._context.draft?.draftType !== 'cloud') {
-			void this.host.respond(requestType, msg, { error: { message: 'Unable to find patch' } });
-			return;
+			return { error: { message: 'Unable to find patch' } };
 		}
-
-		let params: DidExplainParams;
 
 		try {
 			// TODO@eamodio HACK -- only works for the first patch
@@ -849,17 +779,16 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 
 			if (result == null) throw new Error('Error retrieving content');
 
-			params = { result: result.result };
+			return { result: result.result };
 		} catch (ex) {
 			debugger;
-			params = { error: { message: ex.message } };
+			return { error: { message: ex.message } };
 		}
-
-		void this.host.respond(requestType, msg, params);
 	}
 
-	private async generateRequest<T extends typeof GenerateRequest>(requestType: T, msg: IpcCallMessageType<T>) {
-		let repo: Repository | undefined;
+	@ipcRequest(GenerateRequest)
+	private async onGenerateDetails(): Promise<IpcResponse<typeof GenerateRequest>> {
+		let repo: GlRepository | undefined;
 		if (this._context.create?.changes != null) {
 			for (const change of this._context.create.changes.values()) {
 				if (change.repository) {
@@ -870,11 +799,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		}
 
 		if (!repo) {
-			void this.host.respond(requestType, msg, { error: { message: 'Unable to find changes' } });
-			return;
+			return { error: { message: 'Unable to find changes' } };
 		}
-
-		let params: DidGenerateParams;
 
 		try {
 			// TODO@eamodio HACK -- only works for the first patch
@@ -893,23 +819,22 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 
 			if (result == null) throw new Error('Error retrieving content');
 
-			params = {
+			return {
 				title: result.result.summary,
 				description: result.result.body,
 			};
 		} catch (ex) {
 			debugger;
-			params = { error: { message: ex.message } };
+			return { error: { message: ex.message } };
 		}
-
-		void this.host.respond(requestType, msg, params);
 	}
 
 	private async openPatchContents(_params: ExecuteFileActionParams) {
 		// TODO@eamodio Open the patch contents for the selected repo in an untitled editor
 	}
 
-	private onPatchChecked(params: DraftPatchCheckedParams) {
+	@ipcCommand(DraftPatchCheckedCommand)
+	private onPatchChecked(params: IpcParams<typeof DraftPatchCheckedCommand>) {
 		if (params.patch.repository.located || params.checked === false) return;
 
 		const patch = (this._context.draft as Draft)?.changesets?.[0].patches?.find(
@@ -935,7 +860,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		});
 	}
 
-	private updateCreateCheckedState(params: UpdateCreatePatchRepositoryCheckedStateParams) {
+	@ipcCommand(UpdateCreatePatchRepositoryCheckedStateCommand)
+	private onUpdateCreateCheckedState(params: IpcParams<typeof UpdateCreatePatchRepositoryCheckedStateCommand>) {
 		const changeset = this._context.create?.changes.get(params.repoUri);
 		if (changeset == null) return;
 
@@ -943,7 +869,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		void this.notifyDidChangeCreateDraftState();
 	}
 
-	private updateCreateMetadata(params: UpdateCreatePatchMetadataParams) {
+	@ipcCommand(UpdateCreatePatchMetadataCommand)
+	private onUpdateCreateMetadata(params: IpcParams<typeof UpdateCreatePatchMetadataCommand>) {
 		if (this._context.create == null) return;
 
 		this._context.create.title = params.title;
@@ -952,14 +879,16 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		void this.notifyDidChangeCreateDraftState();
 	}
 
-	private updateDraftMetadata(params: UpdatePatchDetailsMetadataParams) {
+	@ipcCommand(UpdatePatchDetailsMetadataCommand)
+	private onUpdateDraftMetadata(params: IpcParams<typeof UpdatePatchDetailsMetadataCommand>) {
 		if (this._context.draft == null) return;
 
 		this._context.draftVisibiltyState = params.visibility;
 		void this.notifyDidChangeViewDraftState();
 	}
 
-	private async updateDraftPermissions() {
+	@ipcCommand(UpdatePatchDetailsPermissionsCommand)
+	private async onUpdateDraftPermissions() {
 		const draft = this._context.draft as Draft;
 		const draftId = draft.id;
 		const changes = [];
@@ -991,6 +920,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		if (changes.length === 0 && adds.length === 0) {
 			return;
 		}
+
 		if (changes.length !== 0) {
 			const results = await Promise.all(changes);
 			console.log(results);
@@ -1011,7 +941,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 	// 	this.updateCreateFromLocalPatch(this._context.open);
 	// }
 
-	private switchMode(params: SwitchModeParams) {
+	@ipcCommand(SwitchModeCommand)
+	private onSwitchMode(params: IpcParams<typeof SwitchModeCommand>) {
 		this.setMode(params.mode);
 	}
 
@@ -1025,14 +956,12 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 			return;
 		}
 
-		if (this._notifyDidChangeStateDebounced == null) {
-			this._notifyDidChangeStateDebounced = debounce(this.notifyDidChangeState.bind(this), 500);
-		}
+		this._notifyDidChangeStateDebounced ??= debounce(this.notifyDidChangeState.bind(this), 500);
 
 		this._notifyDidChangeStateDebounced();
 	}
 
-	@debug({ args: false })
+	@trace({ args: false })
 	protected async getState(current: Context): Promise<Serialized<State>> {
 		let create;
 		if (current.mode === 'create' && current.create != null) {
@@ -1100,6 +1029,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 			if (updated.size !== changesetByRepo.size) {
 				for (const [uri, repoChange] of changesetByRepo) {
 					if (updated.has(uri)) continue;
+
 					repoChange.checked = false;
 				}
 			}
@@ -1173,13 +1103,13 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		const patch = draft.changesets?.[0].patches.find(p => isRepoLocated(p.repository));
 
 		let repoPrivacy;
-		if (isRepository(patch?.repository)) {
+		if (GlRepository.is(patch?.repository)) {
 			repoPrivacy = await this.container.git.visibility(patch.repository.uri);
 		}
 
 		const entity = getDraftEntityIdentifier(draft, patch);
 
-		this.container.telemetry.sendEvent(
+		this.host.sendTelemetryEvent(
 			'codeSuggestionViewed',
 			{
 				provider: entity?.provider,
@@ -1196,7 +1126,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 	private async updateViewDraftState(draft: LocalDraft | Draft | undefined) {
 		this._context.draft = draft;
 		if (draft?.draftType === 'cloud') {
-			this._context.draftGkDevUrl = this.container.drafts.generateWebUrl(draft);
+			this._context.draftGkDevUrl = await this.container.drafts.generateWebUrl(draft);
 			await this.createDraftUserState(draft, { force: true });
 		}
 		this.setMode('view', true);
@@ -1248,7 +1178,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 				updatedAt: draft.updatedAt.getTime(),
 				author: {
 					id: draft.author.id,
-					name: draft.author.name,
+					name: draft.isMine ? formatCurrentUserDisplayName(draft.author.name) : draft.author.name,
 					email: draft.author.email,
 					avatar: draft.author.avatarUri?.toString(),
 				},
@@ -1285,6 +1215,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		if (this._context.draftUserState != null && options?.force !== true) {
 			return;
 		}
+
 		// try to create the state if it doesn't exist
 		try {
 			const draftUsers = await this.container.drafts.getDraftUsers(draft.id);
@@ -1320,31 +1251,32 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		});
 	}
 
-	private updatePreferences(preferences: UpdateablePreferences) {
+	@ipcCommand(UpdatePreferencesCommand)
+	private onUpdatePreferences(params: IpcParams<typeof UpdatePreferencesCommand>) {
 		if (
-			this._context.preferences?.files?.compact === preferences.files?.compact &&
-			this._context.preferences?.files?.icon === preferences.files?.icon &&
-			this._context.preferences?.files?.layout === preferences.files?.layout &&
-			this._context.preferences?.files?.threshold === preferences.files?.threshold
+			this._context.preferences?.files?.compact === params.files?.compact &&
+			this._context.preferences?.files?.icon === params.files?.icon &&
+			this._context.preferences?.files?.layout === params.files?.layout &&
+			this._context.preferences?.files?.threshold === params.files?.threshold
 		) {
 			return;
 		}
 
-		if (preferences.files != null) {
-			if (this._context.preferences?.files?.compact !== preferences.files?.compact) {
-				void configuration.updateEffective('views.patchDetails.files.compact', preferences.files?.compact);
+		if (params.files != null) {
+			if (this._context.preferences?.files?.compact !== params.files?.compact) {
+				void configuration.updateEffective('views.patchDetails.files.compact', params.files?.compact);
 			}
-			if (this._context.preferences?.files?.icon !== preferences.files?.icon) {
-				void configuration.updateEffective('views.patchDetails.files.icon', preferences.files?.icon);
+			if (this._context.preferences?.files?.icon !== params.files?.icon) {
+				void configuration.updateEffective('views.patchDetails.files.icon', params.files?.icon);
 			}
-			if (this._context.preferences?.files?.layout !== preferences.files?.layout) {
-				void configuration.updateEffective('views.patchDetails.files.layout', preferences.files?.layout);
+			if (this._context.preferences?.files?.layout !== params.files?.layout) {
+				void configuration.updateEffective('views.patchDetails.files.layout', params.files?.layout);
 			}
-			if (this._context.preferences?.files?.threshold !== preferences.files?.threshold) {
-				void configuration.updateEffective('views.patchDetails.files.threshold', preferences.files?.threshold);
+			if (this._context.preferences?.files?.threshold !== params.files?.threshold) {
+				void configuration.updateEffective('views.patchDetails.files.threshold', params.files?.threshold);
 			}
 
-			this._context.preferences.files = preferences.files;
+			this._context.preferences.files = params.files;
 		}
 
 		void this.notifyDidChangePreferences();
@@ -1385,20 +1317,25 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 			return [
 				commit,
 				new GitFileChange(
-					this.container,
 					params.repoPath,
 					params.path,
 					params.status,
+					joinUriPath(fileUri(params.repoPath), params.path),
 					params.originalPath,
+					params.originalPath != null
+						? joinUriPath(fileUri(params.repoPath), params.originalPath)
+						: undefined,
 					undefined,
 					undefined,
 					params.staged,
+					undefined,
+					params.mode,
 				),
 				revision,
 			];
 		}
 
-		commit = await commit?.getCommitForFile(params.path, params.staged);
+		commit = commit != null ? await getCommitForFile(commit, params.path, params.staged) : undefined;
 		return commit != null ? [commit, commit.file!, revision] : undefined;
 	}
 
@@ -1521,7 +1458,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		return patch?.commit;
 	}
 
-	private async openFile(params: ExecuteFileActionParams) {
+	@ipcCommand(OpenFileCommand)
+	private async onOpenFile(params: IpcParams<typeof OpenFileCommand>) {
 		const result = await this.getFileCommitFromParams(params);
 		if (result == null) return;
 
@@ -1546,7 +1484,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		return 'Patch';
 	}
 
-	private async openFileComparisonWithPrevious(params: ExecuteFileActionParams) {
+	@ipcCommand(OpenFileComparePreviousCommand)
+	private async onOpenFileComparisonWithPrevious(params: IpcParams<typeof OpenFileComparePreviousCommand>) {
 		const result = await this.getFileCommitFromParams(params);
 		if (result == null) return;
 
@@ -1569,7 +1508,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 		this.container.events.fire('file:selected', { uri: file.uri }, { source: this.host.id });
 	}
 
-	private async openFileComparisonWithWorking(params: ExecuteFileActionParams) {
+	@ipcCommand(OpenFileCompareWorkingCommand)
+	private async onOpenFileComparisonWithWorking(params: IpcParams<typeof OpenFileCompareWorkingCommand>) {
 		const result = await this.getFileCommitFromParams(params);
 		if (result == null) return;
 
@@ -1588,8 +1528,8 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 	private async getOrLocatePatchRepository(
 		patch: DraftPatch,
 		options?: { notifyOnLocation?: boolean; prompt?: boolean },
-	): Promise<Repository | undefined> {
-		if (patch.repository == null || isRepository(patch.repository)) {
+	): Promise<GlRepository | undefined> {
+		if (patch.repository == null || GlRepository.is(patch.repository)) {
 			return patch.repository;
 		}
 
@@ -1611,7 +1551,7 @@ export class PatchDetailsWebviewProvider implements WebviewProvider<
 	}
 
 	// Ensures that changesets arent mutated twice on the same draft
-	@gate<PatchDetailsWebviewProvider['ensureChangesets']>(d => d.id)
+	@gate(d => d.id)
 	private async ensureChangesets(draft: Draft) {
 		draft.changesets ??= await this.container.drafts.getChangesets(draft.id);
 		return draft.changesets;
@@ -1659,7 +1599,7 @@ function isDraftMissingContent(draft: Draft): boolean {
 }
 
 function isRepoLocated(repo: DraftPatch['repository']): boolean {
-	return repo != null && isRepository(repo);
+	return repo != null && GlRepository.is(repo);
 }
 
 function toDraftUserSelection(

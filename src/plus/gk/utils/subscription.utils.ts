@@ -1,12 +1,12 @@
-import { SubscriptionState } from '../../../constants.subscription';
-import { getTimeRemaining } from '../../../system/date';
+import { getTimeRemaining } from '@gitlens/utils/date.js';
+import { SubscriptionState } from '../../../constants.subscription.js';
 import type {
 	PaidSubscriptionPlanIds,
 	Subscription,
 	SubscriptionPlan,
 	SubscriptionPlanIds,
 	SubscriptionStateString,
-} from '../models/subscription';
+} from '../models/subscription.js';
 
 const orderedPlans: SubscriptionPlanIds[] = [
 	'community',
@@ -201,8 +201,8 @@ export function isSubscriptionTrialOrPaidFromState(_state: SubscriptionState | u
 }
 
 export function assertSubscriptionState(
-	subscription: Optional<Subscription, 'state'>,
-): asserts subscription is Subscription {}
+	_subscription: Optional<Subscription, 'state'>,
+): asserts _subscription is Subscription {}
 
 export function getCommunitySubscription(subscription?: Subscription): Subscription {
 	return {

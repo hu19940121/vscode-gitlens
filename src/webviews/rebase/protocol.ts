@@ -1,19 +1,26 @@
-import type { MergeConflict } from '../../git/models/mergeConflict';
+import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
+import type { ConflictDetectionResult } from '@gitlens/git/models/mergeConflicts.js';
 import type {
 	ProcessedRebaseCommitEntry as _RebaseCommitEntry,
 	ProcessedRebaseCommandEntry,
 	ProcessedRebaseCommitEntry,
 	RebaseTodoCommitAction,
-} from '../../git/models/rebase';
-import type { Subscription } from '../../plus/gk/models/subscription';
-import type { IpcScope, WebviewState } from '../protocol';
-import { IpcCommand, IpcNotification, IpcRequest } from '../protocol';
+} from '@gitlens/git/models/rebase.js';
+import type { Config } from '../../config.js';
+import type { Subscription } from '../../plus/gk/models/subscription.js';
+import type { WebviewItemContext } from '../../system/webview.js';
+import type { IpcScope } from '../ipc/models/ipc.js';
+import { IpcCommand, IpcNotification, IpcRequest } from '../ipc/models/ipc.js';
+import type { WebviewState } from '../protocol.js';
 
 export const scope: IpcScope = 'rebase';
 
 export interface State extends WebviewState<'gitlens.rebase'> {
 	branch: string;
 	onto: { sha: string; commit?: Commit } | undefined;
+
+	/** True if the commits are already on top of onto */
+	isInPlace: boolean;
 
 	/** Pending entries that can still be edited */
 	entries: RebaseEntry[];
@@ -24,15 +31,17 @@ export interface State extends WebviewState<'gitlens.rebase'> {
 	ascending: boolean;
 
 	/**
-	 * True if this is a complex rebase (--rebase-merges) that should be read-only.
-	 * Complex rebases contain label/reset/merge commands that form a DAG structure.
+	 * True if this is a --rebase-merges rebase with actual merge commits.
+	 * Reordering is disabled to preserve the DAG structure, but action changes are allowed.
 	 */
-	isReadOnly?: boolean;
+	preservesMerges?: boolean;
 
+	/** Layout density */
+	density: Config['rebaseEditor']['density'];
 	/** Where to reveal commits when clicking on links or double-clicking rows */
-	revealLocation: 'graph' | 'inspect';
+	revealLocation: Config['rebaseEditor']['revealLocation'];
 	/** When to automatically reveal commits */
-	revealBehavior: 'never' | 'onOpen' | 'onSelection';
+	revealBehavior: Config['rebaseEditor']['revealBehavior'];
 
 	/** Active rebase status - undefined if starting a new rebase */
 	rebaseStatus?: RebaseActiveStatus;
@@ -42,7 +51,28 @@ export interface State extends WebviewState<'gitlens.rebase'> {
 
 	/** Subscription state for Pro feature gating */
 	subscription?: Subscription;
+
+	/** Conflicted files when rebase is paused due to conflicts */
+	conflictFiles?: ConflictFileInfo[];
+
+	/** Whether the close-warning banner has been dismissed */
+	closeWarningDismissed?: boolean;
 }
+
+export interface ConflictFileInfo {
+	path: string;
+	conflictStatus: GitFileConflictStatus;
+	/** Number of conflict markers in the file */
+	conflictCount?: number;
+}
+
+export interface ConflictFileContextValue {
+	type: 'rebaseConflict';
+	path: string;
+	conflictStatus: GitFileConflictStatus;
+}
+
+export type ConflictFileWebviewContext = WebviewItemContext<ConflictFileContextValue>;
 
 /** Reason the rebase is paused */
 export type RebasePauseReason = 'edit' | 'reword' | 'break' | 'conflict' | 'exec';
@@ -57,6 +87,7 @@ export interface RebaseActiveStatus {
 	currentCommit?: string;
 	/** True if there are conflicts to resolve */
 	hasConflicts?: boolean;
+	isPaused: boolean;
 	/** Reason the rebase is paused (undefined if not paused/in progress) */
 	pauseReason?: RebasePauseReason;
 }
@@ -170,20 +201,53 @@ export interface GetMissingCommitsParams {
 export const GetMissingCommitsCommand = new IpcCommand<GetMissingCommitsParams>(scope, 'commits/get');
 
 export const RecomposeCommand = new IpcCommand(scope, 'recompose/open');
+export const DismissCloseWarningCommand = new IpcCommand(scope, 'closeWarning/dismiss');
+
+export interface OpenConflictFileParams {
+	path: string;
+}
+export const OpenConflictFileCommand = new IpcCommand<OpenConflictFileParams>(scope, 'conflicts/openFile');
+
+export interface OpenConflictChangesParams {
+	path: string;
+	side: 'current' | 'incoming';
+}
+export const OpenConflictChangesCommand = new IpcCommand<OpenConflictChangesParams>(scope, 'conflicts/openChanges');
+
+export interface ResolveConflictParams {
+	path: string;
+	resolution: 'current' | 'incoming';
+}
+export const ResolveConflictCommand = new IpcCommand<ResolveConflictParams>(scope, 'conflicts/resolve');
+
+export interface StageConflictParams {
+	path: string;
+}
+export const StageConflictCommand = new IpcCommand<StageConflictParams>(scope, 'conflicts/stage');
+
+export interface ResolveAllConflictsParams {
+	resolution: 'current' | 'incoming';
+}
+export const ResolveAllConflictsCommand = new IpcCommand<ResolveAllConflictsParams>(scope, 'conflicts/resolveAll');
 
 // REQUESTS
 
-export interface GetPotentialConflictsParams {
-	branch: string;
+export interface GetConflictsParams {
+	/** Distinguishes initial (on-load / upgrade) checks from dynamic (plan-modification / rebase-advance) checks */
+	trigger: 'initial' | 'todo';
+	/** The onto target SHA */
 	onto: string;
+	/** Commit SHAs to check for conflicts, in plan order */
+	commits: string[];
+	/** Optional base override (e.g. 'HEAD' during an active rebase). Defaults to `onto`. */
+	base?: string;
+	/** Only honored when `trigger === 'initial'`. */
+	stopOnFirstConflict?: boolean;
 }
-export interface DidGetPotentialConflictsParams {
-	conflicts?: MergeConflict;
+export interface DidGetConflictsParams {
+	conflicts?: ConflictDetectionResult;
 }
-export const GetPotentialConflictsRequest = new IpcRequest<GetPotentialConflictsParams, DidGetPotentialConflictsParams>(
-	scope,
-	'conflicts/get',
-);
+export const GetConflictsRequest = new IpcRequest<GetConflictsParams, DidGetConflictsParams>(scope, 'conflicts/get');
 
 // NOTIFICATIONS
 
@@ -203,6 +267,8 @@ export interface DidChangeCommitsParams {
 	commits: Record<string, Commit>;
 	/** Map of author name → author info (for new authors from fetched commits) */
 	authors: Record<string, Author>;
+	/** True if the commits are already on top of onto (recalculated when commits are enriched) */
+	isInPlace?: boolean;
 }
 export const DidChangeCommitsNotification = new IpcNotification<DidChangeCommitsParams>(scope, 'commits/didChange');
 

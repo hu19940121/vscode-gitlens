@@ -1,13 +1,15 @@
 import type { Context, ContextProvider, ContextType } from '@lit/context';
-import { fromBase64ToString } from '@env/base64';
-import type { CustomEditorIds, WebviewIds, WebviewViewIds } from '../../../constants.views';
-import { isPromise } from '../../../system/promise';
-import type { IpcMessage, WebviewState } from '../../protocol';
-import { WebviewReadyRequest } from '../../protocol';
-import type { ReactiveElementHost } from './appHost';
-import type { LoggerContext } from './contexts/logger';
-import type { Disposable } from './events';
-import type { HostIpc } from './ipc';
+import { fromBase64ToString } from '@gitlens/utils/base64.js';
+import { isPromise } from '@gitlens/utils/promise.js';
+import type { WebviewIds } from '../../../constants.views.js';
+import type { IpcMessage } from '../../ipc/models/ipc.js';
+import type { WebviewState } from '../../protocol.js';
+import { WebviewReadyRequest } from '../../protocol.js';
+import type { ReactiveElementHost } from './appHost.js';
+import type { LoggerContext } from './contexts/logger.js';
+import type { Disposable } from './events.js';
+import type { HostIpc } from './ipc.js';
+import { getWebviewClientInfo } from './ipc.js';
 
 /**
  * Base class for webview state providers that handles bootstrap initialization.
@@ -18,7 +20,7 @@ import type { HostIpc } from './ipc';
  * - Async: Requests full state from extension after connection
  */
 export abstract class StateProviderBase<
-	ID extends WebviewIds | WebviewViewIds | CustomEditorIds,
+	ID extends WebviewIds,
 	State extends WebviewState<ID>,
 	TContext extends Context<unknown, State>,
 > implements Disposable {
@@ -50,7 +52,7 @@ export abstract class StateProviderBase<
 	) {
 		// Deserialize bootstrap from base64
 		this._state = this.ipc.deserializeIpcData<State>(fromBase64ToString(bootstrap));
-		this.logger?.log(`bootstrap duration=${Date.now() - this._state.timestamp}ms`);
+		this.logger?.debug(`bootstrap duration=${Date.now() - this._state.timestamp}ms`);
 
 		this.provider = this.createContextProvider(this._state);
 		this.onPersistState?.(this._state);
@@ -70,14 +72,15 @@ export abstract class StateProviderBase<
 	protected abstract createContextProvider(state: State): ContextProvider<any, ReactiveElementHost>;
 
 	protected async initializeState(): Promise<void> {
+		const client = getWebviewClientInfo();
 		if (this.deferBootstrap) {
-			const response = await this.ipc.sendRequest(WebviewReadyRequest, { bootstrap: true });
+			const response = await this.ipc.sendRequest(WebviewReadyRequest, { bootstrap: true, ...client });
 			if (response.state != null) {
 				const state: State = (isPromise(response.state) ? await response.state : response.state) as State;
 				this.onDeferredBootstrapStateReceived(state);
 			}
 		} else {
-			void this.ipc.sendRequest(WebviewReadyRequest, { bootstrap: false });
+			void this.ipc.sendRequest(WebviewReadyRequest, { bootstrap: false, ...client });
 		}
 	}
 

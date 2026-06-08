@@ -39,34 +39,35 @@ import {
 } from '@gitkraken/provider-apis';
 import { EntityIdentifierUtils } from '@gitkraken/provider-apis/entity-identifiers';
 import { GitProviderUtils } from '@gitkraken/provider-apis/provider-utils';
-import type { IntegrationIds } from '../../../constants.integrations';
-import {
-	GitCloudHostIntegrationId,
-	GitSelfManagedHostIntegrationId,
-	IssuesCloudHostIntegrationId,
-} from '../../../constants.integrations';
-import type { Account as UserAccount } from '../../../git/models/author';
-import type { IssueMember, IssueProject, IssueShape } from '../../../git/models/issue';
-import { Issue, RepositoryAccessLevel } from '../../../git/models/issue';
+import type { Account as UserAccount } from '@gitlens/git/models/author.js';
+import type { IssueMember, IssueProject, IssueShape } from '@gitlens/git/models/issue.js';
+import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
 import type {
 	PullRequestMember,
 	PullRequestRefs,
 	PullRequestRepositoryIdentityDescriptor,
 	PullRequestReviewer,
 	PullRequestState,
-} from '../../../git/models/pullRequest';
+} from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
 	PullRequestReviewDecision,
 	PullRequestReviewState,
 	PullRequestStatusCheckRollupState,
-} from '../../../git/models/pullRequest';
-import type { Provider, ProviderReference } from '../../../git/models/remoteProvider';
-import { equalsIgnoreCase } from '../../../system/string';
-import type { EnrichableItem } from '../../launchpad/models/enrichedItem';
-import type { Integration, IntegrationType } from '../models/integration';
-import { getEntityIdentifierInput } from './utils';
+} from '@gitlens/git/models/pullRequest.js';
+import type { Provider, ProviderReference } from '@gitlens/git/models/remoteProvider.js';
+import { gitSuffixRegex } from '@gitlens/git/utils/remote.utils.js';
+import { equalsIgnoreCase } from '@gitlens/utils/string.js';
+import type { IntegrationIds } from '../../../constants.integrations.js';
+import {
+	GitCloudHostIntegrationId,
+	GitSelfManagedHostIntegrationId,
+	IssuesCloudHostIntegrationId,
+} from '../../../constants.integrations.js';
+import type { EnrichableItem } from '../../launchpad/models/enrichedItem.js';
+import type { Integration, IntegrationType } from '../models/integration.js';
+import { getEntityIdentifierInput } from './utils.js';
 
 export type ProviderAccount = Account;
 export type ProviderReposInput = (string | number)[] | GetRepoInput[];
@@ -333,8 +334,8 @@ export type GetAzureProjectsForResourceFn = (
 	input: { namespace: string; cursor?: string },
 	options?: EnterpriseOptions,
 ) => Promise<{ data: AzureProject[]; pageInfo?: PageInfo }>;
-export type GetBitbucketResourcesForUserFn = (
-	input: { userId: string },
+export type GetBitbucketResourcesForCurrentUserFn = (
+	input: Record<string, never>,
 	options?: EnterpriseOptions,
 ) => Promise<{ data: BitbucketWorkspaceStub[] }>;
 export type GetBitbucketPullRequestsAuthoredByUserForWorkspaceFn = (
@@ -386,7 +387,7 @@ export interface ProviderInfo extends ProviderMetadata {
 	getLinearOrganizationFn?: GetLinearOrganizationFn;
 	getLinearTeamsForCurrentUserFn?: GetLinearTeamsForCurrentUserFn;
 	getAzureResourcesForUserFn?: GetAzureResourcesForUserFn;
-	getBitbucketResourcesForUserFn?: GetBitbucketResourcesForUserFn;
+	getBitbucketResourcesForCurrentUserFn?: GetBitbucketResourcesForCurrentUserFn;
 	getBitbucketPullRequestsAuthoredByUserForWorkspaceFn?: GetBitbucketPullRequestsAuthoredByUserForWorkspaceFn;
 	getBitbucketServerPullRequestsForCurrentUserFn?: GetBitbucketServerPullRequestsForCurrentUserFn;
 	getJiraProjectsForResourcesFn?: GetJiraProjectsForResourcesFn;
@@ -864,6 +865,7 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 		graphQLId: pr.nodeId,
 		number: Number.parseInt(pr.id, 10),
 		title: pr.title,
+		description: null,
 		url: pr.url,
 		state: toProviderPullRequestState(pr.state),
 		isDraft: pr.isDraft ?? false,
@@ -993,7 +995,7 @@ export function fromProviderPullRequest(
 				owner: pr.repository.owner.login,
 				exists: pr.baseRef != null,
 				url: pr.repository.remoteInfo?.cloneUrlHTTPS
-					? pr.repository.remoteInfo.cloneUrlHTTPS.replace(/\.git$/, '')
+					? pr.repository.remoteInfo.cloneUrlHTTPS.replace(gitSuffixRegex, '')
 					: '',
 			},
 			head: {
@@ -1003,7 +1005,7 @@ export function fromProviderPullRequest(
 				owner: pr.headRepository?.owner.login ?? '',
 				exists: pr.headRef != null,
 				url: pr.headRepository?.remoteInfo?.cloneUrlHTTPS
-					? pr.headRepository.remoteInfo.cloneUrlHTTPS.replace(/\.git$/, '')
+					? pr.headRepository.remoteInfo.cloneUrlHTTPS.replace(gitSuffixRegex, '')
 					: '',
 			},
 			isCrossRepository: pr.headRepository?.id !== pr.repository.id,
@@ -1124,6 +1126,16 @@ export function isGitHubDotCom(domain: string): boolean {
 
 export function isGitLabDotCom(domain: string): boolean {
 	return equalsIgnoreCase(domain, 'gitlab.com');
+}
+
+const azureCloudDomainRegex = /^dev\.azure\.com$|\bvisualstudio\.com$/i;
+export function isAzureCloudDomain(domain: string | undefined): boolean {
+	return domain != null && azureCloudDomainRegex.test(domain);
+}
+
+const bitbucketCloudDomainRegex = /^bitbucket\.org$/i;
+export function isBitbucketCloudDomain(domain: string | undefined): boolean {
+	return domain != null && bitbucketCloudDomainRegex.test(domain);
 }
 
 export function supportsCodeSuggest(provider: ProviderReference): boolean {

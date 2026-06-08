@@ -2,68 +2,103 @@
 
 This workspace contains **GitLens** - a powerful VS Code extension that supercharges Git functionality. It provides blame annotations, commit history visualization, repository exploration, and many advanced Git workflows. The codebase supports both desktop VS Code (Node.js) and VS Code for Web (browser/webworker) environments.
 
+## Working Style Expectations
+
+1. **Accuracy over speed** — Read the actual code before proposing changes. Do not guess at method names, decorator behaviors, or class interfaces. Verify they exist first by searching the codebase.
+2. **Simplicity over abstraction** — Prefer the simplest correct solution. Do not introduce new types, enums, marker interfaces, migration flags, or wrapper abstractions unless they serve multiple consumers. When the user simplifies your approach, adopt it immediately.
+3. **Completeness over iteration** — Before presenting a multi-file change as complete, audit ALL affected locations: call sites, subclass overrides, both Node.js and browser code paths, and sub-providers.
+4. **Fixing over disabling** — When asked to fix a feature, fix the root cause. Do not disable, remove, or work around it unless explicitly asked. "Fix" and "disable" are different instructions.
+5. **Confirming over assuming** — When debugging, present your hypothesis with evidence before implementing. If a request is ambiguous, ask for clarification. Do not silently start editing on non-trivial changes without stating your approach.
+6. **Purposeful changes** — Refactoring and renaming to improve clarity, maintainability, and codebase health are encouraged. Explain what you're changing and why. Do not make silent drive-by changes unrelated to the task at hand.
+7. **Branch ownership** — The current branch owns ALL of its issues, not just those from your current task. Do not dismiss build errors, type errors, or test failures as "pre-existing" without verifying against the base branch (`git diff main --stat` or similar). If an issue exists on this branch but not on the base branch, it is the branch's responsibility regardless of when it was introduced. After completing your current task, address any remaining branch issues. If the scope of remaining issues is too large to handle, ask the user how to proceed.
+
+## Issue Accountability During Work
+
+### Branch vs. Repository Issues
+
+- **Branch issues**: Errors that exist on the current branch but NOT on the base branch. These are the branch's responsibility regardless of which task or session introduced them.
+- **Repository issues**: Errors that also exist on the base branch. These are truly pre-existing and can be noted but not prioritized.
+
+### Workflow
+
+1. **Focus first** — Complete your current task
+2. **Then fix** — After your task is done, address any remaining build errors, type errors, or test failures on the branch
+3. **Ask if too large** — If the remaining issues are extensive or unclear, inform the user and ask how to proceed rather than ignoring them
+
+### Completion Criteria
+
+A task is not complete until:
+
+- The code compiles cleanly (`pnpm run build` or relevant build command succeeds)
+- Related tests pass
+- Any remaining branch issues have been either fixed or raised to the user
+
+## Development Environment
+
+- **Node.js** ≥ 22.12.0, **pnpm** ≥ 10.x (install via corepack: `corepack enable`), **Corepack** ≥ 0.31.0, **Git** ≥ 2.7.2
+- GitLens supports **Node.js** (desktop) and **Web Worker** (browser/vscode.dev) environments — shared code with abstractions in `src/env/`
+- Test both environments during development
+
+### Performance Considerations
+
+- Use lazy loading for heavy services
+- Leverage caching layers (GitCache, PromiseCache, @memoize)
+- Debounce expensive operations
+- Consider webview refresh performance
+- Monitor telemetry for performance regressions
+
 ## Development Commands
 
-### Setup
-
 ```bash
-pnpm install              # Install dependencies (requires Node >= 22.12.0, pnpm >= 10.x)
+pnpm install              # Install dependencies
 ```
 
 ### Build & Development
 
 ```bash
 pnpm run rebuild          # Complete rebuild from scratch
-pnpm run build            # Full development build
-pnpm run build:quick      # Fast build (no linting)
-pnpm run build:turbo      # Turbo build (no typechecking or linting)
-pnpm run build:extension  # Build only the extension (no webviews)
-pnpm run build:webviews   # Build only webviews
+pnpm run build            # Full development build (everything including e2e and unit tests)
 pnpm run bundle           # Production bundle
-pnpm run bundle:turbo     # Turbo production bundle (no typechecking or linting)
+pnpm run bundle:e2e       # E2E tests production bundle (with DEBUG for account simulation)
 ```
 
-### Watch Mode
+### Testing
 
 ```bash
-pnpm run watch            # Watch mode for development
-pnpm run watch:quick      # Fast watch mode (no linting)
-pnpm run watch:turbo      # Turbo watch mode (no typechecking or linting)
-pnpm run watch:extension  # Watch extension only
-pnpm run watch:webviews   # Watch webviews only
-pnpm run watch:tests      # Watch test files
-```
-
-### Testing & Quality
-
-```bash
-pnpm run test             # Run VS Code extension tests
+pnpm run test             # Run unit tests (VS Code extension tests)
 pnpm run test:e2e         # Run Playwright E2E tests
-pnpm run build:tests      # Build test files with esbuild
-pnpm run lint             # Run ESLint with TypeScript rules
-pnpm run lint:fix         # Auto-fix linting issues
+```
+
+> For detailed test running patterns, output interpretation, and debugging: see `docs/testing.md`
+
+### Quality
+
+```bash
+pnpm run check            # Run type-checking and lint rules (also run automatically as part of `pnpm run build`)
+pnpm run check:fix        # Run type-checking and lint rules with auto-fix (better to use so you don't have to deal with auto-fixable issues)
 pnpm run pretty           # Format code with Prettier
 pnpm run pretty:check     # Check formatting
 ```
 
-### Specialized Commands
+### Specialized Commands (typically not needed during normal development as they are part of build/watch)
 
 ```bash
 pnpm run generate:contributions  # Generate package.json contributions from contributions.json
 pnpm run extract:contributions   # Extract contributions from package.json to contributions.json
 pnpm run generate:commandTypes   # Generate command types from contributions
 pnpm run build:icons             # Build icon font from SVG sources
-pnpm run web                     # Run extension in web environment for testing
-pnpm run package                 # Create VSIX package
 ```
 
-### Debugging
+## Git & Repository Guidelines
 
-- Use **"Watch & Run"** launch configuration (F5) for desktop debugging
-- Use **"Watch & Run (web)"** for webworker/browser debugging
-- Press `Ctrl+Shift+P` → "Tasks: Run Task" → "watch" to start build task
-- Tests are co-located with source files in `__tests__/` directories
-- Webview changes can be refreshed without restarting extension
+For commit message format and workflow, use `/commit`. For CHANGELOG format and entry guidelines, use `/audit-commits`. For code reviewing, use `/review` or `/deep-review`. For debugging methodology and common misdiagnosis patterns, use `/investigate`.
+
+### Branching Guidelines
+
+- Feature branches from `main` or from another feature branch if stacking
+- Prefix with an appropriate type: `feature/`, `bug/`, `debt/`
+- Use descriptive names: `feature/search-natural-language`, `bug/graph-performance`
+- If there is a related issue, reference it in the branch name: `feature/#1234-search-natural-language`
 
 ## High-Level Architecture
 
@@ -137,464 +172,116 @@ src/
     └── webviewController.ts  # Base controller for all webviews
 tests/                        # E2E and Unit tests
 walkthroughs/                 # Welcome and tips walkthroughs
+custom-elements.json          # Custom Elements Manifest - generated web component metadata
 ```
 
-### Core Architectural Patterns
-
-**1. Service Locator (Container)**
-
-- `src/container.ts` - Main dependency injection container using singleton pattern
-- Manages 30+ services with lazy initialization
-- All services registered in constructor and exposed as getters
-- Handles lifecycle, configuration changes, and service coordination
-- Example services: GitProviderService, SubscriptionService, TelemetryService, AIProviderService
-
-**2. Provider Pattern for Git Operations**
-
-- `GitProviderService` manages multiple Git providers (local, remote, GitHub, etc.)
-- Allows environment-specific implementations:
-  - **LocalGitProvider** (`src/env/node/git/localGitProvider.ts`): Executes Git via `child_process` for Node.js
-  - **GitHubGitProvider** (`src/plus/integrations/providers/github/githubGitProvider.ts`): Uses GitHub API for browser
-- Each provider implements the `GitProvider` interface
-  - Both providers use a shared set of sub-providers (in `src/git/sub-providers/`) for specific Git operations
-  - LocalGitProvider uses 15 specialized sub-providers (in `src/env/node/git/sub-providers/`):
-    - `branches`, `commits`, `config`, `contributors`, `diff`, `graph`, `patch`, `refs`, `remotes`, `revision`, `staging`, `stash`, `status`, `tags`, `worktrees`
-  - GitHubGitProvider uses 11 specialized sub-providers (in `src/plus/integrations/providers/github/sub-providers/`):
-    - `branches`, `commits`, `config`, `contributors`, `diff`, `graph`, `refs`, `remotes`, `revision`, `status`, `tags`
-
-**3. Layered Architecture**
-
-```
-VS Code Extension API
-    ↓
-Commands (100+ command handlers in src/commands/)
-    ↓
-Controllers (Webviews, Views, Annotations, CodeLens)
-    ↓
-Services (Git, Telemetry, Storage, Integrations, AI, Subscription)
-    ↓
-Git Providers (LocalGitProvider, GitHubGitProvider, etc.)
-    ↓
-Git Execution (Node: child_process | Browser: APIs (GitHub))
-```
-
-**4. Webview IPC Protocol**
-
-- Webviews use typed message-passing with three message types:
-  - **Commands**: Fire-and-forget actions (no response)
-  - **Requests**: Request/response pairs with Promise-based handling
-  - **Notifications**: Extension → Webview state updates
-- Protocol defined in `src/webviews/protocol.ts`
-- **Host-Guest Communication**: IPC between extension host and webviews
-- Webviews built with **Lit Elements only** for reactive UI components
-- **State Management**: Context providers with Lit reactive patterns and signals
-- **Major webviews**:
-  - **Community**: Commit Details, Rebase, Settings
-  - **Pro** (`apps/plus/`): Home (includes Launchpad), Commit Graph, Timeline, Patch Details, Commit Composer
-- Webviews bundled separately from extension (separate webpack config)
-
-**5. Caching Strategy**
-
-- Multiple caching layers for performance:
-  - `GitCache`: Repository-level Git data caching
-  - `PromiseCache`: In-flight request deduplication
-  - `@memoize` decorator: Function result memoization
-  - VS Code storage API: Persistent state across sessions
-
-### Major Services & Components
-
-**Core Services** (accessed via Container)
-
-- **GitProviderService** - Core Git operations and repository management
-- **SubscriptionService** - GitLens Pro subscription and account management
-- **IntegrationService** - GitHub/GitLab/Bitbucket/Azure DevOps integrations
-- **AIProviderService** - AI features (commit messages, explanations, changelogs)
-- **TelemetryService** - Usage analytics and error reporting
-- **WebviewsController** - Manages all webview panels (Graph, Home, Settings, etc.)
-- **AutolinksProvider** - Auto-linking issues/PRs in commit messages
-- **DocumentTracker** - Tracks file changes and editor state
-- **FileAnnotationController** - Blame, heatmap, and change annotations
-
-**VS Code Contributions**
-
-- Commands, Menus, Submenus, Keybindings, and Views defined in `contributions.json`
-- Generate package.json: `pnpm run generate:contributions`
-- Extract from package.json: `pnpm run extract:contributions`
-- All other VS Code contributions are defined in `package.json` (activation events, settings, etc.)
-
-**Extension Activation** (`src/extension.ts`)
-
-- Activates on `onStartupFinished`, file system events, or specific webview opens
-- Creates the `Container` singleton
-- Registers all commands, views, providers, and decorations
-
-**Commands** (`src/commands/`)
-
-- 100+ commands registered in `package.json` (generated from `contributions.json`)
-- Command IDs auto-generated in `src/constants.commands.generated.ts`
-- Commands grouped by functionality (git operations, views, webviews, etc.)
-
-**Views** (`src/views/`)
-
-- Tree views: Commits, Branches, Remotes, Stashes, Tags, Worktrees, Contributors, Repositories
-- Each view has a tree data provider implementing VS Code's `TreeDataProvider`
-- Nodes are hierarchical (repository → branch → commit → file)
-
-### Environment Abstraction
-
-The extension supports both Node.js (desktop) and browser (web) environments:
-
-**Node.js Environment** (`src/env/node/`)
-
-- Uses `child_process` to execute Git commands via `Git.execute()`
-- Direct file system access
-- Full Git command support
-- Commands parsed by specialized parsers in `src/git/parsers/`
-
-**Browser Environment** (`src/env/browser/`)
-
-- Uses GitHub API for Git operations
-- Virtual file system via VS Code's File System API
-- Limited to supported Git hosting providers
-- WebWorker support for browser extension compatibility
-
-**Build Configuration**
-
-- Separate entry points: `main` (Node.js) and `browser` (webworker)
-- Webpack configs in `webpack.config.mjs`:
-  1. `extension:node` - Extension code for Node.js
-  2. `extension:webworker` - Extension code for browser
-  3. `webviews:common` - Shared webview code
-  4. `webviews` - Individual webview apps
-  5. `images` - Icon/image processing
-- Platform detection via `@env/platform` abstractions
-
-**Output Structure**
-
-```
-dist/
-├── gitlens.js              # Main extension bundle (Node.js)
-├── browser/
-│   └── gitlens.js          # Extension bundle for browser
-└── webviews/
-    ├── *.js                # Individual webview apps
-    └── media/              # Webview assets
-```
-
-### Pro Features (Plus)
-
-Files in or under directories named "plus" fall under `LICENSE.plus` (non-OSS):
-
-- **Commit Graph** - Visual commit history with advanced actions
-- **Worktrees** - Multi-branch workflow support
-- **Launchpad** - PR/issue management hub
-- **Visual File History** - Timeline visualization
-- **Cloud Patches** - Private code sharing
-- **Code Suggest** - In-IDE code suggestions for PRs
-- **AI Features** - Commit generation, explanations using various providers
-
-Pro features integrate with GitKraken accounts and require authentication via SubscriptionService.
-
-### Testing Infrastructure
-
-**Test Structure**
-
-- Tests co-located with source files in `__tests__/` directories
-- Pattern: `src/path/to/__tests__/file.test.ts`
-- VS Code extension tests use `@vscode/test-cli`
-- E2E tests use Playwright in `tests/e2e/`
-- Build tests separately: `pnpm run build:tests`
-
-**Running Tests**
-
-```bash
-pnpm run test           # Run extension tests
-pnpm run test:e2e       # Run E2E tests
-pnpm run watch:tests    # Watch mode for tests
-```
+> For detailed architecture (patterns, services, environment abstraction, webviews, build config): see `docs/architecture.md`
 
 ## Coding Standards & Style Rules
 
-### TypeScript Configuration
-
-- **Strict TypeScript** with `strictTypeChecked` ESLint config
-- **No `any` usage** (exceptions only for external APIs)
-- **Explicit return types** for public methods
-- **Prefer `type` over `interface`** for unions
-- Multiple tsconfig files for different targets (node, browser, test)
-
-### Import Organization
-
+- **Strict TypeScript** — no `any` usage (exceptions only for external APIs)
+- **Explicit return types** for public methods; **prefer `type` over `interface`** for unions
 - **Use path aliases**: `@env/` for environment-specific code
 - **Import order**: node built-ins → external → internal → relative
-- **No default exports** (ESLint enforced)
-- **Consistent type imports** with `import type` for type-only imports
+- **No default exports** use `import type` for type-only imports
+- **Always use `.js` extension** in imports (ESM requirement)
+- **Naming**: Classes PascalCase (no `I` prefix), methods/variables camelCase, constants camelCase (not SCREAMING_SNAKE_CASE), files camelCase.ts
+- **Folders**: Models under `models/`, utilities under `utils/` (both host + webview), host-specific in `utils/-webview/`, webview apps under `webviews/apps/`
 
-Example:
+> For error handling patterns, implementation quality rules, and completeness checklist: see `docs/coding-standards.md`
+>
+> For webview accessibility requirements: see `docs/accessibility.md`
 
-```typescript
-import type { Disposable } from 'vscode';
-import { EventEmitter } from 'vscode';
-import type { Container } from './container';
-import { configuration } from './system/configuration';
-```
+### Decorator System
 
-### Naming Conventions
+The codebase uses method decorators (`src/system/decorators/`) that significantly alter runtime behavior:
 
-- **Classes**: PascalCase (no `I` prefix for interfaces)
-- **Methods/Variables**: camelCase
-- **Constants**: camelCase for module-level constants (not SCREAMING_SNAKE_CASE)
-- **Private members**: Leading underscore allowed (e.g., `_cache`)
-- **Files**: camelCase.ts (e.g., `gitProvider.ts`, `branchProvider.utils.ts`)
-- **Folders**:
-  - Models under a `models/` sub-folder
-  - Utilities under a `utils/` sub-folder (usable in both host and webviews)
-  - Extension host-specific utilities in `utils/-webview/` sub-folder
-  - Webview apps under `webviews/apps/`
+| Decorator                           | Purpose                                              | Key Gotcha                                                                 |
+| ----------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------- |
+| `@info()` / `@debug()` / `@trace()` | Logging with scope tracking                          | `getScopedLogger()` must be called BEFORE any `await` (browser limitation) |
+| `@gate()`                           | Deduplicates concurrent calls (returns same promise) | 5-min timeout; most common cause of method hangs                           |
+| `@memoize()`                        | Caches return value permanently on instance          | Caches rejected Promises too; use `invalidateMemoized()` to clear          |
+| `@sequentialize()`                  | Queues calls to execute one at a time                | Different from `@gate()` — queues instead of deduplicating                 |
+| `@debounce()`                       | Debounces method calls per-instance                  |                                                                            |
+| `@command()`                        | Registers VS Code command class                      | Class decorator, not method decorator                                      |
 
-### Code Structure Principles
+Stacking executes bottom-up (outermost runs first). When debugging: check `@gate()` first for hangs, `@memoize()` for stale data, logging decorators last.
 
-- **Single responsibility** - Each service has focused purpose
-- **Dependency injection** - Services injected via Container
-- **Event-driven** - EventEmitter pattern for service communication
-- **Disposable pattern** - Proper cleanup with VS Code Disposable interface
-- **Immutability** - Prefer immutable operations where possible
+For detailed decorator behavior and investigation methodology, use `/investigate`.
 
-### Error Handling
+## Quick Lookup
 
-- Use custom error types extending `Error`
-- Log errors with context using `Logger.error()`
-- Graceful degradation for network/API failures
-- Validate external data with schema validators
-- Provide user-friendly error messages
+Reference examples and critical rules for common tasks.
 
-### Decorators
+### Available Skills
 
-Common decorators used throughout the codebase:
+Skills provide detailed, step-by-step workflows for common tasks. Invoke with `/{skill-name}`.
 
-- `@memoize()` - Cache function results
-- `@debug()` - Add debug logging
-- `@log()` - Add logging
-- `@gate()` - Throttle concurrent calls
-- `@command()` - Register VS Code commands
+| Skill              | Purpose                                                                     |
+| ------------------ | --------------------------------------------------------------------------- |
+| `/triage`          | Triage GitHub issues — verdicts, confidence levels, recommended actions     |
+| `/investigate`     | Structured bug investigation with root cause analysis                       |
+| `/prioritize`      | Prioritize triaged issues — shortlist, backlog, won't fix, community        |
+| `/update-issues`   | Update GitHub issues from triage/investigation/prioritization reports       |
+| `/dev-scope`       | Scope work into a goals doc — defines what and why, not how                 |
+| `/deep-planning`   | Design implementation approach — investigates codebase, presents trade-offs |
+| `/challenge-plan`  | Stress-test a proposed plan or architecture decision                        |
+| `/analyze`         | Deep design/implementation analysis, devil's advocate                       |
+| `/review`          | Code review against standards + impact completeness audit                   |
+| `/deep-review`     | Deep merge-blocking review — traces code paths for correctness              |
+| `/ux-review`       | UX review — traces user flows against goals doc                             |
+| `/a11y-audit`      | Audit a component/file/directory for WCAG 2.1 AA accessibility              |
+| `/a11y-flow-audit` | Audit a page or flow for WCAG 2.1 AA composition-level compliance           |
+| `/a11y-remediate`  | Turn /a11y-audit findings into a leader-facing remediation proposal         |
+| `/modern-css`      | Guide CSS authoring/review — modern patterns, tokens, shadow DOM safety     |
+| `/commit`          | Git commit with GitLens conventions                                         |
+| `/create-issue`    | Create GitHub issues from code changes                                      |
+| `/audit-commits`   | Audit commit range for issues and CHANGELOG entries                         |
+| `/worktree`        | Create isolated git worktrees for feature work                              |
+| `/add-command`     | Scaffold a new VS Code command                                              |
+| `/add-webview`     | Scaffold a new webview with IPC, Lit app, registration                      |
+| `/add-test`        | Generate unit or E2E test files                                             |
+| `/add-icon`        | Add icon to GL Icons font                                                   |
+| `/add-ai-provider` | Add a new AI provider integration                                           |
+| `/live-inspect`    | Launch VS Code with GitLens via Playwright inspect UI/logs                  |
+| `/live-exercise`   | Live operation + audit + fix loop for UI-bearing work                       |
+| `/live-perf`       | Live performance measurement + improvement with three-tier discipline       |
+| `/live-pair`       | Interactive pair-programming with a live instance (user-driven feedback)    |
 
-### Webview Development
+### Canonical Examples
 
-- **Lit Elements** - Use for reactive UI components
-- **Context providers** - For sharing state across components
-- **Signal patterns** - For reactive state management
-- **CSS custom properties** - For VS Code theming support
-- Webview UI code in `src/webviews/apps/{webviewName}/`
-- Use IPC protocol for communication: `postMessage()` → `onIpc()`
-- Refresh webview without restarting extension during development
+When implementing something new, look at these files first:
 
-## Important Patterns and Conventions
+| Task                            | Example File                                   |
+| ------------------------------- | ---------------------------------------------- |
+| Simple command                  | `src/commands/copyCurrentBranch.ts`            |
+| Complex command (multi-command) | `src/commands/gitWizard.ts`                    |
+| IPC protocol                    | `src/webviews/rebase/protocol.ts`              |
+| Webview provider                | `src/webviews/rebase/rebaseWebviewProvider.ts` |
+| Webview app (Lit)               | `src/webviews/apps/rebase/`                    |
+| Unit test                       | `src/system/__tests__/iterable.test.ts`        |
+| E2E test                        | `tests/e2e/specs/smoke.test.ts`                |
+| E2E page object                 | `tests/e2e/pageObjects/gitLensPage.ts`         |
 
-### Configuration Management
+### Critical Rules
 
-- All settings defined in `package.json` contributions
-- Configuration typed in `src/config.ts`
-- Access via `Container.instance.config` or `configuration.get()`
-- Settings are strongly typed with intellisense support
+**contributions.json** (only applies to `contributes/commands`, `contributes/menus`, `contributes/submenus`, `contributes/keybindings`, and `contributes/views`)
 
-### Constants Organization
+- Never edit these sections in `package.json` directly — edit `contributions.json` instead
+- Run `pnpm run generate:contributions` after editing (or let the watcher handle it)
+- Run `pnpm run generate:commandTypes` after adding commands (or let the watcher handle it)
 
-- **Command IDs**: `src/constants.commands.ts` (manual) + `constants.commands.generated.ts` (auto-generated)
-- **Context keys**: `src/constants.context.ts`
-- **Telemetry events**: `src/constants.telemetry.ts`
-- **View IDs**: `src/constants.views.ts`
-- **AI providers**: `src/constants.ai.ts`
-- **Storage keys**: `src/constants.storage.ts`
+**Imports**
 
-### Git Command Execution
+- Always use `.js` extension in imports (ESM requirement)
+- Use named exports only (no `default` exports)
 
-- All Git commands go through `Git.execute()` in `src/env/node/git/git.ts`
-- Commands are parsed and formatted consistently
-- Output is parsed by specialized parsers in `src/git/parsers/`
-- Results cached in GitCache for performance
+**IPC**
 
-### Repository Models
+- `IpcCommand` = fire-and-forget (no response)
+- `IpcRequest` = expects a response (use `await`)
+- `IpcNotification` = extension → webview state updates
 
-Strongly typed Git entities throughout the codebase (located in `src/git/models/`):
+**Testing**
 
-- **Core models**: `GitBranch`, `GitCommit`, `GitTag`, `GitRemote`, `GitWorktree`
-- **Specialized models**: `GitStashCommit` (extends `GitCommit`), `GitStash`, `GitContributor`, `GitFile`, `GitDiff`
-- Models provide rich methods and computed properties
-- Immutable by convention
-
-## Repository Guidelines
-
-### Commit Messages
-
-- Use future-oriented manner, third-person singular present tense
-- Examples: **"Fixes"**, **"Updates"**, **"Improves"**, **"Adds"**, **"Removes"**
-- Reference issues with `#123` syntax for auto-linking
-- Keep first line under 72 characters
-- Example: `Adds support for custom autolinks for Jira - fixes #1234`
-
-### Branch Workflow
-
-- Feature branches from `main`
-- Prefix with feature type: `feature/`, `bug/`, `debt/`
-- Use descriptive names: `feature/search-natural-language`, `bug/graph-performance`
-
-### Code Reviews
-
-- Check TypeScript compilation and tests pass
-- Verify no new ESLint violations
-- Test webview changes in both light and dark themes
-- Validate Plus features with different subscription states
-- Ensure proper error handling and logging
-- Ensure proper telemetry and usage reporting
-- Ensure proper caching and performance
-
-### Contributing Notes
-
-- Update `CHANGELOG.md` for all changes (in future tense)
-- Add yourself to Contributors section in `README.md` for first contribution
-- Follow existing code style (Prettier enforced)
-- All files in `plus/` directories are non-OSS (LICENSE.plus)
-- PRs with changes to `plus/` files grant GitKraken rights to modifications
-
-## Common Development Tasks
-
-### Adding a New Command
-
-1. Create command file in `src/commands/` (e.g., `myCommand.ts`)
-2. Register command in `src/commands.ts`:
-   ```typescript
-   registerCommand(Commands.MyCommand, () => new MyCommand(container));
-   ```
-3. Add to `contributions.json` for package.json generation:
-   ```json
-   {
-   	"command": "gitlens.myCommand",
-   	"title": "My Command",
-   	"category": "GitLens"
-   }
-   ```
-4. Run `pnpm run generate:contributions` to update package.json
-5. Run `pnpm run generate:commandTypes` to update command constants
-
-### Adding a New Webview
-
-1. Create webview provider in `src/webviews/` (e.g., `myWebviewProvider.ts`)
-2. Create Lit app in appropriate location:
-   - For Pro features: `src/webviews/apps/plus/my-webview/`
-   - For community features: `src/webviews/apps/my-webview/`
-   - Create `my-webview.ts` (main app component with Lit Elements)
-   - Add HTML template
-   - Add CSS styles
-3. Register in `WebviewsController` (in `src/webviews/webviewsController.ts`)
-4. Add protocol definitions for IPC in `src/webviews/protocol.ts`:
-   ```typescript
-   export interface MyWebviewShowingArgs { ... }
-   ```
-5. Add webpack entry point in `webpack.config.mjs`
-6. Register webview in extension activation
-
-### Adding a New Tree View
-
-1. Create tree provider in `src/views/` (e.g., `myTreeView.ts`)
-   - Extend `ViewBase` or `RepositoryFolderNode`
-   - Implement `getChildren()` method
-2. Define node types for the tree hierarchy
-3. Add to `contributions.json`:
-   ```json
-   {
-   	"id": "gitlens.views.myView",
-   	"name": "My View",
-   	"when": "..."
-   }
-   ```
-4. Register in extension activation (`src/extension.ts`)
-5. Run `pnpm run generate:contributions`
-
-### Modifying Git Operations
-
-1. Find the relevant Git provider:
-   - Shared Git provider interface: `src/git/gitProvider.ts`
-   - Shared sub-operations: `src/git/sub-providers/`
-   - For Local (Node.js): `src/env/node/git/localGitProvider.ts`
-   - For Local sub-operations: `src/env/node/git/sub-providers/`
-   - For GitHub (browser): `src/plus/integrations/providers/github/githubGitProvider.ts`
-   - For GitHub sub-operations: `src/plus/integrations/providers/github/sub-providers/`
-2. Update provider method with new logic
-3. Update Git command execution in `src/env/node/git/git.ts` if needed (for LocalGitProvider)
-4. Update parsers in `src/git/parsers/` if output format changes
-5. Update models in `src/git/models/` if data structure changes
-6. Consider caching implications (update `GitCache` if needed)
-7. Add tests in `__tests__/` directory
-
-### Working with Icons (GL Icons Font)
-
-1. Add SVG icons to `images/icons/` folder
-2. Append entries to `images/icons/template/mapping.json`:
-   ```json
-   "icon-name": 1234
-   ```
-3. Run icon build commands:
-   ```bash
-   pnpm run icons:svgo        # Optimize SVGs
-   pnpm run build:icons       # Generate font
-   ```
-4. Copy new `glicons.woff2?<uuid>` URL from `src/webviews/apps/shared/glicons.scss`
-5. Search and replace old font URL with new one across the codebase
-
-### Adding New AI Provider
-
-1. Create new AI provider in `src/plus/ai/` extending base classes (e.g., `openAICompatibleProviderBase.ts`)
-2. Add to `AIProviderService` registry in `src/plus/ai/aiProviderService.ts`
-3. Handle authentication and rate limiting
-4. Add provider constants to `src/constants.ai.ts`
-5. Update configuration in `package.json` contributions
-
-### Adding Git Provider Integration
-
-1. Implement `GitProvider` interface (e.g., `gitLabGitProvider.ts`)
-2. Register with `GitProviderService`
-3. Handle provider-specific authentication
-4. Add integration constants to `src/constants.integrations.ts`
-5. Consider adding rich integration features (PRs, issues, avatars)
-
-## Development Environment
-
-### Prerequisites
-
-- **Node.js** ≥ 22.12.0
-- **pnpm** ≥ 10.x (install via corepack: `corepack enable`)
-- **Corepack** ≥ 0.31.0 (check with `corepack -v`)
-- **Git** ≥ 2.7.2
-
-### VS Code Setup
-
-- Install recommended extensions (see `.vscode/extensions.json`)
-- Use provided launch configurations:
-  - **"Watch & Run"** - Debug desktop extension
-  - **"Watch & Run (web)"** - Debug browser extension
-- Use VS Code tasks:
-  - `Ctrl+Shift+B` to start watch task
-  - `Ctrl+Shift+P` → "Tasks: Run Task" → select task
-- **Debug** - F5 to launch Extension Development Host
-- **Test** - Use VS Code's built-in test runner
-
-### Multi-target Support
-
-GitLens supports multiple environments:
-
-- **Node.js** - Traditional VS Code extension (desktop)
-- **Web Worker** - Browser/web VS Code compatibility (vscode.dev)
-- Shared code with environment abstractions in `src/env/`
-- Test both environments during development
-
-### Performance Considerations
-
-- Use lazy loading for heavy services
-- Leverage caching layers (GitCache, PromiseCache, @memoize)
-- Debounce expensive operations
-- Consider webview refresh performance
-- Monitor telemetry for performance regressions
-
----
-
-This architecture enables GitLens to provide powerful Git tooling while maintaining clean separation of concerns, extensibility for new features, and support for multiple runtime environments.
+- When debugging test failures, DON'T simplify NOR change the intent of the tests just to get them to pass. Instead, INVESTIGATE and UNDERSTAND the root cause of the failure and address that directly, or raise an issue to the user if you can't resolve it.

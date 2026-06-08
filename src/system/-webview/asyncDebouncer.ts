@@ -1,9 +1,9 @@
 import type { CancellationToken, Disposable as CodeDisposable } from 'vscode';
 import { CancellationTokenSource } from 'vscode';
-import { CancellationError } from '../../errors';
-import type { Deferrable } from '../function/debounce';
-import type { Deferred } from '../promise';
-import { defer } from '../promise';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import type { Deferrable } from '@gitlens/utils/debounce.js';
+import type { Deferred } from '@gitlens/utils/promise.js';
+import { defer } from '@gitlens/utils/promise.js';
 
 export interface AsyncTask<T> {
 	(cancelationToken: CancellationToken): T | Promise<T>;
@@ -74,6 +74,7 @@ export function createAsyncDebouncer<T>(
 		if (curDeferred == null || lastTask == null) {
 			return;
 		}
+
 		cancelCurrentExecution();
 
 		const task = lastTask;

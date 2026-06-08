@@ -1,6 +1,6 @@
-import type { QuickPickItem, ThemeIcon, Uri } from 'vscode';
-import { proTrialLengthInDays } from '../../constants.subscription';
-import { pluralize } from '../../system/string';
+import type { QuickPick, QuickPickItem, ThemeIcon, Uri } from 'vscode';
+import { pluralize } from '@gitlens/utils/string.js';
+import { proTrialLengthInDays } from '../../constants.subscription.js';
 
 export enum Directive {
 	Back,
@@ -8,7 +8,6 @@ export enum Directive {
 	Reset,
 	LoadMore,
 	Noop,
-	Reload,
 
 	SignIn,
 	StartProTrial,
@@ -18,6 +17,7 @@ export enum Directive {
 
 	RefsAllBranches,
 	ReposAll,
+	ReposAllExceptWorktrees,
 }
 
 export function isDirective<T>(value: Directive | T): value is Directive {
@@ -26,7 +26,7 @@ export function isDirective<T>(value: Directive | T): value is Directive {
 
 export interface DirectiveQuickPickItem extends QuickPickItem {
 	directive: Directive;
-	onDidSelect?: () => void | Promise<void>;
+	onDidSelect?: (quickpick: QuickPick<QuickPickItem>) => void | Promise<void>;
 }
 
 export function createDirectiveQuickPickItem(
@@ -38,7 +38,7 @@ export function createDirectiveQuickPickItem(
 		detail?: string;
 		buttons?: QuickPickItem['buttons'];
 		iconPath?: Uri | { light: Uri; dark: Uri } | ThemeIcon;
-		onDidSelect?: () => void | Promise<void>;
+		onDidSelect?: (quickpick: QuickPick<QuickPickItem>) => void | Promise<void>;
 	},
 ): DirectiveQuickPickItem {
 	let label = options?.label;
@@ -57,9 +57,6 @@ export function createDirectiveQuickPickItem(
 				break;
 			case Directive.Noop:
 				label = 'Try again';
-				break;
-			case Directive.Reload:
-				label = 'Refresh';
 				break;
 			case Directive.Reset:
 				label = 'Reset';
@@ -95,6 +92,11 @@ export function createDirectiveQuickPickItem(
 
 			case Directive.ReposAll:
 				label = 'All Repositories';
+				break;
+
+			case Directive.ReposAllExceptWorktrees:
+				label = 'All Repositories';
+				description = ' excluding worktrees / submodules';
 				break;
 		}
 	}

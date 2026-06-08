@@ -1,22 +1,22 @@
 import type { ConfigurationChangeEvent, StatusBarItem } from 'vscode';
 import { Disposable, MarkdownString, StatusBarAlignment, ThemeColor, window } from 'vscode';
-import type { OpenWalkthroughCommandArgs } from '../../commands/walkthroughs';
-import { proBadge } from '../../constants';
-import type { Colors } from '../../constants.colors';
-import type { GitCloudHostIntegrationId } from '../../constants.integrations';
-import type { Container } from '../../container';
-import { createCommand, executeCommand, registerCommand } from '../../system/-webview/command';
-import { configuration } from '../../system/-webview/configuration';
-import { once } from '../../system/event';
-import { groupByMap } from '../../system/iterable';
-import { wait } from '../../system/promise';
-import { pluralize } from '../../system/string';
-import type { ConnectionStateChangeEvent } from '../integrations/integrationService';
-import type { LaunchpadCommandArgs } from './launchpad';
-import type { LaunchpadItem, LaunchpadProvider, LaunchpadRefreshEvent } from './launchpadProvider';
-import { groupAndSortLaunchpadItems, supportedLaunchpadIntegrations } from './launchpadProvider';
-import type { LaunchpadGroup } from './models/launchpad';
-import { launchpadGroupIconMap, launchpadPriorityGroups } from './models/launchpad';
+import { once } from '@gitlens/utils/event.js';
+import { groupByMap } from '@gitlens/utils/iterable.js';
+import { wait } from '@gitlens/utils/promise.js';
+import { pluralize } from '@gitlens/utils/string.js';
+import type { OpenWalkthroughCommandArgs } from '../../commands/walkthroughs.js';
+import type { Colors } from '../../constants.colors.js';
+import type { GitCloudHostIntegrationId } from '../../constants.integrations.js';
+import { proBadge } from '../../constants.js';
+import type { Container } from '../../container.js';
+import { createCommand, executeCommand, registerCommand } from '../../system/-webview/command.js';
+import { configuration } from '../../system/-webview/configuration.js';
+import type { ConnectionStateChangeEvent } from '../integrations/integrationService.js';
+import type { LaunchpadCommandArgs } from './launchpad.js';
+import type { LaunchpadItem, LaunchpadProvider, LaunchpadRefreshEvent } from './launchpadProvider.js';
+import { groupAndSortLaunchpadItems, supportedLaunchpadIntegrations } from './launchpadProvider.js';
+import type { LaunchpadGroup } from './models/launchpad.js';
+import { launchpadGroupIconMap, launchpadPriorityGroups } from './models/launchpad.js';
 
 type LaunchpadIndicatorState = 'idle' | 'disconnected' | 'loading' | 'load' | 'failed';
 
@@ -122,7 +122,7 @@ export class LaunchpadIndicator implements Disposable {
 			return;
 		}
 
-		if (e.error != null) {
+		if (e.error != null && !e.items?.length) {
 			this.updateStatusBarState('failed');
 
 			return;
@@ -140,7 +140,7 @@ export class LaunchpadIndicator implements Disposable {
 		}
 
 		const items = await this.provider.getCategorizedItems();
-		if (items.error != null) {
+		if (items.error != null && !items.items?.length) {
 			this.updateStatusBarState('failed');
 
 			return;
@@ -345,7 +345,7 @@ export class LaunchpadIndicator implements Disposable {
 		let priorityItem: { item: LaunchpadItem; groupLabel: string } | undefined;
 
 		const groupedItems = groupAndSortLaunchpadItems(categorizedItems);
-		const totalGroupedItems = Array.from(groupedItems.values()).reduce((total, group) => total + group.length, 0);
+		const totalGroupedItems = [...groupedItems.values()].reduce((total, group) => total + group.length, 0);
 
 		const hasImportantGroupsWithItems = groups.some(group => groupedItems.get(group)?.length);
 		if (totalGroupedItems === 0) {
@@ -606,6 +606,7 @@ export class LaunchpadIndicator implements Disposable {
 
 	private storeFirstInteractionIfNeeded() {
 		if (this.container.storage.get('launchpad:indicator:hasInteracted') != null) return;
+
 		void this.container.storage.store('launchpad:indicator:hasInteracted', new Date().toISOString());
 	}
 
@@ -618,6 +619,7 @@ export interface LaunchpadSummaryResult {
 	total: number;
 	groups: LaunchpadGroup[];
 	hasGroupedItems: boolean;
+	error?: Error;
 
 	mergeable?: {
 		total: number;
@@ -654,7 +656,7 @@ export function generateLaunchpadSummary(
 	groups: LaunchpadGroup[],
 ): LaunchpadSummaryResult {
 	const groupedItems = groupAndSortLaunchpadItems(items);
-	const total = Array.from(groupedItems.values()).reduce((total, group) => total + group.length, 0);
+	const total = [...groupedItems.values()].reduce((total, group) => total + group.length, 0);
 	const hasGroupedItems = groups.some(group => groupedItems.get(group)?.length);
 
 	if (total === 0 || !hasGroupedItems) {

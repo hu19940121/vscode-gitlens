@@ -1,12 +1,11 @@
 import type { QuickInputButton } from 'vscode';
 import { ThemeIcon } from 'vscode';
-import { GlyphChars } from '../../../constants';
-import { Container } from '../../../container';
-import type { QuickPickItemOfT } from '../../../quickpicks/items/common';
-import { pad } from '../../../system/string';
-import type { GitWorktree } from '../../models/worktree';
-import { shortenRevision } from '../revision.utils';
-import { getBranchIconPath } from './icons';
+import { GitWorktree } from '@gitlens/git/models/worktree.js';
+import { pad } from '@gitlens/utils/string.js';
+import { GlyphChars } from '../../../constants.js';
+import { Container } from '../../../container.js';
+import type { QuickPickItemOfT } from '../../../quickpicks/items/common.js';
+import { getBranchIconPath } from './icons.js';
 
 export interface WorktreeQuickPickItem extends QuickPickItemOfT<GitWorktree> {
 	readonly opened: boolean;
@@ -64,10 +63,10 @@ export function createWorktreeQuickPickItem(
 			status += ' '.repeat(blank);
 		}
 
-		const formattedDate = worktree.formattedDate;
+		const formattedDate = GitWorktree.formatDateWithStyle(worktree, Container.instance.BranchDateFormatting);
 		if (formattedDate) {
 			if (description) {
-				description += `  ${GlyphChars.Dot}  ${worktree.formattedDate}`;
+				description += `  ${GlyphChars.Dot}  ${formattedDate}`;
 			} else {
 				description = formattedDate;
 			}
@@ -90,7 +89,7 @@ export function createWorktreeQuickPickItem(
 			iconPath = getBranchIconPath(Container.instance, worktree.branch);
 			break;
 		case 'detached':
-			label = shortenRevision(worktree.sha);
+			label = worktree.name;
 			iconPath = new ThemeIcon('git-commit');
 			break;
 	}

@@ -1,20 +1,23 @@
 import type { CancellationToken, ProgressOptions } from 'vscode';
-import type { Source } from '../../../constants.telemetry';
-import { AINoRequestDataError, CancellationError } from '../../../errors';
-import type { Repository } from '../../../git/models/repository';
-import { configuration } from '../../../system/-webview/configuration';
-import type { Deferred } from '../../../system/promise';
-import type { AIResponse } from '../aiProviderService';
-import type { AIService } from '../aiService';
-import type { AIModel } from '../models/model';
-import type { AIChatMessage } from '../models/provider';
-import type { AISummarizedResult } from '../models/results';
-import { parseSummarizeResult } from '../utils/-webview/results.utils';
+import type { AIModel } from '@gitlens/ai/models/model.js';
+import type { AIChatMessage } from '@gitlens/ai/models/provider.js';
+import type { AISummarizedResult } from '@gitlens/ai/models/results.js';
+import { parseSummarizeResult } from '@gitlens/ai/utils/results.utils.js';
+import { truncatePromptWithDiff } from '@gitlens/ai/utils/truncation.utils.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { md5 } from '@gitlens/utils/crypto.js';
+import type { Deferred } from '@gitlens/utils/promise.js';
+import type { Source } from '../../../constants.telemetry.js';
+import { AINoRequestDataError } from '../../../errors.js';
+import type { GlRepository } from '../../../git/models/repository.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import type { AIResponse } from '../aiProviderService.js';
+import type { AIService } from '../aiService.js';
 
 /** Generates a commit message based on staged or unstaged changes */
 export async function generateCommitMessage(
 	service: AIService,
-	changesOrRepo: string | string[] | Repository,
+	changesOrRepo: string | string[] | GlRepository,
 	source: Source,
 	options?: {
 		cancellation?: CancellationToken;
@@ -22,6 +25,7 @@ export async function generateCommitMessage(
 		customInstructions?: string;
 		generating?: Deferred<AIModel>;
 		progress?: ProgressOptions;
+		suppressLargePromptWarning?: boolean;
 	},
 ): Promise<AIResponse<AISummarizedResult> | 'cancelled' | undefined> {
 	const result = await service.sendRequest(
@@ -33,17 +37,30 @@ export async function generateCommitMessage(
 				if (changes == null) throw new AINoRequestDataError('No changes to generate a commit message from.');
 				if (cancellation.isCancellationRequested) throw new CancellationError();
 
+				const customInstructions = configuration.get('ai.generateCommitMessage.customInstructions');
+
+				// Report diff and custom instruction details for telemetry
+				reporting['diff.files.count'] = (changes.match(/^diff --git /gm) ?? []).length;
+				reporting['diff.hunks.count'] = (changes.match(/^@@ /gm) ?? []).length;
+				reporting['diff.lines.count'] = (changes.match(/^[+-](?![+-]{2} )/gm) ?? []).length;
+				reporting['diff.hash'] = md5(changes);
+
+				reporting['customInstructions.setting.used'] = Boolean(customInstructions);
+				reporting['customInstructions.setting.length'] = customInstructions?.length ?? 0;
+
 				const { prompt } = await service.getPrompt(
 					'generate-commitMessage',
 					model,
 					{
 						diff: changes,
 						context: options?.context,
-						instructions: configuration.get('ai.generateCommitMessage.customInstructions'),
+						instructions: customInstructions,
 					},
 					maxInputTokens,
 					retries,
 					reporting,
+					truncatePromptWithDiff,
+					options?.suppressLargePromptWarning ? { suppressLargePromptWarning: true } : undefined,
 				);
 				if (cancellation.isCancellationRequested) throw new CancellationError();
 
@@ -85,7 +102,7 @@ export async function generateCommitMessage(
 /** Generates a stash message based on changes */
 export async function generateStashMessage(
 	service: AIService,
-	changesOrRepo: string | string[] | Repository,
+	changesOrRepo: string | string[] | GlRepository,
 	source: Source,
 	options?: {
 		cancellation?: CancellationToken;
@@ -114,6 +131,7 @@ export async function generateStashMessage(
 					maxInputTokens,
 					retries,
 					reporting,
+					truncatePromptWithDiff,
 				);
 				if (cancellation.isCancellationRequested) throw new CancellationError();
 

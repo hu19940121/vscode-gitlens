@@ -1,18 +1,12 @@
 import { Uri } from 'vscode';
-import { isContainer } from '../../container';
-import { isBranch } from '../../git/models/branch';
-import { isCommit } from '../../git/models/commit';
-import { isRemote } from '../../git/models/remote';
-import { isRepository } from '../../git/models/repository';
-import { isTag } from '../../git/models/tag';
-import { isWorktree } from '../../git/models/worktree';
-import { getCancellationTokenId, isCancellationToken } from '../../system/-webview/cancellation';
-import { isViewNode } from '../../views/nodes/utils/-webview/node.utils';
-import { loggingJsonReplacer } from './json';
+import { getScopedCounter } from '@gitlens/utils/counter.js';
+import { isLoggable } from '@gitlens/utils/loggable.js';
+import { getCancellationTokenId, isCancellationToken } from '../../system/-webview/cancellation.js';
+import { loggingJsonReplacer } from './json.js';
 
 export function defaultResolver(...args: unknown[]): string {
 	if (args.length === 0) return '';
-	if (args.length > 1) return JSON.stringify(args, loggingJsonReplacer);
+	if (args.length > 1) return safeStringify(args);
 
 	const [arg] = args;
 	if (arg == null) return '';
@@ -36,20 +30,37 @@ export function defaultResolver(...args: unknown[]): string {
 				}
 				return arg.toString();
 			}
-			if (
-				isRepository(arg) ||
-				isBranch(arg) ||
-				isCommit(arg) ||
-				isRemote(arg) ||
-				isTag(arg) ||
-				isWorktree(arg) ||
-				isViewNode(arg)
-			) {
-				return arg.toString();
-			}
-			if (isContainer(arg)) return '<container>';
 			if (isCancellationToken(arg)) return getCancellationTokenId(arg);
 
-			return JSON.stringify(arg, loggingJsonReplacer);
+			if (isLoggable(arg)) return arg.toLoggable();
+
+			return safeStringify(arg);
+	}
+}
+
+const _fallbackCounter = getScopedCounter();
+const _objectIds = new WeakMap<object, number>();
+
+/**
+ * JSON.stringify with protection against RangeError from objects
+ * that serialize beyond JavaScript's string length limit.
+ * Returns a stable identity per object via WeakMap.
+ */
+function safeStringify(value: unknown): string {
+	try {
+		return JSON.stringify(value, loggingJsonReplacer);
+	} catch (ex) {
+		if (ex instanceof RangeError) {
+			if (value != null && typeof value === 'object') {
+				let id = _objectIds.get(value);
+				if (id == null) {
+					id = _fallbackCounter.next();
+					_objectIds.set(value, id);
+				}
+				return `#${id}`;
+			}
+			return `#${_fallbackCounter.next()}`;
+		}
+		throw ex;
 	}
 }

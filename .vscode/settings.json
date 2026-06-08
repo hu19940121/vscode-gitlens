@@ -1,6 +1,8 @@
 {
+	"chat.useAgentsMdFile": true,
 	"editor.codeActionsOnSave": {
-		"source.fixAll.eslint": "explicit"
+		"source.fixAll.eslint": "explicit",
+		"source.fixAll.oxc": "explicit"
 	},
 	"files.associations": {
 		".eslintrc*.json": "jsonc"
@@ -40,10 +42,11 @@
 	"[html][javascript][json][jsonc][markdown][scss][svg][typescript][typescriptreact]": {
 		"editor.defaultFormatter": "esbenp.prettier-vscode"
 	},
+	"js/ts.preferences.importModuleSpecifier": "project-relative",
+	"js/ts.tsdk.path": "node_modules/typescript/lib",
+	"oxc.enable.oxlint": true,
+	"oxc.enable.oxfmt": false,
 	"search.exclude": {
 		"**/dist": true
-	},
-	"typescript.preferences.importModuleSpecifier": "project-relative",
-	"typescript.tsdk": "node_modules/typescript/lib",
-	"chat.useAgentsMdFile": true
+	}
 }

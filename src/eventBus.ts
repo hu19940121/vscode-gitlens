@@ -1,12 +1,13 @@
 import type { Disposable, Uri } from 'vscode';
 import { EventEmitter } from 'vscode';
-import type { CustomEditorIds, ViewIds, WebviewIds } from './constants.views';
-import type { CachedGitTypes } from './git/gitProvider';
-import type { GitCommit } from './git/models/commit';
-import type { GitRevisionReference } from './git/models/reference';
-import type { RepositoryChange } from './git/models/repository';
-import type { GitCommitSearchContext } from './git/search';
-import type { Draft, LocalDraft } from './plus/drafts/models/drafts';
+import type { CachedGitTypes, UriScopedCachedGitTypes } from '@gitlens/git/cache.js';
+import { areUriScopedCachedGitTypes } from '@gitlens/git/cache.js';
+import type { GitCommit } from '@gitlens/git/models/commit.js';
+import type { GitBranchReference, GitRevisionReference } from '@gitlens/git/models/reference.js';
+import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
+import type { CustomEditorIds, ViewIds, WebviewIds } from './constants.views.js';
+import type { RepositoryChange } from './git/models/repository.js';
+import type { Draft, LocalDraft } from './plus/drafts/models/drafts.js';
 
 export type CommitSelectedEvent = EventBusEvent<'commit:selected'>;
 interface CommitSelectedEventArgs {
@@ -33,15 +34,38 @@ interface FileSelectedEventArgs {
 }
 
 export type GitCacheResetEvent = EventBusEvent<'git:cache:reset'>;
-interface GitCacheResetEventArgs {
+type GitCacheResetEventArgs = Omit<GlobalGitCacheResetEventArgs | ScopedGitCacheResetEventArgs, 'types'> & {
+	readonly types?: CachedGitTypes[];
+};
+interface GlobalGitCacheResetEventArgs {
 	readonly repoPath?: string;
+	readonly path?: never;
 	readonly types?: CachedGitTypes[];
 }
 
-/**
- *  Out-of-band event to ensure @type {import('./git/models/repository').Repository} fires its change event
- *  Should only be listened to by @type {import('./git/models/repository').Repository}
- */
+interface ScopedGitCacheResetEventArgs {
+	readonly repoPath: string;
+	/** Relative path within the repo for targeted file-level cache clearing */
+	readonly path: string;
+	readonly types: UriScopedCachedGitTypes[];
+}
+
+export function isUriScopedGitCacheReset(args: GitCacheResetEventArgs): args is ScopedGitCacheResetEventArgs {
+	return (
+		args.repoPath != null &&
+		areUriScopedCachedGitTypes(args.types ?? []) &&
+		(args as ScopedGitCacheResetEventArgs).path != null
+	);
+}
+
+/** Event fired when a branch is published to a remote */
+export type GitPublishEvent = EventBusEvent<'git:publish'>;
+interface GitPublishEventArgs {
+	readonly repoPath: string;
+	readonly remote: string;
+	readonly branch: GitBranchReference;
+}
+
 export type GitRepoChangeEvent = EventBusEvent<'git:repo:change'>;
 interface GitRepoChangeEventArgs {
 	readonly repoPath: string;
@@ -54,11 +78,21 @@ type EventsMapping = {
 	'file:selected': FileSelectedEventArgs;
 
 	'git:cache:reset': GitCacheResetEventArgs;
+	/** Event fired when a branch is published to a remote */
+	'git:publish': GitPublishEventArgs;
 	/**
-	 *  Out-of-band event to ensure @type {import('./git/models/repository').Repository} fires its change event
-	 *  Should only be listened to by @type {import('./git/models/repository').Repository}
+	 *  Out-of-band event to ensure @type {import('./git/models/repository.js').GlRepository} fires its change event
+	 *  Should only be listened to by @type {import('./git/models/repository.js').GlRepository}
 	 */
 	'git:repo:change': GitRepoChangeEventArgs;
+	/**
+	 * Event fired when the CLI integration IPC server is started
+	 */
+	'gk:cli:ipc:started': { discoveryFilePath: string | undefined };
+	/**
+	 * Event fired when MCP setup via CLI has completed successfully with extension-based registration
+	 */
+	'gk:cli:mcp:setup:completed': undefined;
 };
 
 interface EventBusEvent<T extends keyof EventsMapping = keyof EventsMapping> {
@@ -134,6 +168,7 @@ export class EventBus implements Disposable {
 			// eslint-disable-next-line prefer-arrow-callback
 			function (e) {
 				if (name !== e.name) return;
+
 				handler.call(thisArgs, e as EventBusEvent<T>);
 			},
 			thisArgs,

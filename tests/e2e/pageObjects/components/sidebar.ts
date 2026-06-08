@@ -1,6 +1,6 @@
 import type { Locator, Page } from '@playwright/test';
-import { MaxTimeout } from '../../baseTest';
-import type { VSCodePage } from '../vscodePage';
+import { MaxTimeout } from '../../baseTest.js';
+import type { VSCodePage } from '../vscodePage.js';
 
 /** Component for VS Code Sidebar interactions */
 export class Sidebar {
@@ -24,7 +24,7 @@ export class Sidebar {
 	}
 
 	async close(): Promise<void> {
-		await this.vscode.executeCommand('workbench.action.closeSidebar', 'View: Close Primary Side Bar');
+		await this.vscode.executeCommand('workbench.action.closeSidebar');
 
 		// if (!(await this.isVisible())) return;
 
@@ -33,7 +33,7 @@ export class Sidebar {
 	}
 
 	async open(): Promise<void> {
-		await this.vscode.executeCommand('workbench.action.focusSideBar', 'View: Focus into Primary Side Bar');
+		await this.vscode.executeCommand('workbench.action.focusSideBar');
 
 		// if (await this.isVisible()) return;
 

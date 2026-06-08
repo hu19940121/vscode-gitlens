@@ -1,8 +1,9 @@
 import { Disposable, ViewColumn } from 'vscode';
-import type { GlCommands } from '../../constants.commands';
-import { registerCommand } from '../../system/-webview/command';
-import type { WebviewPanelsProxy, WebviewsController } from '../webviewsController';
-import type { State } from './protocol';
+import type { GlCommands } from '../../constants.commands.js';
+import { registerCommand } from '../../system/-webview/command.js';
+import { loadChunk } from '../../system/-webview/loadChunk.js';
+import type { WebviewPanelsProxy, WebviewsController } from '../webviewsController.js';
+import type { State } from './protocol.js';
 
 export type SettingsWebviewShowingArgs = [string];
 
@@ -27,8 +28,8 @@ export function registerSettingsWebviewPanel(
 			},
 		},
 		async (container, host) => {
-			const { SettingsWebviewProvider } = await import(
-				/* webpackChunkName: "webview-settings" */ './settingsWebview'
+			const { SettingsWebviewProvider } = await loadChunk(
+				() => import(/* webpackChunkName: "webview-settings" */ './settingsWebview.js'),
 			);
 			return new SettingsWebviewProvider(container, host);
 		},
@@ -45,6 +46,7 @@ export function registerSettingsWebviewCommands<T>(
 				'gitlens.showSettingsPage!branches-view',
 				'gitlens.showSettingsPage!commits-view',
 				'gitlens.showSettingsPage!contributors-view',
+				'gitlens.showSettingsPage!current-line',
 				'gitlens.showSettingsPage!file-history-view',
 				'gitlens.showSettingsPage!line-history-view',
 				'gitlens.showSettingsPage!remotes-view',

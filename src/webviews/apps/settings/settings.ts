@@ -1,25 +1,27 @@
+/* eslint-disable @typescript-eslint/no-deprecated -- disabling until we can migrate to the new Lit-based base */
 /*global document IntersectionObserver*/
 import './settings.scss';
-import type { ConnectCloudIntegrationsCommandArgs } from '../../../commands/cloudIntegrations';
-import type { AutolinkConfig } from '../../../config';
-import type { SupportedCloudIntegrationIds } from '../../../constants.integrations';
-import { IssuesCloudHostIntegrationId } from '../../../constants.integrations';
-import { createCommandLink } from '../../../system/commands';
-import type { IpcMessage, UpdateConfigurationParams } from '../../protocol';
-import { DidChangeConfigurationNotification, UpdateConfigurationCommand } from '../../protocol';
-import type { State } from '../../settings/protocol';
+import type { ConnectCloudIntegrationsCommandArgs } from '../../../commands/cloudIntegrations.js';
+import type { AutolinkConfig } from '../../../config.js';
+import type { SupportedCloudIntegrationIds } from '../../../constants.integrations.js';
+import { IssuesCloudHostIntegrationId } from '../../../constants.integrations.js';
+import { createCommandLink } from '../../../system/commands.js';
+import type { IpcMessage } from '../../ipc/models/ipc.js';
+import type { UpdateConfigurationParams } from '../../protocol.js';
+import { DidChangeConfigurationNotification, UpdateConfigurationCommand } from '../../protocol.js';
+import type { State } from '../../settings/protocol.js';
 import {
 	DidChangeAccountNotification,
 	DidChangeIssueIntegrationConnectedNotification,
 	DidOpenAnchorNotification,
 	GenerateConfigurationPreviewRequest,
-} from '../../settings/protocol';
-import { App } from '../shared/appBase';
-import { formatDate, setDefaultDateLocales } from '../shared/date';
-import { DOM } from '../shared/dom';
-import type { Disposable } from '../shared/events';
-import '../shared/components/feature-badge';
-import '../shared/components/gitlens-logo';
+} from '../../settings/protocol.js';
+import { App } from '../shared/appBase.js';
+import { formatDate, setDefaultDateLocales } from '../shared/date.js';
+import { DOM } from '../shared/dom.js';
+import type { Disposable } from '../shared/events.js';
+import '../shared/components/feature-badge.js';
+import '../shared/components/gitlens-logo.js';
 
 const topOffset = 83;
 const offset = (new Date().getTimezoneOffset() / 60) * 100;
@@ -345,7 +347,7 @@ export class SettingsApp extends App<State> {
 				if (element.checked) {
 					this._changes[element.name] = fromCheckboxValue(element.value);
 				} else {
-					this._changes[element.name] = element.dataset.valueOff == null ? false : element.dataset.valueOff;
+					this._changes[element.name] = element.dataset.valueOff ?? false;
 				}
 
 				break;
@@ -632,9 +634,7 @@ export class SettingsApp extends App<State> {
 					if (lookup != null) {
 						value = this.getSettingValue<string>(lookup);
 					}
-					if (value == null) {
-						value = el.dataset.settingPreviewDefault;
-					}
+					value ??= el.dataset.settingPreviewDefault;
 				}
 
 				el.innerText = value == null ? '' : formatDate(date, value, undefined, false);
@@ -827,7 +827,7 @@ export class SettingsApp extends App<State> {
 		}get access to automatic rich Jira autolinks.`;
 		if (hasAccount && hasConnectedJira) {
 			messageJira =
-				'<i class="codicon codicon-check" style="vertical-align: text-bottom"></i> Jira connected &mdash; automatic rich Jira autolinks are enabled.';
+				'<i class="codicon codicon-check codicon--inline"></i> Jira connected &mdash; automatic rich Jira autolinks are enabled.';
 		}
 		let messageLinear = `<a href="${createCommandLink<ConnectCloudIntegrationsCommandArgs>(
 			'gitlens.plus.cloudIntegrations.connect',
@@ -846,7 +846,7 @@ export class SettingsApp extends App<State> {
 		}get access to automatic rich Linear autolinks.`;
 		if (hasAccount && hasConnectedLinear) {
 			messageLinear =
-				'<i class="codicon codicon-check" style="vertical-align: text-bottom"></i> Linear connected &mdash; automatic rich Linear autolinks are enabled.';
+				'<i class="codicon codicon-check codicon--inline"></i> Linear connected &mdash; automatic rich Linear autolinks are enabled.';
 		}
 
 		$root.innerHTML = `${messageJira}<br/>${messageLinear}`;
@@ -858,7 +858,7 @@ export class SettingsApp extends App<State> {
 
 		const helpTemplate = () => `
 			<div class="setting__hint">
-				<span style="line-height: 2rem">
+				<span class="setting__hint--tall">
 					<i class="icon icon--sm icon__info"></i> Matches prefixes that are followed by a reference value within commit messages.<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;The URL must contain a <code>&lt;num&gt;</code> for the reference value to be included in the link.
 				</span>
 			</div>

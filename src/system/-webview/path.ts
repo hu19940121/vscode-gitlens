@@ -1,9 +1,9 @@
 // eslint-disable-next-line @typescript-eslint/no-restricted-imports
 import { basename, dirname } from 'path';
 import { FileType, Uri, workspace } from 'vscode';
-import { isLinux } from '@env/platform';
-import { Schemes } from '../../constants';
-import { commonBaseIndex, isFolderGlob, normalizePath } from '../path';
+import { isLinux } from '@env/platform.js';
+import { commonBaseIndex, isFolderGlob, normalizePath } from '@gitlens/utils/path.js';
+import { Schemes } from '../../constants.js';
 
 const hasSchemeRegex = /^([a-zA-Z][\w+.-]+):/;
 

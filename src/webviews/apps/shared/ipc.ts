@@ -1,17 +1,24 @@
 /*global window */
 import { inflateSync, strFromU8 } from 'fflate';
-import { getScopedCounter } from '../../../system/counter';
-import { debug, logName } from '../../../system/decorators/log';
-import { deserializeIpcData } from '../../../system/ipcSerialize';
-import { Logger } from '../../../system/logger';
-import { getLogScope, getNewLogScope, setLogScopeExit } from '../../../system/logger.scope';
-import type { Serialized } from '../../../system/serialize';
-import { maybeStopWatch } from '../../../system/stopwatch';
-import type { IpcCallParamsType, IpcCallResponseParamsType, IpcCommand, IpcMessage, IpcRequest } from '../../protocol';
-import { IpcPromiseSettled } from '../../protocol';
-import { DOM } from './dom';
-import type { Disposable, Event } from './events';
-import { Emitter } from './events';
+import { getScopedCounter } from '@gitlens/utils/counter.js';
+import { debug, logName } from '@gitlens/utils/decorators/log.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import { getScopedLogger, maybeStartScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
+import { deserializeIpcData } from '../../../system/ipcSerialize.js';
+import type { Serialized } from '../../../system/serialize.js';
+import type {
+	IpcCallParamsType,
+	IpcCallResponseParamsType,
+	IpcCommand,
+	IpcMessage,
+	IpcRequest,
+} from '../../ipc/models/ipc.js';
+import { IpcPromiseSettled } from '../../protocol.js';
+import { isRpcMessage } from '../../rpc/constants.js';
+import { DOM } from './dom.js';
+import type { Disposable, Event } from './events.js';
+import { Emitter } from './events.js';
 
 export interface HostIpcApi {
 	postMessage(msg: unknown): void;
@@ -22,8 +29,22 @@ export interface HostIpcApi {
 declare function acquireVsCodeApi(): HostIpcApi;
 
 let _api: HostIpcApi | undefined;
+let _factory: (() => HostIpcApi) | undefined;
+
+/**
+ * Sets a custom factory for the host IPC API.
+ * Call this before any other RPC/IPC initialization when hosting
+ * webviews outside of VS Code.
+ *
+ * @param factory - A function that returns a HostIpcApi implementation
+ */
+export function setHostIpcFactory(factory: () => HostIpcApi): void {
+	_factory = factory;
+	_api = undefined; // Reset cached instance so next call uses the new factory
+}
+
 export function getHostIpcApi(): HostIpcApi {
-	return (_api ??= acquireVsCodeApi());
+	return (_api ??= _factory != null ? _factory() : acquireVsCodeApi());
 }
 
 const ipcSequencer = getScopedCounter();
@@ -31,9 +52,17 @@ function nextIpcId() {
 	return `webview:${ipcSequencer.next()}`;
 }
 
+// Stable per-JS-module-evaluation fingerprint. Two readies with the same `clientId` came from the same iframe; two readies
+// with different `clientId`s came from different iframes (VS Code recreated the iframe).
+const _clientId = `wv-${Math.random().toString(36).slice(2, 10)}`;
+const _clientLoadedAt = Date.now();
+export function getWebviewClientInfo(): { clientId: string; clientLoadedAt: number } {
+	return { clientId: _clientId, clientLoadedAt: _clientLoadedAt };
+}
+
 type PendingHandler = (msg: IpcMessage) => void;
 
-@logName<HostIpc>(c => `${c.appName}(HostIpc)`)
+@logName(c => `${c.appName}(HostIpc)`)
 export class HostIpc implements Disposable {
 	private _onReceiveMessage = new Emitter<IpcMessage>();
 	get onReceiveMessage(): Event<IpcMessage> {
@@ -53,14 +82,17 @@ export class HostIpc implements Disposable {
 		this._disposable.dispose();
 	}
 
-	@debug<HostIpc['onMessageReceived']>({ args: { 0: e => `${e.data.id}|${e.data.method}` } })
+	@debug({ args: e => ({ e: `${e.data.id}|${e.data.method}` }) })
 	private onMessageReceived(e: MessageEvent) {
-		const scope = getLogScope();
+		// Skip RPC transport messages — these are handled by the Supertalk endpoint
+		if (isRpcMessage(e.data)) return;
 
 		const msg = e.data as IpcMessage;
-		const sw = maybeStopWatch(getNewLogScope(`(e=${msg.id}|${msg.method})`, scope), {
-			log: false,
-			logLevel: 'debug',
+		using scope = maybeStartScopedLogger(`(e=${msg.id}|${msg.method})`, undefined, {
+			scope: getScopedLogger(),
+		});
+		const sw = maybeStopWatch(scope, {
+			log: { onlyExit: true, level: 'debug' },
 		});
 
 		if (msg.compressed && msg.params instanceof Uint8Array) {
@@ -88,7 +120,7 @@ export class HostIpc implements Disposable {
 			debugger;
 		}
 
-		setLogScopeExit(scope, ` \u2022 ipc (host -> webview) duration=${Date.now() - msg.timestamp}ms`);
+		scope?.addExitInfo(`ipc (host -> webview) duration=${Date.now() - msg.timestamp}ms`);
 
 		// If we have a completionId, then this is a response to a request and it should be handled directly
 		if (msg.completionId != null) {
@@ -107,7 +139,7 @@ export class HostIpc implements Disposable {
 
 	sendCommand<T extends IpcCommand>(commandType: T, params?: never): void;
 	sendCommand<T extends IpcCommand<unknown>>(commandType: T, params: IpcCallParamsType<T>): void;
-	@debug<HostIpc['sendCommand']>({ args: { 0: c => c.method, 1: false } })
+	@debug({ args: commandType => ({ commandType: commandType.method }) })
 	sendCommand<T extends IpcCommand | IpcCommand<unknown>>(commandType: T, params?: IpcCallParamsType<T>): void {
 		const id = nextIpcId();
 		// this.log(`${this.appName}.sendCommand(${id}): name=${command.method}`);
@@ -122,7 +154,7 @@ export class HostIpc implements Disposable {
 		} satisfies IpcMessage<IpcCallParamsType<T>>);
 	}
 
-	@debug<HostIpc['sendRequest']>({ args: { 0: c => c.method, 1: false, 2: false } })
+	@debug({ args: requestType => ({ requestType: requestType.method }) })
 	async sendRequest<T extends IpcRequest<unknown, unknown>>(
 		requestType: T,
 		params: IpcCallParamsType<T>,
@@ -196,13 +228,13 @@ export class HostIpc implements Disposable {
 		this.setPersistedState(state);
 	}
 
-	@debug<HostIpc['postMessage']>({ args: { 0: e => `${e.id}, method=${e.method}` } })
+	@debug({ args: e => ({ e: `${e.id}, method=${e.method}` }) })
 	private postMessage(e: IpcMessage) {
 		this._api.postMessage(e);
 	}
 }
 
-export function assertsSerialized<T>(obj: unknown): asserts obj is Serialized<T> {}
+export function assertsSerialized<T>(_obj: unknown): asserts _obj is Serialized<T> {}
 
 function getQueueKey(method: string, id: string) {
 	return `${method}|${id}`;

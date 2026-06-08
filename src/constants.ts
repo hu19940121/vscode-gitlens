@@ -6,74 +6,16 @@ export const previewBadge = 'ᴘʀᴇᴠɪᴇᴡ';
 export const proBadge = 'ᴘʀᴏ';
 export const proBadgeSuperscript = 'ᴾᴿᴼ';
 
+export const whitespaceRegex = /\s/;
+
 export type AnnotationStatus = 'computing' | 'computed';
 
-export const enum CharCode {
-	/**
-	 * The `#` character.
-	 */
-	Hash = 35,
-	/**
-	 * The `/` character.
-	 */
-	Slash = 47,
-	Digit0 = 48,
-	Digit1 = 49,
-	Digit2 = 50,
-	Digit3 = 51,
-	Digit4 = 52,
-	Digit5 = 53,
-	Digit6 = 54,
-	Digit7 = 55,
-	Digit8 = 56,
-	Digit9 = 57,
-	/**
-	 * The `\` character.
-	 */
-	Backslash = 92,
-	A = 65,
-	B = 66,
-	C = 67,
-	D = 68,
-	E = 69,
-	F = 70,
-	Z = 90,
-	a = 97,
-	b = 98,
-	c = 99,
-	d = 100,
-	e = 101,
-	f = 102,
-	z = 122,
-}
-
-/**
- * `gk-merge-target` means the branch that the current branch is most likely to be merged into, e.g.
- * - branch to compare with by default
- * - default target for creating a PR
- * - etc.
- *
- * `gk-merge-target-user` — merge target branch explicitly defined by user,
- *    if it's defined we use this value instead of `gk-merge-target`, but we keep storing `gk-merge-target` value that was determined automatically.
- *
- *  `gk-merge-base` means the branch that the current branch originates from, e.g. what was the base in the moment of creation.
- *   This value is used for: ... (TODO describe use cases).
- *
- * `vscode-merge-base` — value determined by VS Code that is used to determine the merge base for the current branch.
- *   once `gk-merge-base` is determined, we stop using `vscode-merge-base`
- *
- */
-export type GitConfigKeys =
-	| `branch.${string}.vscode-merge-base`
-	| `branch.${string}.gk-merge-base`
-	| `branch.${string}.gk-merge-target`
-	| `branch.${string}.gk-merge-target-user`
-	| `branch.${string}.gk-associated-issues`
-	| `branch.${string}.github-pr-owner-number`
-	| `branch.${string}.gk-last-accessed`
-	| `branch.${string}.gk-last-modified`;
-
-export type DeprecatedGitConfigKeys = `branch.${string}.gk-target-base`;
+export type {
+	DeprecatedGkConfigKeys,
+	GitConfigKeys,
+	GitCoreConfigKeys,
+	GkConfigKeys,
+} from '@gitlens/git/providers/config.js';
 
 export const enum GlyphChars {
 	AngleBracketLeftHeavy = '\u2770',
@@ -156,6 +98,7 @@ export const enum Schemes {
 	GitHub = 'github',
 	GitLens = 'gitlens',
 	GitLensAIMarkdown = 'gitlens-ai-markdown',
+	GitLensVirtual = 'gitlens-virtual',
 	PRs = 'pr',
 	Remote = 'vscode-remote',
 	Vsls = 'vsls',
@@ -199,13 +142,13 @@ export const urls = Object.freeze({
 	helpCenterHome: `https://help.gitkraken.com/gitlens/home-view/?${utm}`,
 	helpCenterMCP: `https://help.gitkraken.com/mcp/mcp-getting-started/?${utm}`,
 	releaseNotes: `https://help.gitkraken.com/gitlens/gitlens-release-notes-current/?${utm}`,
+	helpCenterAiHooks: `https://help.gitkraken.com/cli/cli-home/?${utm}#how-to-uninstall-gitkraken-cli-ai-hooks`,
 
 	acceleratePrReviews: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#accelerate-pr-reviews`,
 	communityVsPro: `https://help.gitkraken.com/gitlens/gitlens-community-vs-gitlens-pro/?${utm}`,
 	homeView: `https://help.gitkraken.com/gitlens/home-view/?${utm}&utm_campaign=walkthrough`,
 	interactiveCodeHistory: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#interactive-code-history`,
 	startIntegrations: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#improve-workflows-with-integrations`,
-	streamlineCollaboration: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#streamline-collaboration`,
 	aiFeatures: `https://help.gitkraken.com/gitlens/gl-gk-ai/?${utm}`,
 
 	getStarted: `https://help.gitkraken.com/gitlens/gitlens-home/?${utm}`,
@@ -223,5 +166,4 @@ export type WalkthroughSteps =
 	| 'get-started-community'
 	| 'visualize-code-history'
 	| 'accelerate-pr-reviews'
-	| 'streamline-collaboration'
 	| 'improve-workflows-with-integrations';

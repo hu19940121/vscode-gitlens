@@ -1,31 +1,29 @@
-import type { HttpsProxyAgent } from 'https-proxy-agent';
 import type { CancellationToken, Disposable } from 'vscode';
 import { window } from 'vscode';
-import { base64 } from '@env/base64';
-import type { RequestInit, Response } from '@env/fetch';
-import { fetch, getProxyAgent, wrapForForcedInsecureSSL } from '@env/fetch';
-import { isWeb } from '@env/platform';
-import type { Container } from '../../../../container';
+import { fetch, wrapForForcedInsecureSSL } from '@env/fetch.js';
+import type { UnidentifiedAuthor } from '@gitlens/git/models/author.js';
+import type { Issue } from '@gitlens/git/models/issue.js';
+import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { Provider } from '@gitlens/git/models/remoteProvider.js';
+import { base64 } from '@gitlens/utils/base64.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
+import type { Container } from '../../../../container.js';
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
-	CancellationError,
 	ProviderFetchError,
 	RequestClientError,
 	RequestNotFoundError,
-} from '../../../../errors';
-import type { UnidentifiedAuthor } from '../../../../git/models/author';
-import type { Issue } from '../../../../git/models/issue';
-import type { IssueOrPullRequest, IssueOrPullRequestType } from '../../../../git/models/issueOrPullRequest';
-import type { PullRequest } from '../../../../git/models/pullRequest';
-import type { Provider } from '../../../../git/models/remoteProvider';
-import { showIntegrationRequestFailed500WarningMessage } from '../../../../messages';
-import { configuration } from '../../../../system/-webview/configuration';
-import { debug } from '../../../../system/decorators/log';
-import { Logger } from '../../../../system/logger';
-import type { LogScope } from '../../../../system/logger.scope';
-import { getLogScope } from '../../../../system/logger.scope';
-import { maybeStopWatch } from '../../../../system/stopwatch';
+} from '../../../../errors.js';
+import { showIntegrationRequestFailed500WarningMessage } from '../../../../messages.js';
+import { configuration } from '../../../../system/-webview/configuration.js';
+import type { TokenInfo, TokenWithInfo } from '../../authentication/models.js';
 import type {
 	AzureGitCommit,
 	AzureProjectDescriptor,
@@ -34,7 +32,7 @@ import type {
 	AzureWorkItemState,
 	AzureWorkItemStateCategory,
 	WorkItem,
-} from './models';
+} from './models.js';
 import {
 	azurePullRequestStatusToState,
 	azureWorkItemsStateCategoryToState,
@@ -43,7 +41,56 @@ import {
 	getAzurePullRequestWebUrl,
 	isClosedAzurePullRequestStatus,
 	isClosedAzureWorkItemStateCategory,
-} from './models';
+} from './models.js';
+
+class WorkItemStates {
+	private readonly _categories = new Map<string, AzureWorkItemStateCategory>();
+	private readonly _types = new Map<string, AzureWorkItemState[]>();
+
+	// TODO@sergeibbb: we might need some logic for invalidating
+	public getStateCategory(
+		project: string,
+		workItemType: string,
+		stateName: string,
+	): AzureWorkItemStateCategory | undefined {
+		return this._categories.get(this.getStateKey(project, workItemType, stateName));
+	}
+
+	public clear(): void {
+		this._categories.clear();
+		this._types.clear();
+	}
+
+	public saveTypeStates(project: string, workItemType: string, states: AzureWorkItemState[]): void {
+		this.clearTypeStates(project, workItemType);
+		this._types.set(this.getTypeKey(project, workItemType), states);
+		for (const state of states) {
+			this._categories.set(this.getStateKey(project, workItemType, state.name), state.category);
+		}
+	}
+
+	public hasTypeStates(project: string, workItemType: string): boolean {
+		return this._types.has(this.getTypeKey(project, workItemType));
+	}
+
+	private clearTypeStates(project: string, workItemType: string): void {
+		const states = this._types.get(this.getTypeKey(project, workItemType));
+		if (states == null) return;
+
+		for (const state of states) {
+			this._categories.delete(this.getStateKey(project, workItemType, state.name));
+		}
+	}
+
+	private getStateKey(project: string, workItemType: string, stateName: string): string {
+		// By stringifying the pair as JSON we make sure that all possible special characters are escaped
+		return JSON.stringify([project, workItemType, stateName]);
+	}
+
+	private getTypeKey(project: string, workItemType: string): string {
+		return JSON.stringify([project, workItemType]);
+	}
+}
 
 export class AzureDevOpsApi implements Disposable {
 	private readonly _disposable: Disposable;
@@ -51,10 +98,7 @@ export class AzureDevOpsApi implements Disposable {
 
 	constructor(_container: Container) {
 		this._disposable = configuration.onDidChangeAny(e => {
-			if (
-				configuration.changedCore(e, ['http.proxy', 'http.proxyStrictSSL']) ||
-				configuration.changed(e, ['outputLevel', 'proxy'])
-			) {
+			if (configuration.changedCore(e, ['http.proxy', 'http.proxyStrictSSL'])) {
 				this.resetCaches();
 			}
 		});
@@ -64,25 +108,22 @@ export class AzureDevOpsApi implements Disposable {
 		this._disposable.dispose();
 	}
 
-	private _proxyAgent: HttpsProxyAgent | null | undefined = null;
-	private get proxyAgent(): HttpsProxyAgent | undefined {
-		if (isWeb) return undefined;
-
-		if (this._proxyAgent === null) {
-			this._proxyAgent = getProxyAgent();
-		}
-		return this._proxyAgent;
-	}
-
 	private resetCaches(): void {
-		this._proxyAgent = null;
 		this._workItemStates.clear();
 	}
 
-	@debug<AzureDevOpsApi['getPullRequestForBranch']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, branch) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			branch: branch,
+		}),
+	})
 	public async getPullRequestForBranch(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		branch: string,
@@ -90,7 +131,7 @@ export class AzureDevOpsApi implements Disposable {
 			baseUrl: string;
 		},
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const [projectName, _, repoName] = repo.split('/');
 
 		try {
@@ -128,15 +169,24 @@ export class AzureDevOpsApi implements Disposable {
 
 			return fromAzurePullRequest(pr, provider, owner);
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<AzureDevOpsApi['getPullRequestForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getPullRequestForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -146,7 +196,7 @@ export class AzureDevOpsApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const [projectName, _, repoName] = repo.split('/');
 		try {
 			const prResult = await this.request<{ results: Record<string, AzurePullRequest[]>[] }>(
@@ -185,15 +235,23 @@ export class AzureDevOpsApi implements Disposable {
 
 			return fromAzurePullRequest(pullRequest, provider, owner);
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<AzureDevOpsApi['getIssueOrPullRequest']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, id) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+		}),
+	})
 	public async getIssueOrPullRequest(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		id: string,
@@ -202,7 +260,7 @@ export class AzureDevOpsApi implements Disposable {
 			type?: IssueOrPullRequestType;
 		},
 	): Promise<IssueOrPullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const [projectName, _, repoName] = repo.split('/');
 
 		if (options?.type === undefined || options?.type === 'issue') {
@@ -247,7 +305,7 @@ export class AzureDevOpsApi implements Disposable {
 				}
 			} catch (ex) {
 				if (ex.original?.status !== 404) {
-					Logger.error(ex, scope);
+					scope?.error(ex);
 					return undefined;
 				}
 			}
@@ -284,7 +342,7 @@ export class AzureDevOpsApi implements Disposable {
 				return undefined;
 			} catch (ex) {
 				if (ex.original?.status !== 404) {
-					Logger.error(ex, scope);
+					scope?.error(ex);
 					return undefined;
 				}
 			}
@@ -292,17 +350,24 @@ export class AzureDevOpsApi implements Disposable {
 		return undefined;
 	}
 
-	@debug<AzureDevOpsApi['getIssue']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, project, id) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			project: project,
+			id: id,
+		}),
+	})
 	public async getIssue(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		project: AzureProjectDescriptor,
 		id: string,
 		options: {
 			baseUrl: string;
 		},
 	): Promise<Issue | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			// Try to get the Work item (wit) first with specific fields
@@ -333,7 +398,7 @@ export class AzureDevOpsApi implements Disposable {
 			}
 		} catch (ex) {
 			if (ex.original?.status !== 404) {
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				return undefined;
 			}
 		}
@@ -341,10 +406,19 @@ export class AzureDevOpsApi implements Disposable {
 		return undefined;
 	}
 
-	@debug<AzureDevOpsApi['getAccountForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getAccountForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -353,7 +427,7 @@ export class AzureDevOpsApi implements Disposable {
 			avatarSize?: number;
 		},
 	): Promise<UnidentifiedAuthor | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const [projectName, _, repoName] = repo.split('/');
 
 		try {
@@ -383,7 +457,7 @@ export class AzureDevOpsApi implements Disposable {
 			} satisfies UnidentifiedAuthor;
 		} catch (ex) {
 			if (ex.original?.status !== 404) {
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				return undefined;
 			}
 		}
@@ -391,13 +465,19 @@ export class AzureDevOpsApi implements Disposable {
 		return undefined;
 	}
 
-	@debug<AzureDevOpsApi['getCurrentUserOnServer']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getCurrentUserOnServer(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		baseUrl: string,
 	): Promise<{ id: string; name?: string; email?: string; username?: string; avatarUrl?: string } | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const connectionData = await this.request<{
@@ -441,7 +521,7 @@ export class AzureDevOpsApi implements Disposable {
 				username: username,
 			};
 		} catch (ex) {
-			Logger.error(ex, scope, `Failed to get current user from ${baseUrl}`);
+			scope?.error(ex, `Failed to get current user from ${baseUrl}`);
 			return undefined;
 		}
 	}
@@ -450,7 +530,7 @@ export class AzureDevOpsApi implements Disposable {
 		issueType: string,
 		state: string,
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		projectName: string,
 		options: {
@@ -470,14 +550,14 @@ export class AzureDevOpsApi implements Disposable {
 	private async retrieveWorkItemTypeStates(
 		workItemType: string,
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		projectName: string,
 		options: {
 			baseUrl: string;
 		},
 	): Promise<AzureWorkItemState[]> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const issueResult = await this.request<{ value: AzureWorkItemState[]; count: number }>(
@@ -493,26 +573,26 @@ export class AzureDevOpsApi implements Disposable {
 
 			return issueResult?.value ?? [];
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return [];
 		}
 	}
 
 	private async request<T>(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		baseUrl: string | undefined,
 		route: string,
 		options: { method: RequestInit['method'] } & Record<string, unknown>,
-		scope: LogScope | undefined,
+		scope: ScopedLogger | undefined,
 		cancellation?: CancellationToken | undefined,
 	): Promise<T | undefined> {
+		const { accessToken, ...tokenInfo } = token;
 		const url = baseUrl ? `${baseUrl}/${route}` : route;
 
 		let rsp: Response;
 		try {
-			const sw = maybeStopWatch(`[AZURE] ${options?.method ?? 'GET'} ${url}`, { log: false });
-			const agent = this.proxyAgent;
+			const sw = maybeStopWatch(`[AZURE] ${options?.method ?? 'GET'} ${url}`, { log: { onlyExit: true } });
 
 			try {
 				let aborter: AbortController | undefined;
@@ -526,18 +606,16 @@ export class AzureDevOpsApi implements Disposable {
 				rsp = await wrapForForcedInsecureSSL(provider.getIgnoreSSLErrors(), () =>
 					fetch(url, {
 						headers: {
-							Authorization: `Basic ${base64(`PAT:${token}`)}`,
+							Authorization: `Basic ${base64(`PAT:${accessToken}`)}`,
 							'Content-Type': 'application/json',
 						},
-						agent: agent,
 						signal: aborter?.signal,
 						...options,
 					}),
 				);
 
 				if (rsp.ok) {
-					const data: T = await rsp.json();
-					return data;
+					return (await rsp.json()) as T;
 				}
 
 				throw new ProviderFetchError('AzureDevOps', rsp);
@@ -546,7 +624,7 @@ export class AzureDevOpsApi implements Disposable {
 			}
 		} catch (ex) {
 			if (ex instanceof ProviderFetchError || ex.name === 'AbortError') {
-				this.handleRequestError(provider, token, ex, scope);
+				this.handleRequestError(provider, tokenInfo, ex, scope);
 			} else if (Logger.isDebugging) {
 				void window.showErrorMessage(`AzureDevOps request failed: ${ex.message}`);
 			}
@@ -557,9 +635,9 @@ export class AzureDevOpsApi implements Disposable {
 
 	private handleRequestError(
 		provider: Provider | undefined,
-		_token: string,
+		tokenInfo: TokenInfo,
 		ex: ProviderFetchError | (Error & { name: 'AbortError' }),
-		scope: LogScope | undefined,
+		scope: ScopedLogger | undefined,
 	): void {
 		if (ex.name === 'AbortError' || !(ex instanceof ProviderFetchError)) throw new CancellationError(ex);
 
@@ -569,7 +647,7 @@ export class AzureDevOpsApi implements Disposable {
 			case 422: // Unprocessable Entity
 				throw new RequestNotFoundError(ex);
 			case 401: // Unauthorized
-				throw new AuthenticationError('azureDevOps', AuthenticationErrorReason.Unauthorized, ex);
+				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, ex);
 			case 403: // Forbidden
 				// TODO: Learn the Azure API docs and put it in order:
 				// 	if (ex.message.includes('rate limit')) {
@@ -585,9 +663,9 @@ export class AzureDevOpsApi implements Disposable {
 
 				// 		throw new RequestRateLimitError(ex, token, resetAt);
 				// 	}
-				throw new AuthenticationError('azure', AuthenticationErrorReason.Forbidden, ex);
+				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, ex);
 			case 500: // Internal Server Error
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				if (ex.response != null) {
 					provider?.trackRequestException();
 					void showIntegrationRequestFailed500WarningMessage(
@@ -600,7 +678,7 @@ export class AzureDevOpsApi implements Disposable {
 				}
 				return;
 			case 502: // Bad Gateway
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				// TODO: Learn the Azure API docs and put it in order:
 				// if (ex.message.includes('timeout')) {
 				// 	provider?.trackRequestException();
@@ -613,59 +691,11 @@ export class AzureDevOpsApi implements Disposable {
 				break;
 		}
 
-		Logger.error(ex, scope);
+		scope?.error(ex);
 		if (Logger.isDebugging) {
 			void window.showErrorMessage(
 				`AzureDevOps request failed: ${(ex.response as any)?.errors?.[0]?.message ?? ex.message}`,
 			);
 		}
-	}
-}
-
-class WorkItemStates {
-	private readonly _categories = new Map<string, AzureWorkItemStateCategory>();
-	private readonly _types = new Map<string, AzureWorkItemState[]>();
-
-	// TODO@sergeibbb: we might need some logic for invalidating
-	public getStateCategory(
-		project: string,
-		workItemType: string,
-		stateName: string,
-	): AzureWorkItemStateCategory | undefined {
-		return this._categories.get(this.getStateKey(project, workItemType, stateName));
-	}
-
-	public clear(): void {
-		this._categories.clear();
-		this._types.clear();
-	}
-
-	public saveTypeStates(project: string, workItemType: string, states: AzureWorkItemState[]): void {
-		this.clearTypeStates(project, workItemType);
-		this._types.set(this.getTypeKey(project, workItemType), states);
-		for (const state of states) {
-			this._categories.set(this.getStateKey(project, workItemType, state.name), state.category);
-		}
-	}
-
-	public hasTypeStates(project: string, workItemType: string): boolean {
-		return this._types.has(this.getTypeKey(project, workItemType));
-	}
-
-	private clearTypeStates(project: string, workItemType: string): void {
-		const states = this._types.get(this.getTypeKey(project, workItemType));
-		if (states == null) return;
-		for (const state of states) {
-			this._categories.delete(this.getStateKey(project, workItemType, state.name));
-		}
-	}
-
-	private getStateKey(project: string, workItemType: string, stateName: string): string {
-		// By stringifying the pair as JSON we make sure that all possible special characters are escaped
-		return JSON.stringify([project, workItemType, stateName]);
-	}
-
-	private getTypeKey(project: string, workItemType: string): string {
-		return JSON.stringify([project, workItemType]);
 	}
 }

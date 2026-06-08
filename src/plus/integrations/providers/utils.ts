@@ -1,23 +1,23 @@
 import type { AnyEntityIdentifierInput, EntityIdentifier } from '@gitkraken/provider-apis';
 import { EntityIdentifierProviderType, EntityType, EntityVersion } from '@gitkraken/provider-apis';
-import type { IntegrationIds } from '../../../constants.integrations';
+import type { Issue, IssueShape } from '@gitlens/git/models/issue.js';
+import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { IssueResourceDescriptor, RepositoryDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import { isIssueResourceDescriptor, isRepositoryDescriptor } from '@gitlens/git/utils/resourceDescriptor.utils.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { IntegrationIds } from '../../../constants.integrations.js';
 import {
 	GitCloudHostIntegrationId,
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
-} from '../../../constants.integrations';
-import type { Container } from '../../../container';
-import type { Issue, IssueShape } from '../../../git/models/issue';
-import type { IssueOrPullRequest } from '../../../git/models/issueOrPullRequest';
-import type { PullRequest } from '../../../git/models/pullRequest';
-import type { IssueResourceDescriptor, RepositoryDescriptor } from '../../../git/models/resourceDescriptor';
-import { isIssueResourceDescriptor, isRepositoryDescriptor } from '../../../git/utils/resourceDescriptor.utils';
-import { Logger } from '../../../system/logger';
-import type { LaunchpadItem } from '../../launchpad/launchpadProvider';
-import { isCloudGitSelfManagedHostIntegrationId } from '../utils/-webview/integration.utils';
-import type { AzureProjectInputDescriptor } from './azure/models';
-import type { GitConfigEntityIdentifier } from './models';
-import { isGitHubDotCom, isGitLabDotCom } from './models';
+} from '../../../constants.integrations.js';
+import type { Container } from '../../../container.js';
+import type { LaunchpadItem } from '../../launchpad/launchpadProvider.js';
+import { isCloudGitSelfManagedHostIntegrationId } from '../utils/-webview/integration.utils.js';
+import type { AzureProjectInputDescriptor } from './azure/models.js';
+import type { GitConfigEntityIdentifier } from './models.js';
+import { isGitHubDotCom, isGitLabDotCom } from './models.js';
 
 function isLaunchpadItem(item: IssueOrPullRequest | LaunchpadItem): item is LaunchpadItem {
 	return (item as LaunchpadItem).uuid !== undefined;
@@ -248,6 +248,10 @@ export function decodeEntityIdentifiersFromGitConfig(str: string): GitConfigEnti
 export async function getIssueFromGitConfigEntityIdentifier(
 	container: Container,
 	identifier: GitConfigEntityIdentifier,
+	options?: {
+		/** Only return a value already in the local cache. No remote fetch — returns undefined on cache miss. */
+		cached?: boolean;
+	},
 ): Promise<Issue | undefined> {
 	if (identifier.entityType !== EntityType.Issue) {
 		return undefined;
@@ -275,19 +279,22 @@ export async function getIssueFromGitConfigEntityIdentifier(
 	}
 
 	const integration = await container.integrations.get(integrationId);
+	const resource = {
+		id: identifier.metadata.owner.id,
+		key: identifier.metadata.owner.key,
+		owner: identifier.metadata.owner.owner,
+		name: identifier.metadata.owner.name,
+	};
+
+	if (options?.cached) {
+		return container.cache.peekIssue(identifier.metadata.id, resource, integration);
+	}
+
 	if (integration == null) {
 		return undefined;
 	}
 
-	return integration.getIssue(
-		{
-			id: identifier.metadata.owner.id,
-			key: identifier.metadata.owner.key,
-			owner: identifier.metadata.owner.owner,
-			name: identifier.metadata.owner.name,
-		},
-		identifier.metadata.id,
-	);
+	return integration.getIssue(resource, identifier.metadata.id);
 }
 
 export function getIssueOwner(

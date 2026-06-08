@@ -6,16 +6,16 @@ import type {
 	ProcessedRebaseEntry,
 	ProcessedRebaseTodo,
 	RebaseTodoAction,
-} from '../../git/models/rebase';
-import { parseRebaseTodo } from '../../git/parsers/rebaseTodoParser';
+} from '@gitlens/git/models/rebase.js';
+import { parseRebaseTodo } from '@gitlens/git/parsers/rebaseTodoParser.js';
+import { map } from '@gitlens/utils/iterable.js';
 import {
 	formatRebaseTodoEntryLine,
 	formatUpdateRefLine,
 	processRebaseEntries,
-} from '../../git/utils/-webview/rebase.parsing.utils';
-import { map } from '../../system/iterable';
-import type { MoveEntryParams } from './protocol';
-import { maxSmallIntegerV8 } from './rebaseWebviewProvider';
+} from '../../git/utils/-webview/rebase.parsing.utils.js';
+import type { MoveEntryParams } from './protocol.js';
+import { maxSmallIntegerV8 } from './rebaseWebviewProvider.js';
 
 /** Encapsulates all read/write operations on the rebase todo file */
 export class RebaseTodoDocument {
@@ -92,9 +92,7 @@ export class RebaseTodoDocument {
 				new Range(new Position(entry.line, 0), new Position(entry.line, maxSmallIntegerV8)),
 			);
 
-			// Preserve flag (e.g., fixup -c, fixup -C) if present
-			const flagPart = entry.flag ? ` ${entry.flag}` : '';
-			edit.replace(this.document.uri, range, `${action}${flagPart} ${entry.sha} ${entry.message}`);
+			edit.replace(this.document.uri, range, formatRebaseTodoEntryLine(entry, action));
 		}
 
 		// If oldest entry needs reset and wasn't in the batch, reset it
@@ -107,12 +105,7 @@ export class RebaseTodoDocument {
 						new Position(originalOldest.line, maxSmallIntegerV8),
 					),
 				);
-				const flagPart = originalOldest.flag ? ` ${originalOldest.flag}` : '';
-				edit.replace(
-					this.document.uri,
-					range,
-					`pick${flagPart} ${originalOldest.sha} ${originalOldest.message}`,
-				);
+				edit.replace(this.document.uri, range, formatRebaseTodoEntryLine(originalOldest, 'pick'));
 			}
 		}
 
@@ -133,7 +126,7 @@ export class RebaseTodoDocument {
 			new Range(new Position(oldestCommit.line, 0), new Position(oldestCommit.line, maxSmallIntegerV8)),
 		);
 		const edit = new WorkspaceEdit();
-		edit.replace(this.document.uri, range, `pick ${oldestCommit.sha} ${oldestCommit.message}`);
+		edit.replace(this.document.uri, range, formatRebaseTodoEntryLine(oldestCommit, 'pick'));
 		await workspace.applyEdit(edit);
 	}
 
@@ -226,12 +219,12 @@ export class RebaseTodoDocument {
 		if (sortedLines.length === 0) return;
 
 		const firstLine = sortedLines[0];
-		const lastLine = sortedLines[sortedLines.length - 1];
+		const lastLine = sortedLines.at(-1)!;
 
 		// Build new content with entries in new order, each followed by its update-refs
 		const newLines: string[] = [];
 		for (const entry of newEntries) {
-			const overrideAction = fixOldestCommit && entry.id === fixOldestCommit.id ? 'pick' : undefined;
+			const overrideAction = entry.id === fixOldestCommit?.id ? 'pick' : undefined;
 			newLines.push(formatRebaseTodoEntryLine(entry, overrideAction));
 
 			// Add update-ref lines after commit entries

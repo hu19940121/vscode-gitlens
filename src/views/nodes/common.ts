@@ -1,18 +1,15 @@
 import type { Command, Disposable, Uri } from 'vscode';
 import { commands, MarkdownString, ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { GlyphChars } from '../../constants';
-import { unknownGitUri } from '../../git/gitUri';
-import type { Repository } from '../../git/models/repository';
-import { groupRepositories } from '../../git/utils/-webview/repository.utils';
-import { createDirectiveQuickPickItem, Directive } from '../../quickpicks/items/directive';
-import { showRepositoriesPicker2 } from '../../quickpicks/repositoryPicker';
-import { configuration } from '../../system/-webview/configuration';
-import { getScopedCounter } from '../../system/counter';
-import { getSettledValue, isPromise } from '../../system/promise';
-import { compareSubstringIgnoreCase, equalsIgnoreCase, pluralize } from '../../system/string';
-import type { View } from '../viewBase';
-import type { PageableViewNode } from './abstract/viewNode';
-import { ContextValues, ViewNode } from './abstract/viewNode';
+import { getScopedCounter } from '@gitlens/utils/counter.js';
+import { isPromise } from '@gitlens/utils/promise.js';
+import { compareSubstringIgnoreCase, equalsIgnoreCase, pluralize } from '@gitlens/utils/string.js';
+import { GlyphChars } from '../../constants.js';
+import { unknownGitUri } from '../../git/gitUri.js';
+import type { GlRepository } from '../../git/models/repository.js';
+import { configuration } from '../../system/-webview/configuration.js';
+import type { View } from '../viewBase.js';
+import type { PageableViewNode } from './abstract/viewNode.js';
+import { ContextValues, ViewNode } from './abstract/viewNode.js';
 
 type AllowedContextValues = ContextValues | `gitlens:views:${View['type']}`;
 
@@ -151,7 +148,7 @@ export class GroupedHeaderNode extends ActionMessageNodeBase {
 		super(
 			view,
 			parent,
-			view.grouped ? view.name.toLocaleUpperCase() : 'Showing',
+			view.grouped ? (view.groupedLabel ?? view.name).toLocaleUpperCase() : 'Showing',
 			view.grouped ? view.description : undefined,
 			undefined,
 			undefined,
@@ -160,63 +157,26 @@ export class GroupedHeaderNode extends ActionMessageNodeBase {
 	}
 
 	override async action(): Promise<void> {
-		if (!this.view.supportsRepositoryFilter) return;
-
-		const { openRepositories: repos } = this.view.container.git;
-		if (repos.length <= 1) return;
-
-		if (this.view.supportsWorktreeCollapsing) {
-			const grouped = await groupRepositories(repos);
-			if (grouped.size <= 1) return;
-		}
-
-		const isFiltered = this.view.repositoryFilter?.length;
-		const result = await showRepositoriesPicker2(
-			this.view.container,
-			`Select Repositories or Worktrees to Show`,
-			`Choose which repositories or worktrees to show`,
-			repos,
-			{
-				additionalItems: [createDirectiveQuickPickItem(Directive.ReposAll, !isFiltered)],
-				picked: isFiltered ? await this.view.getFilteredRepositories() : undefined,
-			},
-		);
-
-		if (result.directive === Directive.ReposAll) {
-			this.view.repositoryFilter = undefined;
-		} else if (result.value != null) {
-			if (result.value.length) {
-				this.view.repositoryFilter = result.value.map(r => r.id);
-			} else {
-				this.view.repositoryFilter = undefined;
-			}
-		} else {
-			return;
-		}
-
-		this.view.triggerNodeChange(this);
+		if (!this.view.canFilterRepositories()) return;
+		return this.view.filterRepositories();
 	}
 
 	override async getTreeItem(): Promise<TreeItem> {
-		const [itemResult, reposResult] = await Promise.allSettled([
-			super.getTreeItem(),
-			this.view.getFilteredRepositories(),
-		]);
-
-		const item = getSettledValue(itemResult)!;
-		const repos = getSettledValue(reposResult) ?? [];
+		const item = await super.getTreeItem();
+		const repos = this.view.getFilteredRepositories();
 
 		item.description = this.getDescription(repos);
 		item.tooltip = this.getTooltip(repos);
 		if (!this.view.grouped) {
-			item.iconPath = this.view.isRepositoryFilterActive()
-				? new ThemeIcon('filter-filled')
-				: new ThemeIcon('filter');
+			item.iconPath =
+				this.view.isRepositoryFilterActive() || this.view.isRepositoryFilterExcludingWorktreesActive()
+					? new ThemeIcon('filter-filled')
+					: new ThemeIcon('filter');
 		}
 		return item;
 	}
 
-	private getDescription(repos: Repository[]): string | undefined {
+	private getDescription(repos: GlRepository[]): string | undefined {
 		const description = this.getViewDescription();
 		const label = this.getRepositoryFilterLabel(repos, true);
 		return label
@@ -226,7 +186,7 @@ export class GroupedHeaderNode extends ActionMessageNodeBase {
 			: description;
 	}
 
-	private getTooltip(repos: Repository[]): MarkdownString {
+	private getTooltip(repos: GlRepository[]): MarkdownString {
 		const tooltip = new MarkdownString();
 		if (this.view.grouped) {
 			tooltip.appendText(this.view.name);
@@ -243,19 +203,28 @@ export class GroupedHeaderNode extends ActionMessageNodeBase {
 			}
 		}
 
-		if (!this.view.supportsRepositoryFilter || repos.length <= 1) return tooltip;
+		if (!this.view.supportsRepositoryFilter) return tooltip;
 
-		tooltip.appendMarkdown(`\n\nShowing ${this.getRepositoryFilterLabel(repos, false)}`);
-		if (this.view.isRepositoryFilterActive()) {
+		if (this.view.isRepositoryFilterExcludingWorktreesActive()) {
+			tooltip.appendMarkdown('\n\nShowing all repos, excluding worktrees / submodules');
 			tooltip.appendMarkdown('\\\nClick to change filtering');
 		} else {
-			tooltip.appendMarkdown('\\\nClick to filter by a repo or worktree');
+			const { openRepositories } = this.view.container.git;
+			const type = openRepositories.some(r => r.isWorktree) ? 'repos / worktrees' : 'repos';
+
+			if (this.view.isRepositoryFilterActive()) {
+				tooltip.appendMarkdown(`\n\nShowing ${repos.length} of ${openRepositories.length} ${type}`);
+				tooltip.appendMarkdown('\\\nClick to change filtering');
+			} else if (repos.length > 1) {
+				tooltip.appendMarkdown(`\n\nShowing all ${type}`);
+				tooltip.appendMarkdown('\\\nClick to filter by a repo or worktree');
+			}
 		}
 
 		return tooltip;
 	}
 
-	private getRepositoryFilterLabel(repos?: Repository[], addSuffix?: boolean): string | undefined {
+	private getRepositoryFilterLabel(repos?: GlRepository[], addSuffix?: boolean): string | undefined {
 		if (!this.view.supportsRepositoryFilter) return undefined;
 		if (!repos?.length) return undefined;
 
@@ -268,7 +237,8 @@ export class GroupedHeaderNode extends ActionMessageNodeBase {
 			return undefined;
 		}
 
-		const mixed = !this.view.supportsWorktreeCollapsing;
+		// When excluding worktrees/submodules, always show "repos" not "repos / worktrees"
+		const mixed = !this.view.supportsWorktreeCollapsing && !this.view.isRepositoryFilterExcludingWorktreesActive();
 
 		const label = pluralize(mixed ? 'repo / worktree' : 'repo', repos.length, {
 			plural: mixed ? 'repos / worktrees' : 'repos',

@@ -1,10 +1,21 @@
-import { networkInterfaces, tmpdir } from 'os';
+import { hostname, networkInterfaces, tmpdir } from 'os';
 import { join } from 'path';
-import { platform } from 'process';
+import { platform, env as processEnv } from 'process';
 import { env, UIKind } from 'vscode';
 
 export const isWeb = env.uiKind === UIKind.Web;
-export const isOffline = Object.values(networkInterfaces()).every(iface => iface?.every(addr => addr.internal));
+
+let cachedOffline: { value: boolean; expires: number } | undefined;
+const offlineCacheTTL = 5000;
+
+export function getIsOffline(): boolean {
+	const now = Date.now();
+	if (cachedOffline != null && cachedOffline.expires > now) return cachedOffline.value;
+
+	const value = Object.values(networkInterfaces()).every(iface => iface?.every(addr => addr.internal));
+	cachedOffline = { value: value, expires: now + offlineCacheTTL };
+	return value;
+}
 
 export const isLinux = platform === 'linux';
 export const isMac = platform === 'darwin';
@@ -27,4 +38,33 @@ export function getTempFile(filename: string): string {
 export function getAltKeySymbol(): string {
 	if (isMac) return '⌥';
 	return 'Alt';
+}
+
+export function getCmdKeySymbol(): string {
+	if (isMac) return '⌘';
+	return 'Ctrl';
+}
+
+export function getShiftKeySymbol(): string {
+	if (isMac) return '⇧';
+	return 'Shift';
+}
+
+/**
+ * Returns an identifier for the current remote instance, if running in a remote environment.
+ * Used to differentiate between multiple instances of the same remote type (e.g., multiple WSL distros).
+ *
+ * @returns The WSL distro name, hostname for SSH, or undefined if not applicable
+ */
+export function getRemoteInstanceIdentifier(): string | undefined {
+	// For WSL, use the distro name (e.g., "Ubuntu", "Debian")
+	const wslDistro = processEnv.WSL_DISTRO_NAME;
+	if (wslDistro) return wslDistro;
+
+	// For SSH and other remotes, use hostname to differentiate
+	try {
+		return hostname();
+	} catch {
+		return undefined;
+	}
 }

@@ -1,23 +1,24 @@
 import type { TextEditor, Uri } from 'vscode';
 import { ProgressLocation } from 'vscode';
-import type { Container } from '../container';
-import { uncommitted, uncommittedStaged } from '../git/models/revision';
-import { showGenericErrorMessage } from '../messages';
-import { command } from '../system/-webview/command';
-import { createMarkdownCommandLink } from '../system/commands';
-import { Logger } from '../system/logger';
-import { capitalize } from '../system/string';
-import type { CommandContext } from './commandContext';
+import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import { capitalize } from '@gitlens/utils/string.js';
+import type { Container } from '../container.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command } from '../system/-webview/command.js';
+import { createMarkdownCommandLink } from '../system/commands.js';
+import type { CommandContext } from './commandContext.js';
 import {
 	isCommandContextViewNodeHasRepoPath,
 	isCommandContextViewNodeHasRepository,
 	isCommandContextViewNodeHasWorktree,
-} from './commandContext.utils';
-import type { ExplainBaseArgs } from './explainBase';
-import { ExplainCommandBase } from './explainBase';
+} from './commandContext.utils.js';
+import type { ExplainBaseArgs } from './explainBase.js';
+import { ExplainCommandBase } from './explainBase.js';
 
 export interface ExplainWipCommandArgs extends ExplainBaseArgs {
 	staged?: boolean;
+	prompt?: string;
 }
 
 @command()
@@ -98,6 +99,7 @@ export class ExplainWipCommand extends ExplainCommandBase {
 				{
 					diff: diff.contents,
 					message: `${capitalize(label)} changes in ${repoName}`,
+					instructions: args.prompt,
 				},
 				{
 					...args.source,

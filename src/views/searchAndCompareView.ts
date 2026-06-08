@@ -1,29 +1,29 @@
 import type { ConfigurationChangeEvent, Disposable } from 'vscode';
 import { TreeItem, TreeItemCollapsibleState } from 'vscode';
-import type { SearchAndCompareViewConfig, ViewFilesLayout } from '../config';
-import type { SearchQuery } from '../constants.search';
-import type { StoredNamedRef, StoredSearchAndCompareItem } from '../constants.storage';
-import type { Container } from '../container';
-import { unknownGitUri } from '../git/gitUri';
-import type { GitLog } from '../git/models/log';
-import { getSearchQuery } from '../git/search';
-import { createReference } from '../git/utils/reference.utils';
-import { showComparisonPicker } from '../quickpicks/comparisonPicker';
-import { executeCommand } from '../system/-webview/command';
-import { configuration } from '../system/-webview/configuration';
-import { filterMap } from '../system/array';
-import { gate } from '../system/decorators/gate';
-import { debug, log } from '../system/decorators/log';
-import { updateRecordValue } from '../system/object';
-import { isPromise } from '../system/promise';
-import { RepositoryFolderNode } from './nodes/abstract/repositoryFolderNode';
-import { ContextValues, ViewNode } from './nodes/abstract/viewNode';
-import { CompareResultsNode, restoreComparisonCheckedFiles } from './nodes/compareResultsNode';
-import { SearchResultsNode } from './nodes/searchResultsNode';
-import type { GroupedViewContext, RevealOptions } from './viewBase';
-import { disposeChildren, ViewBase } from './viewBase';
-import type { CopyNodeCommandArgs } from './viewCommands';
-import { registerViewCommand } from './viewCommands';
+import type { GitLog } from '@gitlens/git/models/log.js';
+import type { SearchQuery } from '@gitlens/git/models/search.js';
+import { createReference } from '@gitlens/git/utils/reference.utils.js';
+import { filterMap } from '@gitlens/utils/array.js';
+import { debug, trace } from '@gitlens/utils/decorators/log.js';
+import { updateRecordValue } from '@gitlens/utils/object.js';
+import { isPromise } from '@gitlens/utils/promise.js';
+import type { SearchAndCompareViewConfig, ViewFilesLayout } from '../config.js';
+import type { StoredNamedRef, StoredSearchAndCompareItem } from '../constants.storage.js';
+import type { Container } from '../container.js';
+import { unknownGitUri } from '../git/gitUri.js';
+import { getSearchQuery } from '../git/utils/-webview/search.utils.js';
+import { showComparisonPicker } from '../quickpicks/comparisonPicker.js';
+import { executeCommand } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { gate } from '../system/decorators/gate.js';
+import { RepositoryFolderNode } from './nodes/abstract/repositoryFolderNode.js';
+import { ContextValues, ViewNode } from './nodes/abstract/viewNode.js';
+import { CompareResultsNode, restoreComparisonCheckedFiles } from './nodes/compareResultsNode.js';
+import { SearchResultsNode } from './nodes/searchResultsNode.js';
+import type { GroupedViewContext, RevealOptions } from './viewBase.js';
+import { disposeChildren, ViewBase } from './viewBase.js';
+import type { CopyNodeCommandArgs } from './viewCommands.js';
+import { registerViewCommand } from './viewCommands.js';
 
 export class SearchAndCompareViewNode extends ViewNode<'search-compare', SearchAndCompareView> {
 	constructor(view: SearchAndCompareView) {
@@ -87,7 +87,7 @@ export class SearchAndCompareViewNode extends ViewNode<'search-compare', SearchA
 		this.view.triggerNodeChange();
 	}
 
-	@log()
+	@debug()
 	async clear(): Promise<void> {
 		if (this.children.length === 0) return;
 
@@ -98,7 +98,7 @@ export class SearchAndCompareViewNode extends ViewNode<'search-compare', SearchA
 		this.view.triggerNodeChange();
 	}
 
-	@log<SearchAndCompareViewNode['dismiss']>({ args: { 0: n => n.toString() } })
+	@debug()
 	dismiss(node: CompareResultsNode | SearchResultsNode): void {
 		node.dismiss();
 
@@ -115,7 +115,7 @@ export class SearchAndCompareViewNode extends ViewNode<'search-compare', SearchA
 	}
 
 	@gate()
-	@debug()
+	@trace()
 	override async refresh(reset: boolean = false): Promise<void> {
 		const children = this.children;
 		if (children.length === 0) return;
@@ -184,6 +184,7 @@ export class SearchAndCompareView extends ViewBase<
 		const changed = super.filterConfigurationChanged(e);
 		if (
 			!changed &&
+			!configuration.changed(e, 'defaultCurrentUserNameStyle') &&
 			!configuration.changed(e, 'defaultDateFormat') &&
 			!configuration.changed(e, 'defaultDateLocale') &&
 			!configuration.changed(e, 'defaultDateShortFormat') &&
@@ -210,7 +211,7 @@ export class SearchAndCompareView extends ViewBase<
 		this.root.dismiss(node);
 	}
 
-	@log()
+	@debug()
 	async compare(
 		repoPath: string,
 		ref1: string | StoredNamedRef,
@@ -234,10 +235,11 @@ export class SearchAndCompareView extends ViewBase<
 		);
 	}
 
-	@log()
+	@debug()
 	private async selectForCompare(repoPath?: string, ref1?: string | StoredNamedRef): Promise<void> {
 		const result = await showComparisonPicker(this.container, repoPath, {
 			head: ref1 != null ? createReference(typeof ref1 === 'string' ? ref1 : ref1.ref, repoPath!) : undefined,
+			headIncludes: ['branches', 'tags', 'workingTree', 'HEAD'],
 		});
 		if (result == null) return;
 

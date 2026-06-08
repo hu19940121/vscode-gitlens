@@ -83,11 +83,13 @@ Add the following to your User Settings to run prettier:
 "editor.formatOnSave": true,
 ```
 
-### Linting
+### Linting & Type-checking
 
-This project uses [ESLint](https://eslint.org/) for code linting. You can run ESLint across the code by calling `pnpm run lint` from a terminal. Warnings from ESLint show up in the `Errors and Warnings` quick box and you can navigate to them from inside VS Code.
+This project uses [oxlint](https://oxc.rs) for fast, Rust-native linting and type-aware type-checking. You can run both across the codebase by calling `pnpm run check` from a terminal (or `pnpm run check:fix` to apply auto-fixes). Linting and type-checking also run automatically as part of `pnpm run build` and `pnpm run watch`.
 
-To lint the code as you make changes you can install the [ESLint](https://marketplace.visualstudio.com/items?itemName=dbaeumer.vscode-eslint) extension.
+A small set of rules that oxlint doesn't yet cover (such as import resolution and bidirectional-Unicode/"trojan source" safety) are enforced with [ESLint](https://eslint.org/). These run in CI; to run the full oxlint + ESLint suite locally for complete rule parity, use `pnpm run lint:ci`.
+
+To lint as you make changes, install the [Oxc](https://marketplace.visualstudio.com/items?itemName=oxc.oxc-vscode) VS Code extension (already enabled via the workspace settings). Warnings show up in the `Problems` panel where you can navigate to them from inside VS Code.
 
 ### Bundling
 
@@ -252,27 +254,44 @@ To add new icons to the GL Icons font follow the steps below:
 
 Once you've finished copy the new `glicons.woff2?<uuid>` URL from `src/webviews/apps/shared/glicons.scss` and search and replace the old references with the new one.
 
-## Testing
+## Testing (Unit and E2E)
 
 GitLens uses VS Code's testing infrastructure for unit and integration tests.
+
+### Building Tests
+
+Unit and E2E tests are built as part of the main build, but can also be built directly.
+
+```bash
+# Build everything (extension, webviews, and tests)
+pnpm run build
+pnpm run build:quick  # Quick build (no type-checking, linting, or codegen)
+
+# Build unit tests only
+pnpm run build:tests
+
+# Build E2E tests
+pnpm run bundle:e2e
+```
 
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run unit tests
 pnpm run test
 
 # Run E2E tests
 pnpm run test:e2e
-
-# Build test files (required before running tests)
-pnpm run build:tests
-
-# Watch mode for tests during development
-pnpm run watch:tests
 ```
 
-### Writing Tests
+### Watch Mode
+
+```bash
+# Watch mode for everything during development (extension, webviews, and tests)
+pnpm run watch
+```
+
+### Writing Unit Tests
 
 Tests are co-located with source files in `__tests__/` directories:
 

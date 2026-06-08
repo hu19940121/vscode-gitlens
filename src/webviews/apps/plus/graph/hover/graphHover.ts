@@ -2,14 +2,14 @@ import type { GraphRow } from '@gitkraken/gitkraken-components';
 import { css, html } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { until } from 'lit/directives/until.js';
-import type { Deferrable } from '../../../../../system/function/debounce';
-import { debounce } from '../../../../../system/function/debounce';
-import { getSettledValue, isPromise } from '../../../../../system/promise';
-import type { DidGetRowHoverParams } from '../../../../plus/graph/protocol';
-import { GlElement } from '../../../shared/components/element';
-import type { GlPopover } from '../../../shared/components/overlays/popover';
-import '../../../shared/components/markdown/markdown';
-import '../../../shared/components/overlays/popover';
+import type { Deferrable } from '@gitlens/utils/debounce.js';
+import { debounce } from '@gitlens/utils/debounce.js';
+import { getSettledValue, isPromise } from '@gitlens/utils/promise.js';
+import type { DidGetRowHoverParams } from '../../../../plus/graph/protocol.js';
+import { GlElement } from '../../../shared/components/element.js';
+import type { GlPopover } from '../../../shared/components/overlays/popover.js';
+import '../../../shared/components/markdown/markdown.js';
+import '../../../shared/components/overlays/popover.js';
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -29,6 +29,11 @@ type Anchor = string | HTMLElement | { getBoundingClientRect: () => Omit<DOMRect
 @customElement('gl-graph-hover')
 export class GlGraphHover extends GlElement {
 	static override styles = css`
+		:host {
+			position: absolute;
+			z-index: 102;
+		}
+
 		gl-popover::part(body) {
 			--max-width: min(92vw, 45rem);
 			max-height: 50vh;
@@ -96,6 +101,7 @@ export class GlGraphHover extends GlElement {
 			.skidding=${this.skidding}
 			.placement=${this.placement}
 			trigger="manual"
+			hoist
 			@sl-reposition=${this.onReposition}
 		>
 			<div slot="content">
@@ -156,7 +162,7 @@ export class GlGraphHover extends GlElement {
 	private _showCoreDebounced: Deferrable<GlGraphHover['showCore']> | undefined = undefined;
 
 	onRowHovered(row: GraphRow, anchor: Anchor): void {
-		const showQuickly = Date.now() - this._lastUnhoveredTimestamp <= 750;
+		const showQuickly = performance.now() - this._lastUnhoveredTimestamp <= 750;
 		this.resetUnhoverTimer();
 
 		if (this.requestMarkdown == null) return;
@@ -193,9 +199,17 @@ export class GlGraphHover extends GlElement {
 		}
 	}
 
+	onRowChanged(row: GraphRow): void {
+		if (!this.open || row.sha === this.shaHovering) return;
+
+		this._showCoreDebounced?.cancel();
+		this.hide();
+	}
+
 	onRowUnhovered(_row: GraphRow, relatedTarget: EventTarget | null): void {
 		this.recalculated = false;
 		this.resetUnhoverTimer();
+		this._showCoreDebounced?.cancel();
 
 		if (relatedTarget != null && relatedTarget instanceof HTMLElement) {
 			if (relatedTarget.classList.contains('resizable-handle')) {
@@ -206,7 +220,9 @@ export class GlGraphHover extends GlElement {
 			if (relatedTarget.closest('gl-graph-hover')) return;
 		}
 
-		this.hide();
+		// Use a short delay to allow row-to-row transitions without flicker.
+		// The rowhoverstart event will cancel this timer if moving to another row.
+		this.unhoverTimer = setTimeout(() => this.hide(), 150);
 	}
 
 	private onWindowKeydown = (e: KeyboardEvent) => {
@@ -222,6 +238,7 @@ export class GlGraphHover extends GlElement {
 		if (typeof markdown === 'string') {
 			this.markdown = markdown;
 		} else if (isPromise(markdown)) {
+			this.markdown = undefined;
 			const previousSha = this.shaHovering;
 			void markdown
 				.then(markdown => {
@@ -244,7 +261,7 @@ export class GlGraphHover extends GlElement {
 	private _lastUnhoveredTimestamp = 0;
 
 	hide(): void {
-		this._lastUnhoveredTimestamp = Date.now();
+		this._lastUnhoveredTimestamp = performance.now();
 
 		this._showCoreDebounced?.cancel();
 		this.resetUnhoverTimer();
@@ -254,7 +271,7 @@ export class GlGraphHover extends GlElement {
 		this.open = false;
 	}
 
-	private resetUnhoverTimer(): void {
+	resetUnhoverTimer(): void {
 		if (this.unhoverTimer) {
 			clearTimeout(this.unhoverTimer);
 			this.unhoverTimer = undefined;

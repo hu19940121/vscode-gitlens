@@ -1,13 +1,19 @@
 import type { Disposable, Uri, ViewBadge, ViewColumn } from 'vscode';
-import type { CustomEditorCommands, WebviewCommands, WebviewViewCommands } from '../constants.commands';
-import type { WebviewTelemetryContext } from '../constants.telemetry';
+import type { GlWebviewCommands } from '../constants.commands.js';
+import type {
+	Source,
+	TelemetryEvents,
+	WebviewTelemetryContext,
+	WebviewTelemetryEvents,
+} from '../constants.telemetry.js';
 import type {
 	CustomEditorIds,
 	WebviewIds,
-	WebviewOrWebviewViewOrCustomEditorTypeFromId,
+	WebviewPanelIds,
+	WebviewTypeFromId,
 	WebviewViewIds,
-} from '../constants.views';
-import type { WebviewContext } from '../system/webview';
+} from '../constants.views.js';
+import type { WebviewContext } from '../system/webview.js';
 import type {
 	IpcCallMessageType,
 	IpcCallParamsType,
@@ -15,10 +21,11 @@ import type {
 	IpcMessage,
 	IpcNotification,
 	IpcRequest,
-	WebviewState,
-} from './protocol';
-import type { WebviewCommandCallback } from './webviewCommandRegistrar';
-import type { WebviewShowOptions } from './webviewsController';
+} from './ipc/models/ipc.js';
+import type { WebviewState } from './protocol.js';
+import type { EventVisibilityBuffer, SubscriptionTracker } from './rpc/eventVisibilityBuffer.js';
+import type { WebviewCommandCallback } from './webviewCommandRegistrar.js';
+import type { WebviewShowOptions } from './webviewsController.js';
 
 export type WebviewShowingArgs<T extends unknown[], SerializedState> = T | [{ state: Partial<SerializedState> }] | [];
 
@@ -49,6 +56,14 @@ export interface WebviewProvider<
 	includeEndOfBody?(): string | Promise<string>;
 
 	onReady?(): void | Promise<void>;
+	/**
+	 * Called when the webview iframe sends `core/webview/ready` while the host already considered the controller ready —
+	 * i.e., the iframe was reloaded under us (e.g., panel layout settle, editor-tab webview restored after a window reload).
+	 * The host replays the buffered post-bootstrap IPC log automatically, so providers usually do NOT need to re-push state.
+	 * Use this hook only for things outside the IPC log: re-establishing RPC subscriptions, re-deriving non-IPC state,
+	 * telemetry, or one-shot reconnect side effects.
+	 */
+	onReconnect?(): void | Promise<void>;
 	onRefresh?(force?: boolean): void;
 	onReloaded?(): void;
 	onMessageReceived?(e: IpcMessage): void;
@@ -56,6 +71,25 @@ export interface WebviewProvider<
 	onFocusChanged?(focused: boolean): void;
 	onVisibilityChanged?(visible: boolean): void;
 	onWindowFocusChanged?(focused: boolean): void;
+
+	/**
+	 * Returns services to expose via RPC (Supertalk).
+	 *
+	 * If provided, these services will be exposed to the webview and can be
+	 * called via `wrapServices<T>()` from the webview side. This enables a
+	 * service-oriented architecture alongside or instead of IPC messages.
+	 *
+	 * @example
+	 * ```typescript
+	 * getRpcServices() {
+	 *   return {
+	 *     getCommit: (sha: string) => this.getCommitDetails(sha),
+	 *     search: (query: string) => this.performSearch(query),
+	 *   };
+	 * }
+	 * ```
+	 */
+	getRpcServices?(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): object;
 }
 
 export interface WebviewStateProvier<
@@ -66,11 +100,10 @@ export interface WebviewStateProvier<
 	canReceiveMessage?(e: IpcMessage): boolean;
 }
 
-export interface WebviewHost<ID extends WebviewIds | WebviewViewIds | CustomEditorIds> {
+export interface WebviewHost<ID extends WebviewIds | CustomEditorIds> {
 	readonly id: ID;
 	readonly instanceId: string;
-	readonly type: WebviewOrWebviewViewOrCustomEditorTypeFromId<ID>;
-
+	readonly type: WebviewTypeFromId<ID>;
 	readonly originalTitle: string;
 	title: string;
 	description: string | undefined;
@@ -88,15 +121,26 @@ export interface WebviewHost<ID extends WebviewIds | WebviewViewIds | CustomEdit
 
 	addPendingIpcNotification(
 		type: IpcNotification<any>,
-		mapping: Map<IpcNotification<any>, () => Promise<boolean>>,
+		mapping: Map<IpcNotification<any>, () => Promise<boolean | void>>,
 		thisArg: any,
 	): void;
 	clearPendingIpcNotifications(): void;
 	sendPendingIpcNotifications(): void;
 
 	getTelemetryContext(): WebviewTelemetryContext;
-	is(type: 'editor'): this is WebviewHost<ID extends WebviewIds ? ID : never>;
-	is(type: 'view'): this is WebviewHost<ID extends WebviewViewIds ? ID : never>;
+	/**
+	 * Sends a telemetry event, automatically merging the provider's telemetry context
+	 * @param name The event name
+	 * @param data The event data (excluding properties provided by the provider's getTelemetryContext)
+	 */
+	sendTelemetryEvent<T extends keyof TelemetryEvents>(
+		name: T,
+		...args: [keyof WebviewTelemetryEvents[T]] extends [never]
+			? [data?: never, source?: Source]
+			: [data: WebviewTelemetryEvents[T], source?: Source]
+	): void;
+	is(type: 'editor'): this is WebviewHost<ID & (WebviewPanelIds | CustomEditorIds)>;
+	is(type: 'view'): this is WebviewHost<ID & WebviewViewIds>;
 
 	notify<T extends IpcNotification<unknown>>(
 		notificationType: T,
@@ -110,7 +154,12 @@ export interface WebviewHost<ID extends WebviewIds | WebviewViewIds | CustomEdit
 		params: IpcCallResponseParamsType<T>,
 	): Promise<boolean>;
 	registerWebviewCommand<T extends Partial<WebviewContext>>(
-		command: WebviewCommands | WebviewViewCommands | CustomEditorCommands,
+		command: GlWebviewCommands,
+		callback: WebviewCommandCallback<T>,
+	): Disposable;
+	registerWebviewCommandForId<T extends Partial<WebviewContext>>(
+		webviewId: string,
+		command: GlWebviewCommands,
 		callback: WebviewCommandCallback<T>,
 	): Disposable;
 	show(loading: boolean, options?: WebviewShowOptions, ...args: unknown[]): Promise<void>;

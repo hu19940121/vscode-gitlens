@@ -1,10 +1,9 @@
-import type { IntegrationIds } from '../../../constants.integrations';
-import type { Container } from '../../../container';
-import { Logger } from '../../../system/logger';
-import { getLogScope } from '../../../system/logger.scope';
-import type { ServerConnection } from '../../gk/serverConnection';
-import type { CloudIntegrationAuthenticationSession, CloudIntegrationConnection } from './models';
-import { toCloudIntegrationType } from './models';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import type { IntegrationIds } from '../../../constants.integrations.js';
+import type { Container } from '../../../container.js';
+import type { ServerConnection } from '../../gk/serverConnection.js';
+import type { CloudIntegrationAuthenticationSession, CloudIntegrationConnection } from './models.js';
+import { toCloudIntegrationType } from './models.js';
 
 export class CloudIntegrationService {
 	constructor(
@@ -13,7 +12,7 @@ export class CloudIntegrationService {
 	) {}
 
 	async getConnections(): Promise<CloudIntegrationConnection[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const providersRsp = await this.connection.fetchGkApi(
 			'v1/provider-tokens',
@@ -21,11 +20,13 @@ export class CloudIntegrationService {
 			{ organizationId: false },
 		);
 		if (!providersRsp.ok) {
-			const error = (await providersRsp.json())?.error;
+			const error = ((await providersRsp.json()) as { error?: unknown })?.error;
 			const errorMessage =
-				typeof error === 'string' ? error : ((error?.message as string) ?? providersRsp.statusText);
+				typeof error === 'string'
+					? error
+					: ((error as { message?: string })?.message ?? providersRsp.statusText);
 			if (error != null) {
-				Logger.error(undefined, scope, `Failed to get connected providers from cloud: ${errorMessage}`);
+				scope?.error(undefined, `Failed to get connected providers from cloud: ${errorMessage}`);
 			}
 			if (this.container.telemetry.enabled) {
 				this.container.telemetry.sendEvent('cloudIntegrations/getConnections/failed', {
@@ -35,21 +36,22 @@ export class CloudIntegrationService {
 			return undefined;
 		}
 
-		return (await providersRsp.json())?.data as Promise<CloudIntegrationConnection[] | undefined>;
+		return ((await providersRsp.json()) as { data?: unknown })?.data as CloudIntegrationConnection[] | undefined;
 	}
 
 	async getConnectionSession(
 		id: IntegrationIds,
 		refreshToken?: string,
 	): Promise<CloudIntegrationAuthenticationSession | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const refresh = Boolean(refreshToken);
 		const cloudIntegrationType = toCloudIntegrationType[id];
 		if (cloudIntegrationType == null) {
-			Logger.error(undefined, scope, `Unsupported cloud integration type: ${id}`);
+			scope?.error(undefined, `Unsupported cloud integration type: ${id}`);
 			return undefined;
 		}
+
 		const reqInitOptions = refreshToken
 			? {
 					method: 'POST',
@@ -65,13 +67,12 @@ export class CloudIntegrationService {
 			{ organizationId: false },
 		);
 		if (!tokenRsp.ok) {
-			const error = (await tokenRsp.json())?.error;
+			const error = ((await tokenRsp.json()) as { error?: unknown })?.error;
 			const errorMessage =
-				typeof error === 'string' ? error : ((error?.message as string) ?? tokenRsp.statusText);
+				typeof error === 'string' ? error : ((error as { message?: string })?.message ?? tokenRsp.statusText);
 			if (error != null) {
-				Logger.error(
+				scope?.error(
 					undefined,
-					scope,
 					`Failed to ${refresh ? 'refresh' : 'get'} ${id} token from cloud: ${errorMessage}`,
 				);
 			}
@@ -95,24 +96,26 @@ export class CloudIntegrationService {
 					{ organizationId: false },
 				);
 				if (newTokenRsp.ok) {
-					return (await newTokenRsp.json())?.data as Promise<
-						CloudIntegrationAuthenticationSession | undefined
-					>;
+					return ((await newTokenRsp.json()) as { data?: unknown })?.data as
+						| CloudIntegrationAuthenticationSession
+						| undefined;
 				}
 			}
 
 			return undefined;
 		}
 
-		return (await tokenRsp.json())?.data as Promise<CloudIntegrationAuthenticationSession | undefined>;
+		return ((await tokenRsp.json()) as { data?: unknown })?.data as
+			| CloudIntegrationAuthenticationSession
+			| undefined;
 	}
 
 	async disconnect(id: IntegrationIds): Promise<boolean> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const cloudIntegrationType = toCloudIntegrationType[id];
 		if (cloudIntegrationType == null) {
-			Logger.error(undefined, scope, `Unsupported cloud integration type: ${id}`);
+			scope?.error(undefined, `Unsupported cloud integration type: ${id}`);
 			return false;
 		}
 
@@ -122,11 +125,11 @@ export class CloudIntegrationService {
 			{ organizationId: false },
 		);
 		if (!tokenRsp.ok) {
-			const error = (await tokenRsp.json())?.error;
+			const error = ((await tokenRsp.json()) as { error?: unknown })?.error;
 			const errorMessage =
-				typeof error === 'string' ? error : ((error?.message as string) ?? tokenRsp.statusText);
+				typeof error === 'string' ? error : ((error as { message?: string })?.message ?? tokenRsp.statusText);
 			if (error != null) {
-				Logger.error(undefined, scope, `Failed to disconnect ${id} token from cloud: ${errorMessage}`);
+				scope?.error(undefined, `Failed to disconnect ${id} token from cloud: ${errorMessage}`);
 			}
 			if (this.container.telemetry.enabled) {
 				this.container.telemetry.sendEvent('cloudIntegrations/disconnect/failed', {

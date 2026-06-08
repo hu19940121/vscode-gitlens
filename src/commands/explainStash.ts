@@ -1,18 +1,19 @@
 import type { TextEditor, Uri } from 'vscode';
 import { ProgressLocation } from 'vscode';
-import type { Container } from '../container';
-import type { GitCommit, GitStashCommit } from '../git/models/commit';
-import { showGenericErrorMessage } from '../messages';
-import { showStashPicker } from '../quickpicks/stashPicker';
-import { command } from '../system/-webview/command';
-import { Logger } from '../system/logger';
-import type { CommandContext } from './commandContext';
-import { isCommandContextViewNodeHasCommit } from './commandContext.utils';
-import type { ExplainBaseArgs } from './explainBase';
-import { ExplainCommandBase } from './explainBase';
+import type { GitCommit, GitStashCommit } from '@gitlens/git/models/commit.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { Container } from '../container.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { showStashPicker } from '../quickpicks/stashPicker.js';
+import { command } from '../system/-webview/command.js';
+import type { CommandContext } from './commandContext.js';
+import { isCommandContextViewNodeHasCommit } from './commandContext.utils.js';
+import type { ExplainBaseArgs } from './explainBase.js';
+import { ExplainCommandBase } from './explainBase.js';
 
 export interface ExplainStashCommandArgs extends ExplainBaseArgs {
 	rev?: string;
+	prompt?: string;
 }
 
 @command()
@@ -54,6 +55,7 @@ export class ExplainStashCommand extends ExplainCommandBase {
 					'Choose a stash to explain',
 				);
 				if (pick?.ref == null) return;
+
 				args.rev = pick.ref;
 				commit = pick;
 			} else {
@@ -73,6 +75,7 @@ export class ExplainStashCommand extends ExplainCommandBase {
 				},
 				{
 					progress: { location: ProgressLocation.Notification, title: 'Explaining stash...' },
+					prompt: args.prompt,
 				},
 			);
 
@@ -89,7 +92,7 @@ export class ExplainStashCommand extends ExplainCommandBase {
 				command: {
 					label: 'Explain Stash Changes',
 					name: 'gitlens.ai.explainStash',
-					args: { repoPath: svc.path, ref: commit.ref, source: args.source },
+					args: { repoPath: svc.path, rev: commit.ref, prompt: args.prompt, source: args.source },
 				},
 			});
 		} catch (ex) {

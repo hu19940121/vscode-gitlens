@@ -1,14 +1,14 @@
 import type { ColorTheme, ThemeIcon } from 'vscode';
 import { version as codeVersion, ColorThemeKind, env, ExtensionMode, Uri, window, workspace } from 'vscode';
-import { getPlatform } from '@env/platform';
-import type { IconPath } from '../../@types/vscode.iconpath';
-import type { Container } from '../../container';
-import { joinPaths, normalizePath } from '../path';
-import { getDistributionGroup } from '../string';
-import { satisfies } from '../version';
-import { executeCoreCommand } from './command';
-import { configuration } from './configuration';
-import { exists } from './vscode/uris';
+import { getPlatform } from '@env/platform.js';
+import { joinPaths, normalizePath } from '@gitlens/utils/path.js';
+import { getDistributionGroup } from '@gitlens/utils/string.js';
+import { satisfies } from '@gitlens/utils/version.js';
+import type { IconPath } from '../../@types/vscode.iconpath.d.js';
+import type { Container } from '../../container.js';
+import { executeCoreCommand } from './command.js';
+import { configuration } from './configuration.js';
+import { exists } from './vscode/uris.js';
 
 export const deviceCohortGroup = getDistributionGroup(env.machineId);
 
@@ -82,6 +82,13 @@ export async function getHostExecutablePath(): Promise<string> {
 
 	switch (platform) {
 		case 'windows':
+			_hostExecutablePath =
+				// VS Code 1.110+ restructured its install directory, adding a commit-hash directory level (Windows only)
+				(await checkPath(joinPaths(env.appRoot, '..', '..', '..', 'bin', app))) ??
+				(await checkPath(joinPaths(env.appRoot, '..', '..', 'bin', app))) ??
+				(await checkPath(joinPaths(env.appRoot, 'bin', app))) ??
+				app;
+			break;
 		case 'linux':
 			_hostExecutablePath =
 				(await checkPath(joinPaths(env.appRoot, '..', '..', 'bin', app))) ??
@@ -104,7 +111,12 @@ export async function getHostExecutablePath(): Promise<string> {
 export async function getHostEditorCommand(includeWorkspaceUri: boolean = false): Promise<string> {
 	const path = normalizePath(await getHostExecutablePath()).replace(/ /g, '\\ ');
 	if (includeWorkspaceUri) {
-		const uri = workspace.workspaceFile ?? workspace.workspaceFolders?.[0]?.uri;
+		let uri = workspace.workspaceFile;
+		if (uri != null) {
+			return `${path} --wait --reuse-window --file-uri="${uri.toString()}"`;
+		}
+
+		uri = workspace.workspaceFolders?.[0]?.uri;
 		if (uri != null) {
 			return `${path} --wait --reuse-window --folder-uri="${uri.toString()}"`;
 		}
@@ -162,11 +174,36 @@ export async function revealInFileExplorer(uri: Uri): Promise<void> {
 	void (await executeCoreCommand('revealFileInOS', uri));
 }
 
-export function supportedInVSCodeVersion(feature: 'language-models'): boolean {
-	switch (feature) {
-		case 'language-models':
-			return satisfies(codeVersion, '>= 1.90-insider');
-		default:
-			return false;
+type CodeFeatures =
+	| 'language-models'
+	| 'quickpick-resourceuri'
+	| 'quickpick-prompt'
+	| 'quickpick-button-location'
+	| 'quickpick-button-toggle';
+
+const _supportedFeatureMap = new Map<CodeFeatures, boolean>();
+
+export function supportedInVSCodeVersion(feature: CodeFeatures): boolean {
+	let supported = _supportedFeatureMap.get(feature);
+	if (supported == null) {
+		switch (feature) {
+			case 'language-models':
+				supported = satisfies(codeVersion, '>= 1.90-insider');
+				break;
+			case 'quickpick-resourceuri':
+			case 'quickpick-prompt':
+				supported = satisfies(codeVersion, '>= 1.108');
+				break;
+			case 'quickpick-button-location':
+			case 'quickpick-button-toggle':
+				supported = satisfies(codeVersion, '>= 1.109');
+				break;
+			default:
+				return false;
+		}
+
+		_supportedFeatureMap.set(feature, supported);
 	}
+
+	return supported;
 }
