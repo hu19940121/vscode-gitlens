@@ -2,10 +2,10 @@ import type { PropertyValueMap } from 'lit';
 import { css, html, LitElement } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
-import type { GlTooltip } from './overlays/tooltip';
-import { focusOutlineButton } from './styles/lit/a11y.css';
-import { elementBase } from './styles/lit/base.css';
-import './overlays/tooltip';
+import type { GlTooltip } from './overlays/tooltip.js';
+import { focusOutlineButton } from './styles/lit/a11y.css.js';
+import { elementBase } from './styles/lit/base.css.js';
+import './overlays/tooltip.js';
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -31,6 +31,7 @@ export class GlButton extends LitElement {
 				--button-border: var(--vscode-button-border, transparent);
 
 				/* Layout variables */
+				--button-width: max-content;
 				--button-padding: 0.4rem;
 				--button-gap: 0.6rem;
 				--button-compact-padding: 0.4rem;
@@ -39,6 +40,7 @@ export class GlButton extends LitElement {
 				--button-line-height: 1.35;
 
 				display: inline-block;
+				width: var(--button-width);
 				border: none;
 				font-family: inherit;
 				font-size: inherit;
@@ -69,7 +71,7 @@ export class GlButton extends LitElement {
 				color: inherit;
 				text-decoration: none;
 
-				width: max-content;
+				width: var(--button-width);
 				max-width: 100%;
 				height: 100%;
 				cursor: pointer;
@@ -140,17 +142,21 @@ export class GlButton extends LitElement {
 			:host([appearance='alert']) {
 				--button-background: transparent;
 				--button-border: var(--color-alert-infoBorder);
-				--button-foreground: var(--color-button-foreground);
+				--button-foreground: var(--color-alert-infoForeground);
 				--button-hover-background: var(--color-alert-infoBorder);
 				--button-line-height: 1.64;
 				width: max-content;
+			}
+
+			:host([appearance='alert']:hover) {
+				--button-foreground: var(--vscode-button-foreground);
 			}
 
 			/* Variant property for semantic states - appearance controls structure, variant controls color */
 
 			/* Solid buttons (default and secondary) with variants get full color treatment */
 			:host([variant='danger']) {
-				--button-foreground: var(--vscode-errorForeground, #f48771);
+				--button-foreground: var(--vscode-inputValidation-errorForeground, #f48771);
 				--button-background: var(--vscode-inputValidation-errorBackground, #5a1d1d);
 				--button-hover-background: color-mix(
 					in srgb,
@@ -161,20 +167,14 @@ export class GlButton extends LitElement {
 			}
 
 			:host([variant='warning']) {
-				--button-foreground: #fff;
-				--button-background: var(
-					--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor,
-					#cc6600
-				);
+				--button-foreground: var(--vscode-inputValidation-warningForeground, #ffcc66);
+				--button-background: var(--vscode-inputValidation-warningBackground, #352a05);
 				--button-hover-background: color-mix(
 					in srgb,
-					#000 20%,
-					var(--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor, #cc6600)
+					#000 30%,
+					var(--vscode-inputValidation-warningBorder, #b89500)
 				);
-				--button-border: var(
-					--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor,
-					#cc6600
-				);
+				--button-border: var(--vscode-inputValidation-warningBorder, #b89500);
 			}
 
 			:host([variant='success']) {
@@ -197,10 +197,7 @@ export class GlButton extends LitElement {
 			:host([appearance='toolbar'][variant='warning']),
 			:host([appearance='input'][variant='warning']),
 			:host([appearance='alert'][variant='warning']) {
-				--button-foreground: var(
-					--vscode-gitlens-decorations\\.statusMergingOrRebasingConflictForegroundColor,
-					#cc6600
-				);
+				--button-foreground: var(--vscode-editorWarning-foreground, #cca700);
 				--button-background: transparent;
 				--button-border: transparent;
 			}
@@ -213,15 +210,10 @@ export class GlButton extends LitElement {
 				--button-border: transparent;
 			}
 
-			:host-context(.vscode-light):host([appearance='alert']:not(:hover)),
-			:host-context(.vscode-high-contrast-light):host([appearance='alert']:not(:hover)) {
-				--button-foreground: var(--color-foreground);
-			}
-
 			:host([appearance='input']) .control {
 				padding: var(--button-input-padding);
 				--button-line-height: 1.1;
-				height: 1.8rem;
+				height: var(--button-input-height, 1.8rem);
 				gap: 0.2rem;
 			}
 
@@ -234,6 +226,14 @@ export class GlButton extends LitElement {
 			:host([appearance='alert'][href]) > a {
 				display: block;
 				width: max-content;
+			}
+
+			/* Give solid-filled buttons a bit more horizontal breathing room. Exposed via a
+			   CSS var so consumers (e.g. compose-mode commit checkbox) can collapse to a
+			   square icon button. */
+			:host(:not([appearance])) .control,
+			:host([appearance='secondary']) .control {
+				padding-inline: var(--button-padding-inline, 0.8rem);
 			}
 
 			:host([density='compact']) .control {
@@ -309,6 +309,9 @@ export class GlButton extends LitElement {
 	@property({ type: Boolean, reflect: true })
 	truncate = false;
 
+	@property({ type: String, attribute: 'aria-label' })
+	override ariaLabel: string | null = null;
+
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
@@ -356,6 +359,7 @@ export class GlButton extends LitElement {
 		if (this.href != null) {
 			return html`<a
 				class="control"
+				aria-label=${ifDefined(this.ariaLabel)}
 				tabindex="${ifDefined(this.disabled === false ? undefined : -1)}"
 				href=${this.href}
 				@keypress=${(e: KeyboardEvent) => this.onLinkKeypress(e)}
@@ -365,6 +369,7 @@ export class GlButton extends LitElement {
 		return html`<button
 			class="control"
 			role=${ifDefined(this.role)}
+			aria-label=${ifDefined(this.ariaLabel)}
 			aria-checked=${ifDefined(this.ariaChecked)}
 			?disabled=${this.disabled}
 		>

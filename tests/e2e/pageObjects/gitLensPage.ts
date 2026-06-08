@@ -1,6 +1,7 @@
 import type { FrameLocator, Locator } from '@playwright/test';
-import { MaxTimeout } from '../baseTest';
-import { VSCodePage } from './vscodePage';
+import type { SimulationState } from '../../../src/plus/gk/__debug__accountDebug.js';
+import { MaxTimeout, ShortTimeout } from '../baseTest.js';
+import { VSCodePage } from './vscodePage.js';
 
 /**
  * Page object for GitLens-specific UI interactions.
@@ -9,6 +10,37 @@ import { VSCodePage } from './vscodePage';
 export class GitLensPage extends VSCodePage {
 	async isActivated(): Promise<boolean> {
 		return this.gitlensTab.isVisible();
+	}
+
+	/**
+	 * Simulate a subscription state for testing Pro features.
+	 * This allows tests to access Pro-gated features like worktrees.
+	 *
+	 * The debug module is loaded asynchronously after extension activation,
+	 * so we retry the command until it succeeds.
+	 *
+	 * @param state - Subscription state
+	 */
+	async startSubscriptionSimulation(
+		state: SimulationState = { state: 6 /*SubscriptionState.Paid*/, planId: 'pro' },
+	): Promise<{ success: boolean } & Disposable> {
+		if (!(await this.waitForCommand('gitlens.plus.simulate.subscription'))) {
+			throw new Error('gitlens.plus.simulate.subscription command not found');
+		}
+
+		const success = await this.executeCommand<boolean>('gitlens.plus.simulate.subscription', state);
+		// Wait for the subscription change event to propagate through the system
+		await this.page.waitForTimeout(ShortTimeout);
+		return {
+			success: success,
+			[Symbol.dispose]: async () => {
+				await this.stopSubscriptionSimulation();
+			},
+		};
+	}
+
+	async stopSubscriptionSimulation(): Promise<void> {
+		await this.executeCommand('gitlens.plus.simulate.subscription', { state: null });
 	}
 
 	/**
@@ -71,7 +103,7 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showHomeView(): Promise<void> {
-		await this.executeCommand('gitlens.showHomeView', 'GitLens: Show Home View');
+		await this.executeCommand('gitlens.showHomeView');
 	}
 
 	/** Launchpad section in GitLens sidebar */
@@ -85,7 +117,7 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showLaunchpadView(): Promise<void> {
-		await this.executeCommand('gitlens.showLaunchpad', 'GitLens: Show Launchpad');
+		await this.executeCommand('gitlens.showLaunchpad');
 	}
 
 	// ============================================================================
@@ -113,7 +145,7 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showLineHistoryView(): Promise<void> {
-		await this.executeCommand('gitlens.showLineHistoryView', 'GitLens: Show Line History View');
+		await this.executeCommand('gitlens.showLineHistoryView');
 	}
 
 	/** File History section in GitLens Inspect sidebar */
@@ -127,7 +159,7 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showFileHistoryView(): Promise<void> {
-		await this.executeCommand('gitlens.showFileHistoryView', 'GitLens: Show File History View');
+		await this.executeCommand('gitlens.showFileHistoryView');
 	}
 
 	/** Visual History section in GitLens Inspect sidebar */
@@ -141,7 +173,7 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showVisualFileHistoryView(): Promise<void> {
-		await this.executeCommand('gitlens.showTimelineView', 'GitLens: Show Visual File History View');
+		await this.executeCommand('gitlens.showTimelineView');
 	}
 
 	/** Search & Compare section in GitLens Inspect sidebar */
@@ -155,7 +187,7 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showSearchAndCompareView(): Promise<void> {
-		await this.executeCommand('gitlens.showSearchAndCompareView', 'GitLens: Show Search & Compare View');
+		await this.executeCommand('gitlens.showSearchAndCompareView');
 	}
 
 	// ============================================================================
@@ -175,12 +207,11 @@ export class GitLensPage extends VSCodePage {
 
 	/** Commit Graph webview in the panel */
 	get commitGraphViewWebview(): Promise<FrameLocator | null> {
-		// Find the GitLens webview with title "Graph"
 		return this.getGitLensWebview('Graph', 'webviewView');
 	}
 
 	async showCommitGraphView(): Promise<void> {
-		await this.executeCommand('gitlens.showGraphView', 'GitLens: Show Commit Graph View');
+		await this.executeCommand('gitlens.showGraphView');
 	}
 
 	/** Commit Graph Details tab in the panel */
@@ -190,7 +221,6 @@ export class GitLensPage extends VSCodePage {
 
 	/** Commit Graph Details webview in the panel */
 	get commitGraphDetailsViewWebview(): Promise<FrameLocator | null> {
-		// Find the GitLens webview with title "Graph Details"
 		return this.getGitLensWebview('Graph Details', 'webviewView');
 	}
 
@@ -213,7 +243,7 @@ export class GitLensPage extends VSCodePage {
 	// ============================================================================
 
 	async showGitLensView(): Promise<void> {
-		await this.executeCommand('gitlens.views.scm.grouped.focus', 'Source Control: Focus on GitLens View');
+		await this.executeCommand('gitlens.views.scm.grouped.focus');
 	}
 
 	get gitlensViewSection(): Locator {
@@ -225,35 +255,74 @@ export class GitLensPage extends VSCodePage {
 	}
 
 	async showCommitsView(): Promise<void> {
-		await this.executeCommand('gitlens.showCommitsView', 'GitLens: Show Commits View');
+		await this.executeCommand('gitlens.showCommitsView');
 	}
 
 	async showBranchesView(): Promise<void> {
-		await this.executeCommand('gitlens.showBranchesView', 'GitLens: Show Branches View');
+		await this.executeCommand('gitlens.showBranchesView');
 	}
 
 	async showRemotesView(): Promise<void> {
-		await this.executeCommand('gitlens.showRemotesView', 'GitLens: Show Remotes View');
+		await this.executeCommand('gitlens.showRemotesView');
 	}
 
 	async showStashesView(): Promise<void> {
-		await this.executeCommand('gitlens.showStashesView', 'GitLens: Show Stashes View');
+		await this.executeCommand('gitlens.showStashesView');
 	}
 
 	async showTagsView(): Promise<void> {
-		await this.executeCommand('gitlens.showTagsView', 'GitLens: Show Tags View');
+		await this.executeCommand('gitlens.showTagsView');
 	}
 
 	async showWorktreesView(): Promise<void> {
-		await this.executeCommand('gitlens.showWorktreesView', 'GitLens: Show Worktrees View');
+		await this.executeCommand('gitlens.showWorktreesView');
 	}
 
 	async showContributorsView(): Promise<void> {
-		await this.executeCommand('gitlens.showContributorsView', 'GitLens: Show Contributors View');
+		await this.executeCommand('gitlens.showContributorsView');
 	}
 
 	// ============================================================================
 	// GitLens Webviews
+	// ============================================================================
+
+	// ============================================================================
+	// Blame Annotations
+	// ============================================================================
+
+	/**
+	 * Toggle file blame annotations on the active editor.
+	 */
+	async toggleFileBlame(): Promise<void> {
+		await this.executeCommand('gitlens.toggleFileBlame');
+	}
+
+	/**
+	 * Check if blame annotations are currently visible in the active editor.
+	 *
+	 * VS Code renders GitLens gutter blame decorations as CSS `::before`
+	 * pseudo-elements on `<span>` elements within `.view-lines`. The decoration
+	 * class names contain the `ced-` prefix (content editor decoration).
+	 *
+	 * @param expectedText — Text to search for in `::before` content (e.g. commit message or date pattern)
+	 */
+	async hasBlameAnnotations(expectedText: string): Promise<boolean> {
+		return this.page.evaluate((pattern: string) => {
+			// Blame decorations live on <span> elements inside .view-lines with ced-* classes
+			const candidates = document.querySelectorAll('.monaco-editor .view-lines span[class*="ced-"]');
+			for (const el of candidates) {
+				const content = window.getComputedStyle(el, '::before').getPropertyValue('content');
+				if (content && content !== 'none' && content !== '""') {
+					const text = content.replace(/^"|"$/g, '');
+					if (text.includes(pattern)) return true;
+				}
+			}
+			return false;
+		}, expectedText);
+	}
+
+	// ============================================================================
+	// Webviews
 	// ============================================================================
 
 	async getRebaseWebview(): Promise<FrameLocator | null> {
@@ -265,10 +334,10 @@ export class GitLensPage extends VSCodePage {
 	 * This avoids needing to know specific content inside the webview.
 	 *
 	 * @param parent - The parent locator to search within
-	 * @param timeout - Timeout in ms (default: 5000)
+	 * @param timeout - Timeout in ms
 	 * @returns A FrameLocator for the webview content, or null if not found
 	 */
-	async getWebview(parent: Locator, timeout = 5000): Promise<FrameLocator | null> {
+	async getWebview(parent: Locator, timeout = MaxTimeout / 2): Promise<FrameLocator | null> {
 		const startTime = Date.now();
 		while (Date.now() - startTime < timeout) {
 			const iframes = parent.locator('iframe');
@@ -285,7 +354,7 @@ export class GitLensPage extends VSCodePage {
 					continue;
 				}
 			}
-			await this.page.waitForTimeout(500);
+			await this.page.waitForTimeout(ShortTimeout);
 		}
 		return null;
 	}
@@ -299,37 +368,61 @@ export class GitLensPage extends VSCodePage {
 	 *
 	 * @param title - The title of the webview (e.g., "Graph", "Graph Details", "Home")
 	 * @param purpose - The purpose of the webview (e.g., "webviewView", "webviewPanel")
-	 * @param timeout - Timeout in ms (default: 5000)
+	 * @param timeout - Timeout in ms
 	 * @returns A FrameLocator for the matching webview content, or null if not found
 	 */
 	async getGitLensWebview(
 		title: string,
 		purpose: 'webviewView' | 'webviewPanel' | 'customEditor',
-		timeout = 5000,
+		timeout = MaxTimeout / 2,
 	): Promise<FrameLocator | null> {
+		let iterations = 0;
+		let usePurpose = true;
+
 		const startTime = Date.now();
 		while (Date.now() - startTime < timeout) {
-			// Find GitLens webviewView iframes
+			// Find GitLens webview iframes
 			const iframes = this.page.locator(
-				purpose === 'webviewView'
+				usePurpose && purpose === 'webviewView'
 					? `iframe.webview[src*="extensionId=eamodio.gitlens"][src*="purpose=${purpose}"]`
 					: `iframe.webview[src*="extensionId=eamodio.gitlens"]`,
 			);
-			const count = await iframes.count();
 
-			for (let i = 0; i < count; i++) {
-				try {
-					const outerFrame = iframes.nth(i).contentFrame();
-					// Use partial match for title to handle cases where branch name is appended (e.g. "Interactive Rebase (main)")
-					const activeFrame = outerFrame.locator(`iframe#active-frame[title*="${title}"]`);
-					if ((await activeFrame.count()) > 0) {
-						return activeFrame.contentFrame();
+			iterations++;
+			const count = await iframes.count();
+			if (count !== 0) {
+				for (let i = 0; i < count; i++) {
+					try {
+						const outerFrame = iframes.nth(i).contentFrame();
+						// CSS title*= is a substring match, so do a precise check on the actual
+						// title attribute to avoid false positives (e.g. "Graph" matching both
+						// "Commit Graph" and "Commit Graph Inspect")
+						const activeFrame = outerFrame.locator(`iframe#active-frame[title*="${title}"]`);
+						if ((await activeFrame.count()) > 0) {
+							const actualTitle = await activeFrame.getAttribute('title');
+							// Accept exact match or title with branch suffix, e.g. "Interactive Rebase (main)"
+							if (
+								actualTitle != null &&
+								(actualTitle === title ||
+									actualTitle.startsWith(`${title} (`) ||
+									actualTitle.startsWith(`${title},`))
+							) {
+								return activeFrame.contentFrame();
+							}
+							// Substring matched but title doesn't match precisely — skip
+							continue;
+						}
+					} catch {
+						continue;
 					}
-				} catch {
-					continue;
 				}
+			} else if (purpose === 'webviewView') {
+				// There is a VS Code issue where sometimes WebviewViews don't always get their purpose set (seems to happen after hiding and re-showing)
+				// So alternate using purpose filter every other iteration (use it on odd iterations: 1, 3, 5...)
+				usePurpose = iterations % 2 === 1;
+				continue;
 			}
-			await this.page.waitForTimeout(500);
+			await this.page.waitForTimeout(ShortTimeout);
 		}
 		return null;
 	}

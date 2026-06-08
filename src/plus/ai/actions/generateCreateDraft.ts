@@ -1,20 +1,22 @@
 import type { CancellationToken, ProgressOptions } from 'vscode';
-import type { AIGenerateCreateDraftEventData } from '../../../constants.telemetry';
-import { AINoRequestDataError, CancellationError } from '../../../errors';
-import type { Repository } from '../../../git/models/repository';
-import { configuration } from '../../../system/-webview/configuration';
-import type { Deferred } from '../../../system/promise';
-import type { AIResponse, AISourceContext } from '../aiProviderService';
-import type { AIService } from '../aiService';
-import type { AIModel } from '../models/model';
-import type { AIChatMessage } from '../models/provider';
-import type { AISummarizedResult } from '../models/results';
-import { parseSummarizeResult } from '../utils/-webview/results.utils';
+import type { AIModel } from '@gitlens/ai/models/model.js';
+import type { AIChatMessage } from '@gitlens/ai/models/provider.js';
+import type { AISummarizedResult } from '@gitlens/ai/models/results.js';
+import { parseSummarizeResult } from '@gitlens/ai/utils/results.utils.js';
+import { truncatePromptWithDiff } from '@gitlens/ai/utils/truncation.utils.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import type { Deferred } from '@gitlens/utils/promise.js';
+import type { AIGenerateCreateDraftEventData } from '../../../constants.telemetry.js';
+import { AINoRequestDataError } from '../../../errors.js';
+import type { GlRepository } from '../../../git/models/repository.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import type { AIResponse, AISourceContext } from '../aiProviderService.js';
+import type { AIService } from '../aiService.js';
 
 /** Generates a draft message (cloud patch or code suggestion) */
 export async function generateCreateDraft(
 	service: AIService,
-	changesOrRepo: string | string[] | Repository,
+	changesOrRepo: string | string[] | GlRepository,
 	sourceContext: AISourceContext<{ type: AIGenerateCreateDraftEventData['draftType'] }>,
 	options?: {
 		cancellation?: CancellationToken;
@@ -52,6 +54,7 @@ export async function generateCreateDraft(
 					maxInputTokens,
 					retries,
 					reporting,
+					truncatePromptWithDiff,
 				);
 				if (cancellation.isCancellationRequested) throw new CancellationError();
 

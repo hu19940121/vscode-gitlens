@@ -1,27 +1,26 @@
 import type { CancellationToken, ConfigurationChangeEvent } from 'vscode';
 import { Disposable, ProgressLocation, TreeItem, TreeItemCollapsibleState, window } from 'vscode';
-import { onDidFetchAvatar } from '../avatars';
-import type { ContributorsViewConfig, ViewFilesLayout } from '../config';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import type { GitContributor } from '../git/models/contributor';
-import type { RepositoryChangeEvent } from '../git/models/repository';
-import { RepositoryChange, RepositoryChangeComparisonMode } from '../git/models/repository';
-import { executeCommand } from '../system/-webview/command';
-import { configuration } from '../system/-webview/configuration';
-import { setContext } from '../system/-webview/context';
-import { gate } from '../system/decorators/gate';
-import { debug } from '../system/decorators/log';
-import { RepositoriesSubscribeableNode } from './nodes/abstract/repositoriesSubscribeableNode';
-import { RepositoryFolderNode } from './nodes/abstract/repositoryFolderNode';
-import type { ViewNode } from './nodes/abstract/viewNode';
-import { ContributorNode } from './nodes/contributorNode';
-import { ContributorsNode } from './nodes/contributorsNode';
-import { updateSorting, updateSortingDirection } from './utils/-webview/sorting.utils';
-import type { GroupedViewContext, RevealOptions } from './viewBase';
-import { ViewBase } from './viewBase';
-import type { CopyNodeCommandArgs } from './viewCommands';
-import { registerViewCommand } from './viewCommands';
+import type { GitContributor } from '@gitlens/git/models/contributor.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { onDidFetchAvatar } from '../avatars.js';
+import type { ContributorsViewConfig, ViewFilesLayout } from '../config.js';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import type { RepositoryChangeEvent } from '../git/models/repository.js';
+import { executeCommand } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { setContext } from '../system/-webview/context.js';
+import { gate } from '../system/decorators/gate.js';
+import { RepositoriesSubscribeableNode } from './nodes/abstract/repositoriesSubscribeableNode.js';
+import { RepositoryFolderNode } from './nodes/abstract/repositoryFolderNode.js';
+import type { ViewNode } from './nodes/abstract/viewNode.js';
+import { ContributorNode } from './nodes/contributorNode.js';
+import { ContributorsNode } from './nodes/contributorsNode.js';
+import { updateSorting, updateSortingDirection } from './utils/-webview/sorting.utils.js';
+import type { GroupedViewContext, RevealOptions } from './viewBase.js';
+import { ViewBase } from './viewBase.js';
+import type { CopyNodeCommandArgs } from './viewCommands.js';
+import { registerViewCommand } from './viewCommands.js';
 
 export class ContributorsRepositoryNode extends RepositoryFolderNode<ContributorsView, ContributorsNode> {
 	async getChildren(): Promise<ViewNode[]> {
@@ -31,7 +30,7 @@ export class ContributorsRepositoryNode extends RepositoryFolderNode<Contributor
 		return this.child.getChildren();
 	}
 
-	@debug()
+	@trace()
 	protected override async subscribe(): Promise<Disposable> {
 		return Disposable.from(
 			await super.subscribe(),
@@ -40,13 +39,7 @@ export class ContributorsRepositoryNode extends RepositoryFolderNode<Contributor
 	}
 
 	protected changed(e: RepositoryChangeEvent): boolean {
-		return e.changed(
-			RepositoryChange.Config,
-			RepositoryChange.Heads,
-			RepositoryChange.Remotes,
-			RepositoryChange.Unknown,
-			RepositoryChangeComparisonMode.Any,
-		);
+		return e.changed('config', 'heads', 'remotes', 'unknown');
 	}
 }
 
@@ -60,14 +53,18 @@ export class ContributorsViewNode extends RepositoriesSubscribeableNode<Contribu
 				await this.view.container.git.isDiscoveringRepositories;
 			}
 
-			const repositories = await this.view.getFilteredRepositories();
+			const repositories = this.view.getFilteredRepositories();
 			if (!repositories.length) {
 				this.view.message = 'No contributors could be found.';
 				return [];
 			}
 
+			const repo = this.view.container.git.getBestRepositoryOrFirst();
 			this.children = repositories.map(
-				r => new ContributorsRepositoryNode(GitUri.fromRepoPath(r.path), this.view, this, r),
+				r =>
+					new ContributorsRepositoryNode(GitUri.fromRepoPath(r.path), this.view, this, r, {
+						expand: r === repo,
+					}),
 			);
 		}
 
@@ -156,6 +153,7 @@ export class ContributorsView extends ViewBase<'contributors', ContributorsViewN
 				},
 				this,
 			),
+			registerViewCommand(this.getQualifiedCommand('filterRepositories'), () => this.filterRepositories(), this),
 			registerViewCommand(
 				this.getQualifiedCommand('setFilesLayoutToAuto'),
 				() => this.setFilesLayout('auto'),
@@ -220,6 +218,7 @@ export class ContributorsView extends ViewBase<'contributors', ContributorsViewN
 		const changed = super.filterConfigurationChanged(e);
 		if (
 			!changed &&
+			!configuration.changed(e, 'defaultCurrentUserNameStyle') &&
 			!configuration.changed(e, 'defaultDateFormat') &&
 			!configuration.changed(e, 'defaultDateLocale') &&
 			!configuration.changed(e, 'defaultDateShortFormat') &&

@@ -1,25 +1,25 @@
 import { css, html, LitElement } from 'lit';
-import { customElement, property, query } from 'lit/decorators.js';
+import { customElement, property, query, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import { when } from 'lit/directives/when.js';
 import Sortable from 'sortablejs';
-import type { AIModel } from '../../../../../plus/ai/models/model';
-import type { ComposerBaseCommit, ComposerCommit, ComposerHunk } from '../../../../plus/composer/protocol';
+import type { AIModel } from '@gitlens/ai/models/model.js';
+import type { ComposerBaseCommit, ComposerCommit, ComposerHunk } from '../../../../plus/composer/protocol.js';
 import {
 	getCommitChanges,
 	getFileChanges,
 	getFileCountForCommit,
 	getUnassignedHunks,
 	getUniqueFileNames,
-} from '../../../../plus/composer/utils/composer.utils';
-import { focusableBaseStyles } from '../../../shared/components/styles/lit/a11y.css';
-import { boxSizingBase, inlineCode, scrollableBase } from '../../../shared/components/styles/lit/base.css';
-import { ruleStyles } from '../../shared/components/vscode.css';
-import { composerItemCommitStyles, composerItemContentStyles, composerItemStyles } from './composer.css';
-import '../../../shared/components/button';
-import '../../../shared/components/button-container';
-import '../../../shared/components/overlays/popover';
-import './commit-item';
+} from '../../../../plus/composer/utils/composer.utils.js';
+import { focusableBaseStyles } from '../../../shared/components/styles/lit/a11y.css.js';
+import { boxSizingBase, inlineCode, scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
+import { ruleStyles } from '../../shared/components/vscode.css.js';
+import { composerItemCommitStyles, composerItemContentStyles, composerItemStyles } from './composer.css.js';
+import '../../../shared/components/button.js';
+import '../../../shared/components/button-container.js';
+import '../../../shared/components/overlays/popover.js';
+import './commit-item.js';
 
 @customElement('gl-commits-panel')
 export class CommitsPanel extends LitElement {
@@ -299,8 +299,8 @@ export class CommitsPanel extends LitElement {
 			.auto-compose__instructions-input {
 				width: 100%;
 				padding: 0.5rem;
-				border: 1px solid var(--vscode-input-border);
-				border-radius: 3px;
+				border: 1px solid var(--vscode-input-border, transparent);
+				border-radius: var(--gl-input-border-radius);
 				background: var(--vscode-input-background);
 				color: var(--vscode-input-foreground);
 				font-family: inherit;
@@ -381,7 +381,10 @@ export class CommitsPanel extends LitElement {
 	repoName: string | null = null;
 
 	@property({ type: String })
-	customInstructions: string = '';
+	initialCustomInstructions: string = '';
+
+	@state()
+	private customInstructions: string = '';
 
 	@property({ type: Boolean })
 	hasUsedAutoCompose: boolean = false;
@@ -435,12 +438,64 @@ export class CommitsPanel extends LitElement {
 	private commitsSortable?: Sortable;
 	private isDraggingHunks = false;
 	private draggedHunkIds: string[] = [];
+	private hasScrolledToFirstNonLocked = false;
+
+	// Internal selection state for immediate visual feedback on click.
+	// These mirror the parent-provided selection properties but are updated
+	// locally before the parent processes the event, so the highlight renders
+	// without waiting for the details panel's expensive diff work.
+	@state() private _selectedCommitId: string | null = null;
+	@state() private _selectedCommitIds: Set<string> = new Set();
+	@state() private _selectedUnassignedSection: string | null = null;
+	@state() private _compositionSummarySelected: boolean = false;
+	private _pendingDispatch = 0;
+
+	// Cached per-commit stats to avoid recomputing on selection-only renders.
+	// getCommitChanges / getFileCountForCommit are O(hunks × hunkIndices) per
+	// commit — recomputing them for every commit on every render is expensive.
+	private _commitChanges = new Map<string, { additions: number; deletions: number }>();
+	private _commitFileCounts = new Map<string, number>();
+
+	override willUpdate(changedProperties: Map<PropertyKey, unknown>) {
+		// Sync internal selection state from parent properties.
+		// This handles external selection changes (auto-select on load, shift-click
+		// processed by parent, etc.) while letting local click updates take priority.
+		if (changedProperties.has('selectedCommitId')) {
+			this._selectedCommitId = this.selectedCommitId;
+		}
+		if (changedProperties.has('selectedCommitIds')) {
+			// Defensive copy: isolates internal state from in-place mutations
+			// on the parent's Set (e.g. clear()/add() without creating a new Set)
+			this._selectedCommitIds = new Set(this.selectedCommitIds);
+		}
+		if (changedProperties.has('selectedUnassignedSection')) {
+			this._selectedUnassignedSection = this.selectedUnassignedSection;
+		}
+		if (changedProperties.has('compositionSummarySelected')) {
+			this._compositionSummarySelected = this.compositionSummarySelected;
+		}
+		if (changedProperties.has('initialCustomInstructions')) {
+			this.customInstructions = this.initialCustomInstructions;
+		}
+
+		// Recompute per-commit stats only when the underlying data changes,
+		// not on every selection change.
+		if (changedProperties.has('commits') || changedProperties.has('hunks')) {
+			this._commitChanges.clear();
+			this._commitFileCounts.clear();
+			for (const commit of this.commits) {
+				this._commitChanges.set(commit.id, getCommitChanges(commit, this.hunks));
+				this._commitFileCounts.set(commit.id, getFileCountForCommit(commit, this.hunks));
+			}
+		}
+	}
 
 	override firstUpdated() {
 		this.initializeSortable();
 		this.initializeDropZones();
 		this.addEventListener('hunk-drag-start', this.handleHunkDragStart.bind(this));
 		this.addEventListener('hunk-drag-end', this.handleHunkDragEnd.bind(this));
+		this.scrollToFirstNonLockedCommit();
 	}
 
 	override updated(changedProperties: Map<string | number | symbol, unknown>) {
@@ -454,12 +509,56 @@ export class CommitsPanel extends LitElement {
 			// Reinitialize both commit sortable and drop zones
 			this.initializeSortable();
 			this.initializeCommitDropZones();
+
+			if (changedProperties.has('commits')) {
+				const previousCommits = changedProperties.get('commits') as ComposerCommit[] | undefined;
+				if (!previousCommits?.length && this.commits.length > 0) {
+					this.scrollToFirstNonLockedCommit();
+				}
+			}
 		}
 	}
 
 	override disconnectedCallback() {
 		super.disconnectedCallback?.();
 		this.commitsSortable?.destroy();
+	}
+
+	private scrollToFirstNonLockedCommit() {
+		if (this.hasScrolledToFirstNonLocked) return;
+
+		const hasLockedCommit = this.commits.some(c => c.locked === true);
+		if (!hasLockedCommit) return;
+
+		this.hasScrolledToFirstNonLocked = true;
+
+		const reversedCommits = this.commits.toReversed();
+		const firstNonLockedIndex = reversedCommits.findIndex(c => c.locked !== true);
+		if (firstNonLockedIndex === -1) return;
+
+		const firstNonLockedCommit = reversedCommits[firstNonLockedIndex];
+		requestAnimationFrame(() => {
+			const commitItem = this.shadowRoot?.querySelector(
+				`gl-commit-item[data-commit-id="${firstNonLockedCommit.id}"]`,
+			);
+			if (!commitItem) return;
+
+			const container = this.shadowRoot?.querySelector('.container.scrollable');
+			if (!container) {
+				commitItem.scrollIntoView({ block: 'center' });
+				return;
+			}
+
+			const itemRect = commitItem.getBoundingClientRect();
+			const containerRect = container.getBoundingClientRect();
+			const itemTop = itemRect.top - containerRect.top + container.scrollTop;
+			const targetPosition = itemTop - containerRect.height * 0.1;
+
+			container.scrollTo({
+				top: Math.max(0, targetPosition),
+				behavior: 'smooth',
+			});
+		});
 	}
 
 	private initializeSortable() {
@@ -483,6 +582,7 @@ export class CommitsPanel extends LitElement {
 				filter: (_evt, target) => {
 					const commitId = target.dataset.commitId;
 					if (!commitId) return false;
+
 					const commit = this.commits.find(c => c.id === commitId);
 					return commit?.locked === true;
 				},
@@ -554,7 +654,7 @@ export class CommitsPanel extends LitElement {
 		const commitItems = this.shadowRoot?.querySelectorAll('gl-commit-item');
 
 		commitItems?.forEach(commitItem => {
-			this.setupNativeDropZone(commitItem as HTMLElement, 'commit');
+			this.setupNativeDropZone(commitItem, 'commit');
 		});
 	}
 
@@ -760,7 +860,37 @@ export class CommitsPanel extends LitElement {
 		}
 
 		const multiSelect = e?.shiftKey ?? false;
-		this.dispatchEvent(
+
+		// Immediately update local visual selection for instant highlight.
+		// For shift-click in recompose mode, range selection depends on parent
+		// state (anchorCommitId) so we let the parent handle it.
+		if (!multiSelect) {
+			this._selectedCommitId = commitId;
+			this._selectedCommitIds = new Set();
+		} else if (!this.recompose?.enabled) {
+			// Toggle-style multi-select: replicate parent logic locally
+			const newSelection = new Set(this._selectedCommitIds);
+			if (this._selectedCommitId && newSelection.size === 0) {
+				newSelection.add(this._selectedCommitId);
+			}
+			if (newSelection.has(commitId)) {
+				newSelection.delete(commitId);
+			} else {
+				newSelection.add(commitId);
+			}
+
+			if (newSelection.size === 1) {
+				this._selectedCommitId = [...newSelection][0];
+				this._selectedCommitIds = new Set();
+			} else {
+				this._selectedCommitId = null;
+				this._selectedCommitIds = newSelection;
+			}
+		}
+		this._selectedUnassignedSection = null;
+		this._compositionSummarySelected = false;
+
+		this.dispatchAfterPaint(
 			new CustomEvent('commit-select', {
 				detail: { commitId: commitId, multiSelect: multiSelect },
 				bubbles: true,
@@ -771,7 +901,13 @@ export class CommitsPanel extends LitElement {
 	private dispatchUnassignedSelect(section: string, e?: MouseEvent | KeyboardEvent) {
 		if (e instanceof KeyboardEvent && e.key !== 'Enter') return;
 
-		this.dispatchEvent(
+		// Immediately update local visual selection
+		this._selectedCommitId = null;
+		this._selectedCommitIds = new Set();
+		this._selectedUnassignedSection = section;
+		this._compositionSummarySelected = false;
+
+		this.dispatchAfterPaint(
 			new CustomEvent('unassigned-select', {
 				detail: { section: section },
 				bubbles: true,
@@ -879,12 +1015,33 @@ export class CommitsPanel extends LitElement {
 	private handleCompositionSummaryClick(e: MouseEvent | KeyboardEvent) {
 		if (e instanceof KeyboardEvent && e.key !== 'Enter') return;
 
+		// Immediately update local visual selection
+		this._selectedCommitId = null;
+		this._selectedCommitIds = new Set();
+		this._selectedUnassignedSection = null;
+		this._compositionSummarySelected = true;
+
 		// Dispatch event to show composition summary
-		this.dispatchEvent(
+		this.dispatchAfterPaint(
 			new CustomEvent('select-composition-summary', {
 				bubbles: true,
 			}),
 		);
+	}
+
+	/**
+	 * Dispatches an event after the browser has painted the current frame.
+	 * Uses `setTimeout(0)` — per the spec the browser runs the rendering
+	 * step (style, layout, paint) between the current macrotask and the
+	 * next, so local DOM changes are painted before this callback fires.
+	 */
+	private dispatchAfterPaint(event: Event) {
+		const gen = ++this._pendingDispatch;
+		setTimeout(() => {
+			if (gen !== this._pendingDispatch || !this.isConnected) return;
+
+			this.dispatchEvent(event);
+		}, 0);
 	}
 
 	private handleCompositionFeedbackHelpful() {
@@ -938,14 +1095,6 @@ export class CommitsPanel extends LitElement {
 	private handleCustomInstructionsChange(e: Event) {
 		const input = e.target as HTMLInputElement;
 		this.customInstructions = input.value;
-
-		// Dispatch event to notify app component of custom instructions change
-		this.dispatchEvent(
-			new CustomEvent('custom-instructions-change', {
-				detail: { customInstructions: this.customInstructions },
-				bubbles: true,
-			}),
-		);
 	}
 
 	private getIncludeButtonText(sectionKey: string): string {
@@ -1000,7 +1149,7 @@ export class CommitsPanel extends LitElement {
 		return sections.map(
 			section => html`
 				<div
-					class="composer-item is-uncommitted${this.selectedUnassignedSection === section.key
+					class="composer-item is-uncommitted${this._selectedUnassignedSection === section.key
 						? ' is-selected'
 						: ''}"
 					tabindex="0"
@@ -1052,7 +1201,7 @@ export class CommitsPanel extends LitElement {
 			<div class="composition-summary">
 				<h3 class="composition-summary__header">Composition Summary</h3>
 				<div
-					class="composer-item is-summary${this.compositionSummarySelected ? ' is-selected' : ''}"
+					class="composer-item is-summary${this._compositionSummarySelected ? ' is-selected' : ''}"
 					tabindex="0"
 					@click=${this.handleCompositionSummaryClick}
 					@keydown=${this.handleCompositionSummaryClick}
@@ -1099,8 +1248,8 @@ export class CommitsPanel extends LitElement {
 	private renderAutoComposeContainer(disabled = false) {
 		const recomposeCount = this.hasLockedCommits
 			? this.commits.filter(c => !c.locked).length
-			: this.recompose?.enabled && this.selectedCommitIds.size > 1
-				? this.selectedCommitIds.size
+			: this.recompose?.enabled && this._selectedCommitIds.size > 1
+				? this._selectedCommitIds.size
 				: null;
 		return html`
 			<div class="auto-compose${this.hasUsedAutoCompose ? ' is-used' : ''}">
@@ -1251,7 +1400,7 @@ export class CommitsPanel extends LitElement {
 			<!-- Finish & Commit section -->
 			<div class="finish-commit">
 				${when(
-					this.selectedCommitIds.size > 1 && !this.isPreviewMode,
+					this._selectedCommitIds.size > 1 && !this.isPreviewMode,
 					() => html`
 						<h3 class="finish-commit__header">${this.finishHeaderText}</h3>
 						<p class="finish-commit__description">
@@ -1266,7 +1415,7 @@ export class CommitsPanel extends LitElement {
 								?disabled=${this.generating || this.committing}
 								@click=${this.dispatchCombineCommits}
 							>
-								Combine ${this.selectedCommitIds.size} Commits
+								Combine ${this._selectedCommitIds.size} Commits
 							</gl-button>
 						</button-container>
 
@@ -1383,20 +1532,21 @@ export class CommitsPanel extends LitElement {
 
 						<div class="commits-only">
 							${repeat(
-								this.commits.slice().reverse(), // Reverse order - bottom to top
+								this.commits.toReversed(), // Reverse order - bottom to top
 								commit => commit.id,
 								(commit, i) => {
-									const changes = getCommitChanges(commit, this.hunks);
+									const changes = this._commitChanges.get(commit.id);
 									return html`
 										<gl-commit-item
 											.commitId=${commit.id}
 											.message=${commit.message.content}
-											.fileCount=${getFileCountForCommit(commit, this.hunks)}
-											.additions=${changes.additions}
-											.deletions=${changes.deletions}
-											.selected=${this.selectedCommitIds.has(commit.id)}
-											.multiSelected=${this.selectedCommitIds.size > 1 &&
-											this.selectedCommitIds.has(commit.id)}
+											.fileCount=${this._commitFileCounts.get(commit.id) ?? 0}
+											.additions=${changes?.additions ?? 0}
+											.deletions=${changes?.deletions ?? 0}
+											.selected=${this._selectedCommitId === commit.id ||
+											this._selectedCommitIds.has(commit.id)}
+											.multiSelected=${this._selectedCommitIds.size > 1 &&
+											this._selectedCommitIds.has(commit.id)}
 											.isPreviewMode=${this.isPreviewMode}
 											.isRecomposeLocked=${this.isRecomposeLocked}
 											.locked=${commit.locked === true}

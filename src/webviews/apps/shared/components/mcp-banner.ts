@@ -1,8 +1,8 @@
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { urls } from '../../../../constants';
-import { createCommandLink } from '../../../../system/commands';
-import './banner/banner';
+import { urls } from '../../../../constants.js';
+import { createCommandLink } from '../../../../system/commands.js';
+import './banner/banner.js';
 
 export const mcpBannerTagName = 'gl-mcp-banner';
 
@@ -46,13 +46,26 @@ export class GlMcpBanner extends LitElement {
 	@property({ type: Boolean })
 	private canAutoRegister: boolean = false;
 
+	@property({ type: Boolean, attribute: 'can-install-claude-hook' })
+	canInstallClaudeHook: boolean = false;
+
+	@property({ type: Boolean, attribute: 'show-cleanup-notice' })
+	showCleanupNotice: boolean = false;
+
 	override render(): unknown {
 		if (this.collapsed) {
 			return nothing;
 		}
 
+		const installClaudeHookHref = this.canInstallClaudeHook
+			? createCommandLink('gitlens.agents.installClaudeHook')
+			: undefined;
+
 		if (this.canAutoRegister) {
-			const bodyHtml = `GitKraken MCP is active in your AI chat, leveraging Git and your integrations to provide context and perform actions. <a href="${urls.helpCenterMCP}">Learn more</a>`;
+			const cleanupNote = this.showCleanupNotice
+				? ` &mdash; <strong>Note:</strong> You may have a duplicate entry in your Cursor <code>mcp.json</code>. Remove <code>mcpServers.GitKraken</code> to clean it up.`
+				: '';
+			const bodyHtml = `GitKraken MCP is active in your AI chat, leveraging Git and your integrations to provide context and perform actions. <a href="${urls.helpCenterMCP}">Learn more</a>${cleanupNote}`;
 
 			return html`
 				<gl-banner
@@ -61,10 +74,15 @@ export class GlMcpBanner extends LitElement {
 					layout="${this.layout}"
 					banner-title="GitKraken MCP Bundled with GitLens"
 					body="${bodyHtml}"
+					primary-button="Connect More Agents"
+					primary-button-href="${createCommandLink('gitlens.ai.mcp.selectAgents', {
+						source: this.source,
+					})}"
+					secondary-button=${installClaudeHookHref ? 'Install Claude Hooks' : nothing}
+					secondary-button-href=${installClaudeHookHref ?? nothing}
 					dismissible
-					dismiss-href="${createCommandLink('gitlens.storage.store', {
-						key: 'mcp:banner:dismissed',
-						value: true,
+					dismiss-href="${createCommandLink('gitlens.onboarding.dismiss', {
+						id: 'mcp:banner',
 					})}"
 				></gl-banner>
 			`;
@@ -81,10 +99,11 @@ export class GlMcpBanner extends LitElement {
 				body="${bodyHtml}"
 				primary-button="Install GitKraken MCP"
 				primary-button-href="${createCommandLink('gitlens.ai.mcp.install', { source: this.source })}"
+				secondary-button=${installClaudeHookHref ? 'Install Claude Hooks' : nothing}
+				secondary-button-href=${installClaudeHookHref ?? nothing}
 				dismissible
-				dismiss-href="${createCommandLink('gitlens.storage.store', {
-					key: 'mcp:banner:dismissed',
-					value: true,
+				dismiss-href="${createCommandLink('gitlens.onboarding.dismiss', {
+					id: 'mcp:banner',
 				})}"
 			></gl-banner>
 		`;

@@ -1,5 +1,5 @@
 import { css } from 'lit';
-import { elementBase } from '../styles/lit/base.css';
+import { elementBase } from '../styles/lit/base.css.js';
 
 export const treeStyles = [
 	elementBase,
@@ -41,23 +41,90 @@ export const treeItemStyles = [
 			display: none;
 		}
 
+		/* Rich mode: host a multi-line / card component (e.g. gl-commit-row) in the default slot.
+		   Relaxes the single-line tree-row constraints so the consumer's content drives row height. */
+		:host([rich]) {
+			height: auto;
+			min-height: var(--gl-tree-item-min-height, 2.2rem);
+			line-height: normal;
+			padding-top: var(--gl-tree-item-padding-y, 0.4rem);
+			padding-bottom: var(--gl-tree-item-padding-y, 0.4rem);
+		}
+
+		:host([rich]) .item {
+			align-items: stretch;
+		}
+
+		:host([rich]) .text {
+			line-height: normal;
+			white-space: normal;
+			text-overflow: clip;
+		}
+
+		:host([rich]) .main,
+		:host([rich]) .description {
+			display: block;
+		}
+
 		:host(:hover) {
 			color: var(--vscode-list-hoverForeground);
 			background-color: var(--vscode-list-hoverBackground);
+			/* Raise above sibling items so action tooltips aren't painted behind the next row */
+			z-index: 1;
 		}
 
+		/* Disabled state — propagated from disable-check so AI-excluded files (or any other
+		   row that shouldn't be acted on) read as visually inactive AND inert (clicking the
+		   row will not open the file or trigger any action — same UX as a disabled menu item).
+		   The checkbox visual is already dimmed via .checkbox:has(:disabled) and the underlying
+		   <input> is :disabled, so it cannot be activated regardless. */
+		:host([disable-check]) .item,
+		:host([disable-check]) slot[name='decorations-before'],
+		:host([disable-check]) slot[name='decorations-after'],
+		:host([disable-check]) .actions {
+			opacity: 0.7;
+			color: var(--vscode-disabledForeground, inherit);
+		}
+
+		:host([disable-check]) .item {
+			cursor: default;
+			pointer-events: none;
+		}
+
+		:host([disable-check]) .actions {
+			pointer-events: none;
+		}
+
+		:host([disable-check]:hover) {
+			background-color: transparent;
+		}
+
+		/* A selected row defaults to the inactive selection colors. When the tree has focus, EVERY
+		   selected row brightens to the active colors (not just the cursor row) — matching VS Code
+		   multi-select. The signal is the --gl-tree-focus-within var (0/1), set by gl-tree-view's
+		   :host(:focus-within) and inherited across the shadow boundary: clicking a row focuses its
+		   inner button, so the container's own focus event never fires and focusin doesn't cross the
+		   nested shadow roots — a CSS-only signal is the reliable one. */
 		:host([aria-selected='true']) {
+			--gl-tree-selection-bg: color-mix(
+				in srgb,
+				var(--vscode-list-activeSelectionBackground) calc(var(--gl-tree-focus-within, 0) * 100%),
+				var(--vscode-list-inactiveSelectionBackground)
+			);
 			color: var(--vscode-list-inactiveSelectionForeground);
-			background-color: var(--vscode-list-inactiveSelectionBackground);
+			background-color: var(--gl-tree-selection-bg);
 		}
 
 		/* Focused state - when the item is the active descendant in the tree */
 		:host([focused]) {
 			outline: 1px solid var(--vscode-list-focusOutline);
 			outline-offset: -0.1rem;
+			z-index: 1;
 		}
 
-		:host([aria-selected='true'][focused]) {
+		/* The cursor row (and any row with real DOM focus within it) always uses the active colors. */
+		:host([aria-selected='true'][focused]),
+		:host([aria-selected='true']:focus-within) {
 			color: var(--vscode-list-activeSelectionForeground);
 			background-color: var(--vscode-list-activeSelectionBackground);
 		}
@@ -73,6 +140,7 @@ export const treeItemStyles = [
 		:host(:focus-within) {
 			outline: 1px solid var(--vscode-list-focusOutline);
 			outline-offset: -0.1rem;
+			z-index: 1;
 		}
 
 		:host([aria-selected='true']:focus-within) {
@@ -87,7 +155,8 @@ export const treeItemStyles = [
 			justify-content: flex-start;
 			align-items: center;
 			gap: 0.6rem;
-			width: 100%;
+			flex: 1;
+			min-width: 0;
 			padding: 0;
 			font-family: inherit;
 			font-size: inherit;
@@ -97,22 +166,24 @@ export const treeItemStyles = [
 			border: none;
 			outline: none;
 			cursor: pointer;
-			min-width: 0;
 		}
 		.icon {
-			display: inline-block;
-			width: 1.6rem;
-			text-align: center;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			width: var(--gl-icon-size, 1.6rem);
 			height: 2.2rem;
-			line-height: 2.2rem;
 			pointer-events: none;
-			vertical-align: text-bottom;
+			flex: none;
 		}
 
 		slot[name='icon']::slotted(*) {
-			width: 1.6rem;
-			aspect-ratio: 1;
-			vertical-align: text-bottom;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			width: var(--gl-icon-size, 1.6rem);
+			height: 1.6rem;
+			vertical-align: middle;
 		}
 
 		.node {
@@ -194,6 +265,7 @@ export const treeItemStyles = [
 			flex: none;
 			user-select: none;
 			color: var(--vscode-icon-foreground);
+			margin-left: 0.4rem;
 		}
 
 		:host(:focus-within) .actions,
@@ -209,6 +281,14 @@ export const treeItemStyles = [
 			display: none;
 		}
 
+		/* Tooltip wrapper around the checkbox has display: block + line-height from the host,
+		   which adds inline leading and pushes the checkbox 1px above the row. Center-fit it. */
+		gl-tooltip:has(> .checkbox) {
+			display: inline-flex;
+			align-items: center;
+			line-height: 0;
+		}
+
 		.checkbox {
 			position: relative;
 			display: inline-flex;
@@ -222,10 +302,11 @@ export const treeItemStyles = [
 			margin-right: 0.6rem;
 		}
 
-		.checkbox:has(:checked) {
-			color: var(--vscode-inputOption-activeForeground);
-			border-color: var(--vscode-inputOption-activeBorder);
-			background-color: var(--vscode-inputOption-activeBackground);
+		.checkbox:has(:checked),
+		.checkbox:has(:indeterminate) {
+			color: var(--vscode-checkbox-foreground);
+			border-color: var(--vscode-checkbox-selectBorder);
+			background-color: var(--vscode-checkbox-selectBackground);
 		}
 
 		.checkbox:has(:disabled) {
@@ -248,9 +329,16 @@ export const treeItemStyles = [
 			cursor: default;
 		}
 
-		.checkbox__check {
+		.checkbox__check,
+		.checkbox__dash {
+			position: absolute;
+			top: 0;
+			left: 0;
 			width: 1.6rem;
 			aspect-ratio: 1 / 1;
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
 			opacity: 0;
 			transition: opacity 0.1s linear;
 			color: var(--vscode-checkbox-foreground);
@@ -261,9 +349,90 @@ export const treeItemStyles = [
 			opacity: 1;
 		}
 
-		slot[name='decorations'] {
-			display: inline-block;
+		.checkbox__input:indeterminate ~ .checkbox__dash {
+			opacity: 1;
+		}
+
+		slot[name='decorations-before'],
+		slot[name='decorations-after'] {
+			display: inline-flex;
+			align-items: center;
+			gap: 0.4rem;
+			flex: none;
+			white-space: nowrap;
 			margin-left: 0.4rem;
+			--gl-pill-border: color-mix(in srgb, transparent 80%, var(--color-foreground));
+		}
+
+		::slotted([slot='decorations-before'].decoration-text) {
+			font-size: var(--gl-decoration-before-font-size, inherit);
+			opacity: var(--gl-decoration-before-opacity, 1);
+		}
+
+		::slotted([slot='decorations-after'].decoration-text) {
+			font-size: var(--gl-decoration-after-font-size, inherit);
+			opacity: var(--gl-decoration-after-opacity, 1);
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--added),
+		::slotted([slot^='decorations-'].conflict-count--added) {
+			color: var(--vscode-gitDecoration-addedResourceForeground);
+		}
+		::slotted([slot^='decorations-'].conflict-count--added) {
+			border-color: color-mix(in srgb, transparent 60%, var(--vscode-gitDecoration-addedResourceForeground));
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--deleted),
+		::slotted([slot^='decorations-'].conflict-count--deleted) {
+			color: var(--vscode-gitDecoration-deletedResourceForeground);
+		}
+		::slotted([slot^='decorations-'].conflict-count--deleted) {
+			border-color: color-mix(in srgb, transparent 60%, var(--vscode-gitDecoration-deletedResourceForeground));
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--modified),
+		::slotted([slot^='decorations-'].conflict-count--modified) {
+			color: var(--vscode-gitDecoration-modifiedResourceForeground);
+		}
+		::slotted([slot^='decorations-'].conflict-count--modified) {
+			border-color: color-mix(in srgb, transparent 60%, var(--vscode-gitDecoration-modifiedResourceForeground));
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--untracked) {
+			color: var(--vscode-gitDecoration-untrackedResourceForeground);
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--renamed) {
+			color: var(--vscode-gitDecoration-renamedResourceForeground);
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--conflict),
+		::slotted([slot^='decorations-'].conflict-count--conflict) {
+			color: var(--vscode-gitDecoration-conflictingResourceForeground);
+		}
+		::slotted([slot^='decorations-'].conflict-count--conflict) {
+			border-color: color-mix(
+				in srgb,
+				transparent 60%,
+				var(--vscode-gitDecoration-conflictingResourceForeground)
+			);
+		}
+
+		::slotted([slot^='decorations-'].decoration-text--muted) {
+			color: var(--vscode-descriptionForeground);
+		}
+
+		/* Agent phase decoration text — own palette (NOT SCM tokens, which semantically belong to
+		   file change states). Matches the tree-icon-agent--* colors so a leaf's icon and its
+		   phase text decoration agree. */
+		::slotted([slot^='decorations-'].decoration-text--agent-working) {
+			color: var(--gl-agent-working-color);
+		}
+		::slotted([slot^='decorations-'].decoration-text--agent-waiting) {
+			color: var(--gl-agent-waiting-color);
+		}
+		::slotted([slot^='decorations-'].decoration-text--agent-idle) {
+			color: var(--gl-agent-idle-color);
 		}
 
 		/* High Contrast Mode Support */
@@ -291,7 +460,8 @@ export const treeItemStyles = [
 				border: 1px solid CanvasText;
 			}
 
-			.checkbox:has(:checked) {
+			.checkbox:has(:checked),
+			.checkbox:has(:indeterminate) {
 				background-color: Highlight;
 				border-color: CanvasText;
 			}
@@ -299,6 +469,10 @@ export const treeItemStyles = [
 			.node--connector::before {
 				border-color: CanvasText;
 				opacity: 1;
+			}
+
+			slot[name='decorations-after'] span {
+				color: CanvasText !important;
 			}
 		}
 	`,

@@ -1,11 +1,12 @@
 import type { Tab } from 'vscode';
 import { version as codeVersion, ConfigurationTarget, Uri, ViewColumn, window, workspace } from 'vscode';
-import type { Container } from '../../../container';
-import { executeCoreCommand } from '../../../system/-webview/command';
-import { configuration } from '../../../system/-webview/configuration';
-import { getTabUri } from '../../../system/-webview/vscode/tabs';
-import { areUrisEqual } from '../../../system/uri';
-import { compare } from '../../../system/version';
+import { areUrisEqual } from '@gitlens/utils/uri.js';
+import { compare } from '@gitlens/utils/version.js';
+import type { Container } from '../../../container.js';
+import { executeCoreCommand } from '../../../system/-webview/command.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import { getTabUri } from '../../../system/-webview/vscode/tabs.js';
+import { exists } from '../../../system/-webview/vscode/uris.js';
 
 export function getOpenRebaseEditorTab(todoUri: Uri): Tab | undefined {
 	for (const group of window.tabGroups.all) {
@@ -67,6 +68,9 @@ export function isRebaseTodoEditorEnabled(): boolean {
 }
 
 export interface OpenRebaseEditorOptions {
+	/** When `true`, opens the editor as an inactive tab (doesn't become the visible/active tab in its group) */
+	background?: boolean;
+	preserveFocus?: boolean;
 	viewColumn?: ViewColumn;
 }
 
@@ -83,15 +87,34 @@ export async function openRebaseEditor(
 	if (gitDir == null) return;
 
 	const rebaseTodoUri = Uri.joinPath(gitDir.uri, 'rebase-merge', 'git-rebase-todo');
-	if (getOpenRebaseEditorTab(rebaseTodoUri) != null) return;
+	const existingTab = getOpenRebaseEditorTab(rebaseTodoUri);
+	if (existingTab != null) {
+		// Leave the existing tab as-is when a background open was requested — don't activate it
+		if (options?.background) return;
+
+		// Focus the existing rebase editor tab
+		await executeCoreCommand('vscode.openWith', rebaseTodoUri, 'gitlens.rebase', {
+			preview: false,
+			preserveFocus: options?.preserveFocus,
+			viewColumn: existingTab.group.viewColumn,
+		});
+		return;
+	}
+
+	// Ensure the file exists before attempting to open it (avoids race condition during rebase setup)
+	if (!(await exists(rebaseTodoUri))) return;
 
 	// Only try to open beside if there is an active tab
 	if (options?.viewColumn === ViewColumn.Beside && window.tabGroups.activeTabGroup.activeTab == null) {
 		options.viewColumn = ViewColumn.Active;
 	}
 
+	// `background: true` is honored at runtime by VS Code's `vscode.openWith` command (microsoft/vscode#96964),
+	// even though it isn't in the public `TextDocumentShowOptions` type
 	await executeCoreCommand('vscode.openWith', rebaseTodoUri, 'gitlens.rebase', {
+		background: options?.background,
 		preview: false,
+		preserveFocus: options?.preserveFocus,
 		viewColumn: options?.viewColumn,
 	});
 }

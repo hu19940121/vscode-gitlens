@@ -1,19 +1,19 @@
 import type { TextEditor, Uri } from 'vscode';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { RemoteResourceType } from '../git/models/remoteResource';
-import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '../git/utils/branch.utils';
-import { showGenericErrorMessage } from '../messages';
-import { CommandQuickPickItem } from '../quickpicks/items/common';
-import { showReferencePicker2 } from '../quickpicks/referencePicker';
-import { getBestRepositoryOrShowPicker } from '../quickpicks/repositoryPicker';
-import { command, executeCommand } from '../system/-webview/command';
-import { Logger } from '../system/logger';
-import { ActiveEditorCommand } from './commandBase';
-import { getCommandUri } from './commandBase.utils';
-import type { CommandContext } from './commandContext';
-import { isCommandContextViewNodeHasBranch } from './commandContext.utils';
-import type { OpenOnRemoteCommandArgs } from './openOnRemote';
+import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
+import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/git/utils/branch.utils.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { CommandQuickPickItem } from '../quickpicks/items/common.js';
+import { showReferencePicker2 } from '../quickpicks/referencePicker.js';
+import { getBestRepositoryOrShowPicker } from '../quickpicks/repositoryPicker.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
+import { isCommandContextViewNodeHasBranch } from './commandContext.utils.js';
+import type { OpenOnRemoteCommandArgs } from './openOnRemote.js';
 
 export interface OpenBranchOnRemoteCommandArgs {
 	branch?: string;
@@ -32,7 +32,7 @@ export class OpenBranchOnRemoteCommand extends ActiveEditorCommand {
 			args = {
 				...args,
 				branch: context.node.branch.name,
-				remote: context.node.branch.getRemoteName(),
+				remote: context.node.branch.remoteName,
 			};
 		}
 

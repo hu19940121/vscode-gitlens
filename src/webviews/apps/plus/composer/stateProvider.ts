@@ -1,5 +1,6 @@
 import { ContextProvider } from '@lit/context';
-import type { State } from '../../../plus/composer/protocol';
+import type { IpcMessage } from '../../../ipc/models/ipc.js';
+import type { State } from '../../../plus/composer/protocol.js';
 import {
 	DidCancelGenerateCommitMessageNotification,
 	DidCancelGenerateCommitsNotification,
@@ -12,17 +13,17 @@ import {
 	DidGenerateCommitsNotification,
 	DidIndexChangeNotification,
 	DidLoadingErrorNotification,
+	DidProgressGeneratingCommitsNotification,
 	DidReloadComposerNotification,
 	DidSafetyErrorNotification,
 	DidStartCommittingNotification,
 	DidStartGeneratingCommitMessageNotification,
 	DidStartGeneratingNotification,
 	DidWorkingDirectoryChangeNotification,
-} from '../../../plus/composer/protocol';
-import type { IpcMessage } from '../../../protocol';
-import type { ReactiveElementHost } from '../../shared/appHost';
-import { StateProviderBase } from '../../shared/stateProviderBase';
-import { stateContext } from './context';
+} from '../../../plus/composer/protocol.js';
+import type { ReactiveElementHost } from '../../shared/appHost.js';
+import { StateProviderBase } from '../../shared/stateProviderBase.js';
+import { stateContext } from './context.js';
 
 export class ComposerStateProvider extends StateProviderBase<State['webviewId'], State, typeof stateContext> {
 	protected override createContextProvider(state: State): ContextProvider<typeof stateContext, ReactiveElementHost> {
@@ -35,6 +36,18 @@ export class ComposerStateProvider extends StateProviderBase<State['webviewId'],
 				const updatedState = {
 					...this._state,
 					generatingCommits: true,
+					generatingCommitsStatus: null,
+					timestamp: Date.now(),
+				};
+
+				(this as any)._state = updatedState;
+				this.provider.setValue(this._state, true);
+				break;
+			}
+			case DidProgressGeneratingCommitsNotification.is(msg): {
+				const updatedState = {
+					...this._state,
+					generatingCommitsStatus: msg.params.message,
 					timestamp: Date.now(),
 				};
 
@@ -84,6 +97,7 @@ export class ComposerStateProvider extends StateProviderBase<State['webviewId'],
 				const updatedState = {
 					...this._state,
 					generatingCommits: false,
+					generatingCommitsStatus: null,
 					commits: newCommits,
 					hunks: (msg.params.hunks ?? this._state.hunks).map(hunk => ({
 						...hunk,
@@ -165,6 +179,7 @@ export class ComposerStateProvider extends StateProviderBase<State['webviewId'],
 					safetyError: null, // Clear any existing safety errors
 					// Clear any ongoing operations
 					generatingCommits: false,
+					generatingCommitsStatus: null,
 					generatingCommitMessage: null,
 					committing: false,
 					// Reset working directory change flag on reload
@@ -227,6 +242,7 @@ export class ComposerStateProvider extends StateProviderBase<State['webviewId'],
 					},
 					// Clear any loading states since the operation failed
 					generatingCommits: false,
+					generatingCommitsStatus: null,
 					generatingCommitMessage: null,
 					timestamp: Date.now(),
 				};
@@ -251,6 +267,7 @@ export class ComposerStateProvider extends StateProviderBase<State['webviewId'],
 				const updatedState = {
 					...this._state,
 					generatingCommits: false,
+					generatingCommitsStatus: null,
 					timestamp: Date.now(),
 				};
 

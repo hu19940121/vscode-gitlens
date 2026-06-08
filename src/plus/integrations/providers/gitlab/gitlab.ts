@@ -1,36 +1,35 @@
-import type { HttpsProxyAgent } from 'https-proxy-agent';
 import type { CancellationToken, Disposable } from 'vscode';
 import { Uri, window } from 'vscode';
-import type { RequestInit, Response } from '@env/fetch';
-import { fetch, getProxyAgent, wrapForForcedInsecureSSL } from '@env/fetch';
-import { isWeb } from '@env/platform';
-import type { Container } from '../../../../container';
+import { fetch, wrapForForcedInsecureSSL } from '@env/fetch.js';
+import type { Account } from '@gitlens/git/models/author.js';
+import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
+import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.js';
+import { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { Provider } from '@gitlens/git/models/remoteProvider.js';
+import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
+import { equalsIgnoreCase } from '@gitlens/utils/string.js';
+import type { Container } from '../../../../container.js';
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
-	CancellationError,
 	ProviderFetchError,
 	RequestClientError,
 	RequestNotFoundError,
 	RequestRateLimitError,
-} from '../../../../errors';
-import type { Account } from '../../../../git/models/author';
-import type { DefaultBranch } from '../../../../git/models/defaultBranch';
-import type { IssueOrPullRequest } from '../../../../git/models/issueOrPullRequest';
-import { PullRequest } from '../../../../git/models/pullRequest';
-import type { Provider } from '../../../../git/models/remoteProvider';
-import type { RepositoryMetadata } from '../../../../git/models/repositoryMetadata';
+} from '../../../../errors.js';
 import {
 	showIntegrationRequestFailed500WarningMessage,
 	showIntegrationRequestTimedOutWarningMessage,
-} from '../../../../messages';
-import { configuration } from '../../../../system/-webview/configuration';
-import { debug } from '../../../../system/decorators/log';
-import { Logger } from '../../../../system/logger';
-import type { LogScope } from '../../../../system/logger.scope';
-import { getLogScope, setLogScopeExit } from '../../../../system/logger.scope';
-import { maybeStopWatch } from '../../../../system/stopwatch';
-import { equalsIgnoreCase } from '../../../../system/string';
+} from '../../../../messages.js';
+import { configuration } from '../../../../system/-webview/configuration.js';
+import type { TokenWithInfo } from '../../authentication/models.js';
+import { selectGitLabUserForCommit } from './gitlab.utils.js';
 import type {
 	GitLabCommit,
 	GitLabIssue,
@@ -40,8 +39,8 @@ import type {
 	GitLabMergeRequestState,
 	GitLabProjectREST,
 	GitLabUser,
-} from './models';
-import { fromGitLabMergeRequest, fromGitLabMergeRequestREST, fromGitLabMergeRequestState } from './models';
+} from './models.js';
+import { fromGitLabMergeRequest, fromGitLabMergeRequestREST, fromGitLabMergeRequestState } from './models.js';
 
 // drop it as soon as we switch to @gitkraken/providers-api
 const gitlabUserIdPrefix = 'gid://gitlab/User/';
@@ -61,7 +60,7 @@ export class GitLabApi implements Disposable {
 		this._disposable = configuration.onDidChangeAny(e => {
 			if (
 				configuration.changedCore(e, ['http.proxy', 'http.proxyStrictSSL']) ||
-				configuration.changed(e, ['proxy', 'remotes'])
+				configuration.changed(e, 'remotes')
 			) {
 				this.resetCaches();
 			}
@@ -74,27 +73,20 @@ export class GitLabApi implements Disposable {
 
 	private resetCaches(): void {
 		this._projectIds.clear();
-		this._proxyAgents.clear();
 	}
 
-	private _proxyAgents = new Map<string, HttpsProxyAgent | null | undefined>();
-	private getProxyAgent(provider: Provider): HttpsProxyAgent | undefined {
-		if (isWeb) return undefined;
-
-		let proxyAgent = this._proxyAgents.get(provider.id);
-		if (proxyAgent === undefined) {
-			const ignoreSSLErrors = provider.getIgnoreSSLErrors();
-			proxyAgent = getProxyAgent(ignoreSSLErrors === true || ignoreSSLErrors === 'force' ? false : undefined);
-			this._proxyAgents.set(provider.id, proxyAgent ?? null);
-		}
-
-		return proxyAgent ?? undefined;
-	}
-
-	@debug<GitLabApi['getAccountForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+		}),
+	})
 	async getAccountForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -104,7 +96,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<Account | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const projectId = await this.getProjectId(provider, token, owner, repo, options?.baseUrl, cancellation);
 		if (!projectId) return undefined;
@@ -123,18 +115,16 @@ export class GitLabApi implements Disposable {
 				scope,
 			);
 
-			let user: GitLabUser | undefined;
+			let users = await this.findUser(provider, token, commit.author_name, options, cancellation);
+			let user = selectGitLabUserForCommit(users, commit.author_name, commit.author_email);
 
-			const users = await this.findUser(provider, token, commit.author_name, options);
-			for (const u of users) {
-				if (u.name === commit.author_name || (u.publicEmail && u.publicEmail === commit.author_email)) {
-					user = u;
-					if (u.state === 'active') break;
-				} else if (
-					equalsIgnoreCase(u.name, commit.author_name) ||
-					(u.publicEmail && equalsIgnoreCase(u.publicEmail, commit.author_email))
-				) {
-					user = u;
+			// If the name search was ambiguous (multiple users share the name), try an email-scoped search to
+			// disambiguate before giving up — otherwise we'd show a stranger's avatar (see #2205)
+			if (user == null && commit.author_email) {
+				const exactNameMatches = users.filter(u => equalsIgnoreCase(u.name, commit.author_name)).length;
+				if (exactNameMatches > 1) {
+					users = await this.findUser(provider, token, commit.author_email, options, cancellation);
+					user = selectGitLabUserForCommit(users, commit.author_name, commit.author_email);
 				}
 			}
 
@@ -160,10 +150,16 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getAccountForEmail']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, _owner, _repo, email) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			email: email,
+		}),
+	})
 	async getAccountForEmail(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		_owner: string,
 		_repo: string,
 		email: string,
@@ -172,7 +168,7 @@ export class GitLabApi implements Disposable {
 			avatarSize?: number;
 		},
 	): Promise<Account | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const [user] = await this.findUser(provider, token, email, options);
@@ -193,10 +189,17 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getDefaultBranch']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+		}),
+	})
 	async getDefaultBranch(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		options?: {
@@ -204,7 +207,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<DefaultBranch | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		interface QueryResult {
 			data: {
@@ -253,10 +256,18 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getIssueOrPullRequest']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, number) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			number: number,
+		}),
+	})
 	async getIssueOrPullRequest(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		number: number,
@@ -265,7 +276,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<IssueOrPullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		interface QueryResult {
 			data: {
@@ -373,10 +384,18 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getPullRequestForBranch']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, branch) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			branch: branch,
+		}),
+	})
 	async getPullRequestForBranch(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		branch: string,
@@ -387,7 +406,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		interface QueryResult {
 			data: {
@@ -508,6 +527,7 @@ export class GitLabApi implements Disposable {
 					avatarUrl: pr.author?.avatarUrl ?? '',
 					url: pr.author?.webUrl ?? '',
 				},
+				// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-conversion
 				String(pr.iid),
 				undefined,
 				pr.title,
@@ -527,10 +547,18 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getPullRequestForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+		}),
+	})
 	async getPullRequestForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -540,7 +568,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const projectId = await this.getProjectId(provider, token, owner, repo, options?.baseUrl, cancellation);
 		if (!projectId) return undefined;
@@ -576,10 +604,18 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getPullRequest']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, id) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+		}),
+	})
 	async getPullRequest(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		id: number,
@@ -588,7 +624,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		interface QueryResult {
 			data: {
@@ -664,10 +700,17 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['getRepositoryMetadata']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+		}),
+	})
 	async getRepositoryMetadata(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		options?: {
@@ -675,7 +718,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<RepositoryMetadata | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const projectId = await this.getProjectId(provider, token, owner, repo, options?.baseUrl, cancellation);
 		if (!projectId) return undefined;
@@ -715,18 +758,19 @@ export class GitLabApi implements Disposable {
 		}
 	}
 
-	@debug<GitLabApi['searchPullRequests']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
 	async searchPullRequests(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		options?: { search?: string; user?: string; repos?: string[]; baseUrl?: string; avatarSize?: number },
 		cancellation?: CancellationToken,
 	): Promise<PullRequest[]> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const search = options?.search;
 		if (!search) {
 			return [];
 		}
+
 		try {
 			const perPageLimit = 20; // with bigger amount we exceed the max GraphQL complexity in the next query
 			const restPRs = await this.request<GitLabMergeRequestREST[]>(
@@ -827,7 +871,7 @@ export class GitLabApi implements Disposable {
 
 	private async findUser(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		search: string,
 		options?: {
 			baseUrl?: string;
@@ -835,7 +879,7 @@ export class GitLabApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<GitLabUser[]> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		interface QueryResult {
 			data: {
@@ -912,13 +956,14 @@ $search: String!
 
 	getProjectId(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		group: string,
 		repo: string,
 		baseUrl: string | undefined,
 		cancellation: CancellationToken | undefined,
 	): Promise<string | undefined> {
-		const key = `${token}|${group}/${repo}`;
+		const { accessToken } = token;
+		const key = `${accessToken}|${group}/${repo}`;
 
 		let projectId = this._projectIds.get(key);
 		if (projectId == null) {
@@ -931,13 +976,13 @@ $search: String!
 
 	private async getProjectIdCore(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		group: string,
 		repo: string,
 		baseUrl: string | undefined,
 		cancellation: CancellationToken | undefined,
 	): Promise<string | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		interface QueryResult {
 			data: { project: { id: string } };
@@ -971,7 +1016,7 @@ $search: String!
 
 			const projectId = match[1];
 
-			setLogScopeExit(scope, ` \u2022 projectId=${projectId}`);
+			scope?.addExitInfo(`projectId=${projectId}`);
 			return projectId;
 		} catch (ex) {
 			if (ex instanceof RequestNotFoundError) return undefined;
@@ -983,17 +1028,17 @@ $search: String!
 
 	private async graphql<T extends object>(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		baseUrl: string | undefined,
 		query: string,
 		variables: Record<string, any>,
 		cancellation: CancellationToken | undefined,
-		scope: LogScope | undefined,
+		scope: ScopedLogger | undefined,
 	): Promise<T | undefined> {
+		const { accessToken } = token;
 		let rsp: Response;
 		try {
-			const sw = maybeStopWatch(`[GITLAB] POST ${baseUrl}`, { log: false });
-			const agent = this.getProxyAgent(provider);
+			const sw = maybeStopWatch(`[GITLAB] POST ${baseUrl}`, { log: { onlyExit: true } });
 
 			try {
 				let aborter: AbortController | undefined;
@@ -1007,15 +1052,14 @@ $search: String!
 				rsp = await wrapForForcedInsecureSSL(provider.getIgnoreSSLErrors(), () =>
 					fetch(`${baseUrl ?? 'https://gitlab.com/api'}/graphql`, {
 						method: 'POST',
-						headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-						agent: agent,
+						headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
 						signal: aborter?.signal,
 						body: JSON.stringify({ query: query, variables: variables }),
 					}),
 				);
 
 				if (rsp.ok) {
-					const data: T | { errors: { message: string }[] } = await rsp.json();
+					const data = (await rsp.json()) as T | { errors: { message: string }[] };
 
 					if ('errors' in data) throw new ProviderFetchError('GitLab', rsp, data.errors);
 					return data;
@@ -1041,19 +1085,19 @@ $search: String!
 
 	private async request<T>(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		baseUrl: string | undefined,
 		route: string,
 		options: { method: RequestInit['method'] } & Record<string, unknown>,
 		cancellation: CancellationToken | undefined,
-		scope: LogScope | undefined,
+		scope: ScopedLogger | undefined,
 	): Promise<T> {
+		const { accessToken } = token;
 		const url = `${baseUrl ?? 'https://gitlab.com/api'}/${route}`;
 
 		let rsp: Response;
 		try {
-			const sw = maybeStopWatch(`[GITLAB] ${options?.method ?? 'GET'} ${url}`, { log: false });
-			const agent = this.getProxyAgent(provider);
+			const sw = maybeStopWatch(`[GITLAB] ${options?.method ?? 'GET'} ${url}`, { log: { onlyExit: true } });
 
 			try {
 				let aborter: AbortController | undefined;
@@ -1066,16 +1110,14 @@ $search: String!
 
 				rsp = await wrapForForcedInsecureSSL(provider.getIgnoreSSLErrors(), () =>
 					fetch(url, {
-						headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-						agent: agent,
+						headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
 						signal: aborter?.signal,
 						...options,
 					}),
 				);
 
 				if (rsp.ok) {
-					const data: T = await rsp.json();
-					return data;
+					return (await rsp.json()) as T;
 				}
 
 				throw new ProviderFetchError('GitLab', rsp);
@@ -1095,12 +1137,13 @@ $search: String!
 
 	private handleRequestError(
 		provider: Provider | undefined,
-		token: string,
+		token: TokenWithInfo,
 		ex: ProviderFetchError | (Error & { name: 'AbortError' }),
-		scope: LogScope | undefined,
+		scope: ScopedLogger | undefined,
 	): void {
 		if (ex.name === 'AbortError' || !(ex instanceof ProviderFetchError)) throw new CancellationError(ex);
 
+		const { accessToken, ...tokenInfo } = token;
 		switch (ex.status) {
 			case 404: // Not found
 			case 410: // Gone
@@ -1108,7 +1151,7 @@ $search: String!
 				throw new RequestNotFoundError(ex);
 			// case 429: //Too Many Requests
 			case 401: // Unauthorized
-				throw new AuthenticationError('gitlab', AuthenticationErrorReason.Unauthorized, ex);
+				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, ex);
 			case 403: // Forbidden
 				if (ex.message.includes('rate limit exceeded')) {
 					let resetAt: number | undefined;
@@ -1121,11 +1164,11 @@ $search: String!
 						}
 					}
 
-					throw new RequestRateLimitError(ex, token, resetAt);
+					throw new RequestRateLimitError(ex, accessToken, resetAt);
 				}
-				throw new AuthenticationError('gitlab', AuthenticationErrorReason.Forbidden, ex);
+				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, ex);
 			case 500: // Internal Server Error
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				if (ex.response != null) {
 					provider?.trackRequestException();
 					void showIntegrationRequestFailed500WarningMessage(
@@ -1138,7 +1181,7 @@ $search: String!
 				}
 				return;
 			case 502: // Bad Gateway
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				// GitHub seems to return this status code for timeouts
 				if (ex.message.includes('timeout')) {
 					provider?.trackRequestException();
@@ -1151,7 +1194,7 @@ $search: String!
 				break;
 		}
 
-		Logger.error(ex, scope);
+		scope?.error(ex);
 		if (Logger.isDebugging) {
 			void window.showErrorMessage(
 				`GitLab request failed: ${(ex.response as any)?.errors?.[0]?.message ?? ex.message}`,
@@ -1159,8 +1202,8 @@ $search: String!
 		}
 	}
 
-	private handleException(ex: Error, provider: Provider, scope: LogScope | undefined): Error {
-		Logger.error(ex, scope);
+	private handleException(ex: Error, provider: Provider, scope: ScopedLogger | undefined): Error {
+		scope?.error(ex);
 		// debugger;
 
 		if (ex instanceof AuthenticationError) {

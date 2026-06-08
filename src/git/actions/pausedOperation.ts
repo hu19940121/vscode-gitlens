@@ -1,17 +1,20 @@
 import { window } from 'vscode';
-import type { Container } from '../../container';
-import { showGitErrorMessage } from '../../messages';
-import { executeCommand } from '../../system/-webview/command';
-import { PausedOperationContinueError } from '../errors';
-import type { GitRepositoryService } from '../gitRepositoryService';
-import type { GitPausedOperationStatus } from '../models/pausedOperationStatus';
-import { openRebaseEditor } from '../utils/-webview/rebase.utils';
-import { getReferenceLabel } from '../utils/reference.utils';
+import { PausedOperationAbortError, PausedOperationContinueError } from '@gitlens/git/errors.js';
+import type { GitPausedOperationStatus } from '@gitlens/git/models/pausedOperationStatus.js';
+import { getReferenceLabel } from '@gitlens/git/utils/reference.utils.js';
+import type { Container } from '../../container.js';
+import { showGitErrorMessage } from '../../messages.js';
+import { executeCommand } from '../../system/-webview/command.js';
+import type { GitRepositoryService } from '../gitRepositoryService.js';
+import { openRebaseEditor } from '../utils/-webview/rebase.utils.js';
 
 export async function abortPausedOperation(svc: GitRepositoryService, options?: { quit?: boolean }): Promise<void> {
 	try {
 		return await svc.pausedOps?.abortPausedOperation?.(options);
 	} catch (ex) {
+		// Ignore this as it can happen when the operation was already aborted (e.g., by clearing the rebase todo file before calling this)
+		if (PausedOperationAbortError.is(ex, 'nothingToAbort')) return;
+
 		void showGitErrorMessage(ex);
 	}
 }
@@ -84,10 +87,11 @@ export async function showPausedOperationStatus(
 	repoPath: string,
 	options?: ShowPausedOperationStatusOptions,
 ): Promise<void> {
-	await container.views.commits.show({ preserveFocus: false });
-	await container.views.commits.revealPausedOperationStatus(repoPath, { focus: true, expand: true, select: true });
-
 	if (options?.openRebaseEditor) {
 		await openRebaseEditor(container, repoPath);
+		return;
 	}
+
+	await container.views.commits.show({ preserveFocus: false });
+	await container.views.commits.revealPausedOperationStatus(repoPath, { focus: true, expand: true, select: true });
 }

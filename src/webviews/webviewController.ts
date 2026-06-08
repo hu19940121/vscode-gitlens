@@ -1,35 +1,46 @@
 import { deflateSync, strFromU8, strToU8 } from 'fflate';
 import type { Event, ViewBadge, Webview, WebviewPanel, WebviewView, WindowState } from 'vscode';
 import { CancellationTokenSource, Disposable, EventEmitter, Uri, ViewColumn, window, workspace } from 'vscode';
-import { base64 } from '@env/base64';
-import { getNonce } from '@env/crypto';
-import type { CustomEditorCommands, WebviewCommands, WebviewViewCommands } from '../constants.commands';
-import type { WebviewTelemetryContext } from '../constants.telemetry';
+import { base64 } from '@gitlens/utils/base64.js';
+import { isCancellationError } from '@gitlens/utils/cancellation.js';
+import { getScopedCounter } from '@gitlens/utils/counter.js';
+import { getNonce } from '@gitlens/utils/crypto.js';
+import { logName, trace } from '@gitlens/utils/decorators/log.js';
+import { sequentialize } from '@gitlens/utils/decorators/sequentialize.js';
+import { getLoggableName, Logger } from '@gitlens/utils/logger.js';
+import { getScopedLogger, maybeStartScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { pauseOnCancelOrTimeout } from '@gitlens/utils/promise.js';
+import { maybeStopWatch, Stopwatch } from '@gitlens/utils/stopwatch.js';
+import type { GlWebviewCommands } from '../constants.commands.js';
+import type {
+	Source,
+	TelemetryEvents,
+	WebviewTelemetryContext,
+	WebviewTelemetryEvents,
+} from '../constants.telemetry.js';
 import type {
 	CustomEditorIds,
 	CustomEditorTypes,
 	WebviewIds,
-	WebviewOrWebviewViewOrCustomEditorTypeFromId,
-	WebviewTypes,
+	WebviewPanelIds,
+	WebviewPanelTypes,
+	WebviewTypeFromId,
 	WebviewViewIds,
 	WebviewViewTypes,
-} from '../constants.views';
-import type { Container } from '../container';
-import { isCancellationError } from '../errors';
-import { getSubscriptionNextPaidPlanId } from '../plus/gk/utils/subscription.utils';
-import { executeCommand, executeCoreCommand } from '../system/-webview/command';
-import { setContext } from '../system/-webview/context';
-import { getViewFocusCommand } from '../system/-webview/vscode/views';
-import { getScopedCounter } from '../system/counter';
-import { debug, logName } from '../system/decorators/log';
-import { sequentialize } from '../system/decorators/sequentialize';
-import { serializeIpcData } from '../system/ipcSerialize';
-import { getLoggableName, Logger } from '../system/logger';
-import { getLogScope, getNewLogScope, setLogScopeExit } from '../system/logger.scope';
-import { pauseOnCancelOrTimeout } from '../system/promise';
-import { maybeStopWatch, Stopwatch } from '../system/stopwatch';
-import type { WebviewContext } from '../system/webview';
-import type { IpcPromise } from './ipc';
+} from '../constants.views.js';
+import type { Container } from '../container.js';
+import { getSubscriptionNextPaidPlanId } from '../plus/gk/utils/subscription.utils.js';
+import { executeCommand, executeCoreCommand } from '../system/-webview/command.js';
+import {
+	includesContextDelimitedString,
+	removeFromContextDelimitedString,
+	setContext,
+} from '../system/-webview/context.js';
+import { getViewFocusCommand } from '../system/-webview/vscode/views.js';
+import { serializeIpcData } from '../system/ipcSerialize.js';
+import type { WebviewContext } from '../system/webview.js';
+import { dispatchIpcMessage } from './ipc/handlerRegistry.js';
+import type { IpcPromise } from './ipc/models/dataTypes.js';
 import type {
 	IpcCallMessageType,
 	IpcCallParamsType,
@@ -37,9 +48,8 @@ import type {
 	IpcMessage,
 	IpcNotification,
 	IpcRequest,
-	WebviewFocusChangedParams,
-	WebviewState,
-} from './protocol';
+} from './ipc/models/ipc.js';
+import type { WebviewFocusChangedParams, WebviewState } from './protocol.js';
 import {
 	ApplicablePromoRequest,
 	DidChangeHostWindowFocusNotification,
@@ -50,48 +60,30 @@ import {
 	TelemetrySendEventCommand,
 	WebviewFocusChangedCommand,
 	WebviewReadyRequest,
-} from './protocol';
-import type { WebviewCommandCallback, WebviewCommandRegistrar } from './webviewCommandRegistrar';
-import type { CustomEditorDescriptor, WebviewPanelDescriptor, WebviewViewDescriptor } from './webviewDescriptors';
-import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from './webviewProvider';
-import type { WebviewShowOptions } from './webviewsController';
+} from './protocol.js';
+import { isRpcMessage } from './rpc/constants.js';
+import { EventVisibilityBuffer, SubscriptionTracker } from './rpc/eventVisibilityBuffer.js';
+import { RpcHost } from './rpc/rpcHost.js';
+import type { WebviewCommandCallback, WebviewCommandRegistrar } from './webviewCommandRegistrar.js';
+import type { CustomEditorDescriptor, WebviewPanelDescriptor, WebviewViewDescriptor } from './webviewDescriptors.js';
+import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from './webviewProvider.js';
+import type { WebviewShowOptions } from './webviewsController.js';
 
 const ipcSequencer = getScopedCounter();
 
-type GetWebviewDescriptor<T extends WebviewIds | WebviewViewIds | CustomEditorIds> = T extends WebviewIds
-	? WebviewPanelDescriptor<T>
-	: T extends WebviewViewIds
-		? WebviewViewDescriptor<T>
-		: T extends CustomEditorIds
-			? CustomEditorDescriptor<T>
+type GetWebviewDescriptor<T extends CustomEditorIds | WebviewIds> = T extends CustomEditorIds
+	? CustomEditorDescriptor<T>
+	: T extends WebviewPanelIds
+		? WebviewPanelDescriptor<T>
+		: T extends WebviewViewIds
+			? WebviewViewDescriptor<T>
 			: never;
 
-type GetWebviewParent<T extends WebviewIds | WebviewViewIds | CustomEditorIds> = T extends WebviewIds
-	? WebviewPanel
-	: T extends WebviewViewIds
-		? WebviewView
-		: T extends CustomEditorIds
-			? WebviewPanel
-			: never;
+type GetWebviewParent<T extends CustomEditorIds | WebviewIds> = T extends WebviewViewIds ? WebviewView : WebviewPanel;
 
-type WebviewPanelController<
-	ID extends WebviewIds,
-	State,
-	SerializedState = State,
-	ShowingArgs extends unknown[] = unknown[],
-> = WebviewController<ID, State, SerializedState, ShowingArgs>;
-type WebviewViewController<
-	ID extends WebviewViewIds,
-	State,
-	SerializedState = State,
-	ShowingArgs extends unknown[] = unknown[],
-> = WebviewController<ID, State, SerializedState, ShowingArgs>;
-
-@logName<WebviewController<WebviewIds | WebviewViewIds | CustomEditorIds, any>>(
-	c => `WebviewController(${c.id}${c.instanceId != null ? `|${c.instanceId}` : ''})`,
-)
+@logName(c => `WebviewController(${c.id}${c.instanceId != null ? `|${c.instanceId}` : ''})`)
 export class WebviewController<
-	ID extends WebviewIds | WebviewViewIds | CustomEditorIds,
+	ID extends CustomEditorIds | WebviewIds,
 	State,
 	SerializedState = State,
 	ShowingArgs extends unknown[] = unknown[],
@@ -99,7 +91,7 @@ export class WebviewController<
 	implements WebviewHost<ID>, Disposable
 {
 	static async create<
-		ID extends WebviewIds,
+		ID extends WebviewPanelIds,
 		State,
 		SerializedState = State,
 		ShowingArgs extends unknown[] = unknown[],
@@ -148,7 +140,7 @@ export class WebviewController<
 		) => Promise<WebviewProvider<State, SerializedState, ShowingArgs>>,
 	): Promise<WebviewController<ID, State, SerializedState, ShowingArgs>>;
 	static async create<
-		ID extends WebviewIds | WebviewViewIds | CustomEditorIds,
+		ID extends CustomEditorIds | WebviewIds,
 		State,
 		SerializedState = State,
 		ShowingArgs extends unknown[] = unknown[],
@@ -182,8 +174,8 @@ export class WebviewController<
 
 	readonly id: ID;
 
-	get type(): WebviewOrWebviewViewOrCustomEditorTypeFromId<ID> {
-		return this.descriptor.type as WebviewOrWebviewViewOrCustomEditorTypeFromId<ID>;
+	get type(): WebviewTypeFromId<ID> {
+		return this.descriptor.type as WebviewTypeFromId<ID>;
 	}
 
 	private _ready: boolean = false;
@@ -191,11 +183,43 @@ export class WebviewController<
 		return this._ready;
 	}
 
+	private _readyCount = 0;
+	private _lastHtmlSetAt: number | undefined;
+
+	/**
+	 * Replay-buffer window for the post-bootstrap IPC log. We only need this around startup, since the iframe is only
+	 * re-mounted under a live controller during VS Code's window-startup / panel-restoration / layout-settle phase.
+	 *
+	 * Two anchors gate the buffer:
+	 *  1. Anchor 1 (per-controller, latched at construction): is this controller within the activation window?
+	 *  2. Anchor 2 (per-controller, latched on first ready): once enabled, buffer for {@link replayWindowMs} then stop.
+	 *
+	 * A reconnect inside the window replays the log; a reconnect outside falls back to a full {@link refresh}.
+	 */
+	private static readonly activationWindowMs = 60_000;
+	private static readonly replayWindowMs = 30_000;
+	private readonly _replayEligible: boolean;
+	private _replayEnabled = false;
+	private _replayBuffer: IpcMessage[] = [];
+	private _replayWindowTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/**
+	 * Refresh coalescing: `refresh(force=true)` tears down the iframe and re-renders the HTML, which is
+	 * destructive while the iframe is mid-render. Coalesce in-flight calls and drop rapid back-to-back
+	 * calls within {@link refreshCoalesceMs} of the previous refresh completing.
+	 */
+	private static readonly refreshCoalesceMs = 1000;
+	private _refreshing: Promise<void> | undefined;
+	private _lastRefreshCompletedAt = 0;
+
 	/** Used to cancel pending ipc promise operations */
 	private cancellation: CancellationTokenSource | undefined;
 	private disposable: Disposable | undefined;
 	private _isInEditor: boolean;
 	private /*readonly*/ provider!: WebviewProvider<State, SerializedState, ShowingArgs>;
+	private _eventBuffer: EventVisibilityBuffer | undefined;
+	private _rpcHost: RpcHost<object> | undefined;
+	private _rpcExposed = false;
 	private readonly webview: Webview;
 
 	private _viewColumn: ViewColumn | undefined;
@@ -217,8 +241,12 @@ export class WebviewController<
 		this.id = descriptor.id as ID;
 		this.webview = parent.webview;
 
+		const readyAt = container.readyAt;
+		this._replayEligible = readyAt == null || Date.now() - readyAt < WebviewController.activationWindowMs;
+
 		const isInEditor = 'onDidChangeViewState' in parent;
 		this._isInEditor = isInEditor;
+		this._viewColumn = isInEditor ? parent.viewColumn : undefined;
 		this._originalTitle = descriptor.title;
 		parent.title = descriptor.title;
 
@@ -229,6 +257,29 @@ export class WebviewController<
 				return;
 			}
 
+			// Set up RPC services if the provider exposes them.
+			// The RpcHost creates a Connection but defers expose() until the
+			// webview sends WebviewReadyRequest (handled in onMessageReceivedCore).
+			const eventBuffer = this.descriptor.webviewHostOptions?.retainContextWhenHidden
+				? new EventVisibilityBuffer()
+				: undefined;
+			this._eventBuffer = eventBuffer;
+			const tracker = new SubscriptionTracker();
+			const rpcServices = this.provider.getRpcServices?.(eventBuffer, tracker);
+			if (rpcServices != null) {
+				try {
+					this._rpcHost = new RpcHost(
+						this.webview,
+						rpcServices,
+						{ webviewId: this.id, webviewInstanceId: this.instanceId },
+						tracker,
+					);
+					Logger.debug(`WebviewController(${this.id}): RPC host created, awaiting connect`);
+				} catch (ex) {
+					Logger.error(ex, `WebviewController(${this.id}): Failed to create RPC host`);
+				}
+			}
+
 			this.disposable = Disposable.from(
 				this._onDidDispose,
 				window.onDidChangeWindowState(this.onWindowStateChanged, this),
@@ -236,10 +287,15 @@ export class WebviewController<
 				isInEditor
 					? parent.onDidChangeViewState(({ webviewPanel }) => {
 							const { visible, active, viewColumn } = webviewPanel;
+							// Only treat a viewColumn change as a forceReload-worthy "move" if the webview was
+							// already alive (`_ready`). During panel restoration the first view-state event is
+							// the panel settling into its restored column — not a user move — and forcing a
+							// reload there tears down the just-created iframe mid-bootstrap, cancelling the
+							// deferred-rows delivery and leaving the Graph stuck on its loading spinner.
 							this.onParentVisibilityChanged(
 								visible,
 								active,
-								this.viewColumn != null && this.viewColumn !== viewColumn,
+								this._ready && this.viewColumn != null && this.viewColumn !== viewColumn,
 							);
 							this._viewColumn = viewColumn;
 						})
@@ -247,8 +303,31 @@ export class WebviewController<
 				parent.onDidDispose(this.onParentDisposed, this),
 				...(this.provider.registerCommands?.() ?? []),
 				this.provider,
+				...(this._rpcHost != null ? [this._rpcHost] : []),
 			);
 		});
+	}
+
+	private async removePlusFeatureOverride() {
+		if (!this.descriptor.plusFeature) {
+			return;
+		}
+
+		if (includesContextDelimitedString('gitlens:plus:disabled:view:overrides', this.descriptor.id)) {
+			const action = 'Enable Pro Features';
+			void window
+				.showInformationMessage(
+					`${this.descriptor.title} was closed as Pro features have been disabled.`,
+					action,
+				)
+				.then(selection => {
+					if (selection === action) {
+						void executeCommand('gitlens.plus.restore');
+					}
+				});
+		}
+
+		return removeFromContextDelimitedString('gitlens:plus:disabled:view:overrides', [this.descriptor.id]);
 	}
 
 	private _disposed: boolean = false;
@@ -256,13 +335,20 @@ export class WebviewController<
 		this._disposed = true;
 		this.cancellation?.cancel();
 		this.cancellation?.dispose();
+		if (this._replayWindowTimer != null) {
+			clearTimeout(this._replayWindowTimer);
+			this._replayWindowTimer = undefined;
+		}
+		this._replayEnabled = false;
+		this._replayBuffer.length = 0;
 		resetContextKeys(this.descriptor.contextKeyPrefix);
+
+		void this.removePlusFeatureOverride();
 
 		this.provider?.onFocusChanged?.(false);
 		this.provider?.onVisibilityChanged?.(false);
 
-		const context = this.provider.getTelemetryContext?.() ?? this.getTelemetryContext();
-		this.container.telemetry.sendEvent(`${this.descriptor.type}/closed`, context);
+		this.sendTelemetryEvent(`${this.descriptor.type}/closed`, {});
 
 		this._ready = false;
 
@@ -271,17 +357,18 @@ export class WebviewController<
 	}
 
 	registerWebviewCommand<T extends Partial<WebviewContext>>(
-		command: WebviewCommands | WebviewViewCommands | CustomEditorCommands,
+		command: GlWebviewCommands,
 		callback: WebviewCommandCallback<T>,
 	): Disposable {
-		return this._commandRegistrar.registerCommand(
-			this.provider,
-			this.id,
-			// We should be able to remove this in the future and always use the instanceId, but we need to do more testing to make sure each webview command always comes with the instanceId
-			this.descriptor.allowMultipleInstances ? this.instanceId : undefined,
-			command,
-			callback,
-		);
+		return this._commandRegistrar.registerCommand(this.provider, this.id, this.instanceId, command, callback);
+	}
+
+	registerWebviewCommandForId<T extends Partial<WebviewContext>>(
+		webviewId: string,
+		command: GlWebviewCommands,
+		callback: WebviewCommandCallback<T>,
+	): Disposable {
+		return this._commandRegistrar.registerCommand(this.provider, webviewId, this.instanceId, command, callback);
 	}
 
 	private _initializing: Promise<void> | undefined;
@@ -292,26 +379,56 @@ export class WebviewController<
 		this._initializing = undefined;
 	}
 
+	private exposeRpc(): void {
+		if (this._rpcExposed || this._rpcHost == null) return;
+
+		this._rpcExposed = true;
+		try {
+			this._rpcHost.expose();
+		} catch (ex) {
+			Logger.error(ex, `WebviewController(${this.id}): Failed to expose RPC services`);
+		}
+	}
+
 	getTelemetryContext(): WebviewTelemetryContext {
 		return {
 			'context.webview.id': this.id,
 			'context.webview.type': this.descriptor.type,
 			'context.webview.instanceId': this.instanceId,
-			'context.webview.host': this.is('editor') ? 'editor' : 'view',
+			'context.webview.host': this.is('editor')
+				? 'editor'
+				: (this.descriptor as WebviewViewDescriptor).location === 'panel'
+					? 'panel'
+					: 'view',
 		};
+	}
+
+	sendTelemetryEvent<T extends keyof TelemetryEvents>(
+		name: T,
+		...args: [keyof WebviewTelemetryEvents[T]] extends [never]
+			? [data?: never, source?: Source]
+			: [data: WebviewTelemetryEvents[T], source?: Source]
+	): void {
+		if (!this.container.telemetry.enabled) return;
+
+		this.container.telemetry.sendEvent(
+			name,
+			{
+				...this.getTelemetryContext(),
+				...this.provider.getTelemetryContext?.(),
+				...(args[0] as any),
+			},
+			args[1],
+		);
 	}
 
 	is(
 		type: 'editor',
-	): this is WebviewPanelController<ID extends WebviewIds ? ID : never, State, SerializedState, ShowingArgs>;
-	is(
-		type: 'view',
-	): this is WebviewViewController<ID extends WebviewViewIds ? ID : never, State, SerializedState, ShowingArgs>;
+	): this is WebviewController<ID & (WebviewPanelIds | CustomEditorIds), State, SerializedState, ShowingArgs>;
+	is(type: 'view'): this is WebviewController<ID & WebviewViewIds, State, SerializedState, ShowingArgs>;
 	is(
 		type: 'editor' | 'view',
-	): this is
-		| WebviewPanelController<ID extends WebviewIds ? ID : never, State, SerializedState, ShowingArgs>
-		| WebviewViewController<ID extends WebviewViewIds ? ID : never, State, SerializedState, ShowingArgs> {
+	): this is WebviewController<ID & (CustomEditorIds | WebviewIds), State, SerializedState, ShowingArgs> {
 		return type === 'editor' ? this._isInEditor : !this._isInEditor;
 	}
 
@@ -379,7 +496,7 @@ export class WebviewController<
 		return this.provider.getSplitArgs?.() ?? [];
 	}
 
-	@debug({ args: false })
+	@trace({ args: false })
 	async show(
 		loading: boolean,
 		options?: WebviewShowOptions,
@@ -389,16 +506,14 @@ export class WebviewController<
 
 		using sw = new Stopwatch(`WebviewController.show(${this.id})`);
 
-		const eventBase = { ...this.getTelemetryContext(), loading: loading };
-
 		let context;
 		const result = await this.provider.onShowing?.(loading, options, ...args);
 		if (result != null) {
 			let show;
 			[show, context] = result;
 			if (show === false) {
-				this.container.telemetry.sendEvent(`${this.descriptor.type}/showAborted`, {
-					...eventBase,
+				this.sendTelemetryEvent(`${this.descriptor.type}/showAborted`, {
+					loading: loading,
 					duration: sw.elapsed(),
 				});
 				return;
@@ -408,7 +523,12 @@ export class WebviewController<
 		if (loading) {
 			this.cancellation ??= new CancellationTokenSource();
 			try {
-				this.webview.html = await this.getHtml(this.webview);
+				const html = await this.getHtml(this.webview);
+				Logger.info(
+					`WebviewController(${this.id}|${this.instanceId}): webview.html set (reason=show:loading, length=${html.length})`,
+				);
+				this._lastHtmlSetAt = Date.now();
+				this.webview.html = html;
 			} catch (ex) {
 				if (isCancellationError(ex)) {
 					this.cancellation.cancel();
@@ -435,11 +555,15 @@ export class WebviewController<
 
 		setContextKeys(this.descriptor.contextKeyPrefix);
 
-		this.container.telemetry.sendEvent(`${this.descriptor.type}/shown`, {
-			...eventBase,
-			duration: sw.elapsed(),
-			...context,
-		});
+		this.sendTelemetryEvent(
+			`${this.descriptor.type}/shown`,
+			{
+				loading: loading,
+				duration: sw.elapsed(),
+				...context,
+			},
+			options.source,
+		);
 	}
 
 	get baseWebviewState(): WebviewState<ID> {
@@ -459,19 +583,45 @@ export class WebviewController<
 		return this.webview.asWebviewUri(uri);
 	}
 
-	@debug()
+	@trace()
 	async refresh(force?: boolean): Promise<void> {
+		// In-flight coalesce: piggyback on an existing refresh rather than tearing down the iframe twice.
+		if (this._refreshing != null) return this._refreshing;
+
+		// Post-refresh quiet window: drop rapid back-to-back invocations. Protects against a second
+		// invocation (VS Code title-bar command double-dispatch, user double-click, or a late async
+		// caller) firing shortly after the previous refresh completes and tearing down a mid-render iframe.
+		if (Date.now() - this._lastRefreshCompletedAt < WebviewController.refreshCoalesceMs) {
+			getScopedLogger()?.info(`refresh coalesced (within ${WebviewController.refreshCoalesceMs}ms of previous)`);
+			return;
+		}
+
+		this._refreshing = this.refreshCore(force).finally(() => {
+			this._lastRefreshCompletedAt = Date.now();
+			this._refreshing = undefined;
+		});
+		return this._refreshing;
+	}
+
+	private async refreshCore(force?: boolean): Promise<void> {
 		this.cancellation?.cancel();
 		this.cancellation = new CancellationTokenSource();
 
 		if (force) {
 			this.clearPendingIpcNotifications();
+			// Iframe is about to be torn down and re-mounted with a fresh bootstrap; any buffered messages were
+			// addressed at the soon-to-be-dead iframe and would double-apply against the new iframe's fresh
+			// bootstrap on a subsequent reconnect. Anchor 2's timer keeps running so post-refresh notifications
+			// continue to be buffered.
+			this._replayBuffer.length = 0;
 		}
 		this.provider.onRefresh?.(force);
 
 		// Mark the webview as not ready, until we know if we are changing the html
 		const wasReady = this._ready;
+		const wasRpcExposed = this._rpcExposed;
 		this._ready = false;
+		this._rpcExposed = false;
 
 		let html;
 		try {
@@ -487,6 +637,10 @@ export class WebviewController<
 
 		if (force) {
 			// Reset the html to get the webview to reload
+			Logger.info(
+				`WebviewController(${this.id}|${this.instanceId}): webview.html set (reason=refresh:reset, length=0)`,
+			);
+			this._lastHtmlSetAt = Date.now();
 			this.webview.html = '';
 		}
 
@@ -495,36 +649,99 @@ export class WebviewController<
 			if (wasReady) {
 				this._ready = true;
 			}
+			this._rpcExposed = wasRpcExposed;
 			return;
 		}
 
+		Logger.info(
+			`WebviewController(${this.id}|${this.instanceId}): webview.html set (reason=refresh:apply, length=${html.length})`,
+		);
+		this._lastHtmlSetAt = Date.now();
 		this.webview.html = html;
 	}
 
-	@debug()
+	@trace()
 	private onParentDisposed() {
 		this.dispose();
 	}
 
-	@debug<WebviewController<ID, State>['onMessageReceivedCore']>({
-		args: { 0: e => (e != null ? `${e.id}, method=${e.method}` : '<undefined>') },
+	@trace({
+		args: e => ({ e: e != null ? `${e.id}, method=${e.method}` : '<undefined>' }),
 	})
 	private async onMessageReceivedCore(e: IpcMessage) {
 		if (e == null) return;
+		// Skip RPC transport messages — these are handled by the Supertalk endpoint
+		if (isRpcMessage(e)) return;
 
-		const scope = getLogScope();
-		setLogScopeExit(scope, ` \u2022 ipc (webview -> host) duration=${Date.now() - e.timestamp}ms`);
+		const scope = getScopedLogger();
+		scope?.addExitInfo(`ipc (webview -> host) duration=${Date.now() - e.timestamp}ms`);
 
 		switch (true) {
-			case WebviewReadyRequest.is(e):
+			case WebviewReadyRequest.is(e): {
+				this._readyCount++;
+				const sinceLastHtmlSet = this._lastHtmlSetAt != null ? Date.now() - this._lastHtmlSetAt : -1;
+				// A re-ready means the webview's iframe was reloaded under us (e.g., panel layout settle, window
+				// reload restoring a serialized panel). The host's prior IPC pipe is severed; the new iframe loaded
+				// a stale bootstrap (frozen at HTML-generation time) and won't re-fetch state on its own. If we're
+				// still inside the replay window, replay the buffered post-bootstrap IPC log so the new iframe sees
+				// the same state the dead one had. Outside the window — where reconnects are anomalous — fall back
+				// to a full refresh, which is the honest answer at that point.
+				const isReconnect = this._ready;
+				const canSoftReconnect = isReconnect && this._replayEnabled;
+				Logger.info(
+					`WebviewController(${this.id}|${this.instanceId}): WebviewReadyRequest #${this._readyCount} (id=${e.id}, clientId=${e.params.clientId ?? '?'}, clientLoadedAt=${e.params.clientLoadedAt ?? '?'}, bootstrap=${e.params.bootstrap}, msgAge=${Date.now() - e.timestamp}ms, sinceLastHtmlSet=${sinceLastHtmlSet}ms, wasAlreadyReady=${this._ready}, replayEligible=${this._replayEligible}, replayEnabled=${this._replayEnabled}, replayBufferSize=${this._replayBuffer.length}, parentVisible=${this.parent.visible})`,
+				);
+
+				if (isReconnect && !canSoftReconnect) {
+					Logger.info(
+						`WebviewController(${this.id}|${this.instanceId}): reconnect outside replay window — forcing refresh`,
+					);
+					void this.refresh(true);
+					break;
+				}
+
+				if (isReconnect) {
+					this.cancellation?.cancel();
+					this.cancellation = new CancellationTokenSource();
+					this._rpcExposed = false;
+					this.clearPendingIpcNotifications();
+				}
+
+				if (isReconnect) {
+					Logger.info(
+						`WebviewController(${this.id}|${this.instanceId}): soft reconnect (replaying ${this._replayBuffer.length} buffered messages)`,
+					);
+				}
+
 				this._ready = true;
+				this.exposeRpc();
 				void this.respond(WebviewReadyRequest, e, {
+					// Honor the iframe's `bootstrap` flag literally — including on reconnect. The new iframe's
+					// HTML re-evaluates its `<script>window.bootstrap=…</script>` tag with the original T=0 payload,
+					// and replay below brings it forward by re-delivering the post-bootstrap delta log. Sending a
+					// fresh `includeBootstrap()` on reconnect would override the original starting point and let
+					// the replayed deltas double-apply on top of an already-current snapshot. The only iframes
+					// that ask for bootstrap on the re-ready are deferred-bootstrap providers — for those we do
+					// return the resolved bootstrap because they explicitly await it.
 					state: e.params.bootstrap ? this.provider.includeBootstrap?.(false) : undefined,
 				});
+				// Start the replay window BEFORE flushing pending so any pending IpcMessages flushed below land in
+				// the replay buffer. Deferred-bootstrap providers (e.g. Graph's deferRows path) push the initial
+				// rows notification BEFORE first-ready; without this ordering it would never make it into the buffer
+				// and a subsequent panel-layout-settle reconnect would replay state minus the rows — empty graph.
+				if (!isReconnect) {
+					this.startReplayWindow();
+				}
 				this.sendPendingIpcNotifications();
-				void this.provider.onReady?.();
+				if (isReconnect) {
+					this.replayBufferedMessages();
+					void this.provider.onReconnect?.();
+				} else {
+					void this.provider.onReady?.();
+				}
 
 				break;
+			}
 
 			case WebviewFocusChangedCommand.is(e):
 				this.onViewFocusChanged(e.params);
@@ -550,28 +767,31 @@ export class WebviewController<
 				break;
 			}
 			case TelemetrySendEventCommand.is(e):
-				this.container.telemetry.sendEvent(
+				this.sendTelemetryEvent(
 					e.params.name,
-					{ ...e.params.data, ...(this.provider.getTelemetryContext?.() ?? this.getTelemetryContext()) },
+					e.params.data != null ? { ...(e.params.data as any) } : undefined,
 					e.params.source,
 				);
 				break;
 
 			default:
-				this.provider.onMessageReceived?.(e);
+				// Try @ipc decorated handlers first, then fall back to onMessageReceived
+				if (!(await dispatchIpcMessage(this, this.provider, e))) {
+					this.provider.onMessageReceived?.(e);
+				}
 				break;
 		}
 	}
 
-	@debug<WebviewController<ID, State>['onViewFocusChanged']>({
-		args: { 0: e => `focused=${e.focused}, inputFocused=${e.inputFocused}` },
+	@trace({
+		args: e => ({ e: `focused=${e.focused}, inputFocused=${e.inputFocused}` }),
 	})
 	onViewFocusChanged(e: WebviewFocusChangedParams): void {
 		setContextKeys(this.descriptor.contextKeyPrefix);
 		this.handleFocusChanged(e.focused);
 	}
 
-	@debug()
+	@trace()
 	private onParentVisibilityChanged(visible: boolean, active?: boolean, forceReload?: boolean) {
 		if (this.descriptor.webviewHostOptions?.retainContextWhenHidden !== true) {
 			if (visible) {
@@ -585,6 +805,7 @@ export class WebviewController<
 				}
 			} else {
 				this._ready = false;
+				this._rpcExposed = false;
 			}
 		} else if (forceReload) {
 			void this.refresh();
@@ -598,10 +819,14 @@ export class WebviewController<
 				this.provider.onActiveChanged?.(active);
 				if (!active) {
 					this.handleFocusChanged(false);
+
+					void this.removePlusFeatureOverride();
 				}
 			}
 		} else {
 			resetContextKeys(this.descriptor.contextKeyPrefix);
+
+			void this.removePlusFeatureOverride();
 
 			if (active != null) {
 				this.provider.onActiveChanged?.(false);
@@ -610,6 +835,8 @@ export class WebviewController<
 		}
 
 		void this.notify(DidChangeWebviewVisibilityNotification, { visible: visible });
+		this._eventBuffer?.setVisible(visible);
+		this._rpcHost?.setVisible(visible);
 		this.provider.onVisibilityChanged?.(visible);
 	}
 
@@ -631,23 +858,19 @@ export class WebviewController<
 
 	private _webRoot: string | undefined;
 	getWebRoot(): string {
-		if (this._webRoot == null) {
-			this._webRoot = this.asWebviewUri(this.getWebRootUri()).toString();
-		}
+		this._webRoot ??= this.asWebviewUri(this.getWebRootUri()).toString();
 		return this._webRoot;
 	}
 
 	private _webRootUri: Uri | undefined;
 	getWebRootUri(): Uri {
-		if (this._webRootUri == null) {
-			this._webRootUri = Uri.joinPath(this.getRootUri(), 'dist', 'webviews');
-		}
+		this._webRootUri ??= Uri.joinPath(this.getRootUri(), 'dist', 'webviews');
 		return this._webRootUri;
 	}
 
-	@debug({ args: false })
+	@trace({ args: false })
 	private async getHtml(webview: Webview): Promise<string> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const webRootUri = this.getWebRootUri();
 		const uri = Uri.joinPath(webRootUri, this.descriptor.fileName);
@@ -660,7 +883,7 @@ export class WebviewController<
 			this.provider.includeEndOfBody?.(),
 		]);
 
-		const sw = maybeStopWatch(scope, { log: false, logLevel: 'debug' });
+		const sw = maybeStopWatch(scope, { log: { onlyExit: true, level: 'debug' } });
 		const serialized = this.serializeIpcData(bootstrap);
 		sw?.stop({ message: `\u2022 serialized bootstrap; length=${serialized.length}` });
 
@@ -672,7 +895,11 @@ export class WebviewController<
 			this._cspNonce,
 			this.asWebviewUri(this.getRootUri()).toString(),
 			this.getWebRoot(),
-			this.is('editor') ? 'editor' : 'view',
+			this.is('editor')
+				? 'editor'
+				: (this.descriptor as WebviewViewDescriptor).location === 'panel'
+					? 'panel'
+					: 'view',
 			serialized,
 			head,
 			body,
@@ -693,8 +920,8 @@ export class WebviewController<
 		const id = this.nextIpcId();
 		const timestamp = Date.now();
 
-		const scope = getNewLogScope(`${getLoggableName(this)}.notify(${id}|${notificationType.method})`, true);
-		const sw = maybeStopWatch(scope, { log: false, logLevel: 'debug' });
+		using scope = maybeStartScopedLogger(`${getLoggableName(this)}.notify(${id}|${notificationType.method})`);
+		const sw = maybeStopWatch(scope, { log: { onlyExit: true, level: 'debug' } });
 
 		const serializedParams = params != null ? this.serializeIpcData(params) : undefined;
 
@@ -718,7 +945,7 @@ export class WebviewController<
 			} catch (ex) {
 				debugger;
 				// Compression failed, keep uncompressed data
-				Logger.error(ex, scope, 'IPC deflate compression failed');
+				scope?.error(ex, 'IPC deflate compression failed');
 				sw?.stop({
 					message: `\u2022 failed deflate compression, using uncompressed data`,
 					suffix: `failed`,
@@ -739,6 +966,18 @@ export class WebviewController<
 		const success = await this.postMessage(msg);
 		if (success) {
 			this._pendingIpcNotifications.clear();
+			// While the replay window is open, append every successfully delivered message to the log in send order
+			// so that on reconnect we can replay the exact sequence the previous iframe saw — including
+			// IpcPromiseSettled and request responses, so embedded IpcPromise placeholders in earlier messages
+			// resolve correctly on the new iframe. WebviewReadyRequest's own response is regenerated per reconnect
+			// (with a fresh bootstrap) and would be ID-mismatched on replay, so skip it. Honor reset semantics:
+			// a reset-type notification supersedes all prior state, so prune the log before storing.
+			if (this._replayEnabled && notificationType !== WebviewReadyRequest.response) {
+				if (notificationType.reset) {
+					this._replayBuffer.length = 0;
+				}
+				this._replayBuffer.push(msg);
+			}
 		} else if (notificationType === IpcPromiseSettled) {
 			this._pendingIpcPromiseNotifications.add({ msg: msg, timestamp: Date.now() });
 		} else {
@@ -794,14 +1033,16 @@ export class WebviewController<
 		return serialized;
 	}
 
-	@sequentialize()
-	@debug<WebviewController<ID, State>['postMessage']>({
-		args: { 0: m => `${m.id}|${m.method}${m.completionId ? `+${m.completionId}` : ''}` },
+	@sequentialize({ getDedupingKey: (message: IpcMessage) => message.id })
+	@trace({
+		args: message => ({
+			message: `${message.id}|${message.method}${message.completionId ? `+${message.completionId}` : ''}`,
+		}),
 	})
 	private async postMessage(message: IpcMessage): Promise<boolean> {
 		if (!this._ready) return Promise.resolve(false);
 
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 
 		// It looks like there is a bug where `postMessage` can sometimes just hang infinitely. Not sure why, but ensure we don't hang forever
@@ -813,7 +1054,7 @@ export class WebviewController<
 				},
 				(ex: unknown) => {
 					clearTimeout(timeout);
-					Logger.error(ex, scope);
+					scope?.error(ex);
 					debugger;
 					return false;
 				},
@@ -821,7 +1062,7 @@ export class WebviewController<
 			new Promise<boolean>(resolve => {
 				timeout = setTimeout(() => {
 					debugger;
-					setLogScopeExit(scope, undefined, 'TIMEDOUT');
+					scope?.setFailed('TIMEDOUT');
 					resolve(false);
 				}, 30000);
 			}),
@@ -846,13 +1087,13 @@ export class WebviewController<
 
 	private _pendingIpcNotifications = new Map<
 		IpcNotification,
-		{ msg: IpcMessage | (() => Promise<boolean>); timestamp: number }
+		{ msg: IpcMessage | (() => Promise<boolean | void>); timestamp: number }
 	>();
 	private _pendingIpcPromiseNotifications = new Set<{ msg: IpcMessage; timestamp: number }>();
 
 	addPendingIpcNotification(
 		type: IpcNotification<any>,
-		mapping: Map<IpcNotification<any>, () => Promise<boolean>>,
+		mapping: Map<IpcNotification<any>, () => Promise<boolean | void>>,
 		thisArg: any,
 	): void {
 		this.addPendingIpcNotificationCore(type, mapping.get(type)?.bind(thisArg));
@@ -860,7 +1101,7 @@ export class WebviewController<
 
 	private addPendingIpcNotificationCore(
 		type: IpcNotification<any>,
-		msgOrFn: IpcMessage | (() => Promise<boolean>) | undefined,
+		msgOrFn: IpcMessage | (() => Promise<boolean | void>) | undefined,
 	) {
 		if (type.reset) {
 			this._pendingIpcNotifications.clear();
@@ -870,6 +1111,7 @@ export class WebviewController<
 			debugger;
 			return;
 		}
+
 		this._pendingIpcNotifications.set(type, { msg: msgOrFn, timestamp: Date.now() });
 	}
 
@@ -885,19 +1127,77 @@ export class WebviewController<
 			return;
 		}
 
-		const ipcs = [...this._pendingIpcNotifications.values(), ...this._pendingIpcPromiseNotifications.values()].sort(
-			(a, b) => a.timestamp - b.timestamp,
-		);
+		// Preserve the IpcNotification type alongside each pending entry so we can decide buffer eligibility
+		// below. Promise-settled entries carry no type — they're addressed at specific call ids and aren't
+		// independently replayable.
+		const typedEntries = Array.from(this._pendingIpcNotifications.entries(), ([type, value]) => ({
+			type: type,
+			...value,
+		}));
+		const untyped = Array.from(this._pendingIpcPromiseNotifications.values(), value => ({
+			type: undefined,
+			...value,
+		}));
+		const ipcs = [...typedEntries, ...untyped].sort((a, b) => a.timestamp - b.timestamp);
 		this._pendingIpcNotifications.clear();
 		this._pendingIpcPromiseNotifications.clear();
 
-		for (const { msg } of ipcs.values()) {
+		for (const { type, msg } of ipcs) {
 			if (typeof msg === 'function') {
 				void msg();
-			} else {
-				void this.postMessage(msg);
+				continue;
+			}
+
+			void this.postMessage(msg);
+			// Mirror notify()'s success-path buffer push for pending IpcMessages that just got flushed —
+			// otherwise pre-first-ready notifications (e.g. Graph's deferred-rows microtask firing during
+			// HTML generation) never enter the replay buffer and a panel-layout-settle reconnect would
+			// deliver bootstrap without them.
+			if (
+				this._replayEnabled &&
+				type != null &&
+				(type as IpcNotification<unknown>) !== WebviewReadyRequest.response
+			) {
+				if (type.reset) {
+					this._replayBuffer.length = 0;
+				}
+				this._replayBuffer.push(msg);
 			}
 		}
+	}
+
+	/**
+	 * Replays the buffered post-bootstrap IPC log to the webview, in original send order. Called on reconnect
+	 * inside the replay window so the freshly-mounted iframe converges to the same state the previous one had,
+	 * without requiring per-provider reconnect logic.
+	 */
+	private replayBufferedMessages(): void {
+		for (const msg of this._replayBuffer) {
+			void this.postMessage(msg);
+		}
+	}
+
+	/**
+	 * Starts the replay-buffer window on first ready (subject to anchor 1: `_replayEligible`). After
+	 * {@link replayWindowMs} elapses, buffering is disabled and the log is dropped — reconnects past this
+	 * point fall back to a full refresh in the WebviewReadyRequest handler.
+	 */
+	private startReplayWindow(): void {
+		if (!this._replayEligible || this._replayWindowTimer != null) return;
+
+		this._replayEnabled = true;
+		Logger.info(
+			`WebviewController(${this.id}|${this.instanceId}): replay window opened (${WebviewController.replayWindowMs}ms)`,
+		);
+		this._replayWindowTimer = setTimeout(() => {
+			const bufferedCount = this._replayBuffer.length;
+			this._replayEnabled = false;
+			this._replayBuffer.length = 0;
+			this._replayWindowTimer = undefined;
+			Logger.info(
+				`WebviewController(${this.id}|${this.instanceId}): replay window closed; discarded ${bufferedCount} buffered messages`,
+			);
+		}, WebviewController.replayWindowMs);
 	}
 
 	async maximize(): Promise<void> {
@@ -907,6 +1207,9 @@ export class WebviewController<
 	}
 }
 
+const htmlTokensRegex =
+	/#{(head|body|endOfBody|webviewId|webviewInstanceId|placement|cspSource|cspNonce|root|webroot|state)}/g;
+
 export function replaceWebviewHtmlTokens<SerializedState>(
 	html: string,
 	webviewId: string,
@@ -915,61 +1218,62 @@ export function replaceWebviewHtmlTokens<SerializedState>(
 	cspNonce: string,
 	root: string,
 	webRoot: string,
-	placement: 'editor' | 'view',
+	placement: 'editor' | 'view' | 'panel',
 	bootstrap?: SerializedState | string,
 	head?: string,
 	body?: string,
 	endOfBody?: string,
 ): string {
-	return html.replace(
-		/#{(head|body|endOfBody|webviewId|webviewInstanceId|placement|cspSource|cspNonce|root|webroot|state)}/g,
-		(_substring: string, token: string) => {
-			switch (token) {
-				case 'head':
-					return head ?? '';
-				case 'body':
-					return body ?? '';
-				case 'state':
-					return bootstrap != null
-						? base64(typeof bootstrap === 'string' ? bootstrap : JSON.stringify(bootstrap))
-						: '';
-				case 'endOfBody':
-					return `${
-						bootstrap != null
-							? `<script type="text/javascript" nonce="${cspNonce}">window.bootstrap=${
-									typeof bootstrap === 'string' ? bootstrap : JSON.stringify(bootstrap)
-								};</script>`
-							: ''
-					}${endOfBody ?? ''}`;
-				case 'webviewId':
-					return webviewId;
-				case 'webviewInstanceId':
-					return webviewInstanceId ?? '';
-				case 'placement':
-					return placement;
-				case 'cspSource':
-					return cspSource;
-				case 'cspNonce':
-					return cspNonce;
-				case 'root':
-					return root;
-				case 'webroot':
-					return webRoot;
-				default:
-					return '';
-			}
-		},
-	);
+	return html.replace(htmlTokensRegex, (_substring: string, token: string) => {
+		switch (token) {
+			case 'head':
+				return head ?? '';
+			case 'body':
+				return body ?? '';
+			case 'state':
+				return bootstrap != null
+					? base64(typeof bootstrap === 'string' ? bootstrap : JSON.stringify(bootstrap))
+					: '';
+			case 'endOfBody':
+				return `${
+					bootstrap != null
+						? `<script type="text/javascript" nonce="${cspNonce}">window.bootstrap=${
+								typeof bootstrap === 'string' ? bootstrap : JSON.stringify(bootstrap)
+							};</script>`
+						: ''
+				}${endOfBody ?? ''}`;
+			case 'webviewId':
+				return webviewId;
+			case 'webviewInstanceId':
+				return webviewInstanceId ?? '';
+			case 'placement':
+				return placement;
+			case 'cspSource':
+				return cspSource;
+			case 'cspNonce':
+				return cspNonce;
+			case 'root':
+				return root;
+			case 'webroot':
+				return webRoot;
+			default:
+				return '';
+		}
+	});
 }
 
 export function resetContextKeys(
-	contextKeyPrefix: `gitlens:webview:${WebviewTypes | CustomEditorTypes}` | `gitlens:webviewView:${WebviewViewTypes}`,
+	contextKeyPrefix:
+		| `gitlens:webview:${WebviewPanelTypes | CustomEditorTypes}`
+		| `gitlens:webviewView:${WebviewViewTypes}`,
 ): void {
 	void setContext(`${contextKeyPrefix}:visible`, false);
 }
 
 export function setContextKeys(
-	contextKeyPrefix: `gitlens:webview:${WebviewTypes | CustomEditorTypes}` | `gitlens:webviewView:${WebviewViewTypes}`,
+	contextKeyPrefix:
+		| `gitlens:webview:${WebviewPanelTypes | CustomEditorTypes}`
+		| `gitlens:webviewView:${WebviewViewTypes}`,
 ): void {
 	void setContext(`${contextKeyPrefix}:visible`, true);
 }

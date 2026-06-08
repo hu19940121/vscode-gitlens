@@ -2,13 +2,17 @@ import { css } from 'lit';
 
 /** Rebase webview layout and global styles */
 export const rebaseStyles = css`
+	.clickable {
+		cursor: pointer;
+	}
+
 	/* ==========================================================================
 	   CSS Custom Properties (Theme Variables)
 	   ========================================================================== */
 
 	:host {
 		/* Layout & Typography */
-		--gk-avatar-size: 2.2rem;
+		--gl-avatar-size: 2.2rem;
 		--font-family: var(--vscode-font-family);
 		--font-size: var(--vscode-font-size);
 
@@ -141,28 +145,43 @@ export const rebaseStyles = css`
 		grid-template-areas:
 			'header'
 			'banner'
-			'entries'
+			'content'
 			'footer';
-		grid-template-rows: auto auto 1fr auto;
+		grid-template-rows: auto auto minmax(0, 1fr) auto;
 		grid-template-columns: minmax(0, 1fr);
 		height: 100vh;
 		min-width: 0;
+		box-sizing: border-box;
+		padding: 0.5rem;
+	}
+
+	.content {
+		grid-area: content;
+		display: flex;
+		flex-direction: column;
+		min-height: 0;
 	}
 
 	/* ==========================================================================
-	   Banners (Read-only)
+	   Banners (Preserves Merges)
 	   ========================================================================== */
 
-	.read-only-banner {
+	.banners {
 		grid-area: banner;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.preserves-merges-banner,
+	.close-warning-banner {
 		margin: 0.5rem 1rem;
 		margin-block-end: 0.5rem;
 
-		/* Warning-style colors */
-		--gl-banner-primary-background: var(--vscode-inputValidation-warningBackground, rgba(205, 145, 0, 0.15));
-		--gl-banner-secondary-background: var(--vscode-inputValidation-warningBackground, rgba(205, 145, 0, 0.15));
-		--gl-banner-text-color: var(--vscode-inputValidation-warningForeground, inherit);
-		--gl-banner-primary-emphasis-background: var(--vscode-inputValidation-warningBorder, #cca700);
+		/* Info-style colors */
+		--gl-banner-primary-background: var(--vscode-inputValidation-infoBackground, rgba(0, 127, 212, 0.15));
+		--gl-banner-secondary-background: var(--vscode-inputValidation-infoBackground, rgba(0, 127, 212, 0.15));
+		--gl-banner-text-color: var(--vscode-inputValidation-infoForeground, inherit);
+		--gl-banner-primary-emphasis-background: var(--vscode-inputValidation-infoBorder, #007fd4);
 	}
 
 	/* ==========================================================================
@@ -174,9 +193,8 @@ export const rebaseStyles = css`
 		display: flex;
 		flex-direction: column;
 		gap: 0.5rem;
-		padding: 0.6rem 1rem;
+		padding: 0.5rem 1rem;
 		min-width: 0;
-		border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
 
 		gl-checkbox {
 			margin-block: 0;
@@ -311,14 +329,17 @@ export const rebaseStyles = css`
 	   ========================================================================== */
 
 	.entries {
-		grid-area: entries;
+		flex: 1 1 0;
 		display: block;
-		height: 100%;
 		min-height: 0;
 		overflow-x: hidden !important;
-		overflow-y: visible;
+		overflow-y: auto;
 		outline: none;
-		margin-inline: 1rem;
+		margin: 0.5rem 1rem;
+		box-sizing: border-box;
+
+		border-top: 1px solid var(--vscode-sideBarSectionHeader-border);
+		border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border);
 	}
 
 	.entries {
@@ -338,7 +359,7 @@ export const rebaseStyles = css`
 	}
 
 	.entries-empty {
-		grid-area: entries;
+		flex: 1 1 0;
 		display: flex;
 		justify-content: center;
 		color: var(--color-foreground--85);
@@ -377,6 +398,75 @@ export const rebaseStyles = css`
 	}
 
 	/* ==========================================================================
+	   Conflict Split Panel
+	   ========================================================================== */
+
+	.entries-panel {
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+
+		> .entries {
+			border-bottom: none;
+		}
+	}
+
+	.conflict-split {
+		flex: 1 1 0;
+		min-height: 0;
+
+		&::part(divider) {
+			background-image: linear-gradient(
+				var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35)),
+				var(--vscode-sideBarSectionHeader-border, rgba(128, 128, 128, 0.35))
+			);
+			background-size: 100% 1px;
+			background-position: center;
+			background-repeat: no-repeat;
+			transition: background-color 0.1s ease-out;
+		}
+
+		&::part(divider):hover,
+		&[dragging]::part(divider) {
+			background-image: linear-gradient(
+				var(--vscode-sash-hoverBorder, var(--vscode-focusBorder)),
+				var(--vscode-sash-hoverBorder, var(--vscode-focusBorder))
+			);
+			background-size: 100% 100%;
+			transition: background-color 0.1s ease-out 0.2s;
+		}
+	}
+
+	.conflict-panel {
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+		height: 100%;
+		padding: 0 1rem;
+	}
+
+	.conflict-panel__header {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		padding: 0.5rem 0;
+		font-weight: 600;
+		color: var(--vscode-editorWarning-foreground, #cca700);
+		flex: none;
+	}
+
+	.conflict-panel__header > span {
+		flex: 1;
+	}
+
+	.conflict-panel__list {
+		flex: 1;
+		min-height: 0;
+		--gl-decoration-before-font-size: 0.8em;
+		--gl-decoration-before-opacity: 0.7;
+	}
+
+	/* ==========================================================================
 	   Footer
 	   ========================================================================== */
 
@@ -387,7 +477,6 @@ export const rebaseStyles = css`
 		align-items: center;
 		gap: 1rem;
 		padding: 0.5rem 1rem;
-		border-top: 1px solid var(--vscode-sideBarSectionHeader-border);
 		background: var(--color-background);
 		z-index: 1;
 		min-width: 0;
@@ -446,6 +535,31 @@ export const rebaseStyles = css`
 		margin-left: 1.6rem;
 	}
 
+	.conflict-loading {
+		display: inline-flex;
+		align-items: center;
+		margin-left: 0.5rem;
+		color: var(--vscode-foreground);
+		opacity: 0.7;
+	}
+
+	.conflict-summary {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin-left: 0.5rem;
+		padding: 0.2rem 0.6rem;
+		border-radius: 0.3rem;
+		font-size: 1.1rem;
+		font-weight: 500;
+
+		&.warning {
+			background-color: var(--vscode-inputValidation-warningBackground, rgba(200, 140, 0, 0.2));
+			color: var(--vscode-inputValidation-warningForeground, #cca700);
+			border: 1px solid var(--vscode-inputValidation-warningBorder, #cca700);
+		}
+	}
+
 	gl-button .button-shortcut {
 		display: block;
 		margin-top: 0.2rem;
@@ -458,5 +572,15 @@ export const rebaseStyles = css`
 
 	gl-button:hover .button-shortcut {
 		opacity: 1;
+	}
+
+	/* ==========================================================================
+	   Density: Comfortable
+	   ========================================================================== */
+
+	.container[data-density='comfortable'] {
+		--gl-rebase-entry-padding-block: 0.5rem;
+		--gl-rebase-entry-graph-height: 29px;
+		--gl-rebase-entry-graph-offset: -0.5rem;
 	}
 `;

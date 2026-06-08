@@ -1,5 +1,8 @@
+.augment/**
+.claude/**
 .devcontainer/**
 .github/**
+.husky/**
 .vscode/**
 .vscode-clean/**
 .vscode-test/**
@@ -12,6 +15,7 @@ images/icons/**
 images/originals/**
 node_modules/**
 out/**
+packages/**
 patches/**
 resources/**
 scripts/**
@@ -29,12 +33,15 @@ tests/**
 .gitattributes
 .gitignore
 .mailmap
+.mcp.json
 .prettierignore
 .prettierrc
+.vscode-agent.json
 .vscode-test.mjs
 .yarnrc
 AGENTS.md
 BACKERS.md
+CLAUDE.md
 CODE_OF_CONDUCT.md
 CONTRIBUTING.md
 contributions.json
@@ -43,6 +50,7 @@ custom-elements.json
 custom-elements-manifest.config.mjs
 eslint.config.mjs
 pnpm-lock.yaml
+pnpm-workspace.yaml
 README.pre.md
 svgo.config.js
 tsconfig*.json

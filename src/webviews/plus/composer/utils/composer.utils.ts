@@ -1,12 +1,15 @@
-import { sha256 } from '@env/crypto';
-import type { Container } from '../../../../container';
-import type { GitCommit, GitCommitIdentityShape } from '../../../../git/models/commit';
-import type { GitDiff, ParsedGitDiff } from '../../../../git/models/diff';
-import type { Repository } from '../../../../git/models/repository';
-import { uncommitted, uncommittedStaged } from '../../../../git/models/revision';
-import { parseGitDiff } from '../../../../git/parsers/diffParser';
-import { getSettledValue } from '../../../../system/promise';
-import type { ComposerCommit, ComposerHunk, ComposerSafetyState } from '../protocol';
+import type { GitCommit, GitCommitIdentityShape } from '@gitlens/git/models/commit.js';
+import type { GitDiff, ParsedGitDiff } from '@gitlens/git/models/diff.js';
+import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
+import { parseGitDiff } from '@gitlens/git/parsers/diffParser.js';
+import { sha256 } from '@gitlens/utils/crypto.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
+import type { Container } from '../../../../container.js';
+import type { GlRepository } from '../../../../git/models/repository.js';
+import type { ComposerCommit, ComposerHunk, ComposerSafetyState } from '../protocol.js';
+
+const hunkOldRangeRegex = /@@ -(\d+),(\d+)/;
+const hunkNewRangeRegex = /@@ -\d+,\d+ \+(\d+),(\d+)/;
 
 export function getHunksForCommit(commit: ComposerCommit, hunks: ComposerHunk[]): ComposerHunk[] {
 	return hunks.filter(hunk => commit.hunkIndices.includes(hunk.index));
@@ -141,6 +144,7 @@ function getAuthorAndCoAuthorsForCommit(commitHunks: ComposerHunk[]): {
 	const coAuthors = new Map<string, GitCommitIdentityShape>();
 	for (const hunk of commitHunks) {
 		if (hunk.author == null) continue;
+
 		coAuthors.set(hunk.author.name, hunk.author);
 		hunk.coAuthors?.forEach(coAuthor => coAuthors.set(coAuthor.name, coAuthor));
 		authorContributionWeights.set(
@@ -176,10 +180,10 @@ function overlap(range1: { start: number; count: number }, range2: { start: numb
 
 // Calculates a similarity score between two hunks that touch the same file, based on the overlap between the lines in their hunk headers
 function getHunkSimilarityValue(hunk1: ComposerHunk, hunk2: ComposerHunk): number {
-	const oldRange1 = hunk1.hunkHeader.match(/@@ -(\d+),(\d+)/);
-	const newRange1 = hunk1.hunkHeader.match(/@@ -\d+,\d+ \+(\d+),(\d+)/);
-	const oldRange2 = hunk2.hunkHeader.match(/@@ -(\d+),(\d+)/);
-	const newRange2 = hunk2.hunkHeader.match(/@@ -\d+,\d+ \+(\d+),(\d+)/);
+	const oldRange1 = hunk1.hunkHeader.match(hunkOldRangeRegex);
+	const newRange1 = hunk1.hunkHeader.match(hunkNewRangeRegex);
+	const oldRange2 = hunk2.hunkHeader.match(hunkOldRangeRegex);
+	const newRange2 = hunk2.hunkHeader.match(hunkNewRangeRegex);
 	if (oldRange1 == null || newRange1 == null || oldRange2 == null || newRange2 == null) {
 		return 0;
 	}
@@ -295,7 +299,7 @@ export function createHunksFromDiffs(stagedDiffContent?: string, unstagedDiffCon
 	const allHunks: ComposerHunk[] = [];
 
 	let count = 0;
-	let hunks: ComposerHunk[] = [];
+	let hunks: ComposerHunk[];
 
 	if (stagedDiffContent) {
 		const stagedDiff = parseGitDiff(stagedDiffContent);
@@ -306,7 +310,7 @@ export function createHunksFromDiffs(stagedDiffContent?: string, unstagedDiffCon
 
 	if (unstagedDiffContent) {
 		const unstagedDiff = parseGitDiff(unstagedDiffContent);
-		({ hunks, count } = convertDiffToComposerHunks(unstagedDiff, 'unstaged', count));
+		({ hunks } = convertDiffToComposerHunks(unstagedDiff, 'unstaged', count));
 
 		allHunks.push(...hunks);
 	}
@@ -425,8 +429,9 @@ export interface ComposerDiffs {
 }
 
 export async function getComposerDiffs(
-	repo: Repository,
+	repo: GlRepository,
 	commits?: { baseSha: string; headSha: string },
+	options?: { includeUntracked?: boolean },
 ): Promise<ComposerDiffs | undefined> {
 	if (commits) {
 		const commitDiffs = await calculateCombinedDiffBetweenCommits(repo, commits.baseSha, commits.headSha);
@@ -438,6 +443,36 @@ export async function getComposerDiffs(
 			unified: commitDiffs,
 		};
 	}
+
+	// Handle untracked files with temp index to avoid modifying real index
+	if (options?.includeUntracked) {
+		const untrackedFiles = await repo.git.status?.getUntrackedFiles();
+		if (untrackedFiles?.length) {
+			// Create temp index that copies current staged state
+			await using disposableIndex = await repo.git.staging?.createTemporaryIndex('current');
+
+			// Stage untracked files with intent-to-add in temp index only
+			await repo.git.staging?.stageFiles(
+				untrackedFiles.map(f => f.path),
+				{ intentToAdd: true, index: disposableIndex },
+			);
+
+			// Get all three diffs using the temp index
+			const [stagedDiffResult, unstagedDiffResult, unifiedDiffResult] = await Promise.allSettled([
+				repo.git.diff.getDiff?.(uncommittedStaged, undefined, { index: disposableIndex }),
+				repo.git.diff.getDiff?.(uncommitted, undefined, { index: disposableIndex }),
+				repo.git.diff.getDiff?.(uncommitted, 'HEAD', { notation: '...', index: disposableIndex }),
+			]);
+
+			return {
+				staged: getSettledValue(stagedDiffResult),
+				unstaged: getSettledValue(unstagedDiffResult),
+				unified: getSettledValue(unifiedDiffResult),
+				commits: undefined,
+			};
+		}
+	}
+
 	const [stagedDiffResult, unstagedDiffResult, unifiedDiffResult] = await Promise.allSettled([
 		// Get staged diff (index vs HEAD)
 		repo.git.diff.getDiff?.(uncommittedStaged),
@@ -459,7 +494,7 @@ export async function getComposerDiffs(
  * Creates a safety state snapshot for the composer to validate against later
  */
 export async function createSafetyState(
-	repo: Repository,
+	repo: GlRepository,
 	diffs: ComposerDiffs,
 	baseSha?: string,
 	headSha?: string,
@@ -484,7 +519,7 @@ export async function createSafetyState(
  * Only validates diffs for sources that have hunks being committed.
  */
 export async function validateSafetyState(
-	repo: Repository,
+	repo: GlRepository,
 	safetyState: ComposerSafetyState,
 	hunksBeingCommitted?: ComposerHunk[],
 	diffs?: ComposerDiffs,
@@ -588,7 +623,7 @@ export function validateResultingDiff(
  */
 export async function getBranchCommits(
 	_container: Container,
-	repo: Repository,
+	repo: GlRepository,
 	branchName: string,
 	mergeTargetName?: string,
 ): Promise<{ commits: GitCommit[]; baseCommit: { sha: string; message: string }; headCommitSha: string } | undefined> {
@@ -614,6 +649,7 @@ export async function getBranchCommits(
 		if (!mergeBase) {
 			return undefined;
 		}
+
 		// Get the base commit from the merge base
 		const baseCommit = await repo.git.commits.getCommit(mergeBase);
 		if (!baseCommit) {
@@ -627,8 +663,8 @@ export async function getBranchCommits(
 		}
 
 		// Convert Map to Array and keep in reverse chronological order (newest first, then reverse to oldest first for processing)
-		const commits = Array.from(log.commits.values()).reverse();
-		const headCommit = commits[commits.length - 1];
+		const commits = [...log.commits.values()].reverse();
+		const headCommit = commits.at(-1)!;
 
 		return {
 			commits: commits,
@@ -652,7 +688,7 @@ export function parseCoAuthorsFromGitCommit(commit: GitCommit): GitCommitIdentit
 	while ((match = coAuthorRegex.exec(commit.message)) !== null) {
 		const [, name, email] = match;
 		if (name) {
-			coAuthors.push({ name: name.trim(), email: email?.trim(), date: commit.date });
+			coAuthors.push({ name: name.trim(), email: email?.trim(), date: commit.author.date });
 		}
 	}
 
@@ -663,11 +699,10 @@ export function parseCoAuthorsFromGitCommit(commit: GitCommit): GitCommitIdentit
  * Creates ComposerCommit array from existing branch commits, preserving order and mapping hunks correctly
  */
 export async function createComposerCommitsFromGitCommits(
-	repo: Repository,
+	repo: GlRepository,
 	commits: GitCommit[],
 ): Promise<{ commits: ComposerCommit[]; hunks: ComposerHunk[] } | undefined> {
 	try {
-		const currentUser = await repo.git.config.getCurrentUser();
 		const composerCommits: ComposerCommit[] = [];
 		const allHunks: ComposerHunk[] = [];
 		let count = 0;
@@ -688,16 +723,12 @@ export async function createComposerCommitsFromGitCommits(
 			// Parse the diff to get hunks
 			const parsedDiff = parseGitDiff(diff.contents);
 			const commitHunkIndices: number[] = [];
-			const author = {
-				...commit.author,
-				name: commit.author.name === 'You' ? (currentUser?.name ?? commit.author.name) : commit.author.name,
-			};
 
 			const { hunks, count: newCount } = convertDiffToComposerHunks(
 				parsedDiff,
 				'commits',
 				count,
-				author,
+				commit.author,
 				parseCoAuthorsFromGitCommit(commit),
 			);
 			allHunks.push(...hunks);
@@ -728,7 +759,7 @@ export async function createComposerCommitsFromGitCommits(
  * Calculates the combined diff from all branch commits for safety state validation
  */
 export async function calculateCombinedDiffBetweenCommits(
-	repo: Repository,
+	repo: GlRepository,
 	baseCommitSha: string,
 	headCommitSha: string,
 ): Promise<GitDiff | undefined> {

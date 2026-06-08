@@ -1,38 +1,52 @@
-import type { TextEditor } from 'vscode';
-import { Disposable, Uri, ViewColumn, window } from 'vscode';
-import type { SearchQuery } from '../../../constants.search';
-import type { Source } from '../../../constants.telemetry';
-import type { Container } from '../../../container';
-import { GitUri } from '../../../git/gitUri';
-import type { GitReference } from '../../../git/models/reference';
-import type { Repository } from '../../../git/models/repository';
-import { executeCommand, executeCoreCommand, registerCommand } from '../../../system/-webview/command';
-import { configuration } from '../../../system/-webview/configuration';
-import { getContext } from '../../../system/-webview/context';
-import { getScmResourceFolderUri, getScmResourceUri, isScm } from '../../../system/-webview/scm';
-import { ViewNode } from '../../../views/nodes/abstract/viewNode';
-import type { BranchNode } from '../../../views/nodes/branchNode';
-import type { CommitFileNode } from '../../../views/nodes/commitFileNode';
-import type { CommitNode } from '../../../views/nodes/commitNode';
-import { PullRequestNode } from '../../../views/nodes/pullRequestNode';
-import type { StashNode } from '../../../views/nodes/stashNode';
-import type { TagNode } from '../../../views/nodes/tagNode';
+import type { TextEditor, Uri } from 'vscode';
+import { Disposable, ViewColumn, window } from 'vscode';
+import type { GitReference } from '@gitlens/git/models/reference.js';
+import type { SearchQuery } from '@gitlens/git/models/search.js';
+import { isUri } from '@gitlens/utils/uri.js';
+import type { Source } from '../../../constants.telemetry.js';
+import type { Container } from '../../../container.js';
+import { GitUri } from '../../../git/gitUri.js';
+import type { GlRepository } from '../../../git/models/repository.js';
+import { executeCommand, executeCoreCommand, registerCommand } from '../../../system/-webview/command.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import { getContext } from '../../../system/-webview/context.js';
+import { loadChunk } from '../../../system/-webview/loadChunk.js';
+import { getScmResourceFolderUri, getScmResourceUri, isScm } from '../../../system/-webview/scm.js';
+import { ViewNode } from '../../../views/nodes/abstract/viewNode.js';
+import type { BranchNode } from '../../../views/nodes/branchNode.js';
+import type { CommitFileNode } from '../../../views/nodes/commitFileNode.js';
+import type { CommitNode } from '../../../views/nodes/commitNode.js';
+import { PullRequestNode } from '../../../views/nodes/pullRequestNode.js';
+import type { StashNode } from '../../../views/nodes/stashNode.js';
+import type { TagNode } from '../../../views/nodes/tagNode.js';
 import type {
 	WebviewPanelShowCommandArgs,
 	WebviewPanelsProxy,
 	WebviewsController,
 	WebviewViewProxy,
-} from '../../webviewsController';
-import type { State } from './protocol';
+} from '../../webviewsController.js';
+import type { GraphActionTarget, GraphShowAction, GraphSidebarPanel, State } from './protocol.js';
 
 export type GraphWebviewShowingArgs = [
-	Repository | { ref: GitReference } | { repository: Repository; search: SearchQuery } | undefined,
+	| GlRepository
+	| { ref: GitReference; source?: Source }
+	| { repository: GlRepository; search?: SearchQuery; source?: Source }
+	| { sidebarPanel: GraphSidebarPanel; source?: Source }
+	| { action: GraphShowAction; target?: GraphActionTarget; source?: Source }
+	| undefined,
 ];
 
 export type ShowInCommitGraphCommandArgs =
-	| { ref: GitReference; preserveFocus?: boolean; source?: Source }
-	| { repository: Repository; search: SearchQuery; preserveFocus?: boolean }
-	| Repository
+	| { ref: GitReference; preserveFocus?: boolean; source?: Source; viewColumn?: ViewColumn }
+	| {
+			repository: GlRepository;
+			search?: SearchQuery;
+			selectSha?: string;
+			preserveFocus?: boolean;
+			source?: Source;
+			viewColumn?: ViewColumn;
+	  }
+	| GlRepository
 	| BranchNode
 	| CommitNode
 	| CommitFileNode
@@ -62,7 +76,9 @@ export function registerGraphWebviewPanel(
 			allowMultipleInstances: configuration.get('graph.allowMultiple'),
 		},
 		async (container, host) => {
-			const { GraphWebviewProvider } = await import(/* webpackChunkName: "webview-graph" */ './graphWebview');
+			const { GraphWebviewProvider } = await loadChunk(
+				() => import(/* webpackChunkName: "webview-graph" */ './graphWebview.js'),
+			);
 			return new GraphWebviewProvider(container, host);
 		},
 	);
@@ -80,12 +96,15 @@ export function registerGraphWebviewView(
 			trackingFeature: 'graphView',
 			type: 'graph',
 			plusFeature: true,
+			location: 'panel',
 			webviewHostOptions: {
 				retainContextWhenHidden: true,
 			},
 		},
 		async (container, host) => {
-			const { GraphWebviewProvider } = await import(/* webpackChunkName: "webview-graph" */ './graphWebview');
+			const { GraphWebviewProvider } = await loadChunk(
+				() => import(/* webpackChunkName: "webview-graph" */ './graphWebview.js'),
+			);
 			return new GraphWebviewProvider(container, host);
 		},
 	);
@@ -103,18 +122,31 @@ export function registerGraphWebviewCommands<T>(
 		}
 
 		const preserveFocus = 'preserveFocus' in args ? (args.preserveFocus ?? false) : false;
+		const column = 'viewColumn' in args ? args.viewColumn : undefined;
+		const source = 'source' in args ? args.source : undefined;
 		if (configuration.get('graph.layout') === 'panel') {
 			if (!container.views.graph.visible) {
 				const instance = panels.getBestInstance({ preserveFocus: preserveFocus }, args);
 				if (instance != null) {
-					void instance.show({ preserveFocus: preserveFocus }, args);
+					void instance.show({ preserveFocus: preserveFocus, column: column, source: source }, args);
 					return;
 				}
 			}
 
-			void container.views.graph.show({ preserveFocus: preserveFocus }, args);
+			void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, args);
 		} else {
-			void panels.show({ preserveFocus: preserveFocus }, args);
+			const instance = panels.getBestInstance({ preserveFocus: preserveFocus }, args);
+			if (instance != null) {
+				void instance.show({ preserveFocus: preserveFocus, column: column, source: source }, args);
+				return;
+			}
+
+			if (container.views.graph.visible) {
+				void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, args);
+				return;
+			}
+
+			void panels.show({ preserveFocus: preserveFocus, column: column, source: source }, args);
 		}
 	}
 
@@ -137,7 +169,12 @@ export function registerGraphWebviewCommands<T>(
 			matchRegex: false,
 		};
 
-		showInCommitGraph({ repository: repository, search: searchQuery });
+		// Optional sha passed by callers that have a commit context (e.g. graph details file commands).
+		// Fall back to `gitUri.sha` when the URI itself carries a revision (e.g. Search & Compare results,
+		// graph compare-mode/multicommit panels whose context builds a `gitlens-git://` URI).
+		const selectSha = typeof args[1] === 'string' ? args[1] : gitUri.sha;
+
+		showInCommitGraph({ repository: repository, search: searchQuery, selectSha: selectSha });
 	}
 	async function openFolderHistoryInGraph(...args: any[]): Promise<void> {
 		const uri = getUriFromArgs(args);
@@ -170,13 +207,13 @@ export function registerGraphWebviewCommands<T>(
 				if (arg.rootUri != null) {
 					const repo = container.git.getRepository(arg.rootUri);
 					if (repo != null) {
-						showInGraphArg = repo;
+						showInGraphArg = { repository: repo };
 					}
 				}
 				args = [];
 			} else if (arg instanceof ViewNode) {
 				if (arg.is('repo-folder')) {
-					showInGraphArg = arg.repo;
+					showInGraphArg = { repository: arg.repo };
 				}
 				args = [];
 			}
@@ -203,7 +240,6 @@ export function registerGraphWebviewCommands<T>(
 			await configuration.updateEffective('graph.layout', 'panel');
 			queueMicrotask(async () => {
 				await executeCoreCommand('gitlens.views.graph.resetViewLocation');
-				await executeCoreCommand('gitlens.views.graphDetails.resetViewLocation');
 				void executeCommand('gitlens.showGraphView');
 			});
 		}),
@@ -231,7 +267,8 @@ export function registerGraphWebviewCommands<T>(
 			}
 
 			const preserveFocus = 'preserveFocus' in args ? (args.preserveFocus ?? false) : false;
-			void container.views.graph.show({ preserveFocus: preserveFocus }, args);
+			const source = 'source' in args ? args.source : undefined;
+			void container.views.graph.show({ preserveFocus: preserveFocus, source: source }, args);
 		}),
 		registerCommand(`${panels.id}.refresh`, () => void panels.getActiveInstance()?.refresh(true)),
 		registerCommand(
@@ -263,9 +300,9 @@ function getUriFromArgs(args: any[]): Uri | undefined {
 
 	if (args.length > 0) {
 		const [arg] = args;
-		if (arg instanceof Uri) {
+		if (isUri(arg)) {
 			uri = arg;
-		} else if (arg?.uri instanceof Uri) {
+		} else if (isUri(arg?.uri)) {
 			uri = arg.uri;
 		} else if (arg?.editor != null) {
 			editor = arg.editor;

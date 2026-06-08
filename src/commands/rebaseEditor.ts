@@ -1,12 +1,12 @@
 import type { TextEditor, Uri } from 'vscode';
-import type { Container } from '../container';
-import { abortPausedOperation } from '../git/actions/pausedOperation';
-import { reopenRebaseTodoEditor } from '../git/utils/-webview/rebase.utils';
-import { command } from '../system/-webview/command';
-import { getOpenTextDocument } from '../system/-webview/vscode/documents';
-import { closeTab } from '../system/-webview/vscode/tabs';
-import { ActiveEditorCommand, GlCommandBase } from './commandBase';
-import { getCommandUri } from './commandBase.utils';
+import type { Container } from '../container.js';
+import { abortPausedOperation } from '../git/actions/pausedOperation.js';
+import { reopenRebaseTodoEditor } from '../git/utils/-webview/rebase.utils.js';
+import { command } from '../system/-webview/command.js';
+import { getOpenTextDocument } from '../system/-webview/vscode/documents.js';
+import { closeTab } from '../system/-webview/vscode/tabs.js';
+import { ActiveEditorCommand, GlCommandBase } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
 
 @command()
 export class DisableRebaseEditorCommand extends GlCommandBase {
@@ -58,6 +58,20 @@ export class RebaseContinue extends ActiveEditorCommand {
 		const document = editor?.document ?? getOpenTextDocument(uri);
 		await document?.save();
 		await closeTab(uri);
+	}
+}
+
+@command()
+export class RebaseRefresh extends ActiveEditorCommand {
+	constructor(private readonly container: Container) {
+		super(['gitlens.rebase.refresh']);
+	}
+
+	execute(editor?: TextEditor, uri?: Uri): void {
+		uri = getCommandUri(uri, editor);
+		if (uri == null) return;
+
+		this.container.rebaseEditor.refresh(uri);
 	}
 }
 

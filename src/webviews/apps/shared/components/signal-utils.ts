@@ -1,8 +1,8 @@
 import { Signal, signal } from '@lit-labs/signals';
 import { AsyncComputed } from 'signal-utils/async-computed';
 import { signalObject } from 'signal-utils/object';
-import type { Deferrable } from '../../../../system/function/debounce';
-import { debounce } from '../../../../system/function/debounce';
+import type { Deferrable } from '@gitlens/utils/debounce.js';
+import { debounce } from '@gitlens/utils/debounce.js';
 
 export const renderAsyncComputed = <T, R = unknown>(
 	v: AsyncComputed<T>,
@@ -90,9 +90,7 @@ export class AsyncComputedState<T, R = unknown> {
 			return;
 		}
 
-		if (this._runDebounced == null) {
-			this._runDebounced = debounce(this._runCore.bind(this), this._debounce);
-		}
+		this._runDebounced ??= debounce(this._runCore.bind(this), this._debounce);
 
 		this._runDebounced();
 	}
@@ -115,6 +113,10 @@ export class AsyncComputedState<T, R = unknown> {
 		error?: (error: unknown) => R;
 	}): R | undefined {
 		return renderAsyncComputed(this.computed, config);
+	}
+
+	dispose(): void {
+		this._runDebounced?.cancel?.();
 	}
 }
 

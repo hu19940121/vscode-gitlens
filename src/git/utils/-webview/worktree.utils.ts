@@ -1,12 +1,15 @@
-import type { CancellationToken } from 'vscode';
-import { filterMap } from '../../../system/iterable';
-import { PageableResult } from '../../../system/paging';
-import type { GitBranch } from '../../models/branch';
-import type { Repository } from '../../models/repository';
-import type { GitWorktree } from '../../models/worktree';
+import type { GitBranch } from '@gitlens/git/models/branch.js';
+import type { GitStatus } from '@gitlens/git/models/status.js';
+import type { GitWorktree } from '@gitlens/git/models/worktree.js';
+import { filterMap } from '@gitlens/utils/iterable.js';
+import { PageableResult } from '@gitlens/utils/paging.js';
+import { normalizePath } from '@gitlens/utils/path.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
+import type { Container } from '../../../container.js';
+import type { GlRepository } from '../../models/repository.js';
 
 export function getOpenedWorktreesByBranch(
-	worktreesByBranch: Map<string, GitWorktree> | undefined,
+	worktreesByBranch: ReadonlyMap<string, GitWorktree> | undefined,
 ): Set<string> | undefined {
 	let openedWorktreesByBranch: Set<string> | undefined;
 	if (worktreesByBranch?.size) {
@@ -19,7 +22,7 @@ export function getOpenedWorktreesByBranch(
 }
 
 export async function getWorktreeForBranch(
-	repo: Repository,
+	repo: GlRepository,
 	branchName: string,
 	upstreamNames?: string | string[],
 	worktrees?: GitWorktree[],
@@ -71,15 +74,42 @@ export async function getWorktreeForBranch(
 	return undefined;
 }
 
+/**
+ * Returns the worktrees — other than the one at `repoPath` — whose HEAD reaches `sha`, i.e. the
+ * worktrees that hold a working copy of the commit's files on a branch that contains the commit.
+ * Used to surface "Open Worktree File" for commits whose branch lives in a sibling worktree.
+ */
+export async function getReachableWorktrees(
+	container: Container,
+	repoPath: string,
+	sha: string,
+	cancellation?: AbortSignal,
+): Promise<GitWorktree[]> {
+	const worktrees = await container.git.getRepository(repoPath)?.git.worktrees?.getWorktrees(cancellation);
+	if (worktrees == null || worktrees.length <= 1) return [];
+
+	const normalizedRepoPath = normalizePath(repoPath);
+	const candidates = worktrees.filter(
+		wt => wt.type !== 'bare' && wt.sha != null && normalizePath(wt.path) !== normalizedRepoPath,
+	);
+	if (!candidates.length) return [];
+
+	const svc = container.git.getRepositoryService(repoPath);
+	const results = await Promise.allSettled(
+		candidates.map(wt => svc.commits.isAncestorOf(sha, wt.sha!, cancellation)),
+	);
+	return candidates.filter((_wt, i) => getSettledValue(results[i]) === true);
+}
+
 export async function getWorktreesByBranch(
-	repos: Repository | Repository[] | undefined,
+	repos: GlRepository | GlRepository[] | undefined,
 	options?: { includeDefault?: boolean },
-	cancellation?: CancellationToken,
+	cancellation?: AbortSignal,
 ): Promise<Map<string, GitWorktree>> {
 	const worktreesByBranch = new Map<string, GitWorktree>();
 	if (repos == null) return worktreesByBranch;
 
-	async function addWorktrees(repo: Repository) {
+	async function addWorktrees(repo: GlRepository) {
 		if (repo.git.worktrees == null) return;
 
 		groupWorktreesByBranch(await repo.git.worktrees.getWorktrees(cancellation), {
@@ -111,4 +141,18 @@ export function groupWorktreesByBranch(
 	}
 
 	return worktreesByBranch;
+}
+
+export async function getWorktreeStatus(container: Container, worktree: GitWorktree): Promise<GitStatus | undefined> {
+	if (worktree.type === 'bare') return undefined;
+	return container.git.getRepositoryService(worktree.uri.fsPath).status.getStatus();
+}
+
+export async function getWorktreeHasWorkingChanges(
+	container: Container,
+	worktree: GitWorktree,
+	options?: { staged?: boolean; unstaged?: boolean; untracked?: boolean },
+): Promise<boolean | undefined> {
+	if (worktree.type === 'bare') return undefined;
+	return container.git.getRepositoryService(worktree.uri.fsPath).status?.hasWorkingChanges(options);
 }

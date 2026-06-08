@@ -1,16 +1,16 @@
-import { parse as parseDiff } from 'diff2html';
+import { parse as parseDiff } from 'diff2html/lib-esm/diff-parser.js';
 import type { DiffFile } from 'diff2html/lib-esm/types';
 import { ColorSchemeType } from 'diff2html/lib-esm/types';
-import type { Diff2HtmlUIConfig } from 'diff2html/lib-esm/ui/js/diff2html-ui.js';
-import { Diff2HtmlUI } from 'diff2html/lib-esm/ui/js/diff2html-ui.js';
+import type { Diff2HtmlUIConfig } from 'diff2html/lib-esm/ui/js/diff2html-ui-base.js';
+import { Diff2HtmlUI } from 'diff2html/lib-esm/ui/js/diff2html-ui-base.js';
 import { css, html, LitElement } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
-import type { ComposerHunk } from '../../../../../plus/composer/protocol';
-import { focusableBaseStyles } from '../../../../shared/components/styles/lit/a11y.css';
-import { boxSizingBase, scrollableBase } from '../../../../shared/components/styles/lit/base.css';
-import { compiledComposerTemplates } from './diff-templates.compiled';
-import { diff2htmlStyles, diffStyles, hljsStyles } from './diff.css';
-import '../../../../shared/components/code-icon';
+import type { ComposerHunk } from '../../../../../plus/composer/protocol.js';
+import { focusableBaseStyles } from '../../../../shared/components/styles/lit/a11y.css.js';
+import { boxSizingBase, scrollableBase } from '../../../../shared/components/styles/lit/base.css.js';
+import { compiledComposerTemplates } from './diff-templates.compiled.js';
+import { diff2htmlStyles, diffStyles, hljsStyles } from './diff.css.js';
+import '../../../../shared/components/code-icon.js';
 
 @customElement('gl-diff-file')
 export class GlDiffFile extends LitElement {
@@ -47,7 +47,6 @@ export class GlDiffFile extends LitElement {
 	@query('#diff')
 	targetElement!: HTMLDivElement;
 
-	@state()
 	private diffText?: string;
 
 	@state()
@@ -68,6 +67,9 @@ export class GlDiffFile extends LitElement {
 		this._isVisible = value;
 	}
 
+	@state()
+	private userExpandedState?: boolean;
+
 	// should only ever be one file
 	get diffFile(): DiffFile | undefined {
 		return this.parsedDiff?.[0];
@@ -75,6 +77,8 @@ export class GlDiffFile extends LitElement {
 
 	private diff2htmlUi?: Diff2HtmlUI;
 	private intersectionObserver?: IntersectionObserver;
+	private detailsToggleListener?: () => void;
+	private _processingTimer?: ReturnType<typeof setTimeout>;
 
 	override connectedCallback() {
 		super.connectedCallback?.();
@@ -83,26 +87,56 @@ export class GlDiffFile extends LitElement {
 
 	override disconnectedCallback() {
 		super.disconnectedCallback?.();
+		this.cancelScheduledProcessing();
 		this.intersectionObserver?.disconnect();
 		this.intersectionObserver = undefined;
-	}
-
-	override firstUpdated() {
-		this.processDiff();
-		this.renderDiff();
 	}
 
 	override updated(changedProperties: Map<string | number | symbol, unknown>) {
 		super.updated(changedProperties);
 
-		if (changedProperties.has('diffText') || changedProperties.has('filename') || changedProperties.has('hunks')) {
-			this.processDiff();
+		if (changedProperties.has('filename') || changedProperties.has('hunks')) {
+			// Invalidate stale parsed data so that if the element is offscreen
+			// (and scheduleProcessing no-ops), the isVisible handler will know
+			// reprocessing is needed when the element scrolls back into view.
+			this.parsedDiff = undefined;
+			this.scheduleProcessing();
 		}
 
 		if (changedProperties.has('parsedDiff') || changedProperties.has('sideBySide')) {
 			this.renderDiff(true);
-		} else if (changedProperties.has('defaultExpanded') || changedProperties.has('isVisible')) {
+		} else if (changedProperties.has('defaultExpanded')) {
+			this.userExpandedState = undefined;
 			this.renderDiff();
+		} else if (changedProperties.has('isVisible')) {
+			if (this.isVisible && !this.parsedDiff && this.hunks?.length) {
+				// Element became visible but hasn't been processed yet — schedule it
+				this.scheduleProcessing();
+			}
+			this.renderDiff();
+		}
+	}
+
+	/**
+	 * Defers diff processing to a macrotask so it doesn't block the browser's
+	 * paint. Without this, selecting a commit with many files causes all
+	 * `parseDiff()` calls to run synchronously in Lit's microtask batch,
+	 * delaying the commits panel's selection highlight until every diff is parsed.
+	 */
+	private scheduleProcessing() {
+		this.cancelScheduledProcessing();
+		this._processingTimer = setTimeout(() => {
+			this._processingTimer = undefined;
+			if (!this.isConnected || !this.isVisible) return;
+
+			this.processDiff();
+		}, 0);
+	}
+
+	private cancelScheduledProcessing() {
+		if (this._processingTimer != null) {
+			clearTimeout(this._processingTimer);
+			this._processingTimer = undefined;
 		}
 	}
 
@@ -127,8 +161,15 @@ export class GlDiffFile extends LitElement {
 
 	private clearDiff() {
 		if (this.targetElement) {
+			this.captureUserExpandedState();
+			this.removeDetailsToggleListener();
+			const currentHeight = this.targetElement.offsetHeight;
+			if (currentHeight > 0) {
+				this.style.minHeight = `${currentHeight}px`;
+			}
 			this.targetElement.innerHTML = '';
 		}
+		this.diff2htmlUi = undefined;
 		this.hasRendered = false;
 	}
 
@@ -143,6 +184,8 @@ export class GlDiffFile extends LitElement {
 		if (this.hasRendered && !force) {
 			return;
 		}
+
+		this.style.minHeight = '';
 
 		if (!this.diff2htmlUi || force) {
 			const config: Diff2HtmlUIConfig = {
@@ -163,19 +206,20 @@ export class GlDiffFile extends LitElement {
 
 		const detailsElement = this.targetElement?.querySelector('details');
 		if (detailsElement) {
-			detailsElement.open = this.defaultExpanded;
+			detailsElement.open = this.userExpandedState ?? this.defaultExpanded;
+			this.setupDetailsToggleListener(detailsElement);
 		}
 
 		this.hasRendered = true;
 	}
 
 	private processDiff() {
-		// create diff text, then call parseDiff
 		if (!this.filename || !this.hunks || this.hunks.length === 0) {
 			this.diffText = undefined;
 			this.parsedDiff = undefined;
 			return;
 		}
+
 		const diffLines = this.hunks
 			.map((hunk, i) => {
 				if (i === 0) {
@@ -192,5 +236,32 @@ export class GlDiffFile extends LitElement {
 		this.parsedDiff = parsedDiff;
 		const lineCount = this.diffFile?.blocks.reduce((p, c) => p + 1 + c.lines.length, 0) ?? -1;
 		this.style.setProperty('--d2h-intrinsic-line-count', lineCount > -1 ? `${lineCount}` : '50');
+	}
+
+	private captureUserExpandedState() {
+		const detailsElement = this.targetElement?.querySelector('details');
+		if (detailsElement) {
+			this.userExpandedState = detailsElement.open;
+		}
+	}
+
+	private setupDetailsToggleListener(detailsElement: HTMLDetailsElement) {
+		this.removeDetailsToggleListener();
+
+		this.detailsToggleListener = () => {
+			this.userExpandedState = detailsElement.open;
+		};
+
+		detailsElement.addEventListener('toggle', this.detailsToggleListener);
+	}
+
+	private removeDetailsToggleListener() {
+		if (this.detailsToggleListener) {
+			const detailsElement = this.targetElement?.querySelector('details');
+			if (detailsElement) {
+				detailsElement.removeEventListener('toggle', this.detailsToggleListener);
+			}
+			this.detailsToggleListener = undefined;
+		}
 	}
 }

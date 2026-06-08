@@ -1,11 +1,11 @@
 import { css, html } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import type { DraftVisibility } from '../../../../plus/drafts/models/drafts';
-import type { Preferences, State } from '../../../commitDetails/protocol';
-import type { Change, DraftUserSelection } from '../../../plus/patchDetails/protocol';
-import { GlElement } from '../../shared/components/element';
-import { buttonStyles } from './button.css';
-import '../../plus/patchDetails/components/gl-patch-create';
+import type { DraftVisibility } from '../../../../plus/drafts/models/drafts.js';
+import type { Preferences, State } from '../../../commitDetails/protocol.js';
+import type { Change, DraftUserSelection } from '../../../plus/patchDetails/protocol.js';
+import { GlElement } from '../../shared/components/element.js';
+import { buttonStyles } from './button.css.js';
+import '../../plus/patchDetails/components/gl-patch-create.js';
 
 export interface CreatePatchState {
 	title?: string;
@@ -112,7 +112,7 @@ export class InspectPatch extends GlElement {
 
 			.message-input__control {
 				flex: 1;
-				border: 1px solid var(--vscode-input-border);
+				border: 1px solid var(--vscode-input-border, transparent);
 				background: var(--vscode-input-background);
 				padding: 0.5rem;
 				font-size: 1.3rem;
@@ -224,7 +224,7 @@ export class InspectPatch extends GlElement {
 			}
 
 			.user-selection {
-				--gk-avatar-size: 2rem;
+				--gl-avatar-size: 2rem;
 				display: flex;
 				flex-direction: row;
 				align-items: center;
@@ -248,14 +248,14 @@ export class InspectPatch extends GlElement {
 
 			.user-selection__actions {
 				flex: none;
-				color: var(--gk-button-ghost-color);
+				color: var(--gl-patch-ghost-color);
 			}
-			.user-selection__actions gk-button::part(base) {
+			.user-selection__actions gl-button::part(base) {
 				padding-right: 0;
 				padding-block: 0.4rem;
 			}
 
-			.user-selection__actions gk-button code-icon {
+			.user-selection__actions gl-button code-icon {
 				pointer-events: none;
 			}
 

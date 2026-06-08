@@ -1,7 +1,7 @@
 import { ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { CommitFormatter } from '../../git/formatters/commitFormatter';
-import { ContextValues } from './abstract/viewNode';
-import { CommitNode } from './commitNode';
+import { CommitFormatter } from '../../git/formatters/commitFormatter.js';
+import { ContextValues } from './abstract/viewNode.js';
+import { CommitNode } from './commitNode.js';
 
 export class RebaseCommitNode extends CommitNode {
 	// eslint-disable-next-line @typescript-eslint/require-await
@@ -15,7 +15,7 @@ export class RebaseCommitNode extends CommitNode {
 		item.description = CommitFormatter.fromTemplate(`\${message}`, this.commit, {
 			messageTruncateAtNewLine: true,
 		});
-		item.iconPath = new ThemeIcon('debug-pause');
+		item.iconPath = new ThemeIcon('gitlens-pause');
 
 		return item;
 	}

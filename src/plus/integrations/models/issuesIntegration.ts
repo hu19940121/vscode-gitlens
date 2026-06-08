@@ -1,14 +1,14 @@
-import type { IntegrationIds } from '../../../constants.integrations';
-import type { Account } from '../../../git/models/author';
-import type { IssueShape } from '../../../git/models/issue';
-import type { ResourceDescriptor } from '../../../git/models/resourceDescriptor';
-import { gate } from '../../../system/decorators/gate';
-import { debug } from '../../../system/decorators/log';
-import { getLogScope } from '../../../system/logger.scope';
-import type { ProviderAuthenticationSession } from '../authentication/models';
-import type { IssueFilter } from '../providers/models';
-import type { Integration, IntegrationType } from './integration';
-import { IntegrationBase } from './integration';
+import type { Account } from '@gitlens/git/models/author.js';
+import type { IssueShape } from '@gitlens/git/models/issue.js';
+import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import type { IntegrationIds } from '../../../constants.integrations.js';
+import { gate } from '../../../system/decorators/gate.js';
+import type { ProviderAuthenticationSession } from '../authentication/models.js';
+import type { IssueFilter } from '../providers/models.js';
+import type { Integration, IntegrationType } from './integration.js';
+import { IntegrationBase } from './integration.js';
 
 export function isIssuesIntegration(integration: Integration): integration is IssuesIntegration {
 	return integration.type === 'issues';
@@ -21,9 +21,9 @@ export abstract class IssuesIntegration<
 	readonly type: IntegrationType = 'issues';
 
 	@gate()
-	@debug()
+	@trace()
 	async getAccountForResource(resource: T): Promise<Account | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 
@@ -45,9 +45,9 @@ export abstract class IssuesIntegration<
 	): Promise<Account | undefined>;
 
 	@gate()
-	@debug()
+	@trace()
 	async getResourcesForUser(): Promise<T[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 
@@ -65,9 +65,9 @@ export abstract class IssuesIntegration<
 
 	protected abstract getProviderResourcesForUser(session: ProviderAuthenticationSession): Promise<T[] | undefined>;
 
-	@debug()
+	@trace()
 	async getProjectsForResources(resources: T[]): Promise<T[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 
@@ -95,12 +95,12 @@ export abstract class IssuesIntegration<
 		resources: T[],
 	): Promise<T[] | undefined>;
 
-	@debug()
+	@trace()
 	async getIssuesForProject(
 		project: T,
 		options?: { user?: string; filters?: IssueFilter[] },
 	): Promise<IssueShape[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 

@@ -1,26 +1,106 @@
-/* eslint-disable no-empty-pattern */
-import { execSync } from 'node:child_process';
-import fs from 'node:fs';
+/* oxlint-disable no-empty-pattern */
+import type { ChildProcess } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import * as process from 'node:process';
 import type { ElectronApplication, Page } from '@playwright/test';
 import { _electron, test as base } from '@playwright/test';
 import { downloadAndUnzipVSCode } from '@vscode/test-electron/out/download';
-import { GitFixture } from './fixtures/git';
-import { VSCodeEvaluator } from './fixtures/vscodeEvaluator';
-import { GitLensPage } from './pageObjects/gitLensPage';
+import { GitFixture } from './fixtures/git.js';
+import { VSCodeEvaluator } from './fixtures/vscodeEvaluator.js';
+import { GitLensPage } from './pageObjects/gitLensPage.js';
 
 export { expect } from '@playwright/test';
-export { GitFixture } from './fixtures/git';
-export type { VSCode } from './fixtures/vscodeEvaluator';
+export { GitFixture } from './fixtures/git.js';
+export type { VSCode } from './fixtures/vscodeEvaluator.js';
 
 export const MaxTimeout = 10000;
+export const DefaultTimeout = 2000;
+export const ShortTimeout = 500;
+
+/** Xvfb display number used for headless Linux testing */
+// eslint-disable-next-line @typescript-eslint/naming-convention
+const XVFB_DISPLAY = ':99';
+
+/** Xvfb process reference for cleanup */
+let xvfbProcess: ChildProcess | undefined;
+
+/**
+ * Ensures Xvfb is running for headless Linux environments (WSL/SSH).
+ * Returns the DISPLAY value to use, or undefined if not needed.
+ */
+function ensureXvfb(): string | undefined {
+	// Only needed on Linux without a display
+	if (process.platform !== 'linux' || process.env.DISPLAY) {
+		return process.env.DISPLAY;
+	}
+
+	try {
+		// Check if Xvfb is available
+		execSync('which Xvfb', { stdio: 'ignore' });
+
+		// Check if Xvfb is already running on our display
+		try {
+			execSync(`xdpyinfo -display ${XVFB_DISPLAY}`, { stdio: 'ignore' });
+			// Already running
+			return XVFB_DISPLAY;
+		} catch {
+			// Not running, start it
+		}
+
+		// Start Xvfb
+		xvfbProcess = spawn('Xvfb', [XVFB_DISPLAY, '-screen', '0', '1920x1080x24'], {
+			detached: true,
+			stdio: 'ignore',
+		});
+		xvfbProcess.unref();
+
+		// Give Xvfb time to start
+		execSync('sleep 0.5');
+
+		return XVFB_DISPLAY;
+	} catch {
+		// Xvfb not available
+		return undefined;
+	}
+}
+
+/**
+ * Patches the test VS Code's product.json to disable the win32VersionedUpdate mutex check.
+ *
+ * On Windows, VS Code checks for a `vscode-updating` mutex created by the InnoSetup installer.
+ * If the system VS Code is being updated (installer waiting for VS Code to restart), this mutex
+ * is active and causes the test VS Code instance to exit immediately with:
+ *   "Code is currently being updated. Please wait for the update to complete before launching."
+ *
+ * Setting `win32VersionedUpdate: false` bypasses this check for the isolated test instance.
+ */
+function patchTestVSCodeProductJson(vscodePath: string): void {
+	if (process.platform !== 'win32') return;
+
+	const vscodeDir = path.dirname(vscodePath);
+	for (const entry of readdirSync(vscodeDir, { withFileTypes: true })) {
+		if (!entry.isDirectory()) continue;
+
+		const productJsonPath = path.join(vscodeDir, entry.name, 'resources', 'app', 'product.json');
+		if (!existsSync(productJsonPath)) continue;
+
+		const product = JSON.parse(readFileSync(productJsonPath, 'utf8')) as Record<string, unknown>;
+		if (product['win32VersionedUpdate']) {
+			product['win32VersionedUpdate'] = false;
+			writeFileSync(productJsonPath, JSON.stringify(product, null, '\t'));
+		}
+		break;
+	}
+}
 
 /** Ensures the E2E runner is built before tests run */
 function ensureRunnerBuilt(): void {
 	const runnerDist = path.join(__dirname, 'runner', 'dist', 'index.js');
-	if (!fs.existsSync(runnerDist)) {
+	if (!existsSync(runnerDist)) {
 		const rootDir = path.resolve(__dirname, '../..');
 		execSync('pnpm run build:e2e-runner', { cwd: rootDir, stdio: 'inherit' });
 	}
@@ -43,6 +123,11 @@ const defaultUserSettings: Record<string, unknown> = {
 	// Use custom dialogs for consistent behavior
 	'files.simpleDialog.enable': true,
 	'window.dialogStyle': 'custom',
+
+	'gitlens.outputLevel': 'debug',
+	'gitlens.telemetry.enabled': false,
+	// Skip onboarding/welcome screens — ephemeral test environments shouldn't show welcome views
+	'gitlens.advanced.skipOnboarding': true,
 
 	// Associate git-rebase-todo files with GitLens rebase editor
 	// TODO: is this needed?
@@ -109,18 +194,17 @@ export const test = base.extend<BaseFixtures, WorkerFixtures>({
 
 			const tempDir = await createTmpDir();
 			const vscodePath = await downloadAndUnzipVSCode(vscodeOptions.vscodeVersion ?? 'stable');
+			// Patch product.json to prevent installer-mutex false positive on Windows
+			patchTestVSCodeProductJson(vscodePath);
 			const extensionPath = path.join(__dirname, '..', '..');
 			const runnerPath = path.join(__dirname, 'runner', 'dist');
 			const userDataDir = path.join(tempDir, 'user-data');
 
 			// Write user settings before launching VS Code
 			const settingsDir = path.join(userDataDir, 'User');
-			await fs.promises.mkdir(settingsDir, { recursive: true });
+			await mkdir(settingsDir, { recursive: true });
 			const mergedSettings = { ...defaultUserSettings, ...vscodeOptions.userSettings };
-			await fs.promises.writeFile(
-				path.join(settingsDir, 'settings.json'),
-				JSON.stringify(mergedSettings, null, '\t'),
-			);
+			await writeFile(path.join(settingsDir, 'settings.json'), JSON.stringify(mergedSettings, null, '\t'));
 
 			// Run setup callback if provided, otherwise open extension folder
 			const workspacePath = vscodeOptions.setup ? await vscodeOptions.setup() : extensionPath;
@@ -142,7 +226,19 @@ export const test = base.extend<BaseFixtures, WorkerFixtures>({
 				],
 			} satisfies Parameters<typeof _electron.launch>[0];
 
-			const electronApp = await _electron.launch(options);
+			// Ensure Xvfb is running for headless Linux environments
+			const display = ensureXvfb();
+
+			const electronApp = await _electron.launch({
+				...options,
+				env: {
+					...process.env,
+					// Allows Claude Code and other CLI agents run the tests from within VS Code
+					ELECTRON_RUN_AS_NODE: undefined!,
+					// Set DISPLAY for headless Linux (Xvfb)
+					...(display ? { DISPLAY: display } : {}),
+				},
+			});
 
 			// Connect to the VS Code test server using Playwright's internal API
 			const evaluator = await VSCodeEvaluator.connect(electronApp);
@@ -163,7 +259,7 @@ export const test = base.extend<BaseFixtures, WorkerFixtures>({
 			// Cleanup
 			evaluator.close();
 			await electronApp.close();
-			await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+			await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 		},
 		{ scope: 'worker' },
 	],
@@ -179,7 +275,7 @@ export const test = base.extend<BaseFixtures, WorkerFixtures>({
 		});
 		// Cleanup after test
 		for (const repo of repos) {
-			await fs.promises.rm(repo.repoDir, { recursive: true, force: true }).catch(() => {});
+			await rm(repo.repoPath, { recursive: true, force: true }).catch(() => {});
 		}
 	},
 
@@ -192,11 +288,11 @@ export const test = base.extend<BaseFixtures, WorkerFixtures>({
 		});
 		// Cleanup after test
 		for (const dir of dirs) {
-			await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+			await rm(dir, { recursive: true, force: true }).catch(() => {});
 		}
 	},
 });
 
 export async function createTmpDir(): Promise<string> {
-	return fs.promises.realpath(await fs.promises.mkdtemp(path.join(os.tmpdir(), 'gltest-')));
+	return realpath(await mkdtemp(path.join(os.tmpdir(), 'gltest-e2e-')));
 }

@@ -1,20 +1,20 @@
 import { Disposable, window } from 'vscode';
-import type { Container } from '../../container';
-import { setContext } from '../../system/-webview/context';
-import { gate } from '../../system/decorators/gate';
-import { log } from '../../system/decorators/log';
-import { once } from '../../system/function';
-import { Logger } from '../../system/logger';
-import { getLogScope } from '../../system/logger.scope';
+import { debug } from '@gitlens/utils/decorators/log.js';
+import { once } from '@gitlens/utils/function.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import type { Container } from '../../container.js';
+import { AuthenticationRequiredError, getPresentableErrorMessage } from '../../errors.js';
+import { setContext } from '../../system/-webview/context.js';
+import { gate } from '../../system/decorators/gate.js';
 import type {
 	Organization,
 	OrganizationMember,
 	OrganizationSettings,
 	OrganizationsResponse,
-} from './models/organization';
-import { fromGKDevAIProviders } from './models/organization';
-import type { ServerConnection } from './serverConnection';
-import type { SubscriptionChangeEvent } from './subscriptionService';
+} from './models/organization.js';
+import { fromGKDevAIProviders } from './models/organization.js';
+import type { ServerConnection } from './serverConnection.js';
+import type { SubscriptionChangeEvent } from './subscriptionService.js';
 
 const organizationsCacheExpiration = 24 * 60 * 60 * 1000; // 1 day
 
@@ -45,13 +45,13 @@ export class OrganizationService implements Disposable {
 	}
 
 	@gate()
-	@log<OrganizationService['getOrganizations']>({ args: { 0: o => `force=${o?.force}, userId=${o?.userId}` } })
+	@debug({ args: options => ({ options: `force=${options?.force}, userId=${options?.userId}` }) })
 	async getOrganizations(options?: {
 		force?: boolean;
 		accessToken?: string;
 		userId?: string;
 	}): Promise<Organization[] | null | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const userId = options?.userId ?? (await this.container.subscription.getSubscription(true))?.account?.id;
 		if (userId == null) {
 			this.updateOrganizations(undefined);
@@ -74,21 +74,25 @@ export class OrganizationService implements Disposable {
 					{ token: options?.accessToken },
 				);
 			} catch (ex) {
-				debugger;
-				Logger.error(ex, scope);
+				if (ex instanceof AuthenticationRequiredError) {
+					this.updateOrganizations(undefined);
+					return this._organizations;
+				}
 
-				void window.showErrorMessage(`Unable to get organizations due to error: ${ex}`, 'OK');
+				debugger;
+				scope?.error(ex);
+
+				void window.showErrorMessage(
+					`Unable to get organizations due to error: ${getPresentableErrorMessage(ex)}`,
+					'OK',
+				);
 				this.updateOrganizations(undefined);
 				return this._organizations;
 			}
 
 			if (!rsp.ok) {
 				debugger;
-				Logger.error(
-					undefined,
-					scope,
-					`Unable to get organizations; status=(${rsp.status}): ${rsp.statusText}`,
-				);
+				scope?.error(undefined, `Unable to get organizations; status=(${rsp.status}): ${rsp.statusText}`);
 
 				void window.showErrorMessage(`Unable to get organizations; Status: ${rsp.statusText}`, 'OK');
 
@@ -115,6 +119,7 @@ export class OrganizationService implements Disposable {
 	private loadStoredOrganizations(userId: string): void {
 		const storedOrganizations = this.container.storage.get(`gk:${userId}:organizations`);
 		if (storedOrganizations == null) return;
+
 		const { timestamp, data: organizations } = storedOrganizations;
 		if (timestamp == null || Date.now() - timestamp > organizationsCacheExpiration) {
 			return;
@@ -181,8 +186,9 @@ export class OrganizationService implements Disposable {
 	}
 
 	@gate()
-	@log()
+	@debug()
 	async getMembers(id?: string | undefined, options?: { force?: boolean }): Promise<OrganizationMember[]> {
+		const scope = getScopedLogger();
 		if (id == null) {
 			id = await this.getActiveOrganizationId();
 			if (id == null) return [];
@@ -192,11 +198,19 @@ export class OrganizationService implements Disposable {
 			type MemberResponse = {
 				members: OrganizationMember[];
 			};
-			const rsp = await this.connection.fetchGkApi(`organization/${id}/members`, { method: 'GET' });
+			let rsp;
+			try {
+				rsp = await this.connection.fetchGkApi(`organization/${id}/members`, { method: 'GET' });
+			} catch (ex) {
+				if (ex instanceof AuthenticationRequiredError) return [];
+
+				debugger;
+				scope?.error(ex);
+				return [];
+			}
 			if (!rsp.ok) {
-				Logger.error(
-					'',
-					getLogScope(),
+				scope?.error(
+					undefined,
 					`Unable to get organization members; status=(${rsp.status}): ${rsp.statusText}`,
 				);
 				return [];
@@ -212,12 +226,12 @@ export class OrganizationService implements Disposable {
 		return this._organizationMembers.get(id) ?? [];
 	}
 
-	@log()
+	@debug()
 	async getMemberById(id: string, organizationId: string): Promise<OrganizationMember | undefined> {
 		return (await this.getMembers(organizationId)).find(m => m.id === id);
 	}
 
-	@log()
+	@debug()
 	async getMembersByIds(ids: string[], organizationId: string): Promise<OrganizationMember[]> {
 		return (await this.getMembers(organizationId)).filter(m => ids.includes(m.id));
 	}
@@ -228,7 +242,7 @@ export class OrganizationService implements Disposable {
 	}
 
 	@gate()
-	@log()
+	@debug()
 	async getOrganizationSettings(
 		orgId: string | undefined,
 		options?: { force?: boolean },
@@ -237,6 +251,9 @@ export class OrganizationService implements Disposable {
 			data: OrganizationSettings;
 			error: string | undefined;
 		};
+
+		const scope = getScopedLogger();
+
 		// TODO: maybe getActiveOrganizationId(false) when force is true
 		const id = orgId ?? (await this.getActiveOrganizationId());
 		if (id == null) return undefined;
@@ -258,15 +275,23 @@ export class OrganizationService implements Disposable {
 
 		if (!this._organizationSettings?.has(id) || options?.force === true) {
 			await this.deleteStoredOrganizationSettings(id);
-			const rsp = await this.connection.fetchGkApi(
-				`v1/organizations/settings`,
-				{ method: 'GET' },
-				{ organizationId: id },
-			);
+			let rsp;
+			try {
+				rsp = await this.connection.fetchGkApi(
+					`v1/organizations/settings`,
+					{ method: 'GET' },
+					{ organizationId: id },
+				);
+			} catch (ex) {
+				if (ex instanceof AuthenticationRequiredError) return undefined;
+
+				debugger;
+				scope?.error(ex);
+				return undefined;
+			}
 			if (!rsp.ok) {
-				Logger.error(
-					'',
-					getLogScope(),
+				scope?.error(
+					undefined,
 					`Unable to get organization settings; status=(${rsp.status}): ${rsp.statusText}`,
 				);
 				return undefined;
@@ -274,17 +299,14 @@ export class OrganizationService implements Disposable {
 
 			const organizationResponse = (await rsp.json()) as OrganizationSettingsResponse;
 			if (organizationResponse.error != null) {
-				Logger.error(
+				scope?.error(
 					'',
-					getLogScope(),
 					`Unable to get organization settings; status=(${rsp.status}): ${organizationResponse.error}`,
 				);
 				return undefined;
 			}
 
-			if (this._organizationSettings == null) {
-				this._organizationSettings = new Map();
-			}
+			this._organizationSettings ??= new Map();
 			this._organizationSettings.set(id, { data: organizationResponse.data, lastValidatedDate: new Date() });
 			await this.storeOrganizationSettings(id, organizationResponse.data, new Date());
 		}

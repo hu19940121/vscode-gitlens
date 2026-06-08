@@ -24,7 +24,10 @@ const remappedTypes = new Map([
 	['TrackedUsageKeys', 'string /* TrackedUsageKeys */'],
 ]);
 
-const program = ts.createProgram(filePaths, {});
+const tsconfigPath = path.join(__dirname, 'tsconfig.node.json');
+const tsconfigFile = ts.readConfigFile(tsconfigPath, ts.sys.readFile);
+const parsedConfig = ts.parseJsonConfigFileContent(tsconfigFile.config, ts.sys, __dirname);
+const program = ts.createProgram(filePaths, parsedConfig.options);
 const typeChecker = program.getTypeChecker();
 
 /** @type {{ file: ts.SourceFile, type: ts.Type } | undefined} */
@@ -194,6 +197,7 @@ function expandType(file, type, indent = '', isRoot = true, prefix = '') {
 			result = unionTypeCache.get(type);
 			if (result == null) {
 				const types = type.types
+					.filter(t => !(t.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null)))
 					.map(t => expandType(file, t, indent, false, prefix))
 					.filter(t => Boolean(t))
 					.join(' | ')
@@ -300,7 +304,7 @@ function expandType(file, type, indent = '', isRoot = true, prefix = '') {
 		}
 	} else if (type.flags & ts.TypeFlags.Boolean) {
 		result = 'boolean';
-	} else if (type.flags & ts.TypeFlags.Never) {
+	} else if (type.flags & (ts.TypeFlags.Never | ts.TypeFlags.Undefined)) {
 		return '';
 	} else {
 		result = typeChecker.typeToString(type);

@@ -1,8 +1,8 @@
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import '../overlays/popover';
-import '../actions/action-item';
-import '../code-icon';
+import '../overlays/popover.js';
+import '../actions/action-item.js';
+import '../code-icon.js';
 
 @customElement('gl-connect')
 export class GlConnect extends LitElement {
@@ -14,6 +14,10 @@ export class GlConnect extends LitElement {
 	static override styles = css`
 		.inline-popover {
 			display: inline-block;
+		}
+
+		.connected-icon {
+			vertical-align: text-bottom;
 		}
 	`;
 
@@ -62,9 +66,8 @@ export class GlConnect extends LitElement {
 
 	private renderText() {
 		if (this.account && this.connected) {
-			return html`<code-icon icon="check" style="vertical-align: text-bottom"></code-icon> ${this
-					.integrationLabel}
-				connected &mdash; automatic rich ${this.integrationLabel} autolinks are enabled`;
+			return html`<code-icon class="connected-icon" icon="check"></code-icon> ${this.integrationLabel} connected
+				&mdash; automatic rich ${this.integrationLabel} autolinks are enabled`;
 		}
 
 		return html`<a href="${this.connectIntegrationUrl}">Connect to ${this.integrationLabel}</a> &mdash;

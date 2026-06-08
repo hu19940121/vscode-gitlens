@@ -1,11 +1,11 @@
 import { ColorSchemeType } from 'diff2html/lib-esm/types';
-import type { Diff2HtmlUIConfig } from 'diff2html/lib-esm/ui/js/diff2html-ui.js';
-import { Diff2HtmlUI } from 'diff2html/lib-esm/ui/js/diff2html-ui.js';
+import type { Diff2HtmlUIConfig } from 'diff2html/lib-esm/ui/js/diff2html-ui-base.js';
+import { Diff2HtmlUI } from 'diff2html/lib-esm/ui/js/diff2html-ui-base.js';
 import { css, html, LitElement } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
-import { boxSizingBase } from '../../../../shared/components/styles/lit/base.css';
-import { compiledComposerTemplates } from './diff-templates.compiled';
-import { diff2htmlStyles, diffStyles, hljsStyles } from './diff.css';
+import { boxSizingBase } from '../../../../shared/components/styles/lit/base.css.js';
+import { compiledComposerTemplates } from './diff-templates.compiled.js';
+import { diff2htmlStyles, diffStyles, hljsStyles } from './diff.css.js';
 
 @customElement('gl-diff-hunk')
 export class GlDiffHunk extends LitElement {
@@ -73,6 +73,7 @@ export class GlDiffHunk extends LitElement {
 			this.targetElement.innerHTML = '';
 			return;
 		}
+
 		const config: Diff2HtmlUIConfig = {
 			colorScheme: ColorSchemeType.AUTO,
 			outputFormat: 'line-by-line',

@@ -1,0 +1,178 @@
+name: CI
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+        branches: ['*']
+        types:
+            - opened
+            - reopened
+            - synchronize
+            - ready_for_review
+    workflow_dispatch:
+
+jobs:
+    build:
+        name: Format, Typecheck, Lint, & Build
+        runs-on: ubuntu-latest
+        if: ${{ !github.event.pull_request.draft }}
+        timeout-minutes: 10
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Calc tools versions
+              id: tools-versions
+              run: |
+                  NODE_VERSION=$(jq -r '.engines.node | gsub("[^0-9.]"; "")' package.json)
+                  PNPM_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
+                  echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
+                  echo "pnpm-version=$PNPM_VERSION" >> $GITHUB_OUTPUT
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ steps.tools-versions.outputs.node-version }}
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+              with:
+                  version: ${{ steps.tools-versions.outputs.pnpm-version }}
+
+            - name: Get pnpm store directory
+              shell: bash
+              run: |
+                  echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+            - name: Setup pnpm cache
+              uses: actions/cache@v4
+              with:
+                  path: ${{ env.STORE_PATH }}
+                  key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+                  restore-keys: |
+                      ${{ runner.os }}-pnpm-store-
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Check formatting
+              run: pnpm run pretty:check
+
+            - name: Build (production)
+              run: pnpm run bundle
+
+    unit-tests:
+        name: Unit Tests
+        runs-on: ubuntu-latest
+        if: ${{ !github.event.pull_request.draft }}
+        timeout-minutes: 15
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Calc tools versions
+              id: tools-versions
+              run: |
+                  NODE_VERSION=$(jq -r '.engines.node | gsub("[^0-9.]"; "")' package.json)
+                  PNPM_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
+                  echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
+                  echo "pnpm-version=$PNPM_VERSION" >> $GITHUB_OUTPUT
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ steps.tools-versions.outputs.node-version }}
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+              with:
+                  version: ${{ steps.tools-versions.outputs.pnpm-version }}
+
+            - name: Get pnpm store directory
+              shell: bash
+              run: |
+                  echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+            - name: Setup pnpm cache
+              uses: actions/cache@v4
+              with:
+                  path: ${{ env.STORE_PATH }}
+                  key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+                  restore-keys: |
+                      ${{ runner.os }}-pnpm-store-
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build test files
+              run: pnpm run build:tests
+
+            - name: Run unit tests
+              run: xvfb-run -a pnpm run test
+
+    e2e-tests:
+        name: E2E Tests
+        runs-on: ubuntu-latest
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        timeout-minutes: 20
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Calc tools versions
+              id: tools-versions
+              run: |
+                  NODE_VERSION=$(jq -r '.engines.node | gsub("[^0-9.]"; "")' package.json)
+                  PNPM_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
+                  echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
+                  echo "pnpm-version=$PNPM_VERSION" >> $GITHUB_OUTPUT
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: ${{ steps.tools-versions.outputs.node-version }}
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@v4
+              with:
+                  version: ${{ steps.tools-versions.outputs.pnpm-version }}
+
+            - name: Get pnpm store directory
+              shell: bash
+              run: |
+                  echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+            - name: Setup pnpm cache
+              uses: actions/cache@v4
+              with:
+                  path: ${{ env.STORE_PATH }}
+                  key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+                  restore-keys: |
+                      ${{ runner.os }}-pnpm-store-
+
+            - name: Install dependencies
+              run: pnpm install --frozen-lockfile
+
+            - name: Build (production with DEBUG for simulator)
+              run: pnpm run bundle:e2e
+
+            - name: Run E2E tests
+              run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x16" pnpm run test:e2e
+
+            - name: Upload test results
+              if: failure()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: playwright-results
+                  path: out/test-results/
+                  retention-days: 7
+
+            - name: Upload Playwright report
+              if: failure()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: playwright-report
+                  path: playwright-report/
+                  retention-days: 7

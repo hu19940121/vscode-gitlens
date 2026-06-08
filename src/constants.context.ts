@@ -1,13 +1,18 @@
 import type { Uri } from 'vscode';
-import type { FileAnnotationType } from './config';
-import type { AnnotationStatus, Keys } from './constants';
-import type { SubscriptionState } from './constants.subscription';
-import type { CustomEditorTypes, GroupableTreeViewTypes, WebviewTypes, WebviewViewTypes } from './constants.views';
-import type { WalkthroughContextKeys } from './constants.walkthroughs';
-import type { Features } from './features';
-import type { OrgAIProviders } from './plus/gk/models/organization';
-import type { PromoKeys } from './plus/gk/models/promo';
-import type { SubscriptionPlanIds } from './plus/gk/models/subscription';
+import type { FileAnnotationType } from './config.js';
+import type { AnnotationStatus, Keys } from './constants.js';
+import type { SubscriptionState } from './constants.subscription.js';
+import type {
+	CustomEditorTypes,
+	GroupableTreeViewTypes,
+	WebviewPanelTypes,
+	WebviewViewTypes,
+} from './constants.views.js';
+import type { GraphWalkthroughContextKeys, WalkthroughContextKeys } from './constants.walkthroughs.js';
+import type { Features } from './features.js';
+import type { OrgAIProviders } from './plus/gk/models/organization.js';
+import type { PromoKeys } from './plus/gk/models/promo.js';
+import type { SubscriptionPlanIds } from './plus/gk/models/subscription.js';
 
 interface CompareSelectedInfo {
 	label: string;
@@ -22,6 +27,7 @@ interface CompareSelectedFileInfo {
 }
 
 export type ContextKeys = {
+	'gitlens:agents:enabled': boolean;
 	'gitlens:debugging': boolean;
 	'gitlens:disabled': boolean;
 	'gitlens:disabledToggleCodeLens': boolean;
@@ -41,6 +47,8 @@ export type ContextKeys = {
 	'gitlens:install:upgradedFrom': string;
 	'gitlens:plus': Exclude<SubscriptionPlanIds, 'community'>;
 	'gitlens:plus:disabled': boolean;
+	/** Pipe-delimited view IDs to allow showing pro views when hidden */
+	'gitlens:plus:disabled:view:overrides': string;
 	'gitlens:plus:disallowedRepos': string[];
 	'gitlens:plus:required': boolean;
 	'gitlens:plus:state': SubscriptionState;
@@ -84,6 +92,7 @@ export type ContextKeys = {
 	Record<`gitlens:feature:unsupported:${Features}`, boolean> &
 	Record<`gitlens:key:${Keys}`, boolean> &
 	Record<`gitlens:views:scm:grouped:views:${GroupableTreeViewTypes}`, boolean> &
-	Record<`gitlens:webview:${WebviewTypes | CustomEditorTypes}:visible`, boolean> &
+	Record<`gitlens:webview:${CustomEditorTypes | WebviewPanelTypes}:visible`, boolean> &
 	Record<`gitlens:webviewView:${WebviewViewTypes}:visible`, boolean> &
+	Record<`gitlens:walkthroughState:${GraphWalkthroughContextKeys}`, boolean> &
 	Record<`gitlens:walkthroughState:${WalkthroughContextKeys}`, boolean>;

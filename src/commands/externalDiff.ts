@@ -1,23 +1,24 @@
 import type { SourceControlResourceState } from 'vscode';
 import { env, Uri, window } from 'vscode';
-import type { ScmResource } from '../@types/vscode.git.resources';
-import { ScmResourceGroupType, ScmStatus } from '../@types/vscode.git.resources.enums';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { isUncommitted, isUncommittedStaged } from '../git/utils/revision.utils';
-import { showGenericErrorMessage } from '../messages';
-import { getRepositoryOrShowPicker } from '../quickpicks/repositoryPicker';
-import { command } from '../system/-webview/command';
-import { configuration } from '../system/-webview/configuration';
-import { filterMap } from '../system/array';
-import { Logger } from '../system/logger';
-import { GlCommandBase } from './commandBase';
-import type { CommandContext } from './commandContext';
+import { GitCommit } from '@gitlens/git/models/commit.js';
+import { isUncommitted, isUncommittedStaged } from '@gitlens/git/utils/revision.utils.js';
+import { filterMap } from '@gitlens/utils/array.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { ScmResource } from '../@types/vscode.git.resources.d.js';
+import { ScmResourceGroupType, ScmStatus } from '../@types/vscode.git.resources.enums.js';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { getRepositoryOrShowPicker } from '../quickpicks/repositoryPicker.js';
+import { command } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { GlCommandBase } from './commandBase.js';
+import type { CommandContext } from './commandContext.js';
 import {
 	isCommandContextViewNodeHasFileCommit,
 	isCommandContextViewNodeHasFileRefs,
 	isCommandContextViewNodeHasRefFile,
-} from './commandContext.utils';
+} from './commandContext.utils.js';
 
 interface ExternalDiffFile {
 	uri: Uri;
@@ -40,7 +41,7 @@ export class ExternalDiffCommand extends GlCommandBase {
 		args = { ...args };
 
 		if (isCommandContextViewNodeHasFileCommit(context)) {
-			const previousSha = await context.node.commit.getPreviousSha();
+			const previousSha = await GitCommit.getPreviousSha(context.node.commit);
 			const ref1 = isUncommitted(previousSha) ? '' : previousSha;
 			const ref2 = context.node.commit.isUncommitted ? '' : context.node.commit.sha;
 
@@ -164,7 +165,7 @@ export class ExternalDiffCommand extends GlCommandBase {
 					args.files.push({ uri: status.uri, staged: false });
 				}
 			} else {
-				repo = await this.container.git.getOrOpenRepository(args.files[0].uri);
+				repo = await this.container.git.getOrAddRepository(args.files[0].uri, { opened: false });
 				if (repo == null) return;
 			}
 

@@ -1,17 +1,17 @@
 import type { Disposable, QuickInputButton } from 'vscode';
 import { authentication, env, ThemeIcon, Uri, window } from 'vscode';
-import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../../../constants.integrations';
-import type { Sources } from '../../../constants.telemetry';
-import type { Container } from '../../../container';
-import { getBuiltInIntegrationSession } from '../../gk/utils/-webview/integrationAuthentication.utils';
-import type { ConfiguredIntegrationService } from './configuredIntegrationService';
-import type { IntegrationAuthenticationSessionDescriptor } from './integrationAuthenticationProvider';
+import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../../../constants.integrations.js';
+import type { Sources } from '../../../constants.telemetry.js';
+import type { Container } from '../../../container.js';
+import { getBuiltInIntegrationSession } from '../../gk/utils/-webview/integrationAuthentication.utils.js';
+import type { ConfiguredIntegrationService } from './configuredIntegrationService.js';
+import type { IntegrationAuthenticationSessionDescriptor } from './integrationAuthenticationProvider.js';
 import {
 	CloudIntegrationAuthenticationProvider,
 	LocalIntegrationAuthenticationProvider,
-} from './integrationAuthenticationProvider';
-import type { IntegrationAuthenticationService } from './integrationAuthenticationService';
-import type { ProviderAuthenticationSession } from './models';
+} from './integrationAuthenticationProvider.js';
+import type { IntegrationAuthenticationService } from './integrationAuthenticationService.js';
+import type { ProviderAuthenticationSession } from './models.js';
 
 export class GitHubAuthenticationProvider extends CloudIntegrationAuthenticationProvider<GitCloudHostIntegrationId.GitHub> {
 	constructor(
@@ -37,18 +37,18 @@ export class GitHubAuthenticationProvider extends CloudIntegrationAuthentication
 		descriptor: IntegrationAuthenticationSessionDescriptor,
 		options?: { createIfNeeded?: boolean; forceNewSession?: boolean; source?: Sources },
 	): Promise<ProviderAuthenticationSession | undefined> {
-		let session = await getBuiltInIntegrationSession(this.container, this.authProviderId, descriptor, {
-			silent: true,
-		});
-		if (session != null && options?.forceNewSession) {
-			session = await getBuiltInIntegrationSession(this.container, this.authProviderId, descriptor, {
-				forceNewSession: true,
-			});
+		const session = await super.getSession(descriptor, options);
+
+		if (session) {
+			return session;
 		}
 
-		if (session != null) return session;
-
-		return super.getSession(descriptor, options);
+		// Call silently with `forceNewSession: undefined`
+		// Because we never want force new session from VSCode,
+		// we only try to use an existing one if presented:
+		return getBuiltInIntegrationSession(this.container, this.authProviderId, descriptor, {
+			silent: true,
+		});
 	}
 }
 
@@ -123,6 +123,7 @@ export class GitHubEnterpriseAuthenticationProvider extends LocalIntegrationAuth
 				label: '',
 			},
 			cloud: false,
+			type: 'pat',
 			domain: descriptor.domain,
 		};
 	}

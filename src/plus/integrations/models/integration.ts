@@ -1,35 +1,36 @@
 /* eslint-disable @typescript-eslint/no-restricted-imports -- TODO need to deal with sharing rich class shapes to webviews */
 import type { CancellationToken, Disposable, Event, MessageItem } from 'vscode';
 import { EventEmitter, window } from 'vscode';
-import type { AutolinkReference, DynamicAutolinkReference } from '../../../autolinks/models/autolinks';
-import type { IntegrationIds, IssuesCloudHostIntegrationId } from '../../../constants.integrations';
-import { GitCloudHostIntegrationId } from '../../../constants.integrations';
-import type { Sources } from '../../../constants.telemetry';
-import type { Container } from '../../../container';
-import { AuthenticationError, CancellationError, RequestClientError } from '../../../errors';
-import type { Account } from '../../../git/models/author';
-import type { Issue, IssueShape } from '../../../git/models/issue';
-import type { IssueOrPullRequest, IssueOrPullRequestType } from '../../../git/models/issueOrPullRequest';
-import type { PullRequest } from '../../../git/models/pullRequest';
-import type { ResourceDescriptor } from '../../../git/models/resourceDescriptor';
-import { showIntegrationDisconnectedTooManyFailedRequestsWarningMessage } from '../../../messages';
-import { configuration } from '../../../system/-webview/configuration';
-import { gate } from '../../../system/decorators/gate';
-import { debug, log } from '../../../system/decorators/log';
-import { Logger } from '../../../system/logger';
-import type { LogScope } from '../../../system/logger.scope';
-import { getLogScope } from '../../../system/logger.scope';
-import { isSubscriptionTrialOrPaidFromState } from '../../gk/utils/subscription.utils';
+import type { Account } from '@gitlens/git/models/author.js';
+import type { Issue, IssueShape } from '@gitlens/git/models/issue.js';
+import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import { isCancellationError } from '@gitlens/utils/cancellation.js';
+import { debug, trace } from '@gitlens/utils/decorators/log.js';
+import { fnv1aHash64 } from '@gitlens/utils/hash.js';
+import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import type { AutolinkReference, GlDynamicAutolinkReference } from '../../../autolinks/models/autolinks.js';
+import type { IntegrationIds, IssuesCloudHostIntegrationId } from '../../../constants.integrations.js';
+import { GitCloudHostIntegrationId } from '../../../constants.integrations.js';
+import type { Sources } from '../../../constants.telemetry.js';
+import type { Container } from '../../../container.js';
+import { AuthenticationError, RequestClientError } from '../../../errors.js';
+import { showIntegrationDisconnectedTooManyFailedRequestsWarningMessage } from '../../../messages.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import { gate } from '../../../system/decorators/gate.js';
+import { isSubscriptionTrialOrPaidFromState } from '../../gk/utils/subscription.utils.js';
 import type {
 	IntegrationAuthenticationProviderDescriptor,
 	IntegrationAuthenticationSessionDescriptor,
-} from '../authentication/integrationAuthenticationProvider';
-import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService';
-import type { ProviderAuthenticationSession } from '../authentication/models';
-import type { IntegrationConnectionChangeEvent } from '../integrationService';
-import type { ProvidersApi } from '../providers/providersApi';
-import type { GitHostIntegration } from './gitHostIntegration';
-import type { IssuesIntegration } from './issuesIntegration';
+} from '../authentication/integrationAuthenticationProvider.js';
+import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
+import type { ProviderAuthenticationSession } from '../authentication/models.js';
+import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
+import type { ProvidersApi } from '../providers/providersApi.js';
+import type { GitHostIntegration } from './gitHostIntegration.js';
+import type { IssuesIntegration } from './issuesIntegration.js';
 
 export type Integration = GitHostIntegration | IssuesIntegration;
 export type IntegrationById<T extends IntegrationIds> = T extends IssuesCloudHostIntegrationId
@@ -46,7 +47,7 @@ export type IntegrationKey<T extends IntegrationIds = IntegrationIds> = T extend
 export type IntegrationConnectedKey<T extends IntegrationIds = IntegrationIds> = `connected:${IntegrationKey<T>}`;
 
 export type IntegrationResult<T> =
-	| { value: T; duration?: number; error?: never }
+	| { value: T; duration?: number; error?: Error }
 	| { error: Error; duration?: number; value?: never }
 	| undefined;
 
@@ -115,8 +116,8 @@ export abstract class IntegrationBase<
 	}
 
 	autolinks():
-		| (AutolinkReference | DynamicAutolinkReference)[]
-		| Promise<(AutolinkReference | DynamicAutolinkReference)[]> {
+		| (AutolinkReference | GlDynamicAutolinkReference)[]
+		| Promise<(AutolinkReference | GlDynamicAutolinkReference)[]> {
 		return [];
 	}
 
@@ -126,6 +127,17 @@ export abstract class IntegrationBase<
 
 	get maybeConnected(): boolean | undefined {
 		return this._session === undefined ? undefined : this._session !== null;
+	}
+
+	/** Hash of the current session's access token. Changes on any token change (account switch or refresh). */
+	private _sessionFingerprint: { session: ProviderAuthenticationSession; hash: string } | undefined;
+	get sessionFingerprint(): string | undefined {
+		if (this._session == null) return undefined;
+
+		if (this._sessionFingerprint?.session !== this._session) {
+			this._sessionFingerprint = { session: this._session, hash: fnv1aHash64(this._session.accessToken) };
+		}
+		return this._sessionFingerprint.hash;
 	}
 
 	get connectionExpired(): boolean | undefined {
@@ -143,7 +155,7 @@ export abstract class IntegrationBase<
 		return this._session ?? undefined;
 	}
 
-	@log()
+	@debug()
 	async connect(source: Sources): Promise<boolean> {
 		try {
 			return Boolean(await this.ensureSession({ createIfNeeded: true, source: source }));
@@ -155,7 +167,7 @@ export abstract class IntegrationBase<
 	protected providerOnConnect?(): void | Promise<void>;
 
 	@gate()
-	@log()
+	@debug()
 	async disconnect(options?: { silent?: boolean; currentSessionOnly?: boolean }): Promise<void> {
 		if (options?.currentSessionOnly && this._session === null) return;
 
@@ -217,7 +229,7 @@ export abstract class IntegrationBase<
 
 	protected providerOnDisconnect?(): void | Promise<void>;
 
-	@log()
+	@debug()
 	async reauthenticate(): Promise<void> {
 		if (this._session === undefined) return;
 
@@ -262,9 +274,13 @@ export abstract class IntegrationBase<
 	}
 
 	private skippedNonCloudReported = false;
-	@log()
+	@debug()
 	async syncCloudConnection(state: 'connected' | 'disconnected', forceSync: boolean): Promise<void> {
-		if (this._session?.cloud === false) {
+		// Initially the condition on `this._session.cloud` has been added here: https://github.com/gitkraken/vscode-gitlens/commit/e95e70c430bd162924cc3bd5c1e8ab90e6293449#diff-4213141a45cccaab7aa2e40028b155a87eb913b07388485831403e60ce5555e4R237
+		// I'm not sure about reasons, but it seems we want to replace it with the cloud session if it's connected.
+		// Gradually we'll stop having non-cloud sessions.
+		// However this is needed to be tested with PATs, e.g. with a GitLab PAT.
+		if (this._session?.cloud === false && state !== 'connected') {
 			if (this.id !== GitCloudHostIntegrationId.GitHub && !this.skippedNonCloudReported) {
 				this.container.telemetry.sendEvent('cloudIntegrations/refreshConnection/skippedUnusualToken', {
 					'integration.id': this.id,
@@ -318,11 +334,11 @@ export abstract class IntegrationBase<
 	protected handleProviderException(
 		syncReqUsecase: SyncReqUsecase,
 		ex: Error,
-		options?: { scope?: LogScope | undefined; silent?: boolean },
+		options?: { scope?: ScopedLogger | undefined; silent?: boolean },
 	): void {
-		if (ex instanceof CancellationError) return;
+		if (isCancellationError(ex)) return;
 
-		Logger.error(ex, options?.scope);
+		options?.scope?.error(ex);
 
 		if (ex instanceof AuthenticationError && this._session?.cloud) {
 			if (!this.hasSessionSyncRequests()) {
@@ -341,13 +357,13 @@ export abstract class IntegrationBase<
 
 	private missingExpirityReported = false;
 	@gate()
-	protected async refreshSessionIfExpired(scope?: LogScope): Promise<void> {
+	protected async refreshSessionIfExpired(scope?: ScopedLogger): Promise<void> {
 		if (this._session?.expiresAt != null && this._session.expiresAt < new Date()) {
 			// The current session is expired, so get the latest from the cloud and refresh if needed
 			try {
 				await this.syncCloudConnection('connected', true);
 			} catch (ex) {
-				Logger.error(ex, scope);
+				scope?.error(ex);
 			}
 		} else if (
 			this._session?.expiresAt == null &&
@@ -363,7 +379,7 @@ export abstract class IntegrationBase<
 		}
 	}
 
-	@debug()
+	@trace()
 	trackRequestException(options?: { silent?: boolean }): void {
 		this.requestExceptionCount++;
 
@@ -376,7 +392,7 @@ export abstract class IntegrationBase<
 	}
 
 	@gate()
-	@debug({ exit: true })
+	@trace({ exit: true })
 	async isConnected(): Promise<boolean> {
 		return (await this.getSession('integrations')) != null;
 	}
@@ -466,12 +482,12 @@ export abstract class IntegrationBase<
 		resources?: ResourceDescriptor[],
 		cancellation?: CancellationToken,
 	): Promise<IssueShape[] | undefined>;
-	@debug()
+	@trace()
 	async searchMyIssues(
 		resources?: ResourceDescriptor | ResourceDescriptor[],
 		cancellation?: CancellationToken,
 	): Promise<IssueShape[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
 
@@ -497,13 +513,13 @@ export abstract class IntegrationBase<
 		cancellation?: CancellationToken,
 	): Promise<IssueShape[] | undefined>;
 
-	@debug()
+	@trace()
 	async getLinkedIssueOrPullRequest(
 		resource: T,
 		link: { id: string; key: string },
 		options?: { expiryOverride?: boolean | number; type?: IssueOrPullRequestType },
 	): Promise<IssueOrPullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -544,13 +560,13 @@ export abstract class IntegrationBase<
 		type: undefined | IssueOrPullRequestType,
 	): Promise<IssueOrPullRequest | undefined>;
 
-	@debug()
+	@trace()
 	async getIssue(
 		resource: T,
 		id: string,
 		options?: { expiryOverride?: boolean | number },
 	): Promise<Issue | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -588,7 +604,7 @@ export abstract class IntegrationBase<
 		avatarSize?: number;
 		expiryOverride?: boolean | number;
 	}): Promise<Account | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;
@@ -599,19 +615,31 @@ export abstract class IntegrationBase<
 
 		const currentAccount = await this.container.cache.getCurrentAccount(
 			this,
-			() => ({
+			cacheable => ({
 				value: (async () => {
 					try {
 						const account = await this.getProviderCurrentAccount?.(this._session!, opts);
 						this.resetRequestExceptionCount('getCurrentAccount');
 						return account;
 					} catch (ex) {
+						if (isCancellationError(ex)) {
+							cacheable.invalidate();
+							return undefined;
+						}
+
 						this.handleProviderException('getCurrentAccount', ex, { scope: scope });
-						return undefined;
+
+						// Invalidate the cache on error, except for auth errors
+						if (!(ex instanceof AuthenticationError)) {
+							cacheable.invalidate();
+						}
+
+						// Re-throw to the caller
+						throw ex;
 					}
 				})(),
 			}),
-			{ expiryOverride: expiryOverride },
+			{ expiryOverride: expiryOverride, expireOnError: false },
 		);
 		return currentAccount;
 	}
@@ -621,9 +649,9 @@ export abstract class IntegrationBase<
 		options?: { avatarSize?: number },
 	): Promise<Account | undefined>;
 
-	@debug()
+	@trace()
 	async getPullRequest(resource: T, id: string): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
 		if (!connected) return undefined;

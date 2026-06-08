@@ -1,5 +1,5 @@
 import { GitPullRequestMergeableState, GitPullRequestReviewState, GitPullRequestState } from '@gitkraken/provider-apis';
-import type { ProviderAccount, ProviderPullRequest } from '../models';
+import type { ProviderAccount, ProviderPullRequest } from '../models.js';
 
 export interface BitbucketServerLink {
 	href: string;
@@ -190,6 +190,7 @@ export const normalizeBitbucketServerPullRequest = (pr: BitbucketServerPullReque
 		id: pr.id.toString(),
 		number: pr.id,
 		title: pr.title,
+		description: pr.description ?? null,
 		url: pr.links.self[0].href,
 		state: bitbucketStateToGitState[pr.state],
 		isDraft: false,

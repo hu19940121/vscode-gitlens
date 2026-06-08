@@ -1,17 +1,17 @@
 import type { TextEditor, Uri } from 'vscode';
 import { ProgressLocation } from 'vscode';
-import type { Container } from '../container';
-import { getBranchMergeTargetName } from '../git/utils/-webview/branch.utils';
-import { showGenericErrorMessage } from '../messages';
-import { prepareCompareDataForAIRequest } from '../plus/ai/utils/-webview/ai.utils';
-import { showReferencePicker2 } from '../quickpicks/referencePicker';
-import { command } from '../system/-webview/command';
-import { Logger } from '../system/logger';
-import { getNodeRepoPath } from '../views/nodes/abstract/viewNode';
-import type { CommandContext } from './commandContext';
-import { isCommandContextViewNodeHasBranch } from './commandContext.utils';
-import type { ExplainBaseArgs } from './explainBase';
-import { ExplainCommandBase } from './explainBase';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { Container } from '../container.js';
+import { getBranchMergeTargetName } from '../git/utils/-webview/branch.utils.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { prepareCompareDataForAIRequest } from '../plus/ai/utils/-webview/ai.utils.js';
+import { showReferencePicker2 } from '../quickpicks/referencePicker.js';
+import { command } from '../system/-webview/command.js';
+import { getNodeRepoPath } from '../views/nodes/abstract/viewNode.js';
+import type { CommandContext } from './commandContext.js';
+import { isCommandContextViewNodeHasBranch } from './commandContext.utils.js';
+import type { ExplainBaseArgs } from './explainBase.js';
+import { ExplainCommandBase } from './explainBase.js';
 
 export interface ExplainBranchCommandArgs extends ExplainBaseArgs {
 	ref?: string;
@@ -56,6 +56,7 @@ export class ExplainBranchCommand extends ExplainCommandBase {
 					sort: { branches: { current: true } },
 				});
 				if (result.value?.ref == null) return;
+
 				args.ref = result.value.ref;
 			}
 

@@ -1,54 +1,49 @@
-import type { HttpsProxyAgent } from 'https-proxy-agent';
 import type { CancellationToken, Disposable } from 'vscode';
 import { window } from 'vscode';
-import type { RequestInit, Response } from '@env/fetch';
-import { fetch, getProxyAgent, wrapForForcedInsecureSSL } from '@env/fetch';
-import { isWeb } from '@env/platform';
-import type { Container } from '../../../../container';
+import { fetch, wrapForForcedInsecureSSL } from '@env/fetch.js';
+import type { Account, CommitAuthor, UnidentifiedAuthor } from '@gitlens/git/models/author.js';
+import type { Issue } from '@gitlens/git/models/issue.js';
+import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { Provider } from '@gitlens/git/models/remoteProvider.js';
+import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { trace } from '@gitlens/utils/decorators/log.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
+import type { Container } from '../../../../container.js';
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
-	CancellationError,
 	ProviderFetchError,
 	RequestClientError,
 	RequestNotFoundError,
-} from '../../../../errors';
-import type { Account, CommitAuthor, UnidentifiedAuthor } from '../../../../git/models/author';
-import type { Issue } from '../../../../git/models/issue';
-import type { IssueOrPullRequest, IssueOrPullRequestType } from '../../../../git/models/issueOrPullRequest';
-import type { PullRequest } from '../../../../git/models/pullRequest';
-import type { Provider } from '../../../../git/models/remoteProvider';
-import type { RepositoryMetadata } from '../../../../git/models/repositoryMetadata';
+} from '../../../../errors.js';
 import {
 	showBitbucketPRCommitLinksAppNotInstalledWarningMessage,
 	showIntegrationRequestFailed500WarningMessage,
-} from '../../../../messages';
-import { configuration } from '../../../../system/-webview/configuration';
-import { debug } from '../../../../system/decorators/log';
-import { Logger } from '../../../../system/logger';
-import type { LogScope } from '../../../../system/logger.scope';
-import { getLogScope } from '../../../../system/logger.scope';
-import { maybeStopWatch } from '../../../../system/stopwatch';
-import type { BitbucketServerCommit, BitbucketServerPullRequest } from '../bitbucket-server/models';
-import { normalizeBitbucketServerPullRequest } from '../bitbucket-server/models';
-import { fromProviderPullRequest } from '../models';
-import type { BitbucketCommit, BitbucketIssue, BitbucketPullRequest, BitbucketRepository } from './models';
+} from '../../../../messages.js';
+import { configuration } from '../../../../system/-webview/configuration.js';
+import type { TokenInfo, TokenWithInfo } from '../../authentication/models.js';
+import type { BitbucketServerCommit, BitbucketServerPullRequest } from '../bitbucket-server/models.js';
+import { normalizeBitbucketServerPullRequest } from '../bitbucket-server/models.js';
+import { fromProviderPullRequest } from '../models.js';
+import type { BitbucketCommit, BitbucketIssue, BitbucketPullRequest, BitbucketRepository } from './models.js';
 import {
 	bitbucketIssueStateToState,
 	fromBitbucketIssue,
 	fromBitbucketPullRequest,
 	parseRawBitbucketAuthor,
-} from './models';
+} from './models.js';
 
 export class BitbucketApi implements Disposable {
 	private readonly _disposable: Disposable;
 
 	constructor(_container: Container) {
 		this._disposable = configuration.onDidChangeAny(e => {
-			if (
-				configuration.changedCore(e, ['http.proxy', 'http.proxyStrictSSL']) ||
-				configuration.changed(e, ['outputLevel', 'proxy'])
-			) {
+			if (configuration.changedCore(e, ['http.proxy', 'http.proxyStrictSSL'])) {
 				this.resetCaches();
 			}
 		});
@@ -58,30 +53,27 @@ export class BitbucketApi implements Disposable {
 		this._disposable.dispose();
 	}
 
-	private _proxyAgent: HttpsProxyAgent | null | undefined = null;
-	private get proxyAgent(): HttpsProxyAgent | undefined {
-		if (isWeb) return undefined;
+	private resetCaches(): void {}
 
-		if (this._proxyAgent === null) {
-			this._proxyAgent = getProxyAgent();
-		}
-		return this._proxyAgent;
-	}
-
-	private resetCaches(): void {
-		this._proxyAgent = null;
-	}
-
-	@debug<BitbucketApi['getPullRequestForBranch']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, branch, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			branch: branch,
+			baseUrl: baseUrl,
+		}),
+	})
 	public async getPullRequestForBranch(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		branch: string,
 		baseUrl: string,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const response = await this.request<{
 			values: BitbucketPullRequest[];
@@ -105,16 +97,25 @@ export class BitbucketApi implements Disposable {
 		return fromBitbucketPullRequest(response.values[0], provider);
 	}
 
-	@debug<BitbucketApi['getServerPullRequestForBranch']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, branch, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			branch: branch,
+			baseUrl: baseUrl,
+		}),
+	})
 	public async getServerPullRequestForBranch(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		branch: string,
 		baseUrl: string,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		const response = await this.request<{
 			values: BitbucketServerPullRequest[];
@@ -141,16 +142,25 @@ export class BitbucketApi implements Disposable {
 		return gitlensPr;
 	}
 
-	@debug<BitbucketApi['getUsersIssuesForRepo']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, userUuid, owner, repo, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			userUuid: userUuid,
+			owner: owner,
+			repo: repo,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getUsersIssuesForRepo(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		userUuid: string,
 		owner: string,
 		repo: string,
 		baseUrl: string,
 	): Promise<Issue[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 		const query = encodeURIComponent(`assignee.uuid="${userUuid}" OR reporter.uuid="${userUuid}"`);
 
 		const response = await this.request<{
@@ -175,16 +185,25 @@ export class BitbucketApi implements Disposable {
 		return response.values.map(issue => fromBitbucketIssue(issue, provider));
 	}
 
-	@debug<BitbucketApi['getIssue']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, id, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getIssue(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		id: string,
 		baseUrl: string,
 	): Promise<Issue | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const response = await this.request<BitbucketIssue>(
@@ -203,15 +222,24 @@ export class BitbucketApi implements Disposable {
 			}
 			return undefined;
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<BitbucketApi['getIssueOrPullRequest']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, id, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+			baseUrl: baseUrl,
+		}),
+	})
 	public async getIssueOrPullRequest(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		id: string,
@@ -220,7 +248,7 @@ export class BitbucketApi implements Disposable {
 			type?: IssueOrPullRequestType;
 		},
 	): Promise<IssueOrPullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		if (options?.type === undefined || options?.type === 'pullrequest') {
 			try {
@@ -240,7 +268,7 @@ export class BitbucketApi implements Disposable {
 				}
 			} catch (ex) {
 				if (ex.original?.status !== 404) {
-					Logger.error(ex, scope);
+					scope?.error(ex);
 					return undefined;
 				}
 			}
@@ -274,7 +302,7 @@ export class BitbucketApi implements Disposable {
 					};
 				}
 			} catch (ex) {
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				return undefined;
 			}
 		}
@@ -282,16 +310,25 @@ export class BitbucketApi implements Disposable {
 		return undefined;
 	}
 
-	@debug<BitbucketApi['getServerPullRequestById']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, id, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+			baseUrl: baseUrl,
+		}),
+	})
 	public async getServerPullRequestById(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		id: string,
 		baseUrl: string,
 	): Promise<IssueOrPullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const prResponse = await this.request<BitbucketServerPullRequest>(
@@ -312,7 +349,7 @@ export class BitbucketApi implements Disposable {
 			}
 		} catch (ex) {
 			if (ex.original?.status !== 404) {
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				return undefined;
 			}
 		}
@@ -320,16 +357,22 @@ export class BitbucketApi implements Disposable {
 		return undefined;
 	}
 
-	@debug<BitbucketApi['getRepositoriesForWorkspace']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, workspace) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			workspace: workspace,
+		}),
+	})
 	async getRepositoriesForWorkspace(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		workspace: string,
 		options: {
 			baseUrl: string;
 		},
 	): Promise<RepositoryMetadata[] | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			interface BitbucketRepositoriesResponse {
@@ -370,15 +413,24 @@ export class BitbucketApi implements Disposable {
 			}
 			return undefined;
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<BitbucketApi['getServerPullRequestForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getServerPullRequestForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -388,7 +440,7 @@ export class BitbucketApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const response = await this.request<{ values: BitbucketServerPullRequest[] }>(
@@ -407,19 +459,29 @@ export class BitbucketApi implements Disposable {
 				undefined,
 			);
 			if (!prResponse) return undefined;
+
 			const providersPr = normalizeBitbucketServerPullRequest(prResponse);
 			const gitlensPr = fromProviderPullRequest(providersPr, provider);
 			return gitlensPr;
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<BitbucketApi['getPullRequestForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getPullRequestForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -429,7 +491,7 @@ export class BitbucketApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<PullRequest | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const fields = [
@@ -470,15 +532,25 @@ export class BitbucketApi implements Disposable {
 					return undefined;
 				}
 			}
-			Logger.error(ex, scope);
+
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<BitbucketApi['getAccountForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getAccountForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -488,7 +560,7 @@ export class BitbucketApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<Account | UnidentifiedAuthor | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const commit = await this.request<BitbucketCommit>(
@@ -527,15 +599,24 @@ export class BitbucketApi implements Disposable {
 				username: undefined,
 			} satisfies UnidentifiedAuthor;
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
-	@debug<BitbucketApi['getServerAccountForCommit']>({ args: { 0: p => p.name, 1: '<token>' } })
+	@trace({
+		args: (provider, token, owner, repo, rev, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			rev: rev,
+			baseUrl: baseUrl,
+		}),
+	})
 	async getServerAccountForCommit(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		owner: string,
 		repo: string,
 		rev: string,
@@ -545,7 +626,7 @@ export class BitbucketApi implements Disposable {
 		},
 		cancellation?: CancellationToken,
 	): Promise<Account | UnidentifiedAuthor | undefined> {
-		const scope = getLogScope();
+		const scope = getScopedLogger();
 
 		try {
 			const commit = await this.request<BitbucketServerCommit>(
@@ -581,26 +662,26 @@ export class BitbucketApi implements Disposable {
 				avatarUrl: undefined,
 			} satisfies UnidentifiedAuthor;
 		} catch (ex) {
-			Logger.error(ex, scope);
+			scope?.error(ex);
 			return undefined;
 		}
 	}
 
 	private async request<T>(
 		provider: Provider,
-		token: string,
+		token: TokenWithInfo,
 		baseUrl: string,
 		route: string,
 		options?: { method: RequestInit['method'] } & Record<string, unknown>,
-		scope?: LogScope | undefined,
+		scope?: ScopedLogger | undefined,
 		cancellation?: CancellationToken | undefined,
 	): Promise<T | undefined> {
+		const { accessToken, ...tokenInfo } = token;
 		const url = `${baseUrl}/${route}`;
 
 		let rsp: Response;
 		try {
-			const sw = maybeStopWatch(`[BITBUCKET] ${options?.method ?? 'GET'} ${url}`, { log: false });
-			const agent = this.proxyAgent;
+			const sw = maybeStopWatch(`[BITBUCKET] ${options?.method ?? 'GET'} ${url}`, { log: { onlyExit: true } });
 
 			try {
 				let aborter: AbortController | undefined;
@@ -613,16 +694,14 @@ export class BitbucketApi implements Disposable {
 
 				rsp = await wrapForForcedInsecureSSL(provider.getIgnoreSSLErrors(), () =>
 					fetch(url, {
-						headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-						agent: agent,
+						headers: { Authorization: `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
 						signal: aborter?.signal,
 						...options,
 					}),
 				);
 
 				if (rsp.ok) {
-					const data: T = await rsp.json();
-					return data;
+					return (await rsp.json()) as T;
 				}
 
 				throw new ProviderFetchError('Bitbucket', rsp);
@@ -631,7 +710,7 @@ export class BitbucketApi implements Disposable {
 			}
 		} catch (ex) {
 			if (ex instanceof ProviderFetchError || ex.name === 'AbortError') {
-				this.handleRequestError(provider, token, ex, scope);
+				this.handleRequestError(provider, tokenInfo, ex, scope);
 			} else if (Logger.isDebugging) {
 				void window.showErrorMessage(`Bitbucket request failed: ${ex.message}`);
 			}
@@ -642,9 +721,9 @@ export class BitbucketApi implements Disposable {
 
 	private handleRequestError(
 		provider: Provider | undefined,
-		_token: string,
+		tokenInfo: TokenInfo,
 		ex: ProviderFetchError | (Error & { name: 'AbortError' }),
-		scope: LogScope | undefined,
+		scope: ScopedLogger | undefined,
 	): void {
 		if (ex.name === 'AbortError' || !(ex instanceof ProviderFetchError)) throw new CancellationError(ex);
 
@@ -654,7 +733,7 @@ export class BitbucketApi implements Disposable {
 			case 422: // Unprocessable Entity
 				throw new RequestNotFoundError(ex);
 			case 401: // Unauthorized
-				throw new AuthenticationError('bitbucket', AuthenticationErrorReason.Unauthorized, ex);
+				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, ex);
 			case 403: // Forbidden
 				// TODO: Learn the Bitbucket API docs and put it in order:
 				// 	if (ex.message.includes('rate limit')) {
@@ -670,9 +749,9 @@ export class BitbucketApi implements Disposable {
 
 				// 		throw new RequestRateLimitError(ex, token, resetAt);
 				// 	}
-				throw new AuthenticationError('bitbucket', AuthenticationErrorReason.Forbidden, ex);
+				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, ex);
 			case 500: // Internal Server Error
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				if (ex.response != null) {
 					provider?.trackRequestException();
 					void showIntegrationRequestFailed500WarningMessage(
@@ -685,7 +764,7 @@ export class BitbucketApi implements Disposable {
 				}
 				return;
 			case 502: // Bad Gateway
-				Logger.error(ex, scope);
+				scope?.error(ex);
 				// TODO: Learn the Bitbucket API docs and put it in order:
 				// if (ex.message.includes('timeout')) {
 				// 	provider?.trackRequestException();
@@ -698,7 +777,7 @@ export class BitbucketApi implements Disposable {
 				break;
 		}
 
-		Logger.error(ex, scope);
+		scope?.error(ex);
 		if (Logger.isDebugging) {
 			void window.showErrorMessage(
 				`Bitbucket request failed: ${(ex.response as any)?.errors?.[0]?.message ?? ex.message}`,

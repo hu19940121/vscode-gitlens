@@ -1,11 +1,13 @@
 import type { CancellationToken, ProgressOptions } from 'vscode';
-import type { Source } from '../../../constants.telemetry';
-import { AINoRequestDataError, CancellationError } from '../../../errors';
-import { configuration } from '../../../system/-webview/configuration';
-import type { Lazy } from '../../../system/lazy';
-import type { AIResponse } from '../aiProviderService';
-import type { AIService } from '../aiService';
-import type { AIChatMessage } from '../models/provider';
+import type { AIChatMessage } from '@gitlens/ai/models/provider.js';
+import { truncatePromptWithChangelog } from '@gitlens/ai/utils/truncation.utils.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import type { Lazy } from '@gitlens/utils/lazy.js';
+import type { Source } from '../../../constants.telemetry.js';
+import { AINoRequestDataError } from '../../../errors.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import type { AIResponse } from '../aiProviderService.js';
+import type { AIService } from '../aiService.js';
 
 export interface AIGenerateChangelogChanges {
 	readonly changes: readonly AIGenerateChangelogChange[];
@@ -48,6 +50,7 @@ export async function generateChangelog(
 					maxInputTokens,
 					retries,
 					reporting,
+					truncatePromptWithChangelog,
 				);
 				if (cancellation.isCancellationRequested) throw new CancellationError();
 

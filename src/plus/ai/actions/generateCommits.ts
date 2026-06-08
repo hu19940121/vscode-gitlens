@@ -1,15 +1,18 @@
 import type { CancellationToken, ProgressOptions } from 'vscode';
-import type { Source } from '../../../constants.telemetry';
-import { CancellationError } from '../../../errors';
-import { configuration } from '../../../system/-webview/configuration';
-import type { Deferred } from '../../../system/promise';
-import { dedent } from '../../../system/string';
-import type { AIService } from '../aiService';
-import type { AIModel } from '../models/model';
-import type { AIProviderResponse } from '../models/provider';
+import { AIConversation } from '@gitlens/ai/models/conversation.js';
+import type { AIModel } from '@gitlens/ai/models/model.js';
+import type { AIProviderResponse } from '@gitlens/ai/models/provider.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { md5 } from '@gitlens/utils/crypto.js';
+import type { Deferred } from '@gitlens/utils/promise.js';
+import { dedent } from '@gitlens/utils/string.js';
+import type { Source } from '../../../constants.telemetry.js';
+import { configuration } from '../../../system/-webview/configuration.js';
+import type { AIService } from '../aiService.js';
 
 export interface AIGenerateCommitsResult {
 	readonly commits: { readonly message: string; readonly explanation: string; readonly hunks: { hunk: number }[] }[];
+	readonly conversation: AIConversation;
 }
 
 export type GenerateCommitsOptions = {
@@ -17,6 +20,8 @@ export type GenerateCommitsOptions = {
 	generating?: Deferred<AIModel>;
 	progress?: ProgressOptions;
 	customInstructions?: string;
+	conversation?: AIConversation;
+	suppressLargePromptWarning?: boolean;
 };
 
 /**
@@ -43,52 +48,123 @@ export async function generateCommits(
 		source: string;
 	}[],
 	existingCommits: { id: string; message: string; aiExplanation?: string; hunkIndices: number[] }[],
+	commitMessages: string[],
 	hunkMap: { index: number; hunkHeader: string }[],
 	source: Source,
 	options?: GenerateCommitsOptions,
 ): Promise<AIGenerateCommitsResult | 'cancelled' | undefined> {
+	const conversation = options?.conversation ?? new AIConversation();
+	let isFirstRun = true;
 	const retryResult = await service.sendRequestConversation<AIGenerateCommitsResult['commits']>(
 		'generate-commits',
 		undefined,
 		{
-			getMessages: async (model, reporting, cancellation, maxCodeCharacters, retries) => {
-				const hunksJson = JSON.stringify(hunks);
-				const existingCommitsJson = JSON.stringify(existingCommits);
-				const hunkMapJson = JSON.stringify(hunkMap);
-
+			getMessages: async (model, reporting, cancellation, maxInputTokens, retries) => {
 				if (cancellation.isCancellationRequested) throw new CancellationError();
 
-				let customInstructions: string | undefined = undefined;
-				const customInstructionsConfig = configuration.get('ai.generateCommits.customInstructions');
-				if (customInstructionsConfig) {
-					customInstructions = `${customInstructionsConfig}${options?.customInstructions ? `\nAnd here is additional guidance for this session:\n${options.customInstructions}` : ''}`;
-				} else {
-					customInstructions = options?.customInstructions;
+				if (conversation.isEmpty) {
+					const hunksJson = JSON.stringify(hunks);
+					const existingCommitsJson = JSON.stringify(existingCommits);
+					const commitMessagesJson = JSON.stringify(commitMessages);
+					const hunkMapJson = JSON.stringify(hunkMap);
+
+					const customInstructionParts: string[] = [];
+
+					const generateCommitMessageCustomInstructions = configuration.get(
+						'ai.generateCommitMessage.customInstructions',
+					);
+					if (generateCommitMessageCustomInstructions) {
+						customInstructionParts.push(
+							`Here are user-set custom instructions for commit messages: ${generateCommitMessageCustomInstructions}`,
+						);
+					}
+
+					const generateCommitsCustomInstructions = configuration.get(
+						'ai.generateCommits.customInstructions',
+					);
+					if (generateCommitsCustomInstructions) {
+						customInstructionParts.push(
+							generateCommitMessageCustomInstructions
+								? `And here are user-set custom instructions for commit organization (any instructions for commit messages here take higher priority): ${generateCommitsCustomInstructions}`
+								: generateCommitsCustomInstructions,
+						);
+					}
+
+					if (options?.customInstructions) {
+						customInstructionParts.push(
+							generateCommitMessageCustomInstructions || generateCommitsCustomInstructions
+								? `And here is additional guidance for this session (any instructions for commit messages here take highest priority): ${options.customInstructions}`
+								: options.customInstructions,
+						);
+					}
+
+					const customInstructions =
+						customInstructionParts.length > 0 ? customInstructionParts.join('\n\n') : undefined;
+
+					// Report diff and custom instruction details for telemetry
+					reporting['diff.files.count'] = new Set(hunks.map(h => h.fileName)).size;
+					reporting['diff.hunks.count'] = hunks.length;
+					reporting['diff.lines.count'] = hunks.reduce(
+						(total, h) =>
+							total + h.content.split('\n').filter(l => l.startsWith('+') || l.startsWith('-')).length,
+						0,
+					);
+					reporting['diff.hash'] = md5(hunks.map(h => h.content).join('\n'));
+
+					reporting['customInstructions.commitMessage.setting.used'] = Boolean(
+						generateCommitMessageCustomInstructions,
+					);
+					reporting['customInstructions.commitMessage.setting.length'] =
+						generateCommitMessageCustomInstructions?.length ?? 0;
+					reporting['customInstructions.setting.used'] = Boolean(generateCommitsCustomInstructions);
+					reporting['customInstructions.setting.length'] = generateCommitsCustomInstructions?.length ?? 0;
+					reporting['customInstructions.used'] = Boolean(options?.customInstructions);
+					reporting['customInstructions.length'] = options?.customInstructions?.length ?? 0;
+
+					const { prompt } = await service.getPrompt(
+						'generate-commits',
+						model,
+						{
+							hunks: hunksJson,
+							existingCommits: existingCommitsJson,
+							commitMessages: commitMessagesJson,
+							hunkMap: hunkMapJson,
+							instructions: customInstructions,
+						},
+						maxInputTokens,
+						retries,
+						reporting,
+						undefined,
+						options?.suppressLargePromptWarning ? { suppressLargePromptWarning: true } : undefined,
+					);
+
+					conversation.addMessage({ role: 'user', content: prompt });
+				} else if (isFirstRun) {
+					const retryPrompt = options?.customInstructions
+						? `Please try again with the following additional guidance:\n\n${options.customInstructions}`
+						: 'Please try again with a different approach.';
+					conversation.addMessage({ role: 'user', content: retryPrompt });
 				}
 
-				const { prompt } = await service.getPrompt(
-					'generate-commits',
-					model,
-					{
-						hunks: hunksJson,
-						existingCommits: existingCommitsJson,
-						hunkMap: hunkMapJson,
-						instructions: customInstructions,
-					},
-					maxCodeCharacters,
-					retries,
-					reporting,
-				);
-				if (cancellation.isCancellationRequested) throw new CancellationError();
+				if (isFirstRun) {
+					isFirstRun = false;
+				}
 
-				return [{ role: 'user', content: prompt }];
+				return [...conversation.messages];
 			},
 
 			validateResponse: (response, _attempt) => {
 				const validationResult = validateCommitsResponse(response, hunks, existingCommits);
 				if (validationResult.isValid) {
+					conversation.addMessage({ role: 'assistant', content: response.content });
 					return { isValid: true, result: validationResult.commits };
 				}
+
+				conversation.addMessages([
+					{ role: 'assistant', content: response.content },
+					{ role: 'user', content: validationResult.retryPrompt },
+				]);
+
 				return validationResult;
 			},
 
@@ -115,7 +191,7 @@ export async function generateCommits(
 		return retryResult;
 	}
 
-	return { commits: retryResult.result };
+	return { commits: retryResult.result, conversation: conversation };
 }
 
 function parseOutputResult(result: string): string {
@@ -192,9 +268,9 @@ function validateCommitsResponse(
 		const inputHunkIndices = new Set(inputHunks.map(h => h.index));
 		const previouslyAssignedHunkIndices = new Set(existingCommits.flatMap(c => c.hunkIndices));
 		const unassignedHunkIndices = new Set([...inputHunkIndices].filter(i => !previouslyAssignedHunkIndices.has(i)));
-		const illegallyAssignedHunkIndices = Array.from(usedHunkIndices).filter(i => !inputHunkIndices.has(i));
-		const missingHunkIndices = Array.from(unassignedHunkIndices).filter(i => !usedHunkIndices.has(i));
-		const extraHunkIndices = Array.from(usedHunkIndices).filter(index => !inputHunkIndices.has(index));
+		const illegallyAssignedHunkIndices = [...usedHunkIndices].filter(i => !inputHunkIndices.has(i));
+		const missingHunkIndices = [...unassignedHunkIndices].filter(i => !usedHunkIndices.has(i));
+		const extraHunkIndices = [...usedHunkIndices].filter(index => !inputHunkIndices.has(index));
 
 		// Check for missing hunks
 		if (missingHunkIndices.length > 0) {

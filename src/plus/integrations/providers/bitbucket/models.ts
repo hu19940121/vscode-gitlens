@@ -1,15 +1,15 @@
-import type { IssueRepository } from '../../../../git/models/issue';
-import { Issue, RepositoryAccessLevel } from '../../../../git/models/issue';
-import type { IssueOrPullRequestState } from '../../../../git/models/issueOrPullRequest';
-import type { PullRequestMember, PullRequestReviewer } from '../../../../git/models/pullRequest';
+import type { IssueRepository } from '@gitlens/git/models/issue.js';
+import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
+import type { IssueOrPullRequestState } from '@gitlens/git/models/issueOrPullRequest.js';
+import type { PullRequestMember, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
 	PullRequestReviewDecision,
 	PullRequestReviewState,
-} from '../../../../git/models/pullRequest';
-import type { Provider } from '../../../../git/models/remoteProvider';
-import type { ResourceDescriptor } from '../../../../git/models/resourceDescriptor';
+} from '@gitlens/git/models/pullRequest.js';
+import type { Provider } from '@gitlens/git/models/remoteProvider.js';
+import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 
 export interface BitbucketRepositoryDescriptor extends ResourceDescriptor {
 	owner: string;
@@ -328,6 +328,7 @@ function getBitbucketReviewDecision(pr: BitbucketPullRequest): PullRequestReview
 	if (!pr.participants) {
 		return undefined;
 	}
+
 	let hasReviews = false;
 	let hasChangeRequests = false;
 	let hasApprovals = false;

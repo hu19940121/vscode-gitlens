@@ -1,49 +1,58 @@
 import { consume } from '@lit/context';
-import type { TemplateResult } from 'lit';
-import { css, html, LitElement, nothing } from 'lit';
+import { SignalWatcher } from '@lit-labs/signals';
+import type { PropertyValues, TemplateResult } from 'lit';
+import { css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { classMap } from 'lit/directives/class-map.js';
 import { when } from 'lit/directives/when.js';
-import type { GlCommands, PlusCommands, WebviewCommands, WebviewViewCommands } from '../../../../../constants.commands';
-import type { LaunchpadCommandArgs } from '../../../../../plus/launchpad/launchpad';
+import { formatDate, fromNow } from '@gitlens/utils/date.js';
+import { interpolate } from '@gitlens/utils/string.js';
+import type { GlWebviewCommandsOrCommandsWithSuffix } from '../../../../../constants.commands.js';
+import { isSubscriptionTrialOrPaidFromState } from '../../../../../plus/gk/utils/subscription.utils.js';
+import type { LaunchpadCommandArgs } from '../../../../../plus/launchpad/launchpad.js';
 import {
 	actionGroupMap,
 	launchpadCategoryToGroupMap,
 	launchpadGroupIconMap,
 	launchpadGroupLabelMap,
-} from '../../../../../plus/launchpad/models/launchpad';
-import { createCommandLink } from '../../../../../system/commands';
-import { fromNow } from '../../../../../system/date';
-import { interpolate, pluralize } from '../../../../../system/string';
-import { createWebviewCommandLink } from '../../../../../system/webview';
+} from '../../../../../plus/launchpad/models/launchpad.js';
+import { createCommandLink } from '../../../../../system/commands.js';
 import type {
+	AgentSessionState,
 	BranchRef,
 	CreatePullRequestCommandArgs,
 	GetOverviewBranch,
 	OpenInGraphParams,
 	OpenInTimelineParams,
 	OpenWorktreeCommandArgs,
-	State,
-} from '../../../../home/protocol';
-import { stateContext } from '../../../home/context';
-import { renderBranchName } from '../../../shared/components/branch-name';
-import type { GlCard } from '../../../shared/components/card/card';
-import { GlElement, observe } from '../../../shared/components/element';
-import { srOnlyStyles } from '../../../shared/components/styles/lit/a11y.css';
-import { linkStyles } from '../../shared/components/vscode.css';
-import '../../../shared/components/code-icon';
-import '../../../shared/components/avatar/avatar';
-import '../../../shared/components/avatar/avatar-list';
-import '../../../shared/components/commit/commit-stats';
-import '../../../shared/components/formatted-date';
-import '../../../shared/components/overlays/tooltip';
-import '../../../shared/components/pills/tracking';
-import '../../../shared/components/rich/issue-icon';
-import '../../../shared/components/rich/pr-icon';
-import '../../../shared/components/actions/action-item';
-import '../../../shared/components/actions/action-nav';
-import '../../../shared/components/branch-icon';
-import './merge-target-status';
+} from '../../../../home/protocol.js';
+import type { HomeState } from '../../../home/state.js';
+import { homeStateContext } from '../../../home/state.js';
+import { agentPhaseToCategory, matchAgentSessionsForWorktree } from '../../../shared/agentUtils.js';
+import type { GlCard } from '../../../shared/components/card/card.js';
+import { getWipTooltipParts } from '../../../shared/components/commit/wip-stats.js';
+import { GlElement, observe } from '../../../shared/components/element.js';
+import { srOnlyStyles } from '../../../shared/components/styles/lit/a11y.css.js';
+import type { AIContextState } from '../../../shared/contexts/ai.js';
+import { aiContext } from '../../../shared/contexts/ai.js';
+import type { SubscriptionContextState } from '../../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../../shared/contexts/subscription.js';
+import type { WebviewContext } from '../../../shared/contexts/webview.js';
+import { webviewContext } from '../../../shared/contexts/webview.js';
+import { linkStyles } from '../../shared/components/vscode.css.js';
+import '../../../shared/components/code-icon.js';
+import '../../../shared/components/avatar/avatar.js';
+import '../../../shared/components/avatar/avatar-list.js';
+import '../../../shared/components/commit/commit-stats.js';
+import '../../../shared/components/formatted-date.js';
+import '../../../shared/components/overlays/tooltip.js';
+import '../../../shared/components/pills/tracking-status.js';
+import '../../../shared/components/rich/issue-icon.js';
+import '../../../shared/components/rich/pr-icon.js';
+import '../../../shared/components/actions/action-item.js';
+import '../../../shared/components/actions/action-nav.js';
+import '../../../shared/components/branch-icon.js';
+import '../../shared/components/merge-target-status.js';
+import '../../../shared/components/pills/agent-status-pill.js';
 
 export const branchCardStyles = css`
 	* {
@@ -126,6 +135,18 @@ export const branchCardStyles = css`
 		margin-block: 0;
 	}
 
+	.branch-item__agents {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		gap: 0.4rem;
+		flex-wrap: wrap;
+	}
+
+	.branch-item__agents code-icon {
+		color: var(--vscode-descriptionForeground);
+	}
+
 	.branch-item__changes {
 		display: flex;
 		align-items: center;
@@ -135,7 +156,7 @@ export const branchCardStyles = css`
 		white-space: nowrap;
 	}
 
-	.branch-item__changes formatted-date {
+	.branch-item__date {
 		margin-inline-end: auto;
 	}
 
@@ -156,10 +177,6 @@ export const branchCardStyles = css`
 
 	.branch-item:not(:focus-within):not(:hover) .branch-item__collapsed-actions {
 		${srOnlyStyles}
-	}
-
-	.pill {
-		--gl-pill-border: color-mix(in srgb, transparent 80%, var(--color-foreground));
 	}
 
 	.work-item {
@@ -221,26 +238,19 @@ export const branchCardStyles = css`
 		color: var(--vscode-gitlens-launchpadIndicatorAttentionColor);
 	}
 
-	.tracking__pill,
 	.wip__pill {
 		display: flex;
 		flex-direction: row;
 		gap: 1rem;
 	}
 
-	.tracking__tooltip,
 	.wip__tooltip {
 		display: contents;
 		vertical-align: middle;
 	}
 
-	.tracking__tooltip p,
 	.wip__tooltip p {
 		margin-block: 0;
-	}
-
-	p.tracking__tooltip--wip {
-		margin-block-start: 1rem;
 	}
 `;
 
@@ -252,12 +262,26 @@ declare global {
 	}
 }
 
-export abstract class GlBranchCardBase extends GlElement {
+// Cast needed because SignalWatcher's Constructor<T> type excludes abstract classes,
+// but GlBranchCardBase is abstract itself and only concrete subclasses are instantiated.
+const SignalWatcherGlElement = SignalWatcher(
+	GlElement as unknown as new (...args: any[]) => GlElement,
+) as unknown as typeof GlElement;
+
+export abstract class GlBranchCardBase extends SignalWatcherGlElement {
 	static override styles = [linkStyles, branchCardStyles];
 
-	@consume<State>({ context: stateContext, subscribe: true })
-	@state()
-	protected _homeState!: State;
+	@consume({ context: subscriptionContext, subscribe: true })
+	protected _subscription!: SubscriptionContextState;
+
+	@consume({ context: aiContext })
+	protected _aiCtx!: AIContextState;
+
+	@consume({ context: webviewContext })
+	protected _webview!: WebviewContext;
+
+	@consume({ context: homeStateContext })
+	protected _homeState!: HomeState;
 
 	@property()
 	repo!: string;
@@ -475,7 +499,7 @@ export abstract class GlBranchCardBase extends GlElement {
 	}
 
 	get isWorktree(): boolean {
-		return this.branch.worktree != null && !this.branch.worktree.isDefault;
+		return this.branch.worktree != null;
 	}
 
 	get cardIndicator(): GlCard['indicator'] {
@@ -487,6 +511,7 @@ export abstract class GlBranchCardBase extends GlElement {
 
 		if (this.wip?.pausedOpStatus != null) {
 			if (this.wip?.hasConflicts) return 'conflict';
+
 			switch (this.wip.pausedOpStatus.type) {
 				case 'cherry-pick':
 					return 'cherry-picking';
@@ -541,9 +566,7 @@ export abstract class GlBranchCardBase extends GlElement {
 		this.eventController?.abort();
 		this.eventController = undefined;
 		if (this.expandable) {
-			if (this.eventController == null) {
-				this.eventController = new AbortController();
-			}
+			this.eventController ??= new AbortController();
 			this.addEventListener('focusin', this.onFocus, { signal: this.eventController.signal });
 		}
 	}
@@ -551,6 +574,7 @@ export abstract class GlBranchCardBase extends GlElement {
 	private readonly onFocus = (e: FocusEvent) => {
 		const actionElement = e.composedPath().some(el => (el as HTMLElement).matches?.('action-item') ?? false);
 		if (actionElement || this.expanded) return;
+
 		this.toggleExpanded(true);
 	};
 
@@ -586,6 +610,7 @@ export abstract class GlBranchCardBase extends GlElement {
 				modified=${workingTreeState.changed}
 				removed=${workingTreeState.deleted}
 				symbol="icons"
+				no-tooltip
 			></commit-stats>
 			<span class="wip__tooltip" slot="content">
 				<p>${parts.length ? `${parts.join(', ')} in the working tree` : 'No working tree changes'}</p>
@@ -605,14 +630,11 @@ export abstract class GlBranchCardBase extends GlElement {
 	}
 
 	protected renderTracking(showWip = false): TemplateResult | NothingType {
-		if (this.branch.upstream == null) return nothing;
-
-		const { state } = this.branch.upstream;
-		// const ahead = this.branch.state.ahead ?? 0;
-		// const behind = this.branch.state.behind ?? 0;
+		const upstream = this.branch.upstream;
+		if (upstream == null) return nothing;
 
 		let working = 0;
-		let wipTooltip;
+		let wipExtra: TemplateResult | NothingType = nothing;
 		if (showWip) {
 			const workingTreeState = this.wip?.workingTreeState;
 			if (workingTreeState != null) {
@@ -620,45 +642,21 @@ export abstract class GlBranchCardBase extends GlElement {
 
 				const wipParts = getWipTooltipParts(workingTreeState);
 				if (wipParts.length) {
-					wipTooltip = html`<p class="tracking__tooltip--wip">${wipParts.join(', ')} in the working tree</p>`;
+					wipExtra = html`<p slot="extra">${wipParts.join(', ')} in the working tree</p>`;
 				}
 			}
 		}
 
-		let tooltip;
-		if (this.branch.upstream.missing) {
-			tooltip = html`${renderBranchName(this.branch.name)} is missing its upstream
-			${renderBranchName(this.branch.upstream.name)}`;
-		} else {
-			const status: string[] = [];
-			if (state.behind) {
-				status.push(`${pluralize('commit', state.behind)} behind`);
-			}
-			if (state.ahead) {
-				status.push(`${pluralize('commit', state.ahead)} ahead of`);
-			}
-
-			if (status.length) {
-				tooltip = html`${renderBranchName(this.branch.name)} is
-				${status.join(', ')}${renderBranchName(this.branch.upstream?.name)}`;
-			} else {
-				tooltip = html`${renderBranchName(this.branch.name)} is up to date with
-				${renderBranchName(this.branch.upstream?.name)}`;
-			}
-		}
-
-		return html`<gl-tooltip class="tracking__pill" placement="bottom"
-			><gl-tracking-pill
-				class="pill"
-				colorized
-				outlined
-				always-show
-				ahead=${state.ahead}
-				behind=${state.behind}
-				working=${working}
-				?missingUpstream=${this.branch.upstream?.missing ?? false}
-			></gl-tracking-pill>
-			<span class="tracking__tooltip" slot="content">${tooltip}${wipTooltip}</span></gl-tooltip
+		return html`<gl-tracking-status
+			.branchName=${this.branch.name}
+			.upstreamName=${upstream.name}
+			.missingUpstream=${upstream.missing ?? false}
+			.ahead=${upstream.state.ahead}
+			.behind=${upstream.state.behind}
+			.working=${working}
+			colorized
+			outlined
+			>${wipExtra}</gl-tracking-status
 		>`;
 	}
 
@@ -688,31 +686,63 @@ export abstract class GlBranchCardBase extends GlElement {
 		return html`<action-nav class="branch-item__collapsed-actions">${actions}</action-nav>`;
 	}
 
-	protected createWebviewCommandLink<T>(
-		command: WebviewCommands | WebviewViewCommands | PlusCommands,
-		args?: T | any,
+	protected createWebviewCommandLinkWithBranchRef<T>(
+		command: GlWebviewCommandsOrCommandsWithSuffix,
+		args?: Omit<T, keyof BranchRef>,
 	): string {
-		return createWebviewCommandLink<T>(
+		return this._webview.createCommandLink<T | BranchRef>(
 			command,
-			'gitlens.views.home',
-			'',
 			args ? { ...args, ...this.branchRef } : this.branchRef,
 		);
 	}
 
-	protected createCommandLink<T>(command: GlCommands, args?: T | any): string {
-		return createCommandLink<T>(command, args ? { ...args, ...this.branchRef } : this.branchRef);
-	}
-
 	protected renderTimestamp(): TemplateResult | NothingType {
-		const { timestamp } = this.branch;
-		if (timestamp == null) return nothing;
+		const { timestamps } = this.branch;
+		if (timestamps == null) return nothing;
 
-		return html`<formatted-date
-			tooltip="Last commit on "
-			.date=${new Date(timestamp)}
-			class="branch-item__date"
-		></formatted-date>`;
+		const { lastCommit, lastAccessed, lastModified } = timestamps;
+
+		// Compute effective date (most recent)
+		const effectiveTimestamp = Math.max(lastCommit ?? 0, lastAccessed ?? 0, lastModified ?? 0);
+		if (effectiveTimestamp === 0) return nothing;
+
+		// Determine which date is the most recent for labeling (bias modified over accessed)
+		let effectiveLabel: string;
+		if (lastModified != null && lastModified >= (lastAccessed ?? 0) && lastModified >= (lastCommit ?? 0)) {
+			effectiveLabel = 'Modified';
+		} else if (lastAccessed != null && lastAccessed >= (lastModified ?? 0) && lastAccessed >= (lastCommit ?? 0)) {
+			effectiveLabel = 'Accessed';
+		} else {
+			effectiveLabel = 'Committed';
+		}
+
+		// Build tooltip lines in fixed order: modified, accessed, committed
+		// Collapse accessed+modified into just "Modified" when they're within the same second
+		const dateFormat = 'MMMM Do, YYYY h:mma'; // TODO fix this
+		const fmtLine = (label: string, ts: number) =>
+			html`${label} ${fromNow(new Date(ts))} <i>(${formatDate(new Date(ts), dateFormat)})</i>`;
+		const sameAccessedModified =
+			lastAccessed != null && lastModified != null && Math.abs(lastAccessed - lastModified) < 30000;
+		const tooltipLines: TemplateResult[] = [];
+		if (sameAccessedModified) {
+			tooltipLines.push(fmtLine('Modified', lastModified));
+		} else {
+			if (lastAccessed != null) {
+				tooltipLines.push(fmtLine('Accessed', lastAccessed));
+			}
+			if (lastModified != null) {
+				tooltipLines.push(fmtLine('Modified', lastModified));
+			}
+		}
+		if (lastCommit != null) {
+			tooltipLines.push(fmtLine('Committed', lastCommit));
+		}
+
+		const effectiveDate = new Date(effectiveTimestamp);
+		return html`<gl-tooltip class="branch-item__date">
+			<time datetime="${effectiveDate.toISOString()}">${effectiveLabel} ${fromNow(effectiveDate)}</time>
+			<span slot="content">${tooltipLines.map((line, i) => (i > 0 ? html`<br />${line}` : line))}</span>
+		</gl-tooltip>`;
 	}
 
 	protected abstract renderBranchIndicator?(): TemplateResult | undefined;
@@ -746,6 +776,7 @@ export abstract class GlBranchCardBase extends GlElement {
 						</div>
 					`,
 				)}
+				${this.renderAgentPillsRow()}
 				${when(
 					// TODO: this doesn't work properly. nothing is true, empty html template is true
 					actionsSection || mergeTargetStatus,
@@ -773,6 +804,64 @@ export abstract class GlBranchCardBase extends GlElement {
 		></gl-branch-icon>`;
 	}
 
+	private renderAgentPillsRow(): TemplateResult | NothingType {
+		// Home's `branch.worktree == null` means "not checked out anywhere" — never the default
+		// worktree (which surfaces with `worktree.path === repoPath`). Bailing here avoids the
+		// matcher's `worktreePath ?? repoPath` fallback, which exists for the Graph's "undefined
+		// ≡ default" convention and would otherwise false-match every no-worktree branch to the
+		// default-worktree session.
+		const worktreePath = this.branch.worktree?.path;
+		if (worktreePath == null) return nothing;
+
+		const sessions = matchAgentSessionsForWorktree(this._homeState?.agentSessions?.get(), {
+			repoPath: this.repo,
+			worktreePath: worktreePath,
+		});
+		if (sessions == null || sessions.length === 0) return nothing;
+
+		if (this.expanded) {
+			return html`
+				<div class="branch-item__agents">
+					<code-icon icon="robot"></code-icon>
+					${sessions.map(s => html`<gl-agent-status-pill .session=${s}></gl-agent-status-pill>`)}
+				</div>
+			`;
+		}
+
+		// Actionable (`needs-input`) sessions never aggregate — each one needs its own Allow/Deny
+		// popover. Working and idle sessions collapse into one summary pill per category.
+		const needsInput: AgentSessionState[] = [];
+		const working: AgentSessionState[] = [];
+		const idle: AgentSessionState[] = [];
+		for (const s of sessions) {
+			const cat = agentPhaseToCategory[s.phase];
+			if (cat === 'needs-input') {
+				needsInput.push(s);
+			} else if (cat === 'working') {
+				working.push(s);
+			} else {
+				idle.push(s);
+			}
+		}
+
+		return html`
+			<div class="branch-item__agents">
+				<code-icon icon="robot"></code-icon>
+				${needsInput.map(s => html`<gl-agent-status-pill .session=${s}></gl-agent-status-pill>`)}
+				${working.length > 0
+					? html`<gl-agent-status-pill
+							.summary=${{ category: 'working', sessions: working }}
+						></gl-agent-status-pill>`
+					: nothing}
+				${idle.length > 0
+					? html`<gl-agent-status-pill
+							.summary=${{ category: 'idle', sessions: idle }}
+						></gl-agent-status-pill>`
+					: nothing}
+			</div>
+		`;
+	}
+
 	protected renderPrItem(): TemplateResult | NothingType {
 		if (!this.pr) {
 			if (this.branch.upstream?.missing === false && this.expanded) {
@@ -783,7 +872,7 @@ export abstract class GlBranchCardBase extends GlElement {
 								class="branch-item__missing"
 								appearance="secondary"
 								full
-								href="${createCommandLink('gitlens.home.createPullRequest', {
+								href="${this._webview.createCommandLink('gitlens.createPullRequest:', {
 									ref: this.branchRef,
 									describeWithAI: false,
 									source: { source: 'home', detail: 'create-pr' },
@@ -792,15 +881,15 @@ export abstract class GlBranchCardBase extends GlElement {
 								<code-icon icon="git-pull-request" slot="prefix"></code-icon>
 								<span>Create a Pull Request</span>
 							</gl-button>
-							${this._homeState.orgSettings.ai &&
-							this._homeState.aiEnabled &&
+							${this._subscription.orgSettings.get().ai &&
+							this._aiCtx.state.get().enabled &&
 							this.remote?.provider?.supportedFeatures?.createPullRequestWithDetails
 								? html`<gl-button
 										class="branch-item__missing"
 										tooltip="Create a Pull Request with AI (Preview)"
 										appearance="secondary"
-										href="${createCommandLink<CreatePullRequestCommandArgs>(
-											'gitlens.home.createPullRequest',
+										href="${this._webview.createCommandLink<CreatePullRequestCommandArgs>(
+											'gitlens.createPullRequest:',
 											{
 												ref: this.branchRef,
 												describeWithAI: true,
@@ -852,6 +941,7 @@ export abstract class GlBranchCardBase extends GlElement {
 		const groupIcon = launchpadGroupIconMap.get(group);
 
 		if (groupLabel == null || groupIcon == null) return nothing;
+
 		const groupIconString = groupIcon.match(/\$\((.*?)\)/)![1].replace('gitlens', 'gl');
 
 		const tooltip = interpolate(actionGroupMap.get(this.launchpadItem.category)![1], {
@@ -865,9 +955,7 @@ export abstract class GlBranchCardBase extends GlElement {
 						<a
 							href=${createCommandLink<Omit<LaunchpadCommandArgs, 'command'>>('gitlens.showLaunchpad', {
 								source: 'home',
-								state: {
-									id: { uuid: this.launchpadItem.uuid, group: group },
-								},
+								state: { id: { uuid: this.launchpadItem.uuid, group: group } },
 							} satisfies Omit<LaunchpadCommandArgs, 'command'>)}
 							class="launchpad__grouping"
 						>
@@ -891,7 +979,7 @@ export abstract class GlBranchCardBase extends GlElement {
 		if (this.showUpgrade) {
 			return html`<gl-merge-target-upgrade
 				class="branch-item__merge-target"
-				.state=${this._homeState.subscription.state}
+				.state=${this._subscription.subscription.get()?.state}
 			></gl-merge-target-upgrade>`;
 		}
 
@@ -940,6 +1028,37 @@ export abstract class GlBranchCardBase extends GlElement {
 
 @customElement('gl-branch-card')
 export class GlBranchCard extends GlBranchCardBase {
+	// Subclass-owned lazy merge-target state. The base's eager `_mergeTarget` stays undefined
+	// here because the home overview's enrichment IPC opts out (`skipMergeTarget: true`) — this
+	// mirrors the graph-overview-card hover pattern by fetching on first card expand instead.
+	@state()
+	private _lazyMergeTarget?: Awaited<GetOverviewBranch['mergeTarget']>;
+
+	// True while the lazy fetch is in flight. Drives `<gl-merge-target-status loading>` so the
+	// chip's `aria-busy="true"` "Checking merge target status…" affordance covers the latency
+	// instead of rendering nothing until resolution.
+	@state()
+	private _lazyMergeTargetLoading = false;
+
+	// In-flight/resolved promise. Handed to the chip's `targetPromise` so the loading state
+	// reuses across collapse/re-expand cycles without re-firing.
+	private _lazyMergeTargetPromise?: Promise<Awaited<GetOverviewBranch['mergeTarget']>>;
+
+	// Lit's `repeat` reuses card instances when the branch list reorders, so a `branch` prop
+	// transition can swap us onto a different branch entirely. Track the id we last fetched
+	// for so `willUpdate` can drop stale state on transition.
+	private _lazyMergeTargetFetchedFor?: string;
+
+	/**
+	 * Surface the lazy-fetched merge-target through the base's `mergeTarget` getter so the
+	 * base's `branchCardIndicator` automatically returns `'branch-merged'` after resolve — no
+	 * separate indicator override needed. Lit re-renders on `_lazyMergeTarget` (`@state`) so
+	 * the swap-in is reactive.
+	 */
+	override get mergeTarget(): Awaited<GetOverviewBranch['mergeTarget']> {
+		return this._lazyMergeTarget;
+	}
+
 	override render(): unknown {
 		return html`
 			<gl-card class="branch-item" focusable .indicator=${this.cardIndicator}>
@@ -949,6 +1068,89 @@ export class GlBranchCard extends GlBranchCardBase {
 				${this.renderCollapsedActions()}
 			</gl-card>
 		`;
+	}
+
+	override willUpdate(changed: PropertyValues<this>): void {
+		super.willUpdate?.(changed);
+
+		// Drop stale lazy state when Lit `repeat` reuses this card instance for a different branch.
+		if (changed.has('branch') && this.branch?.id !== this._lazyMergeTargetFetchedFor) {
+			this._lazyMergeTarget = undefined;
+			this._lazyMergeTargetPromise = undefined;
+			this._lazyMergeTargetFetchedFor = undefined;
+			this._lazyMergeTargetLoading = false;
+		}
+
+		// First expand for this branch kicks off the fetch; subsequent ticks short-circuit via
+		// the `_lazyMergeTargetFetchedFor` dedupe check inside `ensureMergeTargetFetched`.
+		if (this.expanded) {
+			void this.ensureMergeTargetFetched();
+		}
+	}
+
+	/**
+	 * Render the chip with the subclass's lazy promise + loading flag, replacing the base's
+	 * direct read of `this.branch.mergeTarget` (which is `Promise<undefined>` under skip).
+	 * Renders nothing until the first expand fires the fetch — matches graph-overview-card.
+	 */
+	protected override renderMergeTargetStatus(): TemplateResult | NothingType {
+		if (this.showUpgrade) {
+			return super.renderMergeTargetStatus();
+		}
+
+		const promise = this._lazyMergeTargetPromise;
+		if (promise == null) return nothing;
+		return html`<gl-merge-target-status
+			class="branch-item__merge-target"
+			.branch=${this.branch}
+			.targetPromise=${promise}
+			?loading=${this._lazyMergeTargetLoading}
+		></gl-merge-target-status>`;
+	}
+
+	private async ensureMergeTargetFetched(): Promise<void> {
+		const branch = this.branch;
+		if (branch == null) return;
+
+		// Already fetched (or in flight) for this branch — nothing to do. The promise is reused
+		// across expand cycles; the chip handles loading state internally.
+		if (this._lazyMergeTargetFetchedFor === branch.id && this._lazyMergeTargetPromise != null) {
+			return;
+		}
+
+		// Pro gate — mirror the eager path's server-side `isPro` filter. Without this, non-pro
+		// accounts would spin the `aria-busy="true"` loading chip forever because the server
+		// fast-bails and the resolved promise never produces a status. `<gl-merge-target-upgrade>`
+		// is rendered separately via `showUpgrade` so non-pro still sees the upgrade prompt.
+		const subState = this._subscription.subscription.get()?.state;
+		if (subState != null && !isSubscriptionTrialOrPaidFromState(subState)) return;
+
+		const branches = this._homeState?.branchesService;
+		if (branches == null) return;
+
+		this._lazyMergeTargetFetchedFor = branch.id;
+		this._lazyMergeTargetLoading = true;
+		const branchId = branch.id;
+		const repoPath = this.repo;
+		const branchName = branch.name;
+
+		const promise = (async (): Promise<Awaited<GetOverviewBranch['mergeTarget']>> => {
+			try {
+				const enrichment = await branches.getBranchEnrichment(repoPath, branchName);
+				return await enrichment?.mergeTargetStatus;
+			} catch {
+				return undefined;
+			}
+		})();
+		this._lazyMergeTargetPromise = promise;
+
+		const result = await promise;
+		// Bail if a `branch` prop transition reassigned us mid-await — `willUpdate` already
+		// cleared the state for the new branch and `_lazyMergeTargetFetchedFor` no longer matches.
+		if (this._lazyMergeTargetFetchedFor !== branchId) return;
+
+		this._lazyMergeTarget = result;
+		this._lazyMergeTargetLoading = false;
 	}
 
 	protected getCollapsedActions(): TemplateResult[] {
@@ -961,10 +1163,11 @@ export class GlBranchCard extends GlBranchCardBase {
 					alt-label="Open Worktree in New Window"
 					icon="browser"
 					alt-icon="empty-window"
-					href=${this.createCommandLink('gitlens.home.openWorktree')}
-					alt-href=${this.createCommandLink<OpenWorktreeCommandArgs>('gitlens.home.openWorktree', {
-						location: 'newWindow',
-					})}
+					href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openWorktree:')}
+					alt-href=${this.createWebviewCommandLinkWithBranchRef<OpenWorktreeCommandArgs>(
+						'gitlens.openWorktree:',
+						{ location: 'newWindow' },
+					)}
 				></action-item>`,
 			);
 		} else {
@@ -972,7 +1175,7 @@ export class GlBranchCard extends GlBranchCardBase {
 				html`<action-item
 					label="Switch to Branch..."
 					icon="gl-switch"
-					href=${this.createCommandLink('gitlens.home.switchToBranch')}
+					href=${this.createWebviewCommandLinkWithBranchRef('gitlens.switchToBranch:')}
 				></action-item>`,
 			);
 		}
@@ -981,15 +1184,14 @@ export class GlBranchCard extends GlBranchCardBase {
 			html`<action-item
 				label="Open in Commit Graph"
 				icon="gl-graph"
-				href=${createCommandLink('gitlens.home.openInGraph', {
-					...this.branchRef,
+				href=${this.createWebviewCommandLinkWithBranchRef<OpenInGraphParams>('gitlens.showInCommitGraph:', {
 					type: 'branch',
-				} satisfies OpenInGraphParams)}
+				})}
 			></action-item>`,
 			html`<action-item
 				label=${this.isWorktree ? 'Open in Worktrees View' : 'Open in Branches View'}
 				icon="arrow-right"
-				href=${this.createCommandLink('gitlens.openInView.branch:home')}
+				href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openInView.branch:')}
 			></action-item>`,
 		);
 
@@ -999,7 +1201,7 @@ export class GlBranchCard extends GlBranchCardBase {
 	protected getBranchActions(): TemplateResult[] {
 		const actions = [];
 
-		const aiEnabled = this._homeState.orgSettings.ai && this._homeState.aiEnabled;
+		const aiEnabled = this._subscription.orgSettings.get()?.ai && this._aiCtx.state.get().enabled;
 
 		if (this.isWorktree) {
 			actions.push(
@@ -1008,10 +1210,11 @@ export class GlBranchCard extends GlBranchCardBase {
 					alt-label="Open Worktree in New Window"
 					icon="browser"
 					alt-icon="empty-window"
-					href=${this.createCommandLink('gitlens.home.openWorktree')}
-					alt-href=${this.createCommandLink<OpenWorktreeCommandArgs>('gitlens.home.openWorktree', {
-						location: 'newWindow',
-					})}
+					href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openWorktree:')}
+					alt-href=${this.createWebviewCommandLinkWithBranchRef<OpenWorktreeCommandArgs>(
+						'gitlens.openWorktree:',
+						{ location: 'newWindow' },
+					)}
 				></action-item>`,
 			);
 
@@ -1028,7 +1231,7 @@ export class GlBranchCard extends GlBranchCardBase {
 						html`<action-item
 							label="Explain Working Changes (Preview)"
 							icon="sparkle"
-							href=${this.createCommandLink('gitlens.ai.explainWip:home')}
+							href=${this.createWebviewCommandLinkWithBranchRef('gitlens.ai.explainWip:')}
 						></action-item>`,
 					);
 				} else {
@@ -1036,7 +1239,7 @@ export class GlBranchCard extends GlBranchCardBase {
 						html`<action-item
 							label="Explain Branch Changes (Preview)"
 							icon="sparkle"
-							href=${this.createCommandLink('gitlens.ai.explainBranch:home')}
+							href=${this.createWebviewCommandLinkWithBranchRef('gitlens.ai.explainBranch:')}
 						></action-item>`,
 					);
 				}
@@ -1046,7 +1249,7 @@ export class GlBranchCard extends GlBranchCardBase {
 				html`<action-item
 					label="Switch to Branch..."
 					icon="gl-switch"
-					href=${this.createCommandLink('gitlens.home.switchToBranch')}
+					href=${this.createWebviewCommandLinkWithBranchRef('gitlens.switchToBranch:')}
 				></action-item>`,
 			);
 
@@ -1055,7 +1258,7 @@ export class GlBranchCard extends GlBranchCardBase {
 					html`<action-item
 						label="Explain Branch Changes (Preview)"
 						icon="sparkle"
-						href=${this.createCommandLink('gitlens.ai.explainBranch:home')}
+						href=${this.createWebviewCommandLinkWithBranchRef('gitlens.ai.explainBranch:')}
 					></action-item>`,
 				);
 			}
@@ -1066,33 +1269,32 @@ export class GlBranchCard extends GlBranchCardBase {
 			html`<action-item
 				label="Fetch"
 				icon="repo-fetch"
-				href=${this.createCommandLink('gitlens.home.fetch')}
+				href=${this.createWebviewCommandLinkWithBranchRef('gitlens.fetch:')}
 			></action-item>`,
 		);
 		actions.push(
 			html` <action-item
 				label="Visualize Branch History"
 				icon="graph-scatter"
-				href=${createCommandLink('gitlens.visualizeHistory.branch:home', {
+				href=${this._webview.createCommandLink<OpenInTimelineParams>('gitlens.visualizeHistory.branch:', {
 					type: 'branch',
 					repoPath: this.repo,
 					branchId: this.branch.id,
-				} satisfies OpenInTimelineParams)}
+				})}
 			></action-item>`,
 		);
 		actions.push(
 			html`<action-item
 				label="Open in Commit Graph"
 				icon="gl-graph"
-				href=${createCommandLink('gitlens.home.openInGraph', {
-					...this.branchRef,
+				href=${this.createWebviewCommandLinkWithBranchRef<OpenInGraphParams>('gitlens.showInCommitGraph:', {
 					type: 'branch',
-				} satisfies OpenInGraphParams)}
+				})}
 			></action-item>`,
 			html`<action-item
 				label=${this.isWorktree ? 'Open in Worktrees View' : 'Open in Branches View'}
 				icon="arrow-right"
-				href=${this.createCommandLink('gitlens.openInView.branch:home')}
+				href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openInView.branch:')}
 			></action-item>`,
 		);
 
@@ -1104,17 +1306,17 @@ export class GlBranchCard extends GlBranchCardBase {
 			html`<action-item
 				label="Open Pull Request Changes"
 				icon="request-changes"
-				href=${this.createCommandLink('gitlens.home.openPullRequestChanges')}
+				href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openPullRequestChanges:')}
 			></action-item>`,
 			html`<action-item
 				label="Compare Pull Request"
 				icon="git-compare"
-				href=${this.createCommandLink('gitlens.home.openPullRequestComparison')}
+				href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openPullRequestComparison:')}
 			></action-item>`,
 			html`<action-item
 				label="Open Pull Request Details"
 				icon="eye"
-				href=${this.createCommandLink('gitlens.home.openPullRequestDetails')}
+				href=${this.createWebviewCommandLinkWithBranchRef('gitlens.openPullRequestDetails:')}
 			></action-item>`,
 		];
 	}
@@ -1124,110 +1326,9 @@ export class GlBranchCard extends GlBranchCardBase {
 	}
 }
 
-@customElement('gl-work-item')
-export class GlWorkUnit extends LitElement {
-	static override styles = [
-		css`
-			.work-item {
-				display: flex;
-				flex-direction: column;
-				gap: 0.8rem;
-			}
-
-			.work-item_content-empty {
-				gap: 0;
-			}
-
-			.work-item__header {
-				display: flex;
-				flex-direction: row;
-				justify-content: space-between;
-				align-items: center;
-				gap: 0.8rem;
-			}
-
-			.work-item__main {
-				display: block;
-				flex: 1;
-				min-width: 0;
-			}
-
-			.work-item__summary {
-				display: block;
-				flex: none;
-			}
-
-			.work-item__content {
-				display: flex;
-				flex-direction: column;
-				gap: 0.8rem;
-				max-height: 100px;
-
-				transition-property: opacity, max-height, display;
-				transition-duration: 0.2s;
-				transition-behavior: allow-discrete;
-			}
-
-			:host(:not([expanded])) .work-item__content {
-				display: none;
-				opacity: 0;
-				max-height: 0;
-			}
-
-			gl-card::part(base) {
-				margin-block-end: 0;
-				padding-top: var(--gl-card-vertical-padding, 0.8rem);
-				padding-bottom: var(--gl-card-vertical-padding, 0.8rem);
-			}
-		`,
-	];
-
-	@property({ type: Boolean, reflect: true })
-	primary: boolean = false;
-
-	@property({ type: Boolean, reflect: true })
-	nested: boolean = false;
-
-	@property({ reflect: true })
-	indicator?: GlCard['indicator'];
-
-	@property({ type: Boolean, reflect: true })
-	expanded: boolean = false;
-
-	override render(): unknown {
-		return html`<gl-card
-			.density=${this.primary ? 'tight' : undefined}
-			.grouping=${this.nested === false ? undefined : this.primary ? 'item-primary' : 'item'}
-			.indicator=${this.indicator}
-			>${this.renderContent()}</gl-card
-		>`;
-	}
-
-	private renderContent() {
-		const contentRequired =
-			this.querySelectorAll('[slot="context"]').length > 0 ||
-			this.querySelectorAll('[slot="actions"]').length > 0;
-
-		return html`
-			<div class=${classMap({ 'work-item': true, 'work-item_content-empty': !contentRequired })}>
-				<header class="work-item__header">
-					<slot class="work-item__main"></slot>
-					${this.renderSummary()}
-				</header>
-				<div class="work-item__content">
-					<slot class="work-item__context" name="context"></slot>
-					<slot class="work-item__actions" name="actions"></slot>
-				</div>
-			</div>
-		`;
-	}
-
-	private renderSummary() {
-		if (this.expanded) return nothing;
-
-		return html`<slot class="work-item__summary" name="summary"></slot>`;
-	}
-}
+// Re-export GlWorkUnit from shared (component registration is side-effect of the import)
+export { GlWorkUnit } from '../../../shared/components/card/work-item.js';
+import '../../../shared/components/card/work-item.js';
 
 function getLaunchpadItemGroup(
 	pr: Awaited<GetOverviewBranch['pr']>,
@@ -1256,18 +1357,4 @@ function getLaunchpadItemGrouping(group: ReturnType<typeof getLaunchpadItemGroup
 	}
 
 	return undefined;
-}
-
-function getWipTooltipParts(workingTreeState: { added: number; changed: number; deleted: number }) {
-	const parts = [];
-	if (workingTreeState.added) {
-		parts.push(`${pluralize('file', workingTreeState.added ?? 0)} added`);
-	}
-	if (workingTreeState.changed) {
-		parts.push(`${pluralize('file', workingTreeState.changed ?? 0)} changed`);
-	}
-	if (workingTreeState.deleted) {
-		parts.push(`${pluralize('file', workingTreeState.deleted ?? 0)} deleted`);
-	}
-	return parts;
 }

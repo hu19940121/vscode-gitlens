@@ -1,7 +1,8 @@
-import type { Config } from '../../config';
-import type { IssuesCloudHostIntegrationId } from '../../constants.integrations';
-import type { IpcScope, WebviewState } from '../protocol';
-import { IpcNotification, IpcRequest } from '../protocol';
+import type { Config } from '../../config.js';
+import type { IssuesCloudHostIntegrationId } from '../../constants.integrations.js';
+import type { IpcScope } from '../ipc/models/ipc.js';
+import { IpcNotification, IpcRequest } from '../ipc/models/ipc.js';
+import type { WebviewState } from '../protocol.js';
 
 export const scope: IpcScope = 'settings';
 
