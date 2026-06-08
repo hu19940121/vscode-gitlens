@@ -1,16 +1,6 @@
 name: CI
 
 on:
-    push:
-        branches:
-            - main
-    pull_request:
-        branches: ['*']
-        types:
-            - opened
-            - reopened
-            - synchronize
-            - ready_for_review
     workflow_dispatch:
 
 jobs:
