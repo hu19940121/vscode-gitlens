@@ -4604,6 +4604,44 @@
 							"preview"
 						]
 					},
+					"gitlens.ai.openaicompatible.models": {
+						"type": "array",
+						"default": [],
+						"items": {
+							"type": "object",
+							"required": [
+								"id"
+							],
+							"properties": {
+								"id": {
+									"type": "string",
+									"minLength": 1,
+									"description": "Model identifier sent to the provider."
+								},
+								"name": {
+									"type": "string",
+									"description": "Optional display name shown in the model picker."
+								},
+								"maxInputTokens": {
+									"type": "number",
+									"minimum": 1,
+									"description": "Maximum input context size in tokens."
+								},
+								"maxOutputTokens": {
+									"type": "number",
+									"minimum": 1,
+									"description": "Maximum output size in tokens."
+								}
+							},
+							"additionalProperties": false
+						},
+						"markdownDescription": "Specifies models available from the custom OpenAI-compatible provider. When empty, the built-in OpenAI model list is used.",
+						"scope": "window",
+						"order": 34,
+						"tags": [
+							"preview"
+						]
+					},
 					"gitlens.ai.largePromptWarningThreshold": {
 						"type": "number",
 						"default": 120000,

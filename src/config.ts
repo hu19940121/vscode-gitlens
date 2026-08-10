@@ -285,6 +285,12 @@ interface AIConfig {
 		readonly url: string | null;
 	};
 	readonly openaicompatible: {
+		readonly models: readonly {
+			readonly id: string;
+			readonly name?: string;
+			readonly maxInputTokens?: number;
+			readonly maxOutputTokens?: number;
+		}[];
 		readonly url: string | null;
 	};
 	readonly vscode: {

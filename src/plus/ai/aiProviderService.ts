@@ -495,6 +495,16 @@ export class AIProviderService implements AIService, Disposable {
 				// compare below looks for and has to invalidate on its own. Ollama only: it's the one provider
 				// whose model list comes FROM that server, so a new URL can disagree about which models exist.
 				// The rest ship a static list, where re-resolving provably yields the same model.
+				if (configuration.changed(e, 'ai.openaicompatible.models')) {
+					this._modelCache.clear();
+					this._providerModelsCache.delete('openaicompatible');
+					clearResponseFormatRejections();
+					if (this._model?.provider.id === 'openaicompatible') {
+						this._model = undefined;
+					}
+					return;
+				}
+
 				if (configuration.changed(e, 'ai.ollama.url')) {
 					if (
 						this._model?.provider.id === 'ollama' ||
@@ -580,12 +590,16 @@ export class AIProviderService implements AIService, Disposable {
 					silent,
 				);
 			},
-			getProviderConfig: (type: string): { enabled: boolean; key?: string; url?: string } => {
+			getProviderConfig: (type: string) => {
 				const orgConfig = getOrgAIProviderOfType(type as AIProviders);
-				if (orgConfig.url) return orgConfig;
+				const models =
+					type === 'openaicompatible'
+						? (configuration.get('ai.openaicompatible.models') ?? undefined)
+						: undefined;
+				if (orgConfig.url) return { ...orgConfig, models: models };
 
 				const userUrl = configuration.get(`ai.${type}.url` as any) as string | undefined;
-				return { ...orgConfig, url: userUrl || undefined };
+				return { ...orgConfig, url: userUrl || undefined, models: models };
 			},
 			getOrPromptUrl: async (
 				providerId: string,

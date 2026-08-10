@@ -5,7 +5,7 @@ import { isAzureUrl } from '../utils/ai.utils.js';
 import { OpenAICompatibleProviderBase } from './openAICompatibleProviderBase.js';
 
 type OpenAICompatibleModel = AIModel<typeof provider.id>;
-const models: OpenAICompatibleModel[] = openAIModels(provider);
+const defaultModels: OpenAICompatibleModel[] = openAIModels(provider);
 
 export class OpenAICompatibleProvider extends OpenAICompatibleProviderBase<typeof provider.id> {
 	readonly id = provider.id;
@@ -17,7 +17,20 @@ export class OpenAICompatibleProvider extends OpenAICompatibleProviderBase<typeo
 	};
 
 	getModels(): Promise<readonly AIModel<typeof provider.id>[]> {
-		return Promise.resolve(models);
+		const configuredModels = this.context.getProviderConfig(this.id).models;
+		if (!configuredModels?.length) return Promise.resolve(defaultModels);
+
+		return Promise.resolve(
+			configuredModels.map(model => ({
+				id: model.id,
+				name: model.name || model.id,
+				maxTokens: {
+					input: model.maxInputTokens ?? 128000,
+					output: model.maxOutputTokens ?? 16384,
+				},
+				provider: provider,
+			})),
+		);
 	}
 
 	protected getUrl(_model?: AIModel<typeof provider.id>): string | undefined {

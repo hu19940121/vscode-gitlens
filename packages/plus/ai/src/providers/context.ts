@@ -14,7 +14,17 @@ export interface AIProviderContext {
 		silent: boolean,
 	): Promise<string | undefined>;
 
-	getProviderConfig(type: string): { enabled: boolean; key?: string; url?: string };
+	getProviderConfig(type: string): {
+		enabled: boolean;
+		key?: string;
+		url?: string;
+		models?: readonly {
+			id: string;
+			name?: string;
+			maxInputTokens?: number;
+			maxOutputTokens?: number;
+		}[];
+	};
 
 	getOrPromptUrl(
 		providerId: string,
