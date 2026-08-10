@@ -75,7 +75,8 @@ import type { Organization } from './models/organization.js';
 import type { Promo } from './models/promo.js';
 import type { PaidSubscriptionPlanIds, Subscription, SubscriptionUpgradeCommandArgs } from './models/subscription.js';
 import type { ServerConnection } from './serverConnection.js';
-import { ensurePlusFeaturesEnabled } from './utils/-webview/plus.utils.js';
+import { autoResetTrialIfEligible } from './trialAutoReset.js';
+import { arePlusFeaturesEnabled, ensurePlusFeaturesEnabled } from './utils/-webview/plus.utils.js';
 import { getConfiguredActiveOrganizationId, updateActiveOrganizationId } from './utils/-webview/subscription.utils.js';
 import { getSubscriptionFromCheckIn } from './utils/checkin.utils.js';
 import {
@@ -220,7 +221,7 @@ export class SubscriptionService implements Disposable {
 
 					// Replace the next `onAuthenticationChanged` handler to avoid our own trigger below
 					const fn = this.onAuthenticationChanged;
-					// eslint-disable-next-line @typescript-eslint/require-await
+					// oxlint-disable-next-line typescript/require-await
 					this.onAuthenticationChanged = async () => {
 						this.onAuthenticationChanged = fn;
 					};
@@ -242,6 +243,7 @@ export class SubscriptionService implements Disposable {
 
 				m.registerAccountDebug(this.container, {
 					getSubscription: () => this._subscription,
+					getSession: () => this._session,
 					overrideFeaturePreviews: ({ day, durationSeconds }) => {
 						savedFeaturePreviewOverrides ??= {
 							getFn: this.getStoredFeaturePreview,
@@ -753,6 +755,30 @@ export class SubscriptionService implements Disposable {
 		}
 	}
 
+	/**
+	 * Attempts the one-time out-of-window Pro trial reset.
+	 * Remove along with the promo.
+	 */
+	@gate(() => '')
+	@debug()
+	async autoResetTrialIfEligible(source: Source): Promise<void> {
+		// Silent check on purpose — never prompt from this background path
+		if (!arePlusFeaturesEnabled()) return;
+
+		return autoResetTrialIfEligible(
+			this.container,
+			this.connection,
+			{
+				getSubscription: () => this.getSubscription(),
+				ensureSession: () => this.ensureSession(false, source),
+				refreshSubscription: async session => {
+					await this.checkInAndValidate(session, source, { force: true });
+				},
+			},
+			source,
+		);
+	}
+
 	@debug()
 	async referFriend(source: Source | undefined): Promise<void> {
 		if (this.container.telemetry.enabled) {
@@ -840,9 +866,7 @@ export class SubscriptionService implements Disposable {
 	async showAccountView(silent: boolean = false): Promise<void> {
 		if (silent && !configuration.get('plusFeatures.enabled', undefined, true)) return;
 
-		if (!this.container.views.home.visible) {
-			await executeCommand('gitlens.showAccountView');
-		}
+		await executeCommand('gitlens.showAccountView');
 	}
 
 	@debug()
@@ -1206,24 +1230,22 @@ export class SubscriptionService implements Disposable {
 		if (!options?.force && this._session != null) return this._session;
 		if (this._session === null && !createIfNeeded) return undefined;
 
-		if (this._sessionPromise === undefined) {
-			this._sessionPromise = this.getOrCreateSession(createIfNeeded, source, {
-				signUp: options?.signUp,
-				signIn: options?.signIn,
-				context: options?.context,
-			}).then(
-				s => {
-					this._session = s;
-					this._sessionPromise = undefined;
-					return this._session;
-				},
-				() => {
-					this._session = null;
-					this._sessionPromise = undefined;
-					return this._session;
-				},
-			);
-		}
+		this._sessionPromise ??= this.getOrCreateSession(createIfNeeded, source, {
+			signUp: options?.signUp,
+			signIn: options?.signIn,
+			context: options?.context,
+		}).then(
+			s => {
+				this._session = s;
+				this._sessionPromise = undefined;
+				return this._session;
+			},
+			() => {
+				this._session = null;
+				this._sessionPromise = undefined;
+				return this._session;
+			},
+		);
 
 		const session = await this._sessionPromise;
 		return session ?? undefined;

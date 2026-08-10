@@ -24,12 +24,12 @@ export class GlPromo extends LitElement {
 
 			.promo {
 				margin: 0;
-				margin-top: 0.8rem;
+				margin-top: var(--gl-space-8);
 				text-align: center;
 			}
 
 			.header {
-				margin-right: 0.4rem;
+				margin-right: var(--gl-space-4);
 			}
 
 			.content {
@@ -42,13 +42,13 @@ export class GlPromo extends LitElement {
 
 			.link {
 				display: block;
-				color: inherit;
 				max-width: 100%;
-				text-align: center;
-				text-decoration: none;
 				overflow: hidden;
 				text-overflow: ellipsis;
+				color: inherit;
+				text-align: center;
 				white-space: nowrap;
+				text-decoration: none;
 			}
 
 			.link:focus-visible {
@@ -58,6 +58,10 @@ export class GlPromo extends LitElement {
 			.link:hover {
 				color: inherit;
 				text-decoration: underline;
+			}
+
+			.link__compact {
+				display: none;
 			}
 		`,
 	];
@@ -116,7 +120,10 @@ export class GlPromo extends LitElement {
 						part="link"
 						href="${this.getCommandUrl(promo)}"
 						title="${ifDefined(content.link.title)}"
-						>${unsafeHTML(content.link.html)}</a
+						><span class="link__full" part="full">${unsafeHTML(content.link.html)}</span
+						><span class="link__compact" part="compact"
+							>${unsafeHTML(content.link.compactHtml ?? content.link.html)}</span
+						></a
 					>`;
 				}
 				break;

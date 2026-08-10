@@ -7,16 +7,15 @@
  */
 
 import { Disposable } from 'vscode';
-import { getClaudeAgent } from '@env/providers.js';
 import type { Container } from '../../../container.js';
 import { resolveDefaultAgent } from '../../../plus/agents/agentRegistry.js';
 import type { AIModelScope } from '../../../plus/ai/aiProviderService.js';
-import { mcpRegistrationAllowed } from '../../../plus/gk/utils/-webview/mcp.utils.js';
+import { aiModelScopes } from '../../../plus/ai/aiProviderService.js';
 import { configuration } from '../../../system/-webview/configuration.js';
 import { getContext, onDidChangeContext } from '../../../system/-webview/context.js';
 import type { EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
 import { createRpcEventSubscription } from '../eventVisibilityBuffer.js';
-import type { AiModelInfo, AIState, RpcEventSubscription } from './types.js';
+import type { AiModelInfo, AIState, RpcEventSubscription, ScopedAiModelInfo } from './types.js';
 
 export class AIService {
 	/**
@@ -99,6 +98,31 @@ export class AIService {
 	}
 
 	/**
+	 * Get the per-scope model selections for all scopes, in display order.
+	 */
+	async getScopedModels(): Promise<ScopedAiModelInfo[]> {
+		// Resolved one scope at a time rather than concurrently: on a cold cache all three resolve
+		// against the same provider, and `getOrUpdateModel` keys its provider instance off a single
+		// shared field — three concurrent misses each construct a provider and re-register its change
+		// listener, overwriting the previous disposable. The first read warms the shared caches, so the
+		// remaining two are near-free, and the provider's model-list fetch is deduped either way.
+		const scopedModels: ScopedAiModelInfo[] = [];
+		for (const scope of aiModelScopes) {
+			const { model, isOverride } = await this.#container.ai.getScopedModel(scope, { silent: true });
+			scopedModels.push({ scope: scope, model: toAiModelInfo(model), isOverride: isOverride });
+		}
+
+		return scopedModels;
+	}
+
+	/**
+	 * Clears `scope`'s override so it inherits the global default again.
+	 */
+	async clearScopedModel(scope: AIModelScope): Promise<void> {
+		await this.#container.ai.clearScopedModel(scope);
+	}
+
+	/**
 	 * Get the current AI and MCP enablement state.
 	 */
 	getState(): Promise<AIState> {
@@ -107,19 +131,20 @@ export class AIService {
 
 	async #getAIState(): Promise<AIState> {
 		const agentsEnabled = getContext('gitlens:agents:enabled', false);
-		const claude = agentsEnabled ? await getClaudeAgent() : undefined;
+		const claude = agentsEnabled ? await this.#container.agents.getClaude() : undefined;
 		const detected = claude?.detected === true;
 		const supported = claude?.hooksSupported === true;
 		const installed = claude?.hooksInstalled === true;
 
 		const defaultAgentId = configuration.get('ai.defaultAgent') ?? undefined;
-		const defaultAgentDescriptor = defaultAgentId != null ? await resolveDefaultAgent(defaultAgentId) : undefined;
+		const defaultAgentDescriptor =
+			defaultAgentId != null ? await resolveDefaultAgent(this.#container, defaultAgentId) : undefined;
 
 		return {
 			enabled: this.#container.ai.enabled,
 			orgEnabled: getContext('gitlens:gk:organization:ai:enabled', true),
 			mcp: {
-				bundled: mcpRegistrationAllowed(this.#container),
+				bundled: this.#container.gkMcp?.isRegistrationAllowed ?? false,
 				settingEnabled: configuration.get('gitkraken.mcp.autoEnabled'),
 				installed: getContext('gitlens:gk:cli:installed', false),
 			},
@@ -143,12 +168,15 @@ export class AIService {
 }
 
 function toAiModelInfo(
-	model: { id: string; name: string; provider: { id: string; name: string } } | undefined,
+	model:
+		| { id: string; name: string; provider: { id: string; name: string }; consumptionRateLabel?: string }
+		| undefined,
 ): AiModelInfo | undefined {
 	if (model == null) return undefined;
 	return {
 		id: model.id,
 		name: model.name,
 		provider: { id: model.provider.id, name: model.provider.name },
+		consumptionRateLabel: model.consumptionRateLabel,
 	} satisfies AiModelInfo;
 }

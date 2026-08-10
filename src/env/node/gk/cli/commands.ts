@@ -1,4 +1,4 @@
-/* eslint-disable @typescript-eslint/require-await */
+/* oxlint-disable typescript/require-await */
 import type { Account } from '@gitkraken/provider-apis';
 import type { Disposable } from 'vscode';
 import type { Account as AuthorAccount } from '@gitlens/git/models/author.js';
@@ -9,6 +9,7 @@ import { serializePullRequest } from '@gitlens/git/utils/pullRequest.utils.js';
 import type { UnifiedDisposable } from '@gitlens/utils/disposable.js';
 import { defer } from '@gitlens/utils/promise.js';
 import type { CompareWithCommandArgs } from '../../../../commands/compareWith.js';
+import type { ComposerCommandArgs } from '../../../../commands/composer.js';
 import type { Container } from '../../../../container.js';
 import { cherryPick, merge, rebase } from '../../../../git/actions/repository.js';
 import type { GlRepository } from '../../../../git/models/repository.js';
@@ -19,9 +20,7 @@ import type { StartReviewCommandArgs } from '../../../../plus/launchpad/startRev
 import type { StartWorkCommandArgs } from '../../../../plus/startWork/startWork.js';
 import { executeCommand } from '../../../../system/-webview/command.js';
 import { createCommandDecorator } from '../../../../system/decorators/command.js';
-import type { ComposerWebviewShowingArgs } from '../../../../webviews/plus/composer/registration.js';
-import type { WebviewPanelShowCommandArgs } from '../../../../webviews/webviewsController.js';
-import type { CliCommandRequest, CliCommandResponse } from './integration.js';
+import type { CliCommandRequest, CliCommandResponse } from './gkCliService.js';
 
 type CliCommand =
 	| 'cherry-pick'
@@ -188,15 +187,11 @@ export class CliCommandHandlers implements Disposable {
 
 		const instructions = request?.args?.[0];
 
-		void executeCommand<WebviewPanelShowCommandArgs<ComposerWebviewShowingArgs>>(
-			'gitlens.showComposerPage',
-			undefined,
-			{
-				repoPath: repo?.path,
-				source: { source: 'mcp', detail: 'mcp/wip/compose/open' },
-				autoComposeInstructions: instructions,
-			},
-		);
+		void executeCommand<ComposerCommandArgs>('gitlens.composeCommits', {
+			repoPath: repo?.path,
+			source: { source: 'mcp', detail: 'mcp/wip/compose/open' },
+			autoComposeInstructions: instructions,
+		});
 	}
 
 	@command('mcp/pr/review/start')
@@ -280,10 +275,11 @@ export class CliCommandHandlers implements Disposable {
 			throw new Error('No connected integrations. Please connect a GitHub, GitLab, or other integration first.');
 		}
 
-		// Use Launchpad's search to find the PR by URL or number
-		const result = await this.container.launchpad.getCategorizedItems(
-			prSearch != null ? { search: prSearch } : undefined,
-		);
+		// Use Launchpad's search to find the PR by URL or number. Pass no argument when not searching -- an explicit
+		// `undefined` lands in a different `@gate` bucket than a bare call and wouldn't dedupe against other readers.
+		const result = await (prSearch != null
+			? this.container.launchpad.getCategorizedItems({ search: prSearch })
+			: this.container.launchpad.getCategorizedItems());
 
 		// Only throw on total failure (error with no items); partial success returns items alongside the error
 		if (result.error != null && !result.items?.length) {
@@ -383,7 +379,6 @@ function serializeLaunchpadItem(item: LaunchpadItem): Record<string, unknown> {
 		closedDate: item.closedDate,
 		mergedDate: item.mergedDate,
 		currentViewer: toSafeAccount(item.currentViewer),
-		codeSuggestionsCount: item.codeSuggestionsCount,
 		isNew: item.isNew,
 		isSearched: item.isSearched,
 		actionableCategory: item.actionableCategory,

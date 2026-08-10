@@ -1,4 +1,5 @@
 import { createContext } from '@lit/context';
+import type { SearchQuery } from '@gitlens/git/models/search.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import type { AgentSessionState } from '../../../../agents/models/agentSessionState.js';
 import type { StoredGraphWipDraft } from '../../../../constants.storage.js';
@@ -9,9 +10,9 @@ import type {
 	GraphSearchResults,
 	GraphSearchResultsError,
 	GraphSelectedRows,
-	GraphWorkingTreeStats,
 	State,
 	Wip,
+	WipStats,
 } from '../../../plus/graph/protocol.js';
 import type { GetOverviewEnrichmentResponse, OverviewBranchMergeTarget } from '../../../shared/overviewBranches.js';
 
@@ -21,17 +22,24 @@ export interface AppState extends State {
 	activeRow: string | undefined;
 	/**
 	 * Columns whose search operator is currently present in the search query, derived from
-	 * the parsed search query. Used by gl-graph.react.tsx to set `isFilterActive` on each
-	 * column before passing settings to GraphContainer.
+	 * the parsed search query. Drives each column's header filter affordance.
 	 */
 	activeFilterColumns: ReadonlySet<GraphColumnName>;
 	agentSessions: AgentSessionState[];
 	isBusy: boolean;
 	loading: boolean;
+	/** True while one or more targeted row loads remain active past their soft display delay. */
+	ensureLoading: boolean;
+	/**
+	 * Begin a targeted row-loading scope. Returns an idempotent disposer so overlapping consumers
+	 * cannot clear each other's loading affordance.
+	 */
+	beginEnsureLoading(): () => void;
 	/** Composed with `loading` at the `gl-graph` render boundary — true while a scope-anchor
 	 *  IPC is in flight past `scopeLoadingDelayMs`. Owned by `GraphStateProvider.setScope`. */
 	scopeLoading: boolean;
 	mcpBannerCollapsed?: boolean | undefined;
+	mcpCanAutoRegister?: boolean | undefined;
 	hooksBannerCollapsed?: boolean | undefined;
 	canInstallClaudeHook?: boolean | undefined;
 	navigating: 'next' | 'previous' | false;
@@ -43,15 +51,31 @@ export interface AppState extends State {
 	searchResultsResponse: GraphSearchResults | GraphSearchResultsError | undefined;
 	searchResults: GraphSearchResults | undefined;
 	searchResultsError: GraphSearchResultsError | undefined;
+	/** The active search's query, carried from the host so a rebooted/reconnected app can restore its
+	 *  search box (results ride their own channel; without this the box is blank after a reconnect). */
+	searchQuery: SearchQuery | undefined;
 	currentSearchId: number | undefined;
+	/** Bumped locally each time the user submits a NEW search, so consumers can scope per-search UI
+	 *  state to one search session. Unlike `currentSearchId` (assigned by the host, so it only lands a
+	 *  round-trip later) this changes the instant the search is issued. Navigating/resuming an existing
+	 *  search does not bump it. */
+	searchSession: number;
 	selectedRows: GraphSelectedRows | undefined;
 	visibleDays: { top: number; bottom: number } | undefined;
+	/**
+	 * Webview-only monotonic counter bumped whenever the host ships an authoritative refsMetadata REPLACE
+	 * (`refsMetadataReset`). An integration-flip STRIP preserves a non-empty upstream map, so the graph
+	 * component can't detect the reset by emptiness — it watches this token instead to re-arm its per-id
+	 * request dedup and re-request the dropped (PR/issue) types for visible rows. Not part of the host wire
+	 * contract (`State`); lives purely in the reducer→component signal path.
+	 */
+	refsMetadataResetToken: number;
 
 	/**
 	 * Publish a lazily-fetched merge target into `overviewEnrichment` for the given branchId. The graph
-	 * overview's enrichment IPC skips merge-target fetching; the overview card and click-to-scope path
-	 * fetch via `BranchesService.getMergeTargetStatus` and call this so the scope-anchor's
-	 * `reconcileScopeMergeTarget` hook backfills the tip SHA.
+	 * overview's enrichment IPC skips merge-target fetching; the click-to-scope path and the shared branch
+	 * hover (`gl-branch-hover`, backing both the overview card and the graph WIP-bar pills) fetch it and
+	 * call this so the scope-anchor's `reconcileScopeMergeTarget` hook backfills the tip SHA.
 	 */
 	mergeMergeTargetIntoEnrichment(branchId: string, mergeTarget: OverviewBranchMergeTarget | undefined): void;
 
@@ -63,12 +87,31 @@ export interface AppState extends State {
 	ensureOverviewEnrichmentFetched(overview: State['overview']): void;
 
 	/**
-	 * Publish a freshly-picked scope to the `scope` signal — synchronously in its bare form
-	 * (without `mergeBase` / `mergeTargetTipSha`) so the graph component's scope filter activates
-	 * before any concurrent scroll-to-commit / select-row work. The anchor is resolved
-	 * asynchronously via IPC and applied afterward; if the resolved merge base isn't in the
-	 * loaded rows (stale or deep target), the bare scope stays and the foreign-ref heuristic
-	 * bounds visibility.
+	 * Additively fetch enrichment for branch ids that may sit outside the overview's active/recent set —
+	 * a WIP-bar pill on a worktree whose branch missed the recency cut. Merges; never drops. Deduped
+	 * against what's already resolved or in flight, so re-hovering a pill is a no-op.
+	 */
+	ensureEnrichmentFetchedForBranches(branchIds: string[]): void;
+
+	/**
+	 * Publish an authoritative overview enrichment result. Drop-stale applies only within the overview's
+	 * own id set: entries fetched via `ensureEnrichmentFetchedForBranches` and locally-merged merge-targets
+	 * are carried forward.
+	 */
+	publishOverviewEnrichment(enrichment: NonNullable<AppState['overviewEnrichment']>): void;
+
+	/** Clear all enrichment state (shared record + overview fingerprint + additive WIP-bar tracking) as
+	 *  one unit. Both reset paths (scope-anchor invalidation, overview `refresh`) route through here. */
+	resetOverviewEnrichment(): void;
+
+	/**
+	 * Publish a freshly-picked scope to the `scope` signal — at most ONE write per call (never a
+	 * bare-then-anchored two-step; the two produce different visible sets, which reads as commits
+	 * jumping), after the anchor IPC settles: anchored when it yields a merge base that's in the
+	 * loaded rows, bare otherwise. A superseded or invalid call writes nothing. Resolves once the
+	 * publish attempt settles, so callers can sequence a scroll-to-commit / select-row against the
+	 * settled scope — re-checking `scope` after the await, since a superseding call owns the final
+	 * value.
 	 */
 	setScope(scope: GraphScope): Promise<void>;
 
@@ -78,6 +121,18 @@ export interface AppState extends State {
 	 * picks up the fresh anchor without the user re-picking. Initial picks go through `setScope`.
 	 */
 	resolveScopeMergeBase(scope: GraphScope): Promise<void>;
+
+	/** The current branch's merge-target tip + name — row marker's merge-target role/segment. Resolved
+	 *  async on load (and re-resolved on ref move) via the shared scope-anchor pipeline, so it lands after
+	 *  the initial paint and is absent when there's no real target (default branch / detached). */
+	rowMarkerMergeTarget: { sha: string; name?: string } | undefined;
+
+	/**
+	 * Resolve (or refresh) `rowMarkerMergeTarget` for the current branch through the shared
+	 * scope-anchor cache. Idempotent + self-deduping per branch id, so callers can invoke it freely
+	 * (e.g. every render); a ref-move invalidation re-arms it. Non-blocking — the tip lands later.
+	 */
+	ensureRowMarkerMergeTarget(): void;
 
 	/**
 	 * Defer clearing the current scope until the next `DidChangeRefsVisibilityNotification` lands —
@@ -109,12 +164,23 @@ export interface AppState extends State {
 	setWip(repoPath: string, wip: Wip): void;
 
 	/**
-	 * Reseed `workingTreeStats` (header / primary-row badge source) from a panel-driven `getWip`
-	 * response. No-op unless `repoPath` matches the selected repository. `stats` is the primary
-	 * wip's embedded counts (git-authoritative, same object as `wip.stats`) so the file list and
-	 * counts can't drift — no generation guard needed.
+	 * Ingest an AUTHORITATIVE `Wip` for `repoPath` — a `getWip` RPC response, produced by the host
+	 * from the same single `git status` as a push. Reconciles the same mirrors a push does (cache +
+	 * ordering high-water, badge stats, overview entry) and leaves the entry live: it is host truth,
+	 * not a local guess, so a revisit must not have to buy another `git status` to re-confirm it.
+	 * Use this for anything the host produced; {@link setWip} is only for optimistic local edits.
+	 * Ordering is the caller's to enforce.
 	 */
-	setWorkingTreeStats(repoPath: string, stats: GraphWorkingTreeStats): void;
+	ingestWip(repoPath: string, wip: Wip): void;
+
+	/**
+	 * Reseed one worktree's WIP status group (header / row badge source) from a panel-driven `getWip`
+	 * response. Writes into the row-keyed hot plane, so a peer worktree's response lands on that
+	 * peer's row rather than the graph's own. `stats` is that wip's embedded counts
+	 * (git-authoritative, same object as `wip.stats`) so the file list and counts can't drift — no
+	 * generation guard needed.
+	 */
+	setWipStatus(repoPath: string, stats: WipStats): void;
 
 	/**
 	 * Return the cached WIP for `repoPath` plus liveness metadata. `isLive` reflects whether the
@@ -133,6 +199,17 @@ export interface AppState extends State {
 	 * implementation — callers only need to pass the secondary set.
 	 */
 	updateActiveWipWatchers(repoPaths: Iterable<string>): void;
+
+	/**
+	 * Stake a claim on `shas` for an outgoing `GetWipStatsRequest` and return its ticket; pair with
+	 * {@link isCurrentWipStatsRequest} before applying the response. Concurrent batches don't cancel each
+	 * other, and the responses carry no revision, so this is what keeps an older read that lands late from
+	 * rolling a row back over a newer one.
+	 */
+	claimWipStatsRequest(shas: Iterable<string>): number;
+
+	/** Whether `ticket` is still the latest {@link claimWipStatsRequest} for `sha`. */
+	isCurrentWipStatsRequest(sha: string, ticket: number): boolean;
 
 	/**
 	 * Patch one `(worktreePath, draft)` slot in the per-repo wipDrafts map (routed through

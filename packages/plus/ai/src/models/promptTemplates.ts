@@ -101,6 +101,10 @@ interface ReviewDetailPromptTemplateContext {
 	instructions?: string;
 }
 
+interface ReviewRefinePromptTemplateContext {
+	instructions: string;
+}
+
 interface AddressReviewFindingsPromptTemplateContext {
 	reviewMarkdown: string;
 	scopeLabel: string;
@@ -117,18 +121,19 @@ export type PromptTemplateType =
 	| 'generate-commitMessage'
 	| 'generate-stashMessage'
 	| 'generate-changelog'
-	| `generate-create-${'cloudPatch' | 'codeSuggestion' | 'pullRequest'}`
+	| `generate-create-${'cloudPatch' | 'pullRequest'}`
 	| 'generate-commits'
 	| 'generate-searchQuery'
 	| 'explain-changes'
 	| 'review-changes'
 	| 'review-overview'
 	| 'review-detail'
+	| 'review-refine'
 	| 'address-review-findings'
 	| 'start-review-pullRequest'
 	| 'start-work-issue';
 
-type PromptTemplateVersions = '' | '_v2';
+type PromptTemplateVersions = '' | '_v2' | '_v3';
 
 export type PromptTemplateId<T extends PromptTemplateType = PromptTemplateType> = `${T}${PromptTemplateVersions}`;
 
@@ -137,7 +142,7 @@ export type PromptTemplateContext<T extends PromptTemplateType> = T extends 'gen
 	? CommitMessagePromptTemplateContext
 	: T extends 'generate-stashMessage'
 	? StashMessagePromptTemplateContext
-	: T extends 'generate-create-cloudPatch' | 'generate-create-codeSuggestion'
+	: T extends 'generate-create-cloudPatch'
 	? CreateDraftPromptTemplateContext
 	: T extends 'generate-create-pullRequest'
 	? CreatePullRequestPromptTemplateContext
@@ -155,6 +160,8 @@ export type PromptTemplateContext<T extends PromptTemplateType> = T extends 'gen
 	? ReviewOverviewPromptTemplateContext
 	: T extends 'review-detail'
 	? ReviewDetailPromptTemplateContext
+	: T extends 'review-refine'
+	? ReviewRefinePromptTemplateContext
 	: T extends 'address-review-findings'
 	? AddressReviewFindingsPromptTemplateContext
 	: T extends 'start-review-pullRequest'

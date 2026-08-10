@@ -11,7 +11,7 @@ import type { RunningOperationExecState } from './detailsState.js';
  *  - `'error'` → `'error'`
  *  - `'orphaned'` → `'warning'`
  *
- *  Used by both the WIP-row adornment buttons (`gl-graph.react.tsx`) and the details-header
+ *  Used by both the WIP-row adornment buttons and the details-header
  *  toggle chips (`gl-details-header.ts`) so the visual language is shared. `hasResult` defaults
  *  to `true` for backward compatibility with callers that haven't been threaded through. */
 export function statusIconFor(execState: RunningOperationExecState, hasResult: boolean = true): string | null {
@@ -31,30 +31,32 @@ export function statusIconFor(execState: RunningOperationExecState, hasResult: b
 	}
 }
 
-/** Tooltip + aria-label for a WIP-row adornment button (Compose/Review entry point), reflecting
- *  the engaged operation's exec state. Reused by both `tooltip` and `aria-label` attributes so
- *  the spoken label matches the visible hint. `hasResult` distinguishes a `'backed'` entry with
- *  a viewable result from a `'backed'`-no-result placeholder (cancelled / first-error Go Back),
- *  which should read as an idle entry point rather than "View Compose / Review". */
+/** Tooltip + aria-label for a WIP-row adornment button (Compose/Review/Resolve entry point),
+ *  reflecting the engaged operation's exec state. Reused by both `tooltip` and `aria-label`
+ *  attributes so the spoken label matches the visible hint. `hasResult` distinguishes a `'backed'`
+ *  entry with a viewable result from a `'backed'`-no-result placeholder (cancelled / first-error
+ *  Go Back), which should read as an idle entry point rather than "View Compose / Review". */
 export function rowAdornmentTooltipFor(
-	kind: 'review' | 'compose',
+	kind: 'review' | 'compose' | 'resolve',
 	execState: RunningOperationExecState | undefined,
 	hasResult: boolean = true,
 ): string {
-	const verb = kind === 'compose' ? 'Compose' : 'Review';
+	const verb = kind === 'compose' ? 'Compose' : kind === 'review' ? 'Review' : 'Resolve';
+	const idle = kind === 'compose' ? 'Compose Changes…' : kind === 'review' ? 'Review Changes…' : 'Resolve Conflicts…';
+	const view = kind === 'resolve' ? 'View Resolutions' : `View ${verb}`;
 	switch (execState) {
 		case 'generating':
-			return kind === 'compose' ? 'Composing…' : 'Reviewing…';
+			return kind === 'compose' ? 'Composing…' : kind === 'review' ? 'Reviewing…' : 'Resolving…';
 		case 'complete':
-			return `View ${verb}`;
+			return view;
 		case 'backed':
-			return hasResult ? `View ${verb}` : `${verb} Changes…`;
+			return hasResult ? view : idle;
 		case 'error':
 			return `${verb} Failed — Click to View`;
 		case 'orphaned':
 			return `${verb} — Anchor Missing`;
 		default:
-			return `${verb} Changes…`;
+			return idle;
 	}
 }
 

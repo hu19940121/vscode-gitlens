@@ -2,7 +2,9 @@ import * as assert from 'assert';
 import type { AgentSessionState } from '../../../../agents/models/agentSessionState.js';
 import type { OverviewBranch } from '../../../shared/overviewBranches.js';
 import {
+	createPastAgentSessionsResolver,
 	findOverviewBranchForSession,
+	formatAgentElapsed,
 	indexAgentSessionsByRepoAndWorktree,
 	matchAgentSessionsForWorktree,
 } from '../agentUtils.js';
@@ -172,5 +174,130 @@ suite('agentUtils', () => {
 			const found = findOverviewBranchForSession({ active: [defaultBranch], recent: [] }, session);
 			assert.strictEqual(found?.name, 'main');
 		});
+	});
+
+	suite('formatAgentElapsed', () => {
+		const s = 1000;
+		const m = 60 * s;
+		const h = 60 * m;
+		const d = 24 * h;
+		const w = 7 * d;
+		// `now` is pinned and passed through, so each span is exact. Reading the clock twice (once for the
+		// input, once inside the formatter) leaves the boundary cases one tick from the next bucket.
+		const now = Date.now();
+		const elapsed = (ms: number) => formatAgentElapsed(now - ms, now);
+
+		test('returns undefined for undefined', () => {
+			assert.strictEqual(formatAgentElapsed(undefined), undefined);
+		});
+
+		test('rolls seconds → minutes → hours', () => {
+			assert.strictEqual(elapsed(5 * s), '5s');
+			assert.strictEqual(elapsed(5 * m), '5m');
+			assert.strictEqual(elapsed(3 * h + 20 * m), '3h 20m');
+			assert.strictEqual(elapsed(3 * h), '3h');
+		});
+
+		test('rolls hours → days past 24h', () => {
+			assert.strictEqual(elapsed(26 * h), '1d 2h');
+			assert.strictEqual(elapsed(3 * d), '3d');
+		});
+
+		test('rolls days → weeks past 7d', () => {
+			assert.strictEqual(elapsed(9 * d), '1w 2d');
+			assert.strictEqual(elapsed(2 * w), '2w');
+		});
+	});
+});
+
+suite('createPastAgentSessionsResolver', () => {
+	function pastResult(ids: string[], total?: number) {
+		return {
+			sessions: ids.map(id => ({
+				id: id,
+				cwd: wtA,
+				worktreePath: wtA,
+				displayName: id,
+				lastActivity: 0,
+			})),
+			total: total ?? ids.length,
+		};
+	}
+
+	test('drops rows for sessions that are currently tracked', () => {
+		const resolver = createPastAgentSessionsResolver();
+		const resolved = resolver.resolve(pastResult(['s1', 's2']), [makeSession({ id: 's1' })]);
+		assert.deepStrictEqual(
+			resolved?.sessions.map(s => s.id),
+			['s2'],
+		);
+	});
+
+	test('keeps suppressing a session after it departs the tracked set', () => {
+		// The archive case: the row leaves the live list, so the tracked-id filter alone would stop
+		// masking it and the cached past list would paint it as "Past".
+		const resolver = createPastAgentSessionsResolver();
+		const past = pastResult(['s1', 's2']);
+
+		resolver.resolve(past, [makeSession({ id: 's1' })]);
+		const resolved = resolver.resolve(past, []);
+
+		assert.deepStrictEqual(
+			resolved?.sessions.map(s => s.id),
+			['s2'],
+			'the departed session must not reappear under Past',
+		);
+	});
+
+	test('reduces total by what it dropped so the footer stays honest', () => {
+		const resolver = createPastAgentSessionsResolver();
+		const past = pastResult(['s1', 's2'], 7);
+
+		resolver.resolve(past, [makeSession({ id: 's1' })]);
+		const resolved = resolver.resolve(past, []);
+
+		assert.strictEqual(resolved?.total, 6);
+	});
+
+	test('a freshly delivered result retires the suppressions', () => {
+		// The host filters archived ids at fetch time, so a new result is authoritative.
+		const resolver = createPastAgentSessionsResolver();
+		resolver.resolve(pastResult(['s1']), [makeSession({ id: 's1' })]);
+		resolver.resolve(pastResult(['s1']), []);
+
+		const resolved = resolver.resolve(pastResult(['s1']), []);
+		assert.deepStrictEqual(
+			resolved?.sessions.map(s => s.id),
+			['s1'],
+		);
+	});
+
+	test('an unloaded (undefined) live list is not treated as a mass departure', () => {
+		// `agentSessions` is undefined until the context/state lands (and again across a graph-state
+		// reset). Reading that as "every session left" would suppress the matching Past rows for the
+		// component's lifetime, so the prior snapshot must be held instead.
+		const resolver = createPastAgentSessionsResolver();
+		const past = pastResult(['s1', 's2']);
+
+		resolver.resolve(past, [makeSession({ id: 's1' })]);
+		resolver.resolve(past, undefined);
+		const resolved = resolver.resolve(past, [makeSession({ id: 's1' })]);
+
+		assert.deepStrictEqual(
+			resolved?.sessions.map(s => s.id),
+			['s2'],
+			's1 is still merely deduped as live, not suppressed as departed',
+		);
+	});
+
+	test('preserves reference identity when nothing is dropped', () => {
+		const resolver = createPastAgentSessionsResolver();
+		const past = pastResult(['s1']);
+		assert.strictEqual(resolver.resolve(past, []), past);
+	});
+
+	test('returns undefined when there is no past result', () => {
+		const resolver = createPastAgentSessionsResolver();
+		assert.strictEqual(resolver.resolve(undefined, [makeSession({ id: 's1' })]), undefined);
 	});
 });

@@ -5,17 +5,33 @@ import { OpenAICompatibleProviderBase } from './openAICompatibleProviderBase.js'
 type XAIModel = AIModel<typeof provider.id>;
 const models: XAIModel[] = [
 	{
+		id: 'grok-4.5',
+		name: 'Grok 4.5',
+		maxTokens: { input: 500000, output: 65536 },
+		provider: provider,
+	},
+	{
+		id: 'grok-4.3',
+		name: 'Grok 4.3',
+		maxTokens: { input: 1048576, output: 65536 },
+		provider: provider,
+		default: true,
+	},
+	{
 		id: 'grok-beta',
 		name: 'Grok Beta',
 		maxTokens: { input: 131072, output: 4096 },
 		provider: provider,
-		default: true,
+		hidden: true,
+		// Structured outputs require grok-2-1212 or newer; grok-beta predates that floor
+		supportsStructuredOutputs: false,
 	},
 ];
 
 export class XAIProvider extends OpenAICompatibleProviderBase<typeof provider.id> {
 	readonly id = provider.id;
 	readonly name = provider.name;
+	readonly supportsTools = true;
 	protected readonly descriptor = provider;
 	protected readonly config = {
 		keyUrl: 'https://console.x.ai/',

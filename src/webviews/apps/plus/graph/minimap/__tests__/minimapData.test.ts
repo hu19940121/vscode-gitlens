@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import type { GraphRow } from '@gitkraken/gitkraken-components';
+import type { GitGraphRow } from '@gitlens/git/models/graph.js';
 import type { GraphMinimapMarkerTypes, GraphSearchResults } from '../../../../../plus/graph/protocol.js';
 import { aggregate, aggregateSearchResults, getDay } from '../minimapData.js';
 
@@ -8,15 +8,15 @@ const day1Midnight = new Date(2024, 5, 10, 0, 0, 0, 0).getTime();
 const day2 = new Date(2024, 5, 11, 9, 0).getTime();
 const day2Midnight = new Date(2024, 5, 11, 0, 0, 0, 0).getTime();
 
-function row(overrides: Partial<GraphRow> & { sha: string; date: number }): GraphRow {
-	const r: GraphRow = {
+function row(overrides: Partial<GitGraphRow> & { sha: string; date: number }): GitGraphRow {
+	const r: GitGraphRow = {
 		sha: overrides.sha,
 		date: overrides.date,
 		parents: [],
 		author: 'test',
 		email: 'test@test',
 		message: 'message',
-		type: 'commit-node',
+		kind: 'commit',
 	};
 	return Object.assign(r, overrides);
 }
@@ -46,7 +46,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.size, 0);
 		assert.strictEqual(result.markersByDay.size, 0);
@@ -60,7 +61,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'lines',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.size, 0);
 		assert.strictEqual(result.markersByDay.size, 0);
@@ -78,7 +80,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.size, 2);
 		assert.strictEqual(result.statsByDay.get(day1Midnight)?.commits, 2);
@@ -95,7 +98,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.get(day1Midnight)?.sha, 'newer');
 	});
@@ -111,7 +115,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'lines',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const stat = result.statsByDay.get(day1Midnight);
 		assert.strictEqual(stat?.commits, 2);
@@ -134,7 +139,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['localBranches'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const markers = result.markersByDay.get(day1Midnight);
 		assert.deepStrictEqual(
@@ -160,7 +166,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['head'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const markers = result.markersByDay.get(day1Midnight);
 		assert.deepStrictEqual(
@@ -177,7 +184,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['head'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.ok(!withoutPR.markersByDay.get(day1Midnight)?.some(m => m.type === 'pull-request'));
 
@@ -188,7 +196,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['head', 'pullRequests'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const prMarkers = withPR.markersByDay.get(day1Midnight)?.filter(m => m.type === 'pull-request');
 		assert.strictEqual(prMarkers?.length, 1);
@@ -209,7 +218,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['upstream'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const markers = result.markersByDay.get(day1Midnight);
 		assert.strictEqual(markers?.length, 1);
@@ -231,7 +241,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: { 'origin/feat': ['local/feat'] },
 			markerTypes: ['localBranches'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const markers = result.markersByDay.get(day1Midnight);
 		assert.strictEqual(markers?.length, 1);
@@ -240,13 +251,23 @@ suite('minimapData Test Suite', () => {
 
 	test('emits tag markers when tags enabled', () => {
 		const result = aggregate({
-			rows: [row({ sha: 'a', date: day1, tags: [{ name: 'v1.0.0' }, { name: 'stable' }] })],
+			rows: [
+				row({
+					sha: 'a',
+					date: day1,
+					tags: [
+						{ name: 'v1.0.0', annotated: false },
+						{ name: 'stable', annotated: false },
+					],
+				}),
+			],
 			rowsStats: undefined,
 			refMetadata: undefined,
 			downstreams: undefined,
 			markerTypes: ['tags'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const markers = result.markersByDay.get(day1Midnight);
 		assert.deepStrictEqual(
@@ -258,15 +279,16 @@ suite('minimapData Test Suite', () => {
 		);
 	});
 
-	test('emits stash marker for stash-node rows when stashes enabled', () => {
+	test('emits stash marker for stash rows when stashes enabled', () => {
 		const result = aggregate({
-			rows: [row({ sha: 'a', date: day1, type: 'stash-node', message: 'WIP on main' })],
+			rows: [row({ sha: 'a', date: day1, kind: 'stash', message: 'WIP on main' })],
 			rowsStats: undefined,
 			refMetadata: undefined,
 			downstreams: undefined,
 			markerTypes: ['stashes'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		const markers = result.markersByDay.get(day1Midnight);
 		assert.strictEqual(markers?.length, 1);
@@ -282,7 +304,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: allMarkerTypes,
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.markersByDay.size, 0);
 	});
@@ -298,7 +321,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['head'],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.get(day1Midnight)?.sha, 'head');
 	});
@@ -338,8 +362,9 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['worktree'],
 			dataType: 'commits',
-			wipMetadataBySha: {
-				'worktree-wip::/wt-a': {
+			primaryWipRowId: 'wip::/primary',
+			wipRowsById: {
+				'wip::/wt-a': {
 					parentSha: 'parent-a',
 					repoPath: '/wt-a',
 					label: 'wt-a',
@@ -353,6 +378,29 @@ suite('minimapData Test Suite', () => {
 		assert.strictEqual(result.markersByDay.get(day2Midnight), undefined);
 	});
 
+	// The `worktree` marker means "ANOTHER worktree is parked here". The graph's own worktree is an
+	// ordinary entry in `wipRowsById` now, so it has to be excluded explicitly or every graph would
+	// grow a spurious marker on its own HEAD.
+	test('the primary worktree never emits a marker', () => {
+		const result = aggregate({
+			rows: [row({ sha: 'parent-a', date: day1 })],
+			rowsStats: undefined,
+			refMetadata: undefined,
+			downstreams: undefined,
+			markerTypes: ['worktree'],
+			dataType: 'commits',
+			primaryWipRowId: 'wip::/primary',
+			wipRowsById: {
+				'wip::/primary': {
+					parentSha: 'parent-a',
+					repoPath: '/primary',
+					label: 'primary',
+				},
+			},
+		});
+		assert.strictEqual(result.markersByDay.size, 0);
+	});
+
 	test('worktree whose parentSha is not in loaded rows is dropped', () => {
 		const result = aggregate({
 			rows: [row({ sha: 'parent-a', date: day1 })],
@@ -361,8 +409,9 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['worktree'],
 			dataType: 'commits',
-			wipMetadataBySha: {
-				'worktree-wip::/wt-missing': {
+			primaryWipRowId: 'wip::/primary',
+			wipRowsById: {
+				'wip::/wt-missing': {
 					parentSha: 'unknown-sha',
 					repoPath: '/wt-missing',
 					label: 'wt-missing',
@@ -380,13 +429,14 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['worktree'],
 			dataType: 'commits',
-			wipMetadataBySha: {
-				'worktree-wip::/wt-a': {
+			primaryWipRowId: 'wip::/primary',
+			wipRowsById: {
+				'wip::/wt-a': {
 					parentSha: 'parent-a',
 					repoPath: '/wt-a',
 					label: 'wt-a',
 				},
-				'worktree-wip::/wt-b': {
+				'wip::/wt-b': {
 					parentSha: 'parent-a',
 					repoPath: '/wt-b',
 					label: 'wt-b',
@@ -408,8 +458,9 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'commits',
-			wipMetadataBySha: {
-				'worktree-wip::/wt-a': {
+			primaryWipRowId: 'wip::/primary',
+			wipRowsById: {
+				'wip::/wt-a': {
 					parentSha: 'parent-a',
 					repoPath: '/wt-a',
 					label: 'wt-a',
@@ -423,10 +474,10 @@ suite('minimapData Test Suite', () => {
 		const result = aggregate({
 			rows: [
 				row({
-					sha: 'work-dir-changes',
+					sha: 'wip::/repo',
 					date: day2,
 					parents: ['head'],
-					type: 'work-dir-changes',
+					kind: 'workdir',
 				}),
 				row({ sha: 'head', date: day1, heads: [{ id: 'h1', name: 'main', isCurrentHead: true }] }),
 			],
@@ -435,7 +486,8 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.get(day1Midnight)?.commits, 1);
 		assert.strictEqual(result.statsByDay.get(day1Midnight)?.sha, 'head');
@@ -444,13 +496,14 @@ suite('minimapData Test Suite', () => {
 
 	test('WIP row alone produces no buckets', () => {
 		const result = aggregate({
-			rows: [row({ sha: 'work-dir-changes', date: day1, parents: [], type: 'work-dir-changes' })],
+			rows: [row({ sha: 'wip::/repo', date: day1, parents: [], kind: 'workdir' })],
 			rowsStats: undefined,
 			refMetadata: undefined,
 			downstreams: undefined,
 			markerTypes: [],
 			dataType: 'commits',
-			wipMetadataBySha: undefined,
+			wipRowsById: undefined,
+			primaryWipRowId: undefined,
 		});
 		assert.strictEqual(result.statsByDay.size, 0);
 	});
@@ -459,10 +512,10 @@ suite('minimapData Test Suite', () => {
 		const result = aggregate({
 			rows: [
 				row({
-					sha: 'worktree-wip::/wt-a',
+					sha: 'wip::/wt-a',
 					date: day2,
 					parents: ['parent-a'],
-					type: 'work-dir-changes',
+					kind: 'workdir',
 				}),
 				row({ sha: 'parent-a', date: day1 }),
 			],
@@ -471,8 +524,9 @@ suite('minimapData Test Suite', () => {
 			downstreams: undefined,
 			markerTypes: ['worktree'],
 			dataType: 'commits',
-			wipMetadataBySha: {
-				'worktree-wip::/wt-a': {
+			primaryWipRowId: 'wip::/primary',
+			wipRowsById: {
+				'wip::/wt-a': {
 					parentSha: 'parent-a',
 					repoPath: '/wt-a',
 					label: 'wt-a',

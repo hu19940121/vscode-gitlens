@@ -9,9 +9,10 @@
  * - Split panel layout
  */
 import * as process from 'node:process';
-import type { FrameLocator } from '@playwright/test';
+import type { FrameLocator, Locator } from '@playwright/test';
 import type { VSCodeInstance } from '../baseTest.js';
 import { test as base, createTmpDir, expect, GitFixture, MaxTimeout } from '../baseTest.js';
+import { waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
 
 // Configure with a purpose-built test repository
 const test = base.extend({
@@ -59,15 +60,22 @@ async function openGraphWithPro(vscode: VSCodeInstance): Promise<{
 	const sim = await vscode.gitlens.startSubscriptionSimulation({
 		state: 6 /* SubscriptionState.Paid */,
 		planId: 'pro',
+		dismissOnboarding: true,
 	});
 
 	await vscode.gitlens.showCommitGraphView();
+	// Widen the side bar so the graph has room to render the
+	// commit-message column and its rows aren't overlapped by the working-changes/scrollbar layers.
+	await widenSideBarForGraph(vscode);
 
 	const graphWebview = await vscode.gitlens.getGitLensWebview('Graph', 'webviewView', 30000);
 	expect(graphWebview).not.toBeNull();
 
-	// Wait for graph to fully render (column headers appear)
-	await expect(graphWebview!.getByText('COMMIT MESSAGE').first()).toBeVisible({ timeout: 30000 });
+	// The graph renders as a role="tree" (aria-label "Commit graph") of role="treeitem" rows, so gate
+	// readiness on the tree container.
+	await expect(graphWebview!.getByRole('tree', { name: 'Commit graph' })).toBeVisible({ timeout: 30000 });
+	// ...and the rows to actually paint (the tree mounts before the virtualizer paints rows).
+	await waitForGraphRowsRendered(graphWebview!);
 
 	return {
 		graphWebview: graphWebview!,
@@ -85,18 +93,37 @@ async function reopenGraph(vscode: VSCodeInstance): Promise<FrameLocator> {
 	await vscode.gitlens.showCommitGraphView();
 	const graphWebview = await vscode.gitlens.getGitLensWebview('Graph', 'webviewView', 30000);
 	expect(graphWebview).not.toBeNull();
-	await expect(graphWebview!.getByText('COMMIT MESSAGE').first()).toBeVisible({ timeout: 30000 });
+	await expect(graphWebview!.getByRole('tree', { name: 'Commit graph' })).toBeVisible({ timeout: 30000 });
+	await waitForGraphRowsRendered(graphWebview!);
 	return graphWebview!;
 }
 
 /**
- * Select a commit row in the graph by clicking on its message text.
- * Graph rows are rendered by @gitkraken/gitkraken-components with commit messages as visible text.
+ * A graph commit row (role="treeitem") matched by its accessible name.
+ *
+ * New Lit engine: each commit is a role="treeitem" row whose accessible name embeds the message
+ * (e.g. "Commit f5b4898, by You, 7s, Add greeting module"), so we match by that name (substring).
+ * Scoped to the graph tree (role="tree", "Commit graph") so we don't match a details-panel file-tree
+ * treeitem — the details `gl-tree-view` also exposes role="treeitem", and once the panel is open an
+ * unscoped lookup could resolve to the wrong element. Filtered to the visible instance to skip
+ * recycled/off-screen rows the virtualizer keeps mounted.
+ */
+function commitRow(graphWebview: FrameLocator, messageText: string): Locator {
+	return graphWebview
+		.getByRole('tree', { name: 'Commit graph' })
+		.getByRole('treeitem', { name: messageText })
+		.filter({ visible: true })
+		.first();
+}
+
+/**
+ * Select a commit row in the graph by clicking it, located by its message via its accessible name
+ * (see {@link commitRow} for how rows are matched under the new Lit engine).
  */
 async function selectCommitByMessage(graphWebview: FrameLocator, messageText: string): Promise<void> {
-	const messageEl = graphWebview.getByText(messageText, { exact: true }).first();
-	await expect(messageEl).toBeVisible({ timeout: MaxTimeout });
-	await messageEl.click();
+	const row = commitRow(graphWebview, messageText);
+	await expect(row).toBeVisible({ timeout: MaxTimeout });
+	await row.click();
 }
 
 async function ensureDetailsPanelOpen(graphWebview: FrameLocator): Promise<void> {
@@ -139,7 +166,12 @@ async function selectWip(graphWebview: FrameLocator): Promise<void> {
 		return;
 	}
 
-	const wipRow = graphWebview.getByText(/Working (Changes|Tree)/).first();
+	// Match the visible WIP row label, not the hidden tooltip-content span that also carries the
+	// "Working Changes" text (a plain .first() picks the hidden tooltip span).
+	const wipRow = graphWebview
+		.getByText(/Working (Changes|Tree)/)
+		.filter({ visible: true })
+		.first();
 	await expect(wipRow).toBeVisible({ timeout: MaxTimeout });
 	await wipRow.click();
 	await ensureDetailsPanelOpen(graphWebview);
@@ -230,14 +262,15 @@ test.describe('Graph Details - Panel Visibility', () => {
 		await expect(graphWebview.locator('gl-details-commit-panel').first()).toBeVisible({ timeout: MaxTimeout });
 	});
 
-	test('should close details panel via close button', async () => {
+	test('should close details panel via the details-panel toggle', async () => {
 		await selectCommitByMessage(graphWebview, 'Add greeting module');
 		await waitForDetailsLoaded(graphWebview);
 
-		// Click the close action chip in the commit details header
-		const closeButton = graphWebview.locator('gl-details-commit-panel gl-action-chip[icon="close"]').first();
-		await expect(closeButton).toBeVisible({ timeout: MaxTimeout });
-		await closeButton.click();
+		// The per-panel close chip was removed; the details panel is dismissed via the
+		// Hide Details Panel toggle.
+		const hideButton = graphWebview.locator('gl-button[aria-label="Hide Details Panel"]').first();
+		await expect(hideButton).toBeVisible({ timeout: MaxTimeout });
+		await hideButton.click();
 
 		// Details content should no longer be visible
 		await expect(graphWebview.locator('.details-content')).not.toBeVisible({ timeout: MaxTimeout });
@@ -373,16 +406,16 @@ test.describe('Graph Details - WIP Mode', () => {
 		await expect(branchRow).toBeVisible({ timeout: MaxTimeout });
 	});
 
-	test('should close WIP details via close button', async () => {
+	test('should close WIP details via the details-panel toggle', async () => {
 		await selectWip(graphWebview);
 
 		const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
 		await expect(wipDetails).toBeVisible({ timeout: 15000 });
 
-		// Click close button
-		const closeButton = graphWebview.locator('gl-details-wip-header gl-action-chip[icon="close"]').first();
-		await expect(closeButton).toBeVisible({ timeout: MaxTimeout });
-		await closeButton.click();
+		// The per-panel close chip was removed; dismiss the details panel via the toggle.
+		const hideButton = graphWebview.locator('gl-button[aria-label="Hide Details Panel"]').first();
+		await expect(hideButton).toBeVisible({ timeout: MaxTimeout });
+		await hideButton.click();
 
 		// Details content should close
 		await expect(graphWebview.locator('.details-content')).not.toBeVisible({ timeout: MaxTimeout });
@@ -420,9 +453,9 @@ test.describe('Graph Details - Compare Mode', () => {
 		await waitForDetailsLoaded(graphWebview);
 
 		// Ctrl+Click second commit to multi-select
-		const secondCommit = graphWebview.getByText('Add utils module', { exact: true }).first();
+		const secondCommit = commitRow(graphWebview, 'Add utils module');
 		await expect(secondCommit).toBeVisible({ timeout: MaxTimeout });
-		await secondCommit.click({ modifiers: ['Control'] });
+		await secondCommit.click({ modifiers: ['ControlOrMeta'] });
 
 		// Compare panel should appear with its header
 		const compareHeader = graphWebview.locator('.compare-header__title').first();
@@ -434,8 +467,8 @@ test.describe('Graph Details - Compare Mode', () => {
 		// Multi-select two commits
 		await selectCommitByMessage(graphWebview, 'Add greeting module');
 		await waitForDetailsLoaded(graphWebview);
-		const secondCommit = graphWebview.getByText('Add utils module', { exact: true }).first();
-		await secondCommit.click({ modifiers: ['Control'] });
+		const secondCommit = commitRow(graphWebview, 'Add utils module');
+		await secondCommit.click({ modifiers: ['ControlOrMeta'] });
 
 		// Wait for compare panel
 		await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: 15000 });
@@ -450,8 +483,8 @@ test.describe('Graph Details - Compare Mode', () => {
 	test('should show swap button in compare mode', async () => {
 		await selectCommitByMessage(graphWebview, 'Add greeting module');
 		await waitForDetailsLoaded(graphWebview);
-		const secondCommit = graphWebview.getByText('Add utils module', { exact: true }).first();
-		await secondCommit.click({ modifiers: ['Control'] });
+		const secondCommit = commitRow(graphWebview, 'Add utils module');
+		await secondCommit.click({ modifiers: ['ControlOrMeta'] });
 
 		await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: 15000 });
 
@@ -466,36 +499,38 @@ test.describe('Graph Details - Compare Mode', () => {
 		await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: MaxTimeout });
 	});
 
-	test('should show between-count for non-adjacent commits', async () => {
-		// Select "Add greeting module" (2nd commit) and "Add utils module" (4th commit)
-		// There is 1 commit in between: "Add math module"
+	// "Add greeting module" and "Add utils module" have exactly one commit between them ("Add math
+	// module"), so the label is fully determined: assert the whole string, since any non-zero count
+	// renders SOME "N commits in between" and would pass a substring check. Both click orders are
+	// exercised because the range endpoints follow the selection order, so a one-sided count reads 0 in
+	// whichever direction puts the newer commit first — the case that made this never render at all.
+	function testBetweenCount(first: string, second: string): void {
+		test(`should show between-count for non-adjacent commits (${first} first)`, async () => {
+			await selectCommitByMessage(graphWebview, first);
+			await waitForDetailsLoaded(graphWebview);
+			await commitRow(graphWebview, second).click({ modifiers: ['ControlOrMeta'] });
+
+			await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: 15000 });
+
+			const betweenCount = graphWebview.locator('.compare-middle__count').first();
+			await expect(betweenCount).toBeVisible({ timeout: MaxTimeout });
+			await expect(betweenCount).toHaveText('1 commit in between');
+		});
+	}
+	testBetweenCount('Add greeting module', 'Add utils module');
+	testBetweenCount('Add utils module', 'Add greeting module');
+
+	test('should exit compare mode by selecting a single commit', async () => {
 		await selectCommitByMessage(graphWebview, 'Add greeting module');
 		await waitForDetailsLoaded(graphWebview);
-		const secondCommit = graphWebview.getByText('Add utils module', { exact: true }).first();
-		await secondCommit.click({ modifiers: ['Control'] });
+		const secondCommit = commitRow(graphWebview, 'Add utils module');
+		await secondCommit.click({ modifiers: ['ControlOrMeta'] });
 
 		await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: 15000 });
 
-		// The between-count should show "1 commit in between"
-		const betweenCount = graphWebview.locator('.compare-middle__count').first();
-		await expect(betweenCount).toBeVisible({ timeout: MaxTimeout });
-		await expect(betweenCount).toContainText('in between');
-	});
-
-	test('should close compare panel via close button', async () => {
-		await selectCommitByMessage(graphWebview, 'Add greeting module');
-		await waitForDetailsLoaded(graphWebview);
-		const secondCommit = graphWebview.getByText('Add utils module', { exact: true }).first();
-		await secondCommit.click({ modifiers: ['Control'] });
-
-		await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: 15000 });
-
-		// Click close button in the compare header
-		const closeButton = graphWebview
-			.locator('gl-details-multicommit-panel gl-details-header gl-action-chip[icon="close"]')
-			.first();
-		await expect(closeButton).toBeVisible({ timeout: MaxTimeout });
-		await closeButton.click();
+		// Compare mode has no per-panel close button; selecting a single commit clears the
+		// multi-selection and replaces the compare panel with the single-commit details.
+		await selectCommitByMessage(graphWebview, 'Add math module');
 
 		// Compare panel should close
 		await expect(graphWebview.locator('.compare-header__title')).not.toBeVisible({ timeout: MaxTimeout });
@@ -504,8 +539,8 @@ test.describe('Graph Details - Compare Mode', () => {
 	test('should show changed files section in compare mode', async () => {
 		await selectCommitByMessage(graphWebview, 'Add greeting module');
 		await waitForDetailsLoaded(graphWebview);
-		const secondCommit = graphWebview.getByText('Add utils module', { exact: true }).first();
-		await secondCommit.click({ modifiers: ['Control'] });
+		const secondCommit = commitRow(graphWebview, 'Add utils module');
+		await secondCommit.click({ modifiers: ['ControlOrMeta'] });
 
 		await expect(graphWebview.locator('.compare-header__title').first()).toBeVisible({ timeout: 15000 });
 

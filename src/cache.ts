@@ -6,12 +6,12 @@ import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/mo
 import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import type { GitHostIntegration } from '@gitlens/integrations/models/gitHostIntegration.js';
+import type { IntegrationBase } from '@gitlens/integrations/models/integration.js';
 import { isPromise } from '@gitlens/utils/promise.js';
 import { CacheController } from '@gitlens/utils/promiseCache.js';
 import type { Disposable } from './api/gitlens.d.js';
 import type { Container } from './container.js';
-import type { GitHostIntegration } from './plus/integrations/models/gitHostIntegration.js';
-import type { IntegrationBase } from './plus/integrations/models/integration.js';
 
 type Caches = {
 	defaultBranch: { key: `repo:${string}`; value: DefaultBranch };
@@ -52,7 +52,7 @@ type ExpiryOptions = { expiryOverride?: boolean | number; expireOnError?: boolea
 export class CacheProvider implements Disposable {
 	private readonly _cache = new Map<`${Cache}:${CacheKey<Cache>}`, Cached<CacheResult<CacheValue<Cache>>>>();
 
-	// eslint-disable-next-line @typescript-eslint/no-useless-constructor
+	// oxlint-disable-next-line typescript/no-useless-constructor
 	constructor(_container: Container) {}
 
 	dispose(): void {
@@ -61,6 +61,27 @@ export class CacheProvider implements Disposable {
 
 	delete<T extends Cache>(cache: T, key: CacheKey<T>): void {
 		this._cache.delete(`${cache}:${key}`);
+	}
+
+	/** Evicts every cached pull request — by branch, by sha, by id, and the pull request entries in the
+	 *  shared issue-or-pr caches (their keys carry a `pullrequest` type segment; issues stay). A merge
+	 *  invalidates more than the merged pull request alone — a stacked merge lands every layer below it
+	 *  and retargets every layer above — and no caller can name that full set, so the whole class of
+	 *  entries is the correct blast radius. Merges are rare; the cost is a refetch on next demand. */
+	deletePullRequests(): void {
+		for (const key of this._cache.keys()) {
+			if (key.startsWith('prByBranch:') || key.startsWith('prsById:') || key.startsWith('prsBySha:')) {
+				this._cache.delete(key);
+				continue;
+			}
+
+			if (
+				(key.startsWith('issuesOrPrsById:') || key.startsWith('issuesOrPrsByIdAndRepo:')) &&
+				key.includes(`:${'pullrequest' satisfies IssueOrPullRequestType}`)
+			) {
+				this._cache.delete(key);
+			}
+		}
 	}
 
 	/** Returns the resolved cached value without triggering a fetch on cache miss */
@@ -409,7 +430,7 @@ function getExpiresAt<T extends Cache>(cache: T, value: CacheValue<T> | undefine
 		case 'prByBranch':
 		case 'prsById':
 		case 'prsBySha': {
-			if (value == null) return cache === 'prByBranch' ? defaultExpiresAt : 0 /* Never expires */;
+			if (value == null) return cache === 'prByBranch' ? defaultExpiresAt : 0; /* Never expires */
 
 			// Open prs expire after 1 hour, but closed/merge prs expire after 12 hours unless recently updated and then expire in 1 hour
 

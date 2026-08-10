@@ -2,7 +2,7 @@ import type { Endpoints } from '@octokit/types';
 import { GitFileIndexStatus } from '@gitlens/git/models/fileStatus.js';
 import type { IssueLabel } from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
-import type { PullRequestState } from '@gitlens/git/models/pullRequest.js';
+import type { PullRequestMember, PullRequestStackInfo, PullRequestState } from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
@@ -50,6 +50,8 @@ export interface GitHubCommitRef {
 }
 
 export type GitHubContributor = Endpoints['GET /repos/{owner}/{repo}/contributors']['response']['data'][0];
+
+export type GitHubSshSigningKey = Endpoints['GET /users/{username}/ssh_signing_keys']['response']['data'][0];
 
 export interface GitHubMember {
 	login: string;
@@ -129,7 +131,8 @@ export type GitHubPullRequestState = 'OPEN' | 'CLOSED' | 'MERGED';
 export type GitHubIssueOrPullRequestState = GitHubIssueState | GitHubPullRequestState;
 
 export interface GitHubPullRequestLite extends Omit<GitHubIssueOrPullRequest, '__typename'> {
-	author: GitHubMember;
+	/** `Actor` is nullable in GitHub's schema — `null` once the author's account is deleted */
+	author: GitHubMember | null;
 
 	baseRefName: string;
 	baseRefOid: string;
@@ -137,10 +140,12 @@ export interface GitHubPullRequestLite extends Omit<GitHubIssueOrPullRequest, '_
 	headRefName: string;
 	headRefOid: string;
 	headRepository: {
+		isFork: boolean;
 		name: string;
 		owner: {
 			login: string;
 		};
+		sshUrl: string;
 		url: string;
 	};
 
@@ -155,13 +160,29 @@ export interface GitHubPullRequestLite extends Omit<GitHubIssueOrPullRequest, '_
 		owner: {
 			login: string;
 		};
+		sshUrl: string;
 		url: string;
 		viewerPermission: GitHubViewerPermission;
 	};
+
+	/** Only selected against github.com — GitHub Enterprise Server schemas lag and reject the field. */
+	stack?: GitHubPullRequestStack | null;
+	/** Only selected against github.com — see `stack`. */
+	stackEntry?: { position: number } | null;
+}
+
+/** GitHub's stacked-pull-request object. Read-only; all stack mutations are REST-only. */
+export interface GitHubPullRequestStack {
+	id: string;
+	number: number;
+	size: number;
+	/** The branch the bottom of the stack targets — the stack's trunk. */
+	baseRefName: string;
 }
 
 export interface GitHubIssue extends Omit<GitHubIssueOrPullRequest, '__typename'> {
-	author: GitHubMember;
+	/** `Actor` is nullable in GitHub's schema — `null` once the author's account is deleted */
+	author: GitHubMember | null;
 	assignees: { nodes: GitHubMember[] };
 	comments?: {
 		totalCount: number;
@@ -191,13 +212,15 @@ export interface GitHubPullRequest extends GitHubPullRequestLite {
 	assignees: {
 		nodes: GitHubMember[];
 	};
+	body: string;
+	changedFiles: number;
 	checksUrl: string;
 	deletions: number;
 	mergeable: GitHubPullRequestMergeableState;
 	reviewDecision: GitHubPullRequestReviewDecision;
 	latestReviews: {
 		nodes: {
-			author: GitHubMember;
+			author: GitHubMember | null;
 			state: GitHubPullRequestReviewState;
 		}[];
 	};
@@ -208,6 +231,7 @@ export interface GitHubPullRequest extends GitHubPullRequestLite {
 		}[];
 	};
 	commits: {
+		totalCount: number;
 		nodes: {
 			commit: {
 				statusCheckRollup: {
@@ -228,15 +252,23 @@ export type GitHubViewerPermission =
 	| 'READ' // Can read and clone this repository. Can also open and comment on issues and pull requests
 	| 'NONE';
 
+/** `ghost` is how github.com renders an actor whose account was deleted */
+function fromGitHubMemberOrGhost(member: GitHubMember | null | undefined): PullRequestMember {
+	if (member == null) return { id: 'ghost', name: 'ghost' };
+
+	return {
+		id: member.login,
+		name: member.login,
+		username: member.login,
+		avatarUrl: member.avatarUrl,
+		url: member.url,
+	};
+}
+
 export function fromGitHubPullRequestLite(pr: GitHubPullRequestLite, provider: Provider): PullRequest {
 	return new PullRequest(
 		provider,
-		{
-			id: pr.author.login,
-			name: pr.author.login,
-			avatarUrl: pr.author.avatarUrl,
-			url: pr.author.url,
-		},
+		fromGitHubMemberOrGhost(pr.author),
 		String(pr.number),
 		pr.id,
 		pr.title,
@@ -261,6 +293,9 @@ export function fromGitHubPullRequestLite(pr: GitHubPullRequestLite, provider: P
 				sha: pr.headRefOid,
 				branch: pr.headRefName,
 				url: pr.headRepository?.url,
+				cloneHttps: pr.headRepository != null ? `${pr.headRepository.url}.git` : undefined,
+				cloneSsh: pr.headRepository?.sshUrl,
+				isFork: pr.headRepository?.isFork,
 			},
 			base: {
 				exists: pr.repository != null,
@@ -269,11 +304,41 @@ export function fromGitHubPullRequestLite(pr: GitHubPullRequestLite, provider: P
 				sha: pr.baseRefOid,
 				branch: pr.baseRefName,
 				url: pr.repository?.url,
+				cloneHttps: pr.repository != null ? `${pr.repository.url}.git` : undefined,
+				cloneSsh: pr.repository?.sshUrl,
+				isFork: pr.repository?.isFork,
 			},
 			isCrossRepository: pr.isCrossRepository,
 		},
 		pr.isDraft,
+		// The lite fragment selects nothing between `isDraft` and `stack`.
+		undefined, // additions
+		undefined, // deletions
+		undefined, // commentsCount
+		undefined, // thumbsUpCount
+		undefined, // reviewDecision
+		undefined, // reviewRequests
+		undefined, // latestReviews
+		undefined, // assignees
+		undefined, // statusCheckRollupState
+		undefined, // project
+		undefined, // version
+		undefined, // commitCount
+		fromGitHubPullRequestStack(pr),
 	);
+}
+
+/** Both fields are absent on GitHub Enterprise Server (never selected) and `null` when unstacked. */
+function fromGitHubPullRequestStack(pr: GitHubPullRequestLite): PullRequestStackInfo | undefined {
+	if (pr.stack == null || pr.stackEntry == null) return undefined;
+
+	return {
+		id: pr.stack.id,
+		number: pr.stack.number,
+		size: pr.stack.size,
+		position: pr.stackEntry.position,
+		baseRef: pr.stack.baseRefName,
+	};
 }
 
 export function fromGitHubIssueOrPullRequestState(state: GitHubPullRequestState): PullRequestState {
@@ -375,12 +440,7 @@ export function fromGitHubPullRequestStatusCheckRollupState(
 export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider): PullRequest {
 	return new PullRequest(
 		provider,
-		{
-			id: pr.author.login,
-			name: pr.author.login,
-			avatarUrl: pr.author.avatarUrl,
-			url: pr.author.url,
-		},
+		fromGitHubMemberOrGhost(pr.author),
 		String(pr.number),
 		pr.id,
 		pr.title,
@@ -405,6 +465,9 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 				sha: pr.headRefOid,
 				branch: pr.headRefName,
 				url: pr.headRepository?.url,
+				cloneHttps: pr.headRepository != null ? `${pr.headRepository.url}.git` : undefined,
+				cloneSsh: pr.headRepository?.sshUrl,
+				isFork: pr.headRepository?.isFork,
 			},
 			base: {
 				exists: pr.repository != null,
@@ -413,6 +476,9 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 				sha: pr.baseRefOid,
 				branch: pr.baseRefName,
 				url: pr.repository?.url,
+				cloneHttps: pr.repository != null ? `${pr.repository.url}.git` : undefined,
+				cloneSsh: pr.repository?.sshUrl,
+				isFork: pr.repository?.isFork,
 			},
 			isCrossRepository: pr.isCrossRepository,
 		},
@@ -430,6 +496,7 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 							reviewer: {
 								id: r.requestedReviewer.login,
 								name: r.requestedReviewer.login,
+								username: r.requestedReviewer.login,
 								avatarUrl: r.requestedReviewer.avatarUrl,
 								url: r.requestedReviewer.url,
 							},
@@ -439,21 +506,23 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 			)
 			.filter(<T>(r?: T): r is T => Boolean(r)),
 		pr.latestReviews.nodes.map(r => ({
-			reviewer: {
-				id: r.author.login,
-				name: r.author.login,
-				avatarUrl: r.author.avatarUrl,
-				url: r.author.url,
-			},
+			reviewer: fromGitHubMemberOrGhost(r.author),
 			state: fromGitHubPullRequestReviewState(r.state),
 		})),
 		pr.assignees.nodes.map(r => ({
 			id: r.login,
 			name: r.login,
+			username: r.login,
 			avatarUrl: r.avatarUrl,
 			url: r.url,
 		})),
 		fromGitHubPullRequestStatusCheckRollupState(pr.commits.nodes?.[0]?.commit.statusCheckRollup?.state),
+		undefined, // project
+		undefined, // version
+		pr.commits.totalCount,
+		fromGitHubPullRequestStack(pr),
+		pr.changedFiles,
+		pr.body || undefined,
 	);
 }
 
@@ -473,15 +542,19 @@ export function fromGitHubIssue(value: GitHubIssue, provider: Provider): Issue {
 		new Date(value.updatedAt),
 		value.closed,
 		fromGitHubIssueOrPullRequestState(value.state),
-		{
-			id: value.author.login,
-			name: value.author.login,
-			avatarUrl: value.author.avatarUrl,
-			url: value.author.url,
-		},
+		value.author == null
+			? undefined
+			: {
+					id: value.author.login,
+					name: value.author.login,
+					username: value.author.login,
+					avatarUrl: value.author.avatarUrl,
+					url: value.author.url,
+				},
 		value.assignees.nodes.map(assignee => ({
 			id: assignee.login,
 			name: assignee.login,
+			username: assignee.login,
 			avatarUrl: assignee.avatarUrl,
 			url: assignee.url,
 		})),

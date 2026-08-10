@@ -5,11 +5,13 @@ import type { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import { missingRepositoryId } from '@gitlens/git/models/repositoryIdentities.js';
+import { uncommitted } from '@gitlens/git/models/revision.js';
 import type { GitTag } from '@gitlens/git/models/tag.js';
 import { getBranchNameWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import { parseGitRemoteUrl } from '@gitlens/git/utils/remote.utils.js';
 import { isSha } from '@gitlens/git/utils/revision.utils.js';
+import { isIntegrationId, isSupportedCloudIntegrationId } from '@gitlens/integrations/constants.js';
 import { fromBase64ToString } from '@gitlens/utils/base64.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
 import { once } from '@gitlens/utils/event.js';
@@ -18,11 +20,11 @@ import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { maybeUri, normalizePath } from '@gitlens/utils/path.js';
 import type { OpenChatActionCommandArgs } from '../../commands/openChatAction.js';
 import type { OpenCloudPatchCommandArgs } from '../../commands/patches.js';
-import { isIntegrationId, isSupportedCloudIntegrationId } from '../../constants.integrations.js';
 import type { StoredDeepLinkContext, StoredNamedRef } from '../../constants.storage.js';
+import type { Source } from '../../constants.telemetry.js';
 import type { Container } from '../../container.js';
-import { openComparisonChanges, openFileAtRevision } from '../../git/actions/commit.js';
 import { executeGitCommand } from '../../git/actions.js';
+import { openComparisonChanges, openFileAtRevision } from '../../git/actions/commit.js';
 import type { GlRepository, RepositoryChangeEvent } from '../../git/models/repository.js';
 import { isWalkthroughSupported } from '../../onboarding/walkthroughStateProvider.js';
 import { isAgentDescriptor } from '../../plus/agents/agentDescriptor.js';
@@ -34,15 +36,14 @@ import { configuration } from '../../system/-webview/configuration.js';
 import { getOrOpenTextEditor } from '../../system/-webview/vscode/editors.js';
 import type { OpenWorkspaceLocation } from '../../system/-webview/vscode/workspaces.js';
 import { openWorkspace } from '../../system/-webview/vscode/workspaces.js';
-import { showInspectView } from '../../webviews/commitDetails/actions.js';
-import type { ShowWipArgs } from '../../webviews/commitDetails/protocol.js';
-import type { ShowInCommitGraphCommandArgs } from '../../webviews/plus/graph/registration.js';
+import type { GraphWebviewShowingArgs, ShowInCommitGraphCommandArgs } from '../../webviews/plus/graph/registration.js';
 import type { DeepLink, DeepLinkProgress, DeepLinkRepoOpenType, DeepLinkServiceContext, UriTypes } from './deepLink.js';
 import {
 	AccountDeepLinkTypes,
 	DeepLinkActionType,
 	DeepLinkCommandType,
 	DeepLinkCommandTypeToCommand,
+	DeepLinkGraphModeToShowAction,
 	DeepLinkServiceAction,
 	DeepLinkServiceState,
 	deepLinkStateToProgress,
@@ -231,8 +232,7 @@ export class DeepLinkService implements Disposable {
 				switch (this._context.action) {
 					case DeepLinkActionType.SwitchToPullRequest:
 					case DeepLinkActionType.SwitchToPullRequestWorktree:
-					case DeepLinkActionType.SwitchToAndSuggestPullRequest:
-						return DeepLinkServiceAction.OpenInspect;
+						return DeepLinkServiceAction.OpenWorkingChanges;
 					default:
 						return DeepLinkServiceAction.DeepLinkResolved;
 				}
@@ -1179,8 +1179,7 @@ export class DeepLinkService implements Disposable {
 						if (
 							this._context.action === DeepLinkActionType.Switch ||
 							this._context.action === DeepLinkActionType.SwitchToPullRequest ||
-							this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree ||
-							this._context.action === DeepLinkActionType.SwitchToAndSuggestPullRequest
+							this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree
 						) {
 							action = DeepLinkServiceAction.OpenSwitch;
 						} else {
@@ -1200,8 +1199,7 @@ export class DeepLinkService implements Disposable {
 							if (
 								this._context.action === DeepLinkActionType.Switch ||
 								this._context.action === DeepLinkActionType.SwitchToPullRequest ||
-								this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree ||
-								this._context.action === DeepLinkActionType.SwitchToAndSuggestPullRequest
+								this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree
 							) {
 								action = DeepLinkServiceAction.OpenSwitch;
 							} else if (
@@ -1483,16 +1481,15 @@ export class DeepLinkService implements Disposable {
 
 					if (
 						this._context.action === DeepLinkActionType.SwitchToPullRequest ||
-						this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree ||
-						this._context.action === DeepLinkActionType.SwitchToAndSuggestPullRequest
+						this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree
 					) {
-						action = DeepLinkServiceAction.OpenInspect;
+						action = DeepLinkServiceAction.OpenWorkingChanges;
 					} else {
 						action = DeepLinkServiceAction.DeepLinkResolved;
 					}
 					break;
 				}
-				case DeepLinkServiceState.OpenInspect: {
+				case DeepLinkServiceState.OpenWorkingChanges: {
 					// If we arrive at this step, clear any stored data used for the "new window" option
 					await this.container.storage.deleteSecret('deepLinks:pending');
 					if (!repo) {
@@ -1501,12 +1498,11 @@ export class DeepLinkService implements Disposable {
 						break;
 					}
 
-					await showInspectView({
-						type: 'wip',
-						inReview: this._context.action === DeepLinkActionType.SwitchToAndSuggestPullRequest,
-						repository: repo,
-						source: 'launchpad',
-					} satisfies ShowWipArgs);
+					void executeCommand('gitlens.showGraph', {
+						action: 'show-wip',
+						target: { sha: uncommitted, worktreePath: repo.path },
+						source: { source: 'launchpad' },
+					});
 					const { params } = this._context;
 					if (
 						this._context.action === DeepLinkActionType.SwitchToPullRequestWorktree &&
@@ -1583,7 +1579,27 @@ export class DeepLinkService implements Disposable {
 					}
 
 					const detail = this._context.params?.get('source');
-					const source = detail != null ? { source: 'deeplink', detail: detail } : { source: 'deeplink' };
+					const source: Source =
+						detail != null ? { source: 'deeplink', detail: detail } : { source: 'deeplink' };
+
+					if (mainId === DeepLinkCommandType.Graph) {
+						const mode = this._context.params?.get('mode');
+						if (mode != null) {
+							const showAction = DeepLinkGraphModeToShowAction.get(mode);
+							if (showAction == null) {
+								action = DeepLinkServiceAction.DeepLinkErrored;
+								message = `Invalid graph mode '${mode}'.`;
+								break;
+							}
+
+							await executeCommand<GraphWebviewShowingArgs>(command, {
+								action: showAction,
+								source: source,
+							});
+							action = DeepLinkServiceAction.DeepLinkResolved;
+							break;
+						}
+					}
 
 					await executeCommand(command, source);
 					action = DeepLinkServiceAction.DeepLinkResolved;

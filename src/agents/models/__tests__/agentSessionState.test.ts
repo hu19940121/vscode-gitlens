@@ -1,6 +1,6 @@
 import * as assert from 'node:assert';
 import type { AgentSession } from '@gitlens/agents/types.js';
-import { getSessionDisplayName } from '../agentSessionState.js';
+import { getSessionDisplayName, serializeAgentSession } from '../agentSessionState.js';
 
 function makeSession(overrides: Partial<AgentSession>): AgentSession {
 	return {
@@ -18,14 +18,14 @@ function makeSession(overrides: Partial<AgentSession>): AgentSession {
 }
 
 suite('getSessionDisplayName', () => {
-	test('prefers the harness-supplied name', () => {
+	test('uses the harness-supplied name when there are no titles or prompts', () => {
+		// e.g. a subagent whose `name` is its agentType — beats the location anchor.
 		const session = makeSession({
-			name: 'Refactor auth',
-			firstPrompt: 'do something else',
+			name: 'Explore',
 			worktreePath: '/repo/.worktrees/feature-x',
 			cwd: '/Users/me/repo',
 		});
-		assert.strictEqual(getSessionDisplayName(session, 'feature-x'), 'Refactor auth');
+		assert.strictEqual(getSessionDisplayName(session, 'feature-x'), 'Explore');
 	});
 
 	test('falls back to a prompt-derived name when no harness name', () => {
@@ -95,13 +95,30 @@ suite('getSessionDisplayName', () => {
 		assert.strictEqual(getSessionDisplayName(session, undefined), 'Claude Code');
 	});
 
-	test('harness-supplied name beats all transcript titles', () => {
+	test('transcript titles beat the harness auto-slug name', () => {
+		// `name` is the CLI's auto-generated repo slug — a real title outranks it.
 		const session = makeSession({
-			name: 'Harness Name',
+			name: 'vscode-gitlens-9f',
 			firstPrompt: 'do the thing',
 			transcriptTitles: { custom: 'my-slug', ai: 'AI-summed', agent: 'agent-slug' },
 		});
-		assert.strictEqual(getSessionDisplayName(session, undefined), 'Harness Name');
+		assert.strictEqual(getSessionDisplayName(session, undefined), 'my-slug');
+	});
+
+	test('a prompt-derived name beats the harness auto-slug name', () => {
+		const session = makeSession({
+			name: 'vscode-gitlens-9f',
+			firstPrompt: 'please fix the login bug',
+		});
+		assert.strictEqual(getSessionDisplayName(session, undefined), 'Fix the login bug');
+	});
+
+	test('the harness name beats the agentName slug', () => {
+		const session = makeSession({
+			name: 'Explore',
+			transcriptTitles: { agent: 'fallback-slug' },
+		});
+		assert.strictEqual(getSessionDisplayName(session, undefined), 'Explore');
 	});
 
 	test('customTitle wins over firstPrompt-derived name', () => {
@@ -152,5 +169,39 @@ suite('getSessionDisplayName', () => {
 			transcriptTitles: { ai: 'Fix the login flow', agent: 'fallback-slug' },
 		});
 		assert.strictEqual(getSessionDisplayName(session, undefined), 'Fix the login flow');
+	});
+});
+
+suite('serializeAgentSession', () => {
+	const worktreeMetadata = {
+		name: 'feature-x',
+		type: 'branch' as const,
+		isDefault: false,
+		repoPath: '/repo',
+	};
+
+	test('backfills commonPath from the resolved worktree when the provider never probed', () => {
+		// Completed sessions read from the CLI's durable store carry a `worktreePath` but no
+		// `commonPath` — consumers gate card actions on repo identity, so it must be filled in.
+		const session = makeSession({
+			status: 'completed',
+			phase: 'completed',
+			worktreePath: '/repo/.worktrees/feature-x',
+		});
+		assert.strictEqual(serializeAgentSession(session, worktreeMetadata).commonPath, '/repo');
+	});
+
+	test('keeps the provider-resolved commonPath over the worktree lookup', () => {
+		const session = makeSession({
+			worktreePath: '/repo/.worktrees/feature-x',
+			commonPath: '/probed-repo',
+		});
+		assert.strictEqual(serializeAgentSession(session, worktreeMetadata).commonPath, '/probed-repo');
+	});
+
+	test('leaves commonPath undefined when the worktree could not be resolved', () => {
+		// A worktree no open repo owns stays unresolved — the gate correctly refuses to act on it.
+		const session = makeSession({ worktreePath: '/elsewhere/repo' });
+		assert.strictEqual(serializeAgentSession(session, undefined).commonPath, undefined);
 	});
 });

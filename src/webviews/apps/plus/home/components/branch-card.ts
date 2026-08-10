@@ -1,5 +1,5 @@
-import { consume } from '@lit/context';
 import { SignalWatcher } from '@lit-labs/signals';
+import { consume } from '@lit/context';
 import type { PropertyValues, TemplateResult } from 'lit';
 import { css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
@@ -39,20 +39,23 @@ import { subscriptionContext } from '../../../shared/contexts/subscription.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { linkStyles } from '../../shared/components/vscode.css.js';
-import '../../../shared/components/code-icon.js';
+import '../../../shared/components/actions/action-item.js';
+import '../../../shared/components/actions/action-nav.js';
 import '../../../shared/components/avatar/avatar.js';
 import '../../../shared/components/avatar/avatar-list.js';
+import '../../../shared/components/branch-icon.js';
+import '../../../shared/components/button.js';
+import '../../../shared/components/button-container.js';
+import '../../../shared/components/code-icon.js';
 import '../../../shared/components/commit/commit-stats.js';
 import '../../../shared/components/formatted-date.js';
 import '../../../shared/components/overlays/tooltip.js';
+import '../../../shared/components/pills/agent-status-pill.js';
 import '../../../shared/components/pills/tracking-status.js';
 import '../../../shared/components/rich/issue-icon.js';
 import '../../../shared/components/rich/pr-icon.js';
-import '../../../shared/components/actions/action-item.js';
-import '../../../shared/components/actions/action-nav.js';
-import '../../../shared/components/branch-icon.js';
 import '../../shared/components/merge-target-status.js';
-import '../../../shared/components/pills/agent-status-pill.js';
+import '../../shared/components/merge-target-upgrade.js';
 
 export const branchCardStyles = css`
 	* {
@@ -61,6 +64,7 @@ export const branchCardStyles = css`
 
 	gl-avatar-list {
 		--gl-avatar-size: 2.4rem;
+
 		margin-block: -0.4rem;
 	}
 
@@ -71,8 +75,9 @@ export const branchCardStyles = css`
 	.branch-item__container {
 		display: flex;
 		flex-direction: column;
-		gap: 0.6rem;
+		gap: var(--gl-space-6);
 	}
+
 	.branch-item__container > * {
 		margin-block: 0;
 	}
@@ -80,8 +85,9 @@ export const branchCardStyles = css`
 	.branch-item__section {
 		display: flex;
 		flex-direction: column;
-		gap: 0.4rem;
+		gap: var(--gl-space-4);
 	}
+
 	.branch-item__section > * {
 		margin-block: 0;
 	}
@@ -93,9 +99,9 @@ export const branchCardStyles = css`
 
 	.branch-item__actions {
 		display: flex;
-		align-items: center;
-		gap: 0.8rem;
 		flex-direction: row;
+		gap: var(--gl-space-8);
+		align-items: center;
 		justify-content: flex-end;
 		font-size: 0.9em;
 	}
@@ -106,16 +112,16 @@ export const branchCardStyles = css`
 	}
 
 	.branch-item__icon {
-		color: var(--vscode-descriptionForeground);
 		flex: none;
+		color: var(--vscode-descriptionForeground);
 	}
 
 	.branch-item__name {
 		flex-grow: 1;
-		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		font-weight: bold;
+		white-space: nowrap;
 	}
 
 	.branch-item__name--secondary {
@@ -129,18 +135,17 @@ export const branchCardStyles = css`
 
 	.branch-item__grouping {
 		display: inline-flex;
+		gap: var(--gl-space-6);
 		align-items: center;
-		gap: 0.6rem;
 		max-width: 100%;
 		margin-block: 0;
 	}
 
 	.branch-item__agents {
 		display: flex;
-		flex-direction: row;
+		flex-flow: row wrap;
+		gap: var(--gl-space-4);
 		align-items: center;
-		gap: 0.4rem;
-		flex-wrap: wrap;
 	}
 
 	.branch-item__agents code-icon {
@@ -149,10 +154,10 @@ export const branchCardStyles = css`
 
 	.branch-item__changes {
 		display: flex;
-		align-items: center;
-		gap: 1rem;
-		justify-content: flex-end;
 		flex-wrap: wrap;
+		gap: var(--gl-space-10);
+		align-items: center;
+		justify-content: flex-end;
 		white-space: nowrap;
 	}
 
@@ -162,20 +167,20 @@ export const branchCardStyles = css`
 
 	.branch-item__summary {
 		display: flex;
+		gap: var(--gl-space-6);
 		align-items: center;
-		gap: 0.6rem;
 	}
 
 	.branch-item__collapsed-actions {
 		position: absolute;
-		z-index: var(--gl-branch-card-actions-zindex, 2);
 		right: 0.4rem;
 		bottom: 0.3rem;
-		padding: 0.4rem 0.6rem;
+		z-index: var(--gl-branch-card-actions-zindex, 2);
+		padding: var(--gl-space-4) var(--gl-space-6);
 		background-color: var(--gl-card-hover-background);
 	}
 
-	.branch-item:not(:focus-within):not(:hover) .branch-item__collapsed-actions {
+	.branch-item:not(:focus-within, :hover) .branch-item__collapsed-actions {
 		${srOnlyStyles}
 	}
 
@@ -183,12 +188,13 @@ export const branchCardStyles = css`
 		--gl-card-background: color-mix(in lab, var(--vscode-sideBar-background) 100%, #fff 3%);
 		--gl-card-hover-background: color-mix(in lab, var(--vscode-sideBar-background) 100%, #fff 1.5%);
 	}
+
 	.work-item::part(base) {
 		margin-block-end: 0;
 	}
 
 	.branch-item__section.mb-1 {
-		margin-block: 0.4rem;
+		margin-block: var(--gl-space-4);
 	}
 
 	.branch-item__merge-target {
@@ -197,7 +203,7 @@ export const branchCardStyles = css`
 
 	.branch-item__row {
 		display: flex;
-		gap: 0.8rem;
+		gap: var(--gl-space-8);
 	}
 
 	.branch-item__row [full] {
@@ -223,7 +229,7 @@ export const branchCardStyles = css`
 	}
 
 	.branch-item__category {
-		margin-inline-start: 0.6rem;
+		margin-inline-start: var(--gl-space-6);
 	}
 
 	.launchpad-grouping--mergeable {
@@ -241,7 +247,7 @@ export const branchCardStyles = css`
 	.wip__pill {
 		display: flex;
 		flex-direction: row;
-		gap: 1rem;
+		gap: var(--gl-space-10);
 	}
 
 	.wip__tooltip {
@@ -778,8 +784,7 @@ export abstract class GlBranchCardBase extends SignalWatcherGlElement {
 				)}
 				${this.renderAgentPillsRow()}
 				${when(
-					// TODO: this doesn't work properly. nothing is true, empty html template is true
-					actionsSection || mergeTargetStatus,
+					(actionsSection != null && actionsSection !== nothing) || mergeTargetStatus !== nothing,
 					() =>
 						html`<div class="branch-item__actions" slot="actions">
 							${mergeTargetStatus ?? nothing}${actionsSection ?? nothing}
@@ -829,16 +834,19 @@ export abstract class GlBranchCardBase extends SignalWatcherGlElement {
 		}
 
 		// Actionable (`needs-input`) sessions never aggregate — each one needs its own Allow/Deny
-		// popover. Working and idle sessions collapse into one summary pill per category.
+		// popover. Working, idle, and completed sessions collapse into one summary pill per category.
 		const needsInput: AgentSessionState[] = [];
 		const working: AgentSessionState[] = [];
 		const idle: AgentSessionState[] = [];
+		const completed: AgentSessionState[] = [];
 		for (const s of sessions) {
 			const cat = agentPhaseToCategory[s.phase];
 			if (cat === 'needs-input') {
 				needsInput.push(s);
 			} else if (cat === 'working') {
 				working.push(s);
+			} else if (cat === 'completed') {
+				completed.push(s);
 			} else {
 				idle.push(s);
 			}
@@ -848,16 +856,30 @@ export abstract class GlBranchCardBase extends SignalWatcherGlElement {
 			<div class="branch-item__agents">
 				<code-icon icon="robot"></code-icon>
 				${needsInput.map(s => html`<gl-agent-status-pill .session=${s}></gl-agent-status-pill>`)}
-				${working.length > 0
-					? html`<gl-agent-status-pill
-							.summary=${{ category: 'working', sessions: working }}
-						></gl-agent-status-pill>`
-					: nothing}
-				${idle.length > 0
-					? html`<gl-agent-status-pill
-							.summary=${{ category: 'idle', sessions: idle }}
-						></gl-agent-status-pill>`
-					: nothing}
+				${
+					working.length > 0
+						? html`<gl-agent-status-pill
+								.summary=${{ category: 'working', sessions: working }}
+							></gl-agent-status-pill>`
+						: nothing
+				}
+				${
+					idle.length > 0
+						? html`<gl-agent-status-pill
+								.summary=${{ category: 'idle', sessions: idle }}
+							></gl-agent-status-pill>`
+						: nothing
+				}
+				${
+					completed.length > 0
+						? // Completed sessions attach here at any age: worktreePath comes straight from the CLI's
+							// durable record, no git probe needed. The 24h cutoff is specific to the graph WIP-row
+							// indicator, which limits itself to recent activity.
+							html`<gl-agent-status-pill
+								.summary=${{ category: 'completed', sessions: completed }}
+							></gl-agent-status-pill>`
+						: nothing
+				}
 			</div>
 		`;
 	}
@@ -881,25 +903,27 @@ export abstract class GlBranchCardBase extends SignalWatcherGlElement {
 								<code-icon icon="git-pull-request" slot="prefix"></code-icon>
 								<span>Create a Pull Request</span>
 							</gl-button>
-							${this._subscription.orgSettings.get().ai &&
-							this._aiCtx.state.get().enabled &&
-							this.remote?.provider?.supportedFeatures?.createPullRequestWithDetails
-								? html`<gl-button
-										class="branch-item__missing"
-										tooltip="Create a Pull Request with AI (Preview)"
-										appearance="secondary"
-										href="${this._webview.createCommandLink<CreatePullRequestCommandArgs>(
-											'gitlens.createPullRequest:',
-											{
-												ref: this.branchRef,
-												describeWithAI: true,
-												source: { source: 'home', detail: 'create-pr' },
-											},
-										)}"
-									>
-										<code-icon icon="sparkle"></code-icon>
-									</gl-button>`
-								: nothing}
+							${
+								this._subscription.orgSettings.get().ai &&
+								this._aiCtx.state.get().enabled &&
+								this.remote?.provider?.supportedFeatures?.createPullRequestWithDetails
+									? html`<gl-button
+											class="branch-item__missing"
+											tooltip="Create a Pull Request with AI"
+											appearance="secondary"
+											href="${this._webview.createCommandLink<CreatePullRequestCommandArgs>(
+												'gitlens.createPullRequest:',
+												{
+													ref: this.branchRef,
+													describeWithAI: true,
+													source: { source: 'home', detail: 'create-pr' },
+												},
+											)}"
+										>
+											<code-icon icon="sparkle"></code-icon>
+										</gl-button>`
+									: nothing
+							}
 						</button-container>
 					</div>
 				`;
@@ -965,14 +989,16 @@ export abstract class GlBranchCardBase extends SignalWatcherGlElement {
 					</gl-tooltip>
 				</p>
 			</div>
-			${groupIconString
-				? html`<span
-						class="branch-item__summary launchpad-grouping--${getLaunchpadItemGrouping(group)}"
-						slot="summary"
-						><gl-tooltip placement="bottom" content="${groupLabel}"
-							><code-icon icon="${groupIconString}"></code-icon></gl-tooltip
-					></span>`
-				: nothing}`;
+			${
+				groupIconString
+					? html`<span
+							class="branch-item__summary launchpad-grouping--${getLaunchpadItemGrouping(group)}"
+							slot="summary"
+							><gl-tooltip placement="bottom" content="${groupLabel}"
+								><code-icon icon="${groupIconString}"></code-icon></gl-tooltip
+						></span>`
+					: nothing
+			}`;
 	}
 
 	protected renderMergeTargetStatus(): TemplateResult | NothingType {
@@ -1229,7 +1255,7 @@ export class GlBranchCard extends GlBranchCardBase {
 				if (hasWip) {
 					actions.push(
 						html`<action-item
-							label="Explain Working Changes (Preview)"
+							label="Explain Working Changes"
 							icon="sparkle"
 							href=${this.createWebviewCommandLinkWithBranchRef('gitlens.ai.explainWip:')}
 						></action-item>`,
@@ -1237,7 +1263,7 @@ export class GlBranchCard extends GlBranchCardBase {
 				} else {
 					actions.push(
 						html`<action-item
-							label="Explain Branch Changes (Preview)"
+							label="Explain Branch Changes"
 							icon="sparkle"
 							href=${this.createWebviewCommandLinkWithBranchRef('gitlens.ai.explainBranch:')}
 						></action-item>`,
@@ -1256,7 +1282,7 @@ export class GlBranchCard extends GlBranchCardBase {
 			if (aiEnabled) {
 				actions.push(
 					html`<action-item
-						label="Explain Branch Changes (Preview)"
+						label="Explain Branch Changes"
 						icon="sparkle"
 						href=${this.createWebviewCommandLinkWithBranchRef('gitlens.ai.explainBranch:')}
 					></action-item>`,

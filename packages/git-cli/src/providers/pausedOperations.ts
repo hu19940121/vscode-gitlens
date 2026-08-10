@@ -24,7 +24,7 @@ import type { CliGitProviderInternal } from '../cliGitProvider.js';
 import type { Git } from '../exec/git.js';
 import { getGitCommandError } from '../exec/git.js';
 
-const todoCommitRegex = /^(?:p(?:ick)?|revert)\s+([a-f0-9]+)/i;
+const todoCommitRegex = /^(?:p(?:ick)?|revert)\s+([a-f0-9]+)(?:\s+(.+))?$/i;
 
 type Operation = 'cherry-pick' | 'merge' | 'rebase-apply' | 'rebase-merge' | 'revert' | 'sequencer';
 
@@ -124,7 +124,7 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						'--verify',
 						'CHERRY_PICK_HEAD',
 					);
-					if (result.cancelled || cancellation?.aborted) {
+					if (result.completion.status === 'cancelled' || cancellation?.aborted) {
 						throw new CancellationError();
 					}
 
@@ -134,22 +134,25 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						return undefined;
 					}
 
-					const [branchResult, mergeBaseResult] = await Promise.allSettled([
+					const [branchResult, mergeBaseResult, messageResult] = await Promise.allSettled([
 						this.provider.branches.getCurrentBranchReference(repoPath, cancellation),
 						this.provider.refs.getMergeBase(repoPath, 'CHERRY_PICK_HEAD', 'HEAD', undefined, cancellation),
+						this.getCommitMessage(repoPath, cherryPickHead, cancellation),
 					]);
 					if (cancellation?.aborted) throw new CancellationError();
 
 					const current = getSettledValue(branchResult)!;
 					const mergeBase = getSettledValue(mergeBaseResult);
+					// Names the commit being applied, so consumers can say which one a skip would drop
+					const message = getSettledValue(messageResult);
 
 					return {
 						type: 'cherry-pick',
 						repoPath: repoPath,
 						mergeBase: mergeBase,
-						HEAD: createReference(cherryPickHead, repoPath, { refType: 'revision' }),
+						HEAD: createReference(cherryPickHead, repoPath, { refType: 'revision', message: message }),
 						current: current,
-						incoming: createReference(cherryPickHead, repoPath, { refType: 'revision' }),
+						incoming: createReference(cherryPickHead, repoPath, { refType: 'revision', message: message }),
 					} satisfies GitCherryPickStatus;
 				}
 				case 'merge': {
@@ -160,7 +163,7 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						'--verify',
 						'MERGE_HEAD',
 					);
-					if (result.cancelled || cancellation?.aborted) {
+					if (result.completion.status === 'cancelled' || cancellation?.aborted) {
 						throw new CancellationError();
 					}
 
@@ -212,7 +215,7 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						'--verify',
 						'REVERT_HEAD',
 					);
-					if (result.cancelled || cancellation?.aborted) {
+					if (result.completion.status === 'cancelled' || cancellation?.aborted) {
 						throw new CancellationError();
 					}
 
@@ -222,22 +225,25 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						return undefined;
 					}
 
-					const [branchResult, mergeBaseResult] = await Promise.allSettled([
+					const [branchResult, mergeBaseResult, messageResult] = await Promise.allSettled([
 						this.provider.branches.getCurrentBranchReference(repoPath, cancellation),
 						this.provider.refs.getMergeBase(repoPath, 'REVERT_HEAD', 'HEAD', undefined, cancellation),
+						this.getCommitMessage(repoPath, revertHead, cancellation),
 					]);
 					if (cancellation?.aborted) throw new CancellationError();
 
 					const current = getSettledValue(branchResult)!;
 					const mergeBase = getSettledValue(mergeBaseResult);
+					// Names the commit being reverted, so consumers can say which one a skip would drop
+					const message = getSettledValue(messageResult);
 
 					return {
 						type: 'revert',
 						repoPath: repoPath,
 						mergeBase: mergeBase,
-						HEAD: createReference(revertHead, repoPath, { refType: 'revision' }),
+						HEAD: createReference(revertHead, repoPath, { refType: 'revision', message: message }),
 						current: current,
-						incoming: createReference(revertHead, repoPath, { refType: 'revision' }),
+						incoming: createReference(revertHead, repoPath, { refType: 'revision', message: message }),
 					} satisfies GitRevertStatus;
 				}
 				case 'rebase-apply':
@@ -407,6 +413,10 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						return undefined;
 					}
 
+					// The todo line carries only the commit's SUBJECT (the other producers carry the full
+					// message) — good enough to name the commit a skip would drop, without another git call
+					const message = match?.[2]?.trim() || undefined;
+
 					const [branchResult, mergeBaseResult] = await Promise.allSettled([
 						this.provider.branches.getCurrentBranchReference(repoPath, cancellation),
 						this.provider.refs.getMergeBase(repoPath, currentCommitSha, 'HEAD', undefined, cancellation),
@@ -421,9 +431,15 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 							type: 'cherry-pick',
 							repoPath: repoPath,
 							mergeBase: mergeBase,
-							HEAD: createReference(currentCommitSha, repoPath, { refType: 'revision' }),
+							HEAD: createReference(currentCommitSha, repoPath, {
+								refType: 'revision',
+								message: message,
+							}),
 							current: current,
-							incoming: createReference(currentCommitSha, repoPath, { refType: 'revision' }),
+							incoming: createReference(currentCommitSha, repoPath, {
+								refType: 'revision',
+								message: message,
+							}),
 						} satisfies GitCherryPickStatus;
 					}
 
@@ -431,15 +447,45 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						type: 'revert',
 						repoPath: repoPath,
 						mergeBase: mergeBase,
-						HEAD: createReference(currentCommitSha, repoPath, { refType: 'revision' }),
+						HEAD: createReference(currentCommitSha, repoPath, { refType: 'revision', message: message }),
 						current: current,
-						incoming: createReference(currentCommitSha, repoPath, { refType: 'revision' }),
+						incoming: createReference(currentCommitSha, repoPath, {
+							refType: 'revision',
+							message: message,
+						}),
 					} satisfies GitRevertStatus;
 				}
 			}
 		});
 
 		return status;
+	}
+
+	/** Memoized per repo by sha — forced status re-reads on FS noise (every file save while resolving
+	 *  conflicts) would otherwise re-spawn `git log` for an unchanging commit. */
+	private readonly _commitMessageCache = new Map<string, { sha: string; message: string | undefined }>();
+
+	private async getCommitMessage(
+		repoPath: string,
+		sha: string,
+		cancellation?: AbortSignal,
+	): Promise<string | undefined> {
+		const cached = this._commitMessageCache.get(repoPath);
+		if (cached?.sha === sha) return cached.message;
+
+		const result = await this.git.run(
+			{ cwd: repoPath, cancellation: cancellation, errors: 'ignore' },
+			'log',
+			'-1',
+			'--format=%B',
+			sha,
+		);
+		const message = result.stdout.trim() || undefined;
+		// Don't cache a miss — a transient failure would otherwise stick for the operation's lifetime
+		if (message != null) {
+			this._commitMessageCache.set(repoPath, { sha: sha, message: message });
+		}
+		return message;
 	}
 
 	private async readDotGitFile(
@@ -487,7 +533,9 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 		const args = [status.type, options?.quit ? '--quit' : '--abort'];
 
 		try {
-			await this.git.run({ cwd: repoPath, errors: 'throw' }, ...args);
+			// Unbounded like the operations it undoes — an abort of a large rebase can outrun the default
+			// command timeout, and being SIGTERM'd partway through would leave the repo mid-abort.
+			await this.git.run({ cwd: repoPath, errors: 'throw', timeout: 0 }, ...args);
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
 		} catch (ex) {
@@ -509,7 +557,10 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 	}
 
 	@debug()
-	async continuePausedOperation(repoPath: string, options?: { skip?: boolean }): Promise<void> {
+	async continuePausedOperation(
+		repoPath: string,
+		options?: { allowEmpty?: boolean; skip?: boolean; messageEditor?: string },
+	): Promise<void> {
 		const scope = getScopedLogger();
 
 		const status = await this.getPausedOperationStatus(repoPath);
@@ -521,13 +572,66 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 
 		const args = [status.type, options?.skip ? '--skip' : '--continue'];
 
+		// Continuing after a conflicted step can open the commit-message editor (merge-backend rebases,
+		// cherry-picks, and reverts). `GIT_EDITOR` is what git honors for that step, so set it on the
+		// environment; also set `core.editor` config as a fallback.
+		const configs: string[] = [];
+		let env: Record<string, string | undefined> | undefined;
+		if (options?.messageEditor) {
+			configs.push('-c', `core.editor=${options.messageEditor}`);
+			env = { GIT_EDITOR: options.messageEditor };
+		}
+
 		try {
-			await this.git.run({ cwd: repoPath, errors: 'throw' }, ...args);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			if (options?.allowEmpty) {
+				const commitArgs = ['commit', '--allow-empty', '--no-edit'];
+				try {
+					// Git won't record the empty commit on its own; making it explicitly (`--no-edit` reuses the
+					// message git already prepared) is what lets the operation move past it.
+					await this.git.run({ cwd: repoPath, errors: 'throw' }, ...commitArgs);
+				} catch (ex) {
+					scope?.error(ex);
+					// Same reason taxonomy, but attributed to the commit that actually failed
+					throw getGitCommandError(
+						'paused-operation-continue',
+						ex,
+						reason =>
+							new PausedOperationContinueError(
+								{
+									reason: reason,
+									operation: status,
+									skip: false,
+									gitCommand: { repoPath: repoPath, args: commitArgs },
+								},
+								ex,
+							),
+					);
+				}
+			}
+
+			await this.git.run(
+				{
+					cwd: repoPath,
+					errors: 'throw',
+					configs: configs,
+					env: env,
+					// A `--continue` that opens the commit-message editor blocks for as long as the user leaves
+					// that tab open, which is unbounded — the default `advanced.git.timeout` would SIGTERM it
+					// mid-operation. The start paths (merge/rebase/revert) opt out for the same reason.
+					timeout: 0,
+					// The runner dedups in-flight commands by args only — it ignores per-call `configs`/`env`.
+					// A headless continue (with `GIT_EDITOR`) and a plain `--continue` would therefore collapse
+					// into one execution, so the plain one could silently run headless (auto-accepting a commit
+					// message) or the headless one could ride a plain continue and open an editor that hangs the
+					// loop. Tag the headless variant so it can't share a pending command with the plain one.
+					correlationKey: options?.messageEditor ? 'paused-op-continue-headless' : undefined,
+				},
+				...args,
+			);
 		} catch (ex) {
-			scope?.error(ex);
-			throw getGitCommandError(
+			if (PausedOperationContinueError.is(ex)) throw ex;
+
+			const error = getGitCommandError(
 				'paused-operation-continue',
 				ex,
 				reason =>
@@ -541,6 +645,21 @@ export class PausedOperationsGitSubProvider implements GitPausedOperationsSubPro
 						ex,
 					),
 			);
+
+			// An empty commit concludes a single-commit cherry-pick/revert outright, leaving its
+			// `--continue` nothing to continue — the operation finished either way.
+			if (!options?.allowEmpty || !PausedOperationContinueError.is(error, 'nothingToContinue')) {
+				scope?.error(ex);
+				throw error;
+			}
+		} finally {
+			// Notify unconditionally rather than only on success: a throwing `--continue` can still have
+			// mutated the repo (committing the resolved step, then stopping on the NEXT step's conflict or
+			// empty commit), and the error alone can't distinguish that from a no-op failure. Invalidating
+			// after a genuine no-op only costs a re-read; not invalidating after a real advance leaves
+			// consumers rendering a stale step.
+			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
 		}
 	}
 }

@@ -77,6 +77,7 @@ const models: MistralModel[] = [
 export class MistralProvider extends OpenAICompatibleProviderBase<typeof provider.id> {
 	readonly id = provider.id;
 	readonly name = provider.name;
+	readonly supportsTools = true;
 	protected readonly descriptor = provider;
 	protected readonly config = {
 		keyUrl: 'https://console.mistral.ai/api-keys',
@@ -111,11 +112,13 @@ export class MistralProvider extends OpenAICompatibleProviderBase<typeof provide
 		model: AIModel<typeof provider.id>,
 		retries: number,
 		maxInputTokens: number,
-	): Promise<{ retry: true; maxInputTokens: number }> {
+		body?: string,
+		sentTools?: boolean,
+	): Promise<{ retry: true; maxInputTokens: number; withoutTools?: boolean }> {
 		if (rsp.status !== 404 && rsp.status !== 429) {
 			let json;
 			try {
-				json = (await rsp.json()) as MistralError | undefined;
+				json = (body != null ? JSON.parse(body) : await rsp.json()) as MistralError | undefined;
 			} catch {}
 
 			debugger;
@@ -137,10 +140,16 @@ export class MistralProvider extends OpenAICompatibleProviderBase<typeof provide
 				}
 			}
 
+			// This override throws for every non-404/429 status, so the base class's tools-rejection
+			// recovery would never run for Mistral — check it here to keep the text-only fallback
+			if (sentTools && this.isToolsRejection(rsp.status, message)) {
+				return { retry: true, maxInputTokens: maxInputTokens, withoutTools: true };
+			}
+
 			throw new Error(`(${this.name}) ${rsp.status}: ${message || rsp.statusText}`);
 		}
 
-		return super.handleFetchFailure(rsp, action, model, retries, maxInputTokens);
+		return super.handleFetchFailure(rsp, action, model, retries, maxInputTokens, body, sentTools);
 	}
 }
 

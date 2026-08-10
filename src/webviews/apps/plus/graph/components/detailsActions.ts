@@ -15,41 +15,64 @@
  *   for a commit/WIP that has since been replaced by a newer fetch
  */
 import type { Remote } from '@eamodio/supertalk';
+import type { AIReviewFinding } from '@gitlens/ai/models/results.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
+import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
 import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.js';
 import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
 import type { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
 import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import { appendCoauthorsToMessage } from '@gitlens/git/utils/contributor.utils.js';
+import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
 import { areEqual } from '@gitlens/utils/array.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { LruMap } from '@gitlens/utils/lruMap.js';
+import { normalizePath } from '@gitlens/utils/path.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
+import type { PastAgentSessionsResult } from '../../../../../agents/models/agentSessionState.js';
 import type { Autolink } from '../../../../../autolinks/models/autolinks.js';
 import type { ViewFilesLayout } from '../../../../../config.js';
 import type {
+	GraphDetailsFileAction,
 	GraphVirtualFileFailureReason,
 	GraphVirtualFileMode,
+	GraphWipStagingDiscardScope,
+	GraphWipStagingOperation,
+	GraphWipStagingScope,
 	TelemetryEvents,
 } from '../../../../../constants.telemetry.js';
 import { getVirtualFsErrorReason } from '../../../../../virtual/virtualFsError.js';
+import { defaultViewFilesConfig } from '../../../../commitDetails/protocol.js';
 import type { CommitDetails, CommitSignatureShape, CompareDiff, Wip } from '../../../../plus/graph/detailsProtocol.js';
 import type {
+	AutoRebaseSummaryResult,
 	BranchComparisonContributorsScope,
 	BranchComparisonFile,
 	BranchComparisonOptions,
 	BranchComparisonSide,
 	BranchComparisonSummary,
 	ComposeResult,
+	ConflictSide,
 	GraphServices,
+	ReresolveFileResult,
+	ResolveResult,
 	ReviewResult,
 	ScopeSelection,
+	TakeConflictSideResult,
+	UndoAutoRebaseResult,
 } from '../../../../plus/graph/graphService.js';
-import { isWipSha } from '../../../../plus/graph/protocol.js';
+import { isWipSelectionSha } from '../../../../plus/graph/protocol.js';
 import type { BranchMergeTargetStatus } from '../../../../rpc/services/branches.js';
+import type { ConflictDetails } from '../../../../rpc/services/types.js';
 import type { OverviewBranchIssue, OverviewBranchPullRequest } from '../../../../shared/overviewBranches.js';
 import type { FileChangeListItemDetail } from '../../../commitDetails/components/gl-details-base.js';
-import { fetchCommitEnrichment } from '../../../shared/actions/commitEnrichment.js';
+import {
+	applyAvatars,
+	applyReachableFromOtherWorktrees,
+	fetchCommitEnrichment,
+	withCachedEnrichment,
+} from '../../../shared/actions/commitEnrichment.js';
 import type { OpenMultipleChangesArgs } from '../../../shared/actions/file.js';
 import * as fileActions from '../../../shared/actions/file.js';
 import * as prActions from '../../../shared/actions/pr.js';
@@ -69,6 +92,27 @@ import type { DetailsState } from './detailsState.js';
 import type { ScopeItem } from './gl-commits-scope-pane.js';
 
 /** Structural equality for `ScopeSelection`. Used to avoid redundant signal sets and RPC fetches. */
+/** Severity histogram of an AI review's findings. Used by graph-details review telemetry. */
+export function countReviewFindingSeverities(findings: readonly AIReviewFinding[] | undefined): {
+	critical: number;
+	warning: number;
+	suggestion: number;
+} {
+	const counts = { critical: 0, warning: 0, suggestion: 0 };
+	if (findings == null) return counts;
+
+	for (const f of findings) {
+		if (f.severity === 'critical') {
+			counts.critical++;
+		} else if (f.severity === 'warning') {
+			counts.warning++;
+		} else if (f.severity === 'suggestion') {
+			counts.suggestion++;
+		}
+	}
+	return counts;
+}
+
 export function scopeSelectionEqual(a: ScopeSelection | undefined, b: ScopeSelection | undefined): boolean {
 	if (a === b) return true;
 	if (a == null || b == null) return false;
@@ -94,19 +138,30 @@ export function getReviewDiffEndpoints(scope: ScopeSelection | undefined): { lhs
 
 	// wip — match scope inputs as closely as possible with a single range
 	const hasShas = (scope.includeShas?.length ?? 0) > 0;
-	if (scope.includeUnstaged && !scope.includeStaged && !hasShas) {
-		return { lhs: uncommittedStaged, rhs: uncommitted };
+	if (!hasShas) {
+		if (scope.includeUnstaged && !scope.includeStaged) {
+			return { lhs: uncommittedStaged, rhs: uncommitted };
+		}
+		if (!scope.includeUnstaged && scope.includeStaged) {
+			return { lhs: 'HEAD', rhs: uncommittedStaged };
+		}
+		return { lhs: 'HEAD', rhs: uncommitted };
 	}
-	if (!scope.includeUnstaged && scope.includeStaged && !hasShas) {
-		return { lhs: 'HEAD', rhs: uncommittedStaged };
-	}
-	// Default wip → HEAD ↔ working tree (covers includeUnstaged+staged and includeShas variants)
-	return { lhs: 'HEAD', rhs: uncommitted };
+
+	// Seeded scopes guarantee the range-base boundary commit last and the tip first (see
+	// GraphComposeScopeSeed); picker-driven scopes are in pane row order (newest-first), where the
+	// bottom row is the visible range base. Commits-only ranges diff to the selection's own tip —
+	// an interior range ends below HEAD, so 'HEAD' would fold newer commits into the diff.
+	const lhs = `${scope.includeShas.at(-1)}^`;
+	if (scope.includeUnstaged) return { lhs: lhs, rhs: uncommitted };
+	if (scope.includeStaged) return { lhs: lhs, rhs: uncommittedStaged };
+	return { lhs: lhs, rhs: scope.includeShas[0] };
 }
 
 type ResolvedSubService<K extends keyof GraphServices> = Awaited<Remote<GraphServices>[K]>;
 
 export interface ResolvedServices {
+	readonly agents: ResolvedSubService<'agents'>;
 	readonly files: ResolvedSubService<'files'>;
 	readonly drafts: ResolvedSubService<'drafts'>;
 	readonly graphInspect: ResolvedSubService<'graphInspect'>;
@@ -126,6 +181,8 @@ export interface ResolvedServices {
 export interface DetailsResources {
 	readonly commit: Resource<CommitDetails | undefined, [string, string]>;
 	readonly wip: Resource<{ wip: Wip } | undefined, [string, boolean?]>;
+	/** Past (resumable) agent sessions for a worktree — top-3, keyed on `worktreePath`. */
+	readonly pastAgentSessions: Resource<PastAgentSessionsResult | undefined, [string]>;
 	readonly compare: Resource<CompareDiff | undefined, [string, string, string]>;
 	/** Phase 1 — counts + All Files. Keyed on `(repoPath, leftRef, rightRef, options)`. */
 	readonly branchCompareSummary: Resource<
@@ -143,6 +200,9 @@ export interface DetailsResources {
 		ComposeResult,
 		[string, ScopeSelection, string | undefined, string[] | undefined, string[] | undefined]
 	>;
+	/** AI conflict-resolution result. Keyed on `(repoPath, focusedFilePaths, instructions)` — focused
+	 *  paths scope the run to specific conflicted files; `undefined` resolves all conflicts. */
+	readonly resolve: Resource<ResolveResult, [string, readonly string[] | undefined, string | undefined]>;
 	readonly scopeFiles: Resource<GitFileChangeShape[], [string, ScopeSelection]>;
 }
 
@@ -173,9 +233,31 @@ interface CommitEnrichmentCacheEntry {
 
 const wipEnrichmentCacheLimit = 8;
 const commitEnrichmentCacheLimit = 32;
+/** How long the selection must hold still before a burst asks the host for the authoritative commit. Key
+ *  repeat runs at roughly a third of this, so a held arrow key resolves to one fetch at the end. */
+const commitFetchSettleMs = 100;
+/** Age past which a cached WIP payload is revalidated in the background even when it reads as live.
+ *  `isLive` is a point-in-time read of the host's watcher set, so it says "watched now", never "watched
+ *  continuously since this was cached" — a worktree whose row left and re-entered the viewport reads live
+ *  against a payload that missed everything in between. The revalidate doesn't block paint and lands on
+ *  the host's short-lived status cache, so the ceiling on being wrong is this bound rather than forever. */
+const wipCacheRevalidateAfterMs = 60_000;
 
 export class DetailsActions {
 	private _lastFetchedKey?: string;
+	/** When the selection last changed, so an isolated one can skip the settle wait and a burst can extend it. */
+	private _lastSelectionAt = 0;
+	/** Bumped per selection so only the newest waiter may fetch, even if an older one holds the same key. */
+	private _selectionGeneration = 0;
+	/** The repo whose data the fetched signals currently hold. Assigned only where a fetch actually seeds, and never
+	 *  cleared — a fetch that bails seeds nothing, so what's held (and therefore this description of it) is unchanged.
+	 *  Lets a reset tell "stale value from the prior repo" apart from "value this cycle's fetch just seeded for the
+	 *  incoming repo", which values like reachability can't answer about themselves. */
+	private _lastFetchedRepoPath?: string;
+	/** Highest {@link Wip.revision} applied to `state.wip`, per repo. WIP payloads (host pushes and fetch/refresh
+	 *  responses) can arrive out of order relative to the working-tree state they reflect, so we order them by the
+	 *  host's marker rather than by arrival — see {@link acceptWipRevision}. */
+	private readonly _lastAppliedWipRevision = new Map<string, number>();
 	private _pendingStagingOp?: Promise<void>;
 	/** Repo path with a commit RPC in flight. While set, host-pushed WIP for this repo is ignored:
 	 *  the commit's own pre-commit hooks (e.g. lint-staged stashing unstaged changes) churn the
@@ -193,6 +275,8 @@ export class DetailsActions {
 	 *  on a tab aborts any in-flight fetch for the same tab so the latest click wins. */
 	private _compareCommitFilesControllers = new Map<string, AbortController>();
 	private _aiExcludedFilesGeneration = 0;
+	/** Latest-fetch-wins guard for overlapping `fetchPreferences` re-fetches. */
+	private _preferencesGeneration = 0;
 
 	/** Branch-keyed cache of WIP enrichment (autolinks/issues/mergeTarget). Populated on first
 	 *  successful fetch; consulted on subsequent visits to hydrate state synchronously and avoid
@@ -214,6 +298,54 @@ export class DetailsActions {
 		data?: Record<string, string | number | boolean | undefined>,
 	): void {
 		fireAndForget(this.services.telemetry.sendEvent(name, data));
+	}
+
+	/** Builds the shared scope/AI/instructions payload for graph-details mode telemetry events.
+	 *  Privacy-safe: emits only counts, booleans, and AI model identifiers — never paths or content. */
+	buildModeTelemetryContext(
+		instructions: string | undefined,
+		excludedFilesCount: number,
+		effectiveFilesCount: number,
+	): Record<string, string | number | boolean | undefined> {
+		const scope = this.state.scope.get();
+		const aiModel = this.state.aiModel.get();
+		const promptLength = instructions?.length ?? 0;
+
+		const data: Record<string, string | number | boolean | undefined> = {
+			'scope.type': scope?.type,
+			'scope.includeStaged': scope?.type === 'wip' ? scope.includeStaged : undefined,
+			'scope.includeUnstaged': scope?.type === 'wip' ? scope.includeUnstaged : undefined,
+			'scope.commits.count':
+				scope?.type === 'wip' || scope?.type === 'compare' ? (scope.includeShas?.length ?? 0) : 0,
+			'scope.kind':
+				scope?.type === 'wip'
+					? (scope.includeShas?.length ?? 0) === 0
+						? 'wip-only'
+						: scope.includeStaged || scope.includeUnstaged
+							? 'wip+commits'
+							: 'commits-only'
+					: undefined,
+			'scope.files.count': effectiveFilesCount,
+			'scope.files.excluded.count': excludedFilesCount,
+			'customInstructions.used': promptLength > 0,
+			'customInstructions.length': promptLength,
+			'ai.model.id': aiModel?.id,
+			'ai.model.name': aiModel?.name,
+			'ai.model.provider.id': aiModel?.provider.id,
+			'ai.model.provider.name': aiModel?.provider.name,
+		};
+		return data;
+	}
+
+	/** Builds just the AI-model fields — for events that don't carry full scope context (focus area). */
+	buildAIModelTelemetryContext(): Record<string, string | undefined> {
+		const aiModel = this.state.aiModel.get();
+		return {
+			'ai.model.id': aiModel?.id,
+			'ai.model.name': aiModel?.name,
+			'ai.model.provider.id': aiModel?.provider.id,
+			'ai.model.provider.name': aiModel?.provider.name,
+		};
 	}
 
 	private clearCompareCore(): void {
@@ -275,11 +407,13 @@ export class DetailsActions {
 		this._commitEnrichmentCache.clear();
 		this.resources.commit.dispose();
 		this.resources.wip.dispose();
+		this.resources.pastAgentSessions.dispose();
 		this.resources.compare.dispose();
 		this.resources.branchCompareSummary.dispose();
 		this.resources.branchCompareSide.dispose();
 		this.resources.review.dispose();
 		this.resources.compose.dispose();
+		this.resources.resolve.dispose();
 		this._eventUnsubscribe?.();
 		this._eventUnsubscribe = undefined;
 	}
@@ -328,134 +462,51 @@ export class DetailsActions {
 	}
 
 	/**
+	 * Reset repo-scoped state for a switch to {@link repoPath}, unless something else owns it. No-op when the
+	 * last fetch already seeded this repo — that's what makes this safe to call from both the fetch prologues
+	 * and {@link DetailsWorkflowController}'s render-target trigger without the two fighting.
+	 *
+	 * Skips while an open compare sheet (anchored to its own refs) or an active mode owns the state: a mode's
+	 * `fetchBranchCommits` can be in flight, and resetting would clobber `branchCommitsFetching` back to false,
+	 * stranding the picker in "no items + not loading". Cross-repo staleness on that path is caught instead by
+	 * `toggleMode`'s {@link branchCommitsFetchedRepoPath} check.
+	 */
+	resetRepoScopedStateOnSwitch(repoPath?: string): void {
+		if (this._lastFetchedRepoPath === repoPath) return;
+		if (this.state.compareSheetOpen.get() || this.state.compareAsPanel.get()) return;
+		if (this.state.activeMode.get() != null) return;
+
+		this.resetRepoScopedState(repoPath);
+	}
+
+	/**
 	 * Invalidate every repo/worktree-scoped signal in {@link DetailsState} so the panel does not
-	 * surface the prior repo's data after the host's render target switches. Called from the
-	 * worktree-switch trigger in {@link DetailsWorkflowController}.
+	 * surface the prior repo's data after the host's render target switches.
 	 *
 	 * The implicit "next fetch overwrites" pattern fails for signals that are gated (e.g.
 	 * `branchCommits`), never auto-refreshed on repo switch, or that return nothing for the new
 	 * repo and leave the old value latent. Clearing here forces a clean slate so the picker /
 	 * panel show a loading state until the new repo's fetches land.
 	 *
+	 * Callers MUST invoke this BEFORE seeding anything for the incoming repo — the fetch prologues
+	 * do, which is the invariant that keeps this method a plain unconditional wipe. It used to run
+	 * after the panel's `willUpdate` fetch had already seeded (Lit fires `willUpdate` ahead of the
+	 * controller's `hostUpdate`), so each signal seeded synchronously needed its own preserve gate
+	 * to survive; the ones that never got a gate were silently clobbered instead.
+	 *
 	 * Notes on what is NOT touched here:
-	 * - `_lastFetchedKey` is left alone — `willUpdate` on the panel already kicked off
-	 *   `fetchDetails(sha, newRepoPath)` BEFORE this runs (Lit fires `willUpdate` ahead of
-	 *   `hostUpdate`), so the key has already been re-stamped to the new selection. Resetting
-	 *   it here would cause that fetch's success path to abort its write.
-	 * - `_enrichmentController` is left alone for the same reason — see the doc on
-	 *   {@link clearEnrichmentCaches}.
-	 * - Capability flags (`preferences`, `orgSettings`, `aiModel`, etc.) and pure UI toggles
-	 *   are not repo-scoped — they intentionally survive switches.
+	 * - `_lastFetchedKey` / `_lastFetchedRepoPath` are left alone — the prologue stamps them right
+	 *   after this returns, and resetting them would re-arm this reset against its own fetch.
+	 * - `_enrichmentController` is left alone — see the doc on {@link clearEnrichmentCaches}.
 	 */
 	resetRepoScopedState(repoPath?: string): void {
-		const s = this.state;
-
-		// `willUpdate` (which fires before `hostUpdate`) may have synchronously hydrated the
-		// commit/wip signal from cache for the just-arrived selection — already keyed to the
-		// new repo. Wiping unconditionally clobbers that hydrate and the next render lands on
-		// `undefined` (the blank-panel bug). Preserve when the held value already belongs to
-		// the new repo; pair the enrichment chips with the same gate so they don't flash empty
-		// while the kept selection stays visible.
-		const preserveWip = repoPath != null && s.wip.get()?.repo?.path === repoPath;
-		const preserveCommit = repoPath != null && s.commit.get()?.repoPath === repoPath;
-
+		// Which signals this covers is declared at each signal in `createDetailsState` — including the
+		// repo-scoped slice of the transient layer (the commit-input form). Mode signals + scope +
+		// aiExcludedFiles are already cleared by `exitMode`, which runs before this on the switch trigger;
+		// `generating` is panel-derived from the registry, which the switch clears.
+		this.state.resetRepoScoped();
+		// The LRU caches + branch-commits controllers aren't signals, so they still need doing by hand.
 		this.clearEnrichmentCaches(repoPath);
-
-		// Core selection-scoped data
-		if (!preserveCommit) {
-			s.commit.set(undefined);
-		}
-		if (!preserveWip) {
-			s.wip.set(undefined);
-		}
-		s.searchContext.set(undefined);
-
-		// WIP enrichment (branch-scoped chips) — paired with `preserveWip`. Without the gate
-		// the chips would flash empty even though `state.wip` survives the reset.
-		if (!preserveWip) {
-			s.wipAutolinks.set(undefined);
-			s.wipIssues.set(undefined);
-			s.wipMergeTarget.set(undefined);
-			s.wipMergeTargetLoading.set(false);
-			s.wipPullRequest.set(undefined);
-			s.wipPullRequestLoading.set(false);
-		}
-
-		// 2-commit compare fetched data
-		s.commitFrom.set(undefined);
-		s.commitTo.set(undefined);
-		s.compareStats.set(undefined);
-		s.compareFiles.set(undefined);
-		s.compareBetweenCount.set(undefined);
-		s.compareAutolinks.set(undefined);
-		s.compareAutolinksLoading.set(false);
-		s.signatureFrom.set(undefined);
-		s.signatureTo.set(undefined);
-		s.compareEnrichedItems.set(undefined);
-		s.compareEnrichmentLoading.set(false);
-
-		// Single-commit enrichment — paired with `preserveCommit` for the same reason.
-		if (!preserveCommit) {
-			s.autolinks.set(undefined);
-			s.formattedMessage.set(undefined);
-			s.autolinkedIssues.set(undefined);
-			s.pullRequest.set(undefined);
-			s.signature.set(undefined);
-		}
-
-		// Reachability + AI explain
-		s.reachability.set(undefined);
-		s.reachabilityState.set('idle');
-		s.explain.set(undefined);
-		s.compareExplainBusy.set(false);
-		s.compareGenerateChangelogBusy.set(false);
-
-		// Branch-commits picker source (the gated leak that motivated this method)
-		s.branchCommits.set(undefined);
-		s.branchMergeBase.set(undefined);
-		s.branchCommitsFetching.set(false);
-		s.branchCommitsHasMore.set(false);
-		s.branchCommitsLoadingMore.set(false);
-
-		// Branch-comparison phases + per-scope Maps. `openCompare` already resets these on entry,
-		// but the Maps accumulate keys across repos otherwise — clear here so a stale per-scope
-		// value can never resurface on a different repo's same-shaped key.
-		s.branchCompareAheadCount.set(0);
-		s.branchCompareBehindCount.set(0);
-		s.branchCompareAllFiles.set([]);
-		s.branchCompareAllFilesCount.set(0);
-		s.branchCompareAheadCommits.set([]);
-		s.branchCompareBehindCommits.set([]);
-		s.branchCompareAheadFiles.set([]);
-		s.branchCompareBehindFiles.set([]);
-		s.branchCompareAheadLoaded.set(false);
-		s.branchCompareBehindLoaded.set(false);
-		s.branchCompareAheadHasMore.set(false);
-		s.branchCompareBehindHasMore.set(false);
-		s.branchCompareAheadLimit.set(100);
-		s.branchCompareBehindLimit.set(100);
-		s.branchCompareAheadLoadingMore.set(false);
-		s.branchCompareBehindLoadingMore.set(false);
-		s.branchCompareAutolinksByScope.set(new Map());
-		s.branchCompareEnrichedAutolinksByScope.set(new Map());
-		s.branchCompareContributorsByScope.set(new Map());
-		s.branchCompareEnrichmentLoading.set(new Map());
-		s.branchCompareContributorsLoading.set(new Map());
-		s.branchCompareCommitFilesLoading.set(new Map());
-
-		// Capability-ish but repo-scoped
-		s.hasRemotes.set(false);
-
-		// Repo-scoped transient state. Mode signals + scope + aiExcludedFiles are already
-		// cleared via `exitMode` which runs before this in the worktree-switch trigger. The
-		// commit-input form is repo-scoped too — the panel's `updated` hook clears it on
-		// repoChanged but only when no mode is active, so cover the mode-active case here.
-		s.commitMessage.set('');
-		s.commitMessageDirty.set(false);
-		s.amend.set(false);
-		s.amendBaseSha.set(undefined);
-		s.commitError.set(undefined);
-		// `generating` is not reset here — it's panel-derived from the registry, which repo-switch clears.
 	}
 
 	/**
@@ -475,8 +526,10 @@ export class DetailsActions {
 		return shas != null && shas.length >= 2;
 	}
 
+	/** A WIP selection carries EITHER the `uncommitted` revision (the graph's own selection path
+	 *  normalizes to it) or a synthetic WIP row id (alt-mode / host-action slots). */
 	isWip(sha?: string): boolean {
-		return isWipSha(sha);
+		return isWipSelectionSha(sha);
 	}
 
 	fromSha(shas: string[] | undefined, swapped: boolean): string | undefined {
@@ -490,19 +543,40 @@ export class DetailsActions {
 	}
 
 	async fetchCapabilities(): Promise<void> {
-		const s = this.services;
+		// Preferences (fast config reads) gate the file-list render, so resolve them first; the slower
+		// account/integration/AI-model capabilities settle into their own signals after.
+		await this.fetchPreferences();
 
-		const [
-			pullRequestExpanded,
-			[avatars, currentUserNameStyle, dateFormat, dateStyle, files, showSignatureBadges],
-			[indentGuides, indent, enableSmartCommit, workingFilesOrderBy],
-			aiEnabled,
-			aiModel,
-			autolinksEnabled,
-			integrations,
-			hasAccount,
-			orgSettings,
-		] = await Promise.all([
+		// allSettled so one failing leg can't reject the batch and skip `subscribeEvents` below.
+		const s = this.services;
+		const [aiModelRes, autolinksEnabledRes, integrationsRes, hasAccountRes, orgSettingsRes] =
+			await Promise.allSettled([
+				s.ai.getModel(scopeForActiveMode(this.state.activeMode.get())),
+				s.config.get('views.commitDetails.autolinks.enabled'),
+				s.integrations.getIntegrationStates(),
+				s.subscription.hasAccount(),
+				s.subscription.getOrgSettings(),
+			]);
+
+		this.state.autolinksEnabled.set(getSettledValue(autolinksEnabledRes) ?? true);
+		this.state.hasIntegrationsConnected.set(getSettledValue(integrationsRes)?.some(i => i.connected) ?? false);
+		this.state.hasAccount.set(getSettledValue(hasAccountRes) ?? false);
+		this.state.orgSettings.set(getSettledValue(orgSettingsRes) ?? { ai: false, drafts: false });
+		this.state.aiModel.set(getSettledValue(aiModelRes));
+
+		// Subscribe to AI model + config changes so the chips and preferences stay in sync.
+		void this.subscribeEvents();
+	}
+
+	/** Publishes the fast, config/storage-derived {@link Preferences}. Run up front by
+	 *  {@link fetchCapabilities} (correct layout on first paint) and on every `config.onConfigChanged`. */
+	private async fetchPreferences(): Promise<void> {
+		// Latest-fetch-wins guard against overlapping re-fetches (see `_preferencesGeneration`).
+		const generation = ++this._preferencesGeneration;
+		// allSettled so a single failing read can't leave `preferences` unset (stuck loading gate);
+		// each missing value falls back to its default below.
+		const s = this.services;
+		const [pullRequestExpandedRes, filesPrefsRes, treePrefsRes, aiEnabledRes] = await Promise.allSettled([
 			s.storage.getWorkspace('views:commitDetails:pullRequestExpanded'),
 			s.config.getMany(
 				'views.commitDetails.avatars',
@@ -511,6 +585,7 @@ export class DetailsActions {
 				'defaultDateStyle',
 				'views.commitDetails.files',
 				'signing.showSignatureBadges',
+				'sortWorkingChangesBy',
 			),
 			s.config.getManyCore(
 				'workbench.tree.renderIndentGuides',
@@ -519,43 +594,42 @@ export class DetailsActions {
 				'scm.defaultViewSortKey',
 			),
 			s.ai.isEnabled(),
-			s.ai.getModel(scopeForActiveMode(this.state.activeMode.get())),
-			s.config.get('views.commitDetails.autolinks.enabled'),
-			s.integrations.getIntegrationStates(),
-			s.subscription.hasAccount(),
-			s.subscription.getOrgSettings(),
 		]);
+
+		// A newer fetch superseded this one mid-flight — it read fresher config, so don't clobber it.
+		if (this._preferencesGeneration !== generation) return;
+
+		const pullRequestExpanded = getSettledValue(pullRequestExpandedRes);
+		const [avatars, currentUserNameStyle, dateFormat, dateStyle, files, showSignatureBadges, workingChangesSortBy] =
+			getSettledValue(filesPrefsRes) ?? [];
+		const [indentGuides, indent, enableSmartCommit, workingFilesOrderBy] = getSettledValue(treePrefsRes) ?? [];
+		const aiEnabled = getSettledValue(aiEnabledRes);
 
 		this.state.preferences.set({
 			pullRequestExpanded: pullRequestExpanded ?? true,
-			avatars: avatars,
+			avatars: avatars ?? true,
 			currentUserNameStyle: currentUserNameStyle ?? 'you',
 			dateFormat: dateFormat ?? 'MMMM Do, YYYY h:mma',
 			dateStyle: dateStyle ?? 'relative',
-			files: files,
+			files: files ?? defaultViewFilesConfig,
 			indentGuides: indentGuides ?? 'onHover',
 			indent: indent,
 			workingFilesOrderBy: workingFilesOrderBy ?? 'path',
-			aiEnabled: aiEnabled,
+			workingChangesSortBy: workingChangesSortBy ?? 'stage',
+			aiEnabled: aiEnabled ?? false,
 			enableSmartCommit: enableSmartCommit ?? false,
-			showSignatureBadges: showSignatureBadges,
+			showSignatureBadges: showSignatureBadges ?? true,
 			// Graph reads its own per-view `details.showSearchBox` / `details.searchBoxFilter`
 			// from `graph:state`; these fields satisfy the shared `Preferences` shape only.
 			showSearchBox: true,
 			searchBoxFilter: true,
 		});
-		this.state.autolinksEnabled.set(autolinksEnabled ?? true);
-		this.state.hasIntegrationsConnected.set(integrations?.some(i => i.connected) ?? false);
-		this.state.hasAccount.set(hasAccount ?? false);
-		this.state.orgSettings.set(orgSettings ?? { ai: false, drafts: false });
-		this.state.aiModel.set(aiModel);
-
-		// Subscribe to AI model so the picker chip stays in sync with native quickpick changes.
-		void this.subscribeEvents();
 	}
 
 	private async subscribeEvents(): Promise<void> {
 		const unsubscribe = await subscribeAll([
+			// Keep preferences in sync with external settings edits without a reload.
+			() => this.services.config.onConfigChanged(() => void this.fetchPreferences()),
 			// Re-read the model with the active mode's scope. The compose-mode chip should
 			// reflect `'compose'` storage, the review-mode chip should reflect `'review'`
 			// storage, and either falls back to the global default when its scope is unset.
@@ -566,6 +640,15 @@ export class DetailsActions {
 				this.services.graphInspect.onComposeProgress(event => {
 					this.state.composeProgressMessage.set(event?.message);
 				}),
+			() =>
+				this.services.graphInspect.onResolveProgress(event => {
+					this.state.resolveProgressMessage.set(event?.message);
+				}),
+			// The automatic rebase narrates itself in the resolve panel — this is its only progress feed.
+			() =>
+				this.services.graphInspect.onAutoRebaseProgress(event => {
+					this.state.autoRebaseRun.set(event);
+				}),
 		]);
 		if (this._disposed) {
 			unsubscribe();
@@ -575,22 +658,43 @@ export class DetailsActions {
 		this._eventUnsubscribe = unsubscribe;
 	}
 
-	switchAIModel(scope?: 'compose' | 'review'): void {
+	switchAIModel(scope?: 'compose' | 'review' | 'resolve'): void {
 		// Reuses VS Code's native AI provider quickpick — keeps a single point of truth for
 		// model selection and avoids re-implementing the picker in the webview.
-		// `scope` (set by the caller from the active mode) lets the compose / review chips
+		// `scope` (set by the caller from the active mode) lets the compose / review / resolve chips
 		// persist to their own Memento key without mutating the global default.
-		void this.services.commands.execute('gitlens.ai.switchProvider', {
-			source: 'graph-details' as const,
-			scope: scope,
-		});
+		const previous = this.state.aiModel.get();
+		void (async () => {
+			await this.services.commands.execute('gitlens.ai.switchProvider', {
+				source: 'graph-details' as const,
+				scope: scope,
+			});
+
+			// Only the scoped (compose/review) chips emit a change event. The command resolves
+			// after the picker persists the selection, so read the scoped model directly rather
+			// than racing the async `onModelChanged` → `refreshScopedAiModel` that updates state.
+			if (scope == null) return;
+
+			const current = await this.services.ai.getModel(scope);
+			if (current?.id === previous?.id && current?.provider.id === previous?.provider.id) return;
+
+			this.sendTelemetryEvent(`graphDetails/${scope}/changeAiModel`, {
+				'ai.model.id': current?.id,
+				'ai.model.name': current?.name,
+				'ai.model.provider.id': current?.provider.id,
+				'ai.model.provider.name': current?.provider.name,
+				'ai.model.previous.id': previous?.id,
+				'ai.model.previous.name': previous?.name,
+				'ai.model.previous.provider.id': previous?.provider.id,
+				'ai.model.previous.provider.name': previous?.provider.name,
+			});
+		})();
 	}
 
 	/**
 	 * Re-reads `state.aiModel` for the active mode's scope. Call after the active mode flips
-	 * so the chip displayed by the now-active panel matches its scope (compose vs review).
-	 * Falls back to the global default for the `'compose' | 'review'` scopes that don't
-	 * have a remembered model.
+	 * so the chip displayed by the now-active panel matches its scope (compose, review, or resolve).
+	 * Falls back to the global default for a scope that doesn't yet have a remembered model.
 	 */
 	async refreshScopedAiModel(): Promise<void> {
 		const model = await this.services.ai.getModel(scopeForActiveMode(this.state.activeMode.get()));
@@ -600,18 +704,28 @@ export class DetailsActions {
 	/** Direct-RPC review run. Bypasses {@link resources.review} so the run is owned by the
 	 *  caller's `AbortController` (held on the registry entry), not the single-instance
 	 *  `Resource` — letting the in-flight generation survive an anchor switch. The caller is
-	 *  responsible for updating the registry entry on resolve/reject. */
+	 *  responsible for updating the registry entry on resolve/reject.
+	 *
+	 *  `options.mode: 'refine'` makes the run a follow-up on the host-cached review conversation
+	 *  (prior exchanges replayed to the AI) instead of a fresh run. */
 	startReview(
 		repoPath: string,
 		scope: ScopeSelection,
 		instructions: string | undefined,
 		excludedFiles: string[] | undefined,
 		signal: AbortSignal,
+		options?: { mode?: 'refine' },
 	): Promise<ReviewResult> {
-		return this.services.graphInspect.reviewChanges(repoPath, scope, instructions, excludedFiles, signal);
+		return this.services.graphInspect.reviewChanges(repoPath, scope, instructions, excludedFiles, signal, options);
 	}
 
-	/** Direct-RPC compose run. See {@link startReview} for rationale. */
+	/** Direct-RPC compose run. See {@link startReview} for rationale.
+	 *
+	 *  `continuation` threads the prior cached AI session into the host so the library uses
+	 *  continuation prompts instead of a cold start. `'refine'` = same diff, new instruction;
+	 *  `'post-apply'` = a commit-to-here just landed and the AI should plan the remainder with
+	 *  a synthetic "you committed X" bridge turn. Both reuse `priorCacheKey` (the cacheKey from
+	 *  the prior plan or, after partial apply, the retained continuation cacheKey). */
 	startCompose(
 		repoPath: string,
 		scope: ScopeSelection,
@@ -619,6 +733,7 @@ export class DetailsActions {
 		excludedFiles: string[] | undefined,
 		aiExcludedFiles: string[] | undefined,
 		signal: AbortSignal,
+		options?: { priorCacheKey?: string; mode?: 'refine'; excludedCommitIds?: readonly string[] },
 	): Promise<ComposeResult> {
 		return this.services.graphInspect.composeChanges(
 			repoPath,
@@ -627,7 +742,119 @@ export class DetailsActions {
 			excludedFiles,
 			aiExcludedFiles,
 			signal,
+			options,
 		);
+	}
+
+	/** Direct-RPC AI conflict-resolution run. See {@link startReview} for rationale — the run is
+	 *  owned by the caller's `AbortController` so it survives an anchor switch. */
+	startResolve(
+		repoPath: string,
+		focusedFilePaths: readonly string[] | undefined,
+		instructions: string | undefined,
+		signal: AbortSignal,
+	): Promise<ResolveResult> {
+		return this.services.graphInspect.resolveConflicts(repoPath, focusedFilePaths, instructions, signal);
+	}
+
+	/** One-shot pickup of an automatic rebase's escalation handoff — the host seeds the resolve
+	 *  session with the escalated step's already-computed resolutions and returns them, so the
+	 *  panel opens directly in its ready state. `undefined` when there's nothing to hand off. */
+	fetchSeededResolveSession(repoPath: string): Promise<ResolveResult | undefined> {
+		return this.services.graphInspect.getSeededResolveSession(repoPath);
+	}
+
+	/** Fetch the automatic rebase summary for the repo's session (`undefined` = no session). Also
+	 *  (re)registers the host-side virtual diff sessions backing each file's View Changes. */
+	fetchAutoRebaseSummary(repoPath: string): Promise<AutoRebaseSummaryResult | undefined> {
+		return this.services.graphInspect.getAutoRebaseSummary(repoPath);
+	}
+
+	/** Undo a completed automatic rebase — validated host-side (refuses if the branch has moved). */
+	undoAutoRebase(repoPath: string, sessionId: string): Promise<UndoAutoRebaseResult> {
+		return this.services.graphInspect.undoAutoRebase(repoPath, sessionId);
+	}
+
+	/** Re-engage automatic rebase (takeover) to finish the remaining steps after an escalation was
+	 *  resolved manually. Fire-and-forget — resolves once triggered, not when the rebase finishes. */
+	resumeAutoRebase(repoPath: string): Promise<void> {
+		return this.services.graphInspect.resumeAutoRebase(repoPath);
+	}
+
+	/** Aborts a running automatic rebase, restoring the branch to its pre-rebase state. */
+	cancelAutoRebase(repoPath: string): Promise<void> {
+		return this.services.graphInspect.cancelAutoRebase(repoPath);
+	}
+
+	/** Releases the summary's host-side virtual diff sessions — call when its sheet leaves the
+	 *  stack (close, undo, invalidation). Fire-and-forget. */
+	endAutoRebaseSummarySession(): Promise<void> {
+		return this.services.graphInspect.endAutoRebaseSummarySession();
+	}
+
+	/** Re-resolves a single file with user feedback (per-file retry). See {@link startResolve}. */
+	reresolveFile(
+		repoPath: string,
+		filePath: string,
+		feedback: string,
+		signal: AbortSignal,
+	): Promise<ReresolveFileResult> {
+		return this.services.graphInspect.reresolveFile(repoPath, filePath, feedback, signal);
+	}
+
+	/** Queue a manual take-side resolution for a single skipped/errored conflicted file (the fallback
+	 *  for files the AI resolver can't auto-merge). Applied on Apply, dropped on Discard — nothing is
+	 *  written to the working tree here. See {@link startResolve}. */
+	takeConflictSide(repoPath: string, filePath: string, side: ConflictSide): Promise<TakeConflictSideResult> {
+		return this.services.graphInspect.takeConflictSide(repoPath, filePath, side);
+	}
+
+	/** Apply the cached AI resolutions to the working tree. On success, tears down the engagement
+	 *  signals (mirrors `hideMode`) and refreshes the WIP; the controller's `resolve.applyResolutions`
+	 *  wrapper removes the registry entry. On failure, mutates the resource to an error sentinel so
+	 *  the panel surfaces it. */
+	async applyResolutions(repoPath: string | undefined, includedFilePaths?: readonly string[]): Promise<void> {
+		if (!repoPath) return;
+
+		const resolveValue = this.resources.resolve.value.get();
+		if (!resolveValue || !('result' in resolveValue)) return;
+
+		const sha = this.state.activeModeSha.get();
+		this.state.resolveApplying.set(true);
+		try {
+			const result = await this.services.graphInspect.applyResolutions(repoPath, includedFilePaths);
+			if ('error' in result && result.error) {
+				this.resources.resolve.mutate({ error: { message: result.error.message } });
+			} else {
+				// Engagement teardown — mirrors `hideMode`'s clear so stale `activeMode*`/`scope`
+				// can't bleed into the next action via `currentAnchor()`.
+				this.state.activeMode.set(null);
+				this.state.activeModeContext.set(null);
+				this.state.activeModeRepoPath.set(undefined);
+				this.state.activeModeSha.set(undefined);
+				this.state.activeModeShas.set(undefined);
+				this.state.scope.set(undefined);
+				this.state.aiExcludedFiles.set(undefined);
+				this.invalidateAiExcludedFilesFetch();
+				this.state.wipStale.set(false);
+				this.resources.resolve.reset();
+				this.state.resolveFocusedFilePaths.set(undefined);
+				void this.refreshScopedAiModel();
+				this.refreshWip();
+				void this.fetchDetails(sha, repoPath);
+			}
+		} catch {
+			this.resources.resolve.mutate({ error: { message: 'Failed to apply conflict resolutions.' } });
+		} finally {
+			this.state.resolveApplying.set(false);
+		}
+	}
+
+	/** Drop the host-side cached resolve session without writing anything. Fire-and-forget. */
+	discardResolutions(repoPath: string | undefined): Promise<void> {
+		if (!repoPath) return Promise.resolve();
+
+		return this.services.graphInspect.discardResolutions(repoPath);
 	}
 
 	refreshWip(): void {
@@ -641,6 +868,134 @@ export class DetailsActions {
 		}
 	}
 
+	/**
+	 * Gate the commit fetch on the selection holding still, so rapid navigation doesn't spawn a host
+	 * `git log` per keypress. Leading edge: an isolated selection (a click, a single arrow press) goes
+	 * straight through, so nothing gets slower in the common case. Inside a burst it waits, then reports
+	 * whether this selection is still the current one — a superseded one returns false and never asks.
+	 */
+	private async settleBeforeCommitFetch(key: string): Promise<boolean> {
+		const now = Date.now();
+		// Measured against the previous SELECTION, not the previous permitted fetch. Keying it off the fetch
+		// made this a throttle: the timestamp only advanced when a fetch was allowed through, so a sustained
+		// key repeat re-armed the leading edge every window and started git work every ~100ms.
+		const idle = now - this._lastSelectionAt >= commitFetchSettleMs;
+		this._lastSelectionAt = now;
+		// Claimed per SELECTION, not per key. Navigating away and back inside one window (A -> B -> C -> B)
+		// leaves two waiters holding the same key, and a key check alone passes BOTH once the selection
+		// returns to B — so the second fetch starts and immediately cancels the first, which is the exact
+		// wasted git work this gate exists to prevent. Only the newest selection keeps its claim.
+		const generation = ++this._selectionGeneration;
+		if (idle) return true;
+
+		// Inside a burst: wait for the selection to actually stop moving. Every newer selection pushes
+		// `_lastSelectionAt` forward and so extends this wait, leaving exactly one fetch, at the end.
+		for (;;) {
+			const remaining = commitFetchSettleMs - (Date.now() - this._lastSelectionAt);
+			if (remaining <= 0) return this._selectionGeneration === generation && this._lastFetchedKey === key;
+
+			await new Promise(resolve => setTimeout(resolve, remaining));
+			if (this._selectionGeneration !== generation) return false;
+		}
+	}
+
+	/** Repo paths with a background WIP revalidate in flight. `resources.wip` cancels its previous fetch on
+	 *  every new one, so an unguarded re-entry (the same-selection path can fire on any focus churn) would
+	 *  kill the read it just started and restart it — a cancel-restart storm that never converges. */
+	private readonly _wipRevalidatesInFlight = new Set<string>();
+	/** Repos whose revalidation was suppressed because one was already running — re-run once it settles, so a
+	 *  request arriving mid-flight isn't silently dropped along with whatever selection needed it. */
+	private readonly _wipRevalidatesPending = new Set<string>();
+
+	/**
+	 * Background-revalidates the cached WIP for `repoPath` when the entry can't vouch for itself: the host
+	 * isn't watching it, a local optimistic edit is awaiting reconciliation, its watcher coverage gapped,
+	 * or it has simply aged past what a point-in-time liveness read is worth. Never blocks paint, and
+	 * no-ops on a live, fresh entry — so the common revisit still costs zero git work.
+	 */
+	private revalidateWipIfStale(
+		cached: NonNullable<ReturnType<AppState['getWipState']>>,
+		repoPath: string,
+		key: string,
+		enrichSignal: AbortSignal | undefined,
+	): void {
+		if (cached.isLive && cached.ageMs <= wipCacheRevalidateAfterMs) return;
+		if (this._wipRevalidatesInFlight.has(repoPath)) {
+			// Don't stack a second fetch — the shared resource would cancel the first. Record that another
+			// ask arrived instead, and re-run once this one settles: the in-flight read may be answering for
+			// a selection that has since moved on (its payload is then rejected by the repo-path guard
+			// below), and dropping this ask outright would leave the current selection unrevalidated with
+			// nothing left to trigger it.
+			this._wipRevalidatesPending.add(repoPath);
+			return;
+		}
+
+		this._wipRevalidatesInFlight.add(repoPath);
+		void (async () => {
+			try {
+				await this.resources.wip.fetch(repoPath);
+				if (this._lastFetchedKey !== key) return;
+
+				if (this.resources.wip.status.get() === 'success') {
+					const result = this.resources.wip.value.get();
+					if (result != null) {
+						const { wip } = result;
+						// `resources.wip` is a SHARED slot holding whichever fetch resolved last, and a
+						// superseded fetch resolves silently rather than throwing (see `runFetch`) — so on an
+						// A → B → A selection, awaiting A's cancelled fetch can read B's payload while
+						// `_lastFetchedKey` is legitimately A again. Verify the payload names the repo we
+						// asked about before applying it, or B's working tree lands under A's key.
+						if (wip.repo?.path !== repoPath) return;
+						// Drop if a newer WIP landed while this background revalidate was in flight.
+						if (!this.acceptWipRevision(wip, repoPath)) return;
+
+						const prevBranchName = this.state.wip.get()?.branch?.name;
+						this.state.wip.set(wip);
+						this.rederiveDeferredDefaultScope(repoPath);
+						// Authoritative host result (stats travel embedded as `wip.stats`) — reconciles
+						// every mirror and leaves the entry live, so revisits don't re-buy a `git status`.
+						this.graphState?.ingestWip(repoPath, wip);
+						if (this.state.activeMode.get() != null) {
+							this.state.wipStale.set(true);
+						}
+
+						const freshBranchName = wip.branch?.name;
+						// No signal means a repeat selection revalidating in place — the enrichment for this
+						// very selection is already loaded, so the payload normally refreshes alone. UNLESS the
+						// worktree checked out a different branch meanwhile: the merge-target / PR / autolink
+						// chips on screen belong to the old one, and nothing else re-fires them for a selection
+						// that never changed.
+						const signal =
+							enrichSignal ?? (freshBranchName !== prevBranchName ? this.resetEnrichment() : undefined);
+						if (signal != null) {
+							if (freshBranchName != null) {
+								this.fetchWipBranchEnrichment(repoPath, freshBranchName, signal);
+							} else {
+								this.state.wipMergeTargetLoading.set(false);
+							}
+						}
+					}
+				}
+			} catch {
+				// ignore background fetch errors if we already have cached content
+			} finally {
+				this._wipRevalidatesInFlight.delete(repoPath);
+				// Another ask arrived while this was running. Re-read the cache and re-decide: if it's live
+				// and fresh now, this no-ops; if the earlier read answered for a selection that has moved on,
+				// this is what gets the current one revalidated.
+				// ...but only while the panel is still showing this repo. Firing for a repo the user has since
+				// navigated away from would start a fetch on the SHARED resource slot, cancelling the fetch
+				// the current selection is waiting on — and that one reads the slot without a repo guard.
+				if (this._wipRevalidatesPending.delete(repoPath) && this._lastFetchedRepoPath === repoPath) {
+					const current = this.graphState?.getWipState(repoPath);
+					if (current != null) {
+						this.revalidateWipIfStale(current, repoPath, this._lastFetchedKey ?? key, undefined);
+					}
+				}
+			}
+		})();
+	}
+
 	async fetchDetails(
 		sha: string | undefined,
 		repoPath: string | undefined,
@@ -650,7 +1005,21 @@ export class DetailsActions {
 		const s = this.services;
 
 		const key = `${sha}:${repoPath}`;
-		if (key === this._lastFetchedKey) return;
+		if (key === this._lastFetchedKey) {
+			// Same selection as last time. For a commit that means identical content — the sha IS the
+			// content — so there's nothing to do. A WIP row is the exception: its sha is the fixed
+			// `uncommitted` sentinel, so the key stays equal while the working tree underneath it changes
+			// freely. Re-selecting one has to be able to revalidate, or a worktree that changed since the
+			// last look can never repaint. Only the check, not the whole prologue: the graph re-emits a
+			// selection on focus churn, and re-running the rest would flash the panel for no reason.
+			if (repoPath != null && this.isWip(sha)) {
+				const cached = this.graphState?.getWipState(repoPath);
+				if (cached != null) {
+					this.revalidateWipIfStale(cached, repoPath, key, undefined);
+				}
+			}
+			return;
+		}
 
 		// New selection — abort any in-flight enrichment so a stale merge-target / PR / autolink
 		// fetch from a prior selection can't write state (or pin the loading flag) over the new one.
@@ -667,7 +1036,13 @@ export class DetailsActions {
 			return;
 		}
 
+		// Landing on a different repo — drop its predecessor's state before seeding any of this one's
+		// below, so "clear then seed" is one synchronous sequence. `clearEnrichmentCaches` keeps this
+		// repo's cache entries, so the hydrate below still paints at t≈0.
+		this.resetRepoScopedStateOnSwitch(repoPath);
+
 		this._lastFetchedKey = key;
+		this._lastFetchedRepoPath = repoPath;
 
 		// For commit selections, hydrate enrichment from cache if we've seen this sha before.
 		// Misses (or WIP) get cleared to undefined so stale prior-selection chips don't linger.
@@ -745,8 +1120,13 @@ export class DetailsActions {
 				// we know we don't have cached merge-target data (set in fetchWipBranchEnrichment).
 
 				const cached = this.graphState?.getWipState(repoPath);
-				if (cached != null) {
+				// Seed through the same gate as every other writer: records the seeded revision (so a delayed older
+				// push can't later apply over it). A cached payload OLDER than what's applied (an explicit refresh
+				// advanced the panel past the cache) is a MISS, not a hit — it has to fall through to the fetch
+				// below or nothing repaints and the panel keeps whatever the last selection left behind.
+				if (cached != null && this.acceptWipRevision(cached.wip, repoPath)) {
 					this.state.wip.set(cached.wip);
+					this.rederiveDeferredDefaultScope(repoPath);
 					if (this.state.activeMode.get() != null) {
 						this.state.wipStale.set(true);
 					}
@@ -758,44 +1138,11 @@ export class DetailsActions {
 						this.state.wipMergeTargetLoading.set(false);
 					}
 
-					if (!cached.isLive) {
-						// Cache hit but the host isn't actively watching this repo (or there's a
-						// pending local edit awaiting reconciliation) — revalidate quietly in the
-						// background so the panel converges without blocking the initial paint.
-						void (async () => {
-							try {
-								await this.resources.wip.fetch(repoPath);
-								if (this._lastFetchedKey !== key) return;
-
-								if (this.resources.wip.status.get() === 'success') {
-									const result = this.resources.wip.value.get();
-									if (result != null) {
-										const { wip } = result;
-										this.state.wip.set(wip);
-										this.graphState?.setWip(repoPath, wip);
-										// Stats travel embedded as `wip.stats`.
-										if (wip.stats != null) {
-											this.graphState?.setWorkingTreeStats(repoPath, wip.stats);
-										}
-										if (this.state.activeMode.get() != null) {
-											this.state.wipStale.set(true);
-										}
-
-										const freshBranchName = wip.branch?.name;
-										if (freshBranchName != null) {
-											this.fetchWipBranchEnrichment(repoPath, freshBranchName, enrichSignal);
-										} else {
-											this.state.wipMergeTargetLoading.set(false);
-										}
-									}
-								}
-							} catch {
-								// ignore background fetch errors if we already have cached content
-							}
-						})();
-					}
+					// Cache hit the entry can't fully vouch for — revalidate quietly in the background so the
+					// panel converges without blocking the initial paint.
+					this.revalidateWipIfStale(cached, repoPath, key, enrichSignal);
 				} else {
-					// Missing cache entry — block and fetch.
+					// Cache miss, or a cached payload older than what's already applied — block and fetch.
 					await this.resources.wip.fetch(repoPath);
 
 					if (this._lastFetchedKey !== key) return;
@@ -804,12 +1151,20 @@ export class DetailsActions {
 						const result = this.resources.wip.value.get();
 						if (result != null) {
 							const { wip } = result;
+							// `resources.wip` is a shared slot and a superseded fetch resolves silently, so
+							// reaching here proves only that SOMETHING succeeded — not that it was ours. Same
+							// guard as the background revalidate; `acceptWipRevision` can't stand in for it,
+							// since revisions are per-repo counters and comparing one repo's against another's
+							// is meaningless.
+							if (wip.repo?.path !== repoPath) return;
+							// Drop if a newer WIP landed while this fetch was in flight.
+							if (!this.acceptWipRevision(wip, repoPath)) return;
+
 							this.state.wip.set(wip);
-							this.graphState?.setWip(repoPath, wip);
-							// Stats travel embedded as `wip.stats`.
-							if (wip.stats != null) {
-								this.graphState?.setWorkingTreeStats(repoPath, wip.stats);
-							}
+							this.rederiveDeferredDefaultScope(repoPath);
+							// Authoritative host result (stats travel embedded as `wip.stats`) — reconciles every
+							// mirror and leaves the entry live, so revisits don't re-buy a `git status`.
+							this.graphState?.ingestWip(repoPath, wip);
 							if (this.state.activeMode.get() != null) {
 								this.state.wipStale.set(true);
 							}
@@ -826,15 +1181,29 @@ export class DetailsActions {
 					}
 				}
 			} else {
+				// Every selection used to ask the host for the commit immediately, and the host answers by
+				// running `git log` — so holding an arrow key spawned one subprocess per keypress, each
+				// cancelled by the next a few ms after it had already started (measured: 20 spawns for 20
+				// presses, 16 thrown away mid-flight). Let a burst settle first. The shell above already
+				// painted from the eager lite, so only the authoritative payload (files/stats) waits, and a
+				// superseded selection now costs no git work at all instead of a killed subprocess.
+				if (!(await this.settleBeforeCommitFetch(key))) return;
+
 				await this.resources.commit.fetch(repoPath, sha);
 
 				if (this._lastFetchedKey !== key) return;
 
 				if (this.resources.commit.status.get() === 'success') {
 					const commit = this.resources.commit.value.get();
-					this.state.commit.set(commit);
-					if (commit != null) {
-						this._commitEnrichmentCache.update(`${sha}:${repoPath}`, { commit: commit });
+					// The graph already knows which refs reach this row and which branches live in sibling
+					// worktrees, so a hit answers worktree-reachability with no git at all. A miss proves
+					// nothing (the row's ref set is a lower bound), so it falls through to the deferred RPC.
+					const knownReachable = this.isReachableFromSiblingWorktree(graphReachability);
+					const next =
+						commit != null ? withCachedEnrichment(commit, commitCacheHit?.commit, knownReachable) : commit;
+					this.state.commit.set(next);
+					if (next != null) {
+						this._commitEnrichmentCache.update(`${sha}:${repoPath}`, { commit: next });
 						this.fetchEnrichment(repoPath, sha, enrichSignal);
 					}
 				}
@@ -856,7 +1225,14 @@ export class DetailsActions {
 			this.services,
 			this.resources.commit,
 			signal,
-			{ repoPath: repoPath, sha: sha, isStash: isStash, autolinksEnabled: this.state.autolinksEnabled.get() },
+			{
+				repoPath: repoPath,
+				sha: sha,
+				isStash: isStash,
+				isUncommitted: this.isWip(sha),
+				autolinksEnabled: this.state.autolinksEnabled.get(),
+				avatarsEnabled: this.state.preferences.get()?.avatars ?? true,
+			},
 			{
 				setBasicAutolinks: (autolinks, formattedMessage) => {
 					this._commitEnrichmentCache.update(cacheKey, {
@@ -882,8 +1258,50 @@ export class DetailsActions {
 					this._commitEnrichmentCache.update(cacheKey, { signature: sig, hasSignature: true });
 					this.state.signature.set(sig);
 				},
+				setAvatars: avatars => this.patchCommit(cacheKey, sha, repoPath, c => applyAvatars(c, avatars)),
+				setReachableFromOtherWorktrees: reachable =>
+					this.patchCommit(cacheKey, sha, repoPath, c => applyReachableFromOtherWorktrees(c, reachable)),
 			},
 		);
+	}
+
+	/**
+	 * Applies a late-arriving enrichment onto the commit already in state (and its cache shell), so every
+	 * consumer of `CommitDetails` — header, popover, compare pole cards, file contexts — upgrades at once.
+	 * Returning the same object from `patch` is a no-op: the identical-value case (the common one) must
+	 * not write, or it re-renders for nothing. Spreading preserves the `files` array identity, so the file
+	 * tree never rebuilds off an avatar patch.
+	 */
+	private patchCommit(
+		cacheKey: string,
+		sha: string,
+		repoPath: string,
+		patch: (commit: CommitDetails) => CommitDetails,
+	): void {
+		const current = this.state.commit.get();
+		// A newer selection already replaced the commit — drop the stale enrichment.
+		if (current == null || current.sha !== sha || current.repoPath !== repoPath) return;
+
+		const next = patch(current);
+		if (next === current) return;
+
+		this.state.commit.set(next);
+		this._commitEnrichmentCache.update(cacheKey, { commit: next });
+	}
+
+	/**
+	 * True when the row's reachable refs include a branch that's checked out in a sibling worktree — which
+	 * means the commit is an ancestor of that worktree's HEAD, since a checked-out branch's tip IS its HEAD.
+	 * Only a positive is sound: the graph's ref set is a documented lower bound (`partial`), and detached
+	 * worktrees contribute no branch at all, so `undefined` means "ask git", not "no".
+	 */
+	private isReachableFromSiblingWorktree(reachability: GitCommitReachability | undefined): true | undefined {
+		const branches = this.graphState?.worktreeBranches;
+		if (!branches?.length || !reachability?.refs.length) return undefined;
+
+		const siblings = new Set(branches);
+		const reachable = reachability.refs.some(r => r.refType === 'branch' && !r.remote && siblings.has(r.name));
+		return reachable ? true : undefined;
 	}
 
 	private fetchWipBranchEnrichment(repoPath: string, branchName: string, signal: AbortSignal): void {
@@ -1120,19 +1538,34 @@ export class DetailsActions {
 		const commit = this.state.commit.get();
 		if (!commit) return;
 
+		const hasCustomPrompt = (prompt?.length ?? 0) > 0;
+		const isStash = commit.stashNumber != null;
+		const telemetryData = { hasCustomPrompt: hasCustomPrompt, isStash: isStash };
+		this.sendTelemetryEvent('graphDetails/commit/explain', telemetryData);
+
 		try {
 			const result = await this.services.graphInspect.explainCommit(commit.repoPath, commit.sha, prompt);
-			if (this.state.commit.get()?.sha !== commit.sha) return;
+			const isStale = this.state.commit.get()?.sha !== commit.sha;
 
 			if ('error' in result && result.error) {
-				this.state.explain.set({ error: result.error });
+				if (!isStale) {
+					this.state.explain.set({ error: result.error });
+				}
+				this.sendTelemetryEvent('graphDetails/commit/explain/failed', telemetryData);
 			} else if ('result' in result && result.result) {
-				this.state.explain.set({ result: result.result });
+				if (!isStale) {
+					this.state.explain.set({ result: result.result });
+				}
+				this.sendTelemetryEvent('graphDetails/commit/explain/completed', telemetryData);
 			}
 		} catch {
-			if (this.state.commit.get()?.sha !== commit.sha) return;
+			if (this.state.commit.get()?.sha !== commit.sha) {
+				this.sendTelemetryEvent('graphDetails/commit/explain/failed', telemetryData);
+				return;
+			}
 
 			this.state.explain.set({ error: { message: 'Failed to explain commit' } });
+			this.sendTelemetryEvent('graphDetails/commit/explain/failed', telemetryData);
 		}
 	}
 
@@ -1157,7 +1590,12 @@ export class DetailsActions {
 			return;
 		}
 
+		// Same clear-then-seed sequence as `fetchDetails` — the eager `commitFrom`/`commitTo` lite paint
+		// below is seeding, so the switch has to be cleared ahead of it.
+		this.resetRepoScopedStateOnSwitch(repoPath);
+
 		this._lastFetchedKey = key;
+		this._lastFetchedRepoPath = repoPath;
 		this.clearCompareEnrichment();
 		// Search context only applies in single-commit selection — clear on entering compare.
 		this.state.searchContext.set(undefined);
@@ -1363,10 +1801,29 @@ export class DetailsActions {
 		const toSha = this.toSha(shas, swapped);
 		if (!fromSha || !toSha || !repoPath) return;
 
+		const telemetryData = {
+			variant: 'compare' as const,
+			hasCustomPrompt: (prompt?.length ?? 0) > 0,
+			tab: undefined as 'all' | 'ahead' | 'behind' | undefined,
+			includeWorkingTree: false,
+		};
+		this.sendTelemetryEvent('graphDetails/compare/explain', telemetryData);
 		this.state.compareExplainBusy.set(true);
-		void this.services.graphInspect.explainCompare(repoPath, fromSha, toSha, prompt).finally(() => {
-			this.state.compareExplainBusy.set(false);
-		});
+		void this.services.graphInspect
+			.explainCompare(repoPath, fromSha, toSha, prompt)
+			.then(
+				result => {
+					if ('error' in result && result.error) {
+						this.sendTelemetryEvent('graphDetails/compare/explain/failed', telemetryData);
+					} else {
+						this.sendTelemetryEvent('graphDetails/compare/explain/completed', telemetryData);
+					}
+				},
+				() => this.sendTelemetryEvent('graphDetails/compare/explain/failed', telemetryData),
+			)
+			.finally(() => {
+				this.state.compareExplainBusy.set(false);
+			});
 	}
 
 	compareGenerateChangelog(shas: string[] | undefined, repoPath: string | undefined): void {
@@ -1375,6 +1832,11 @@ export class DetailsActions {
 		const toSha = this.toSha(shas, swapped);
 		if (!fromSha || !toSha || !repoPath) return;
 
+		this.sendTelemetryEvent('graphDetails/compare/generateChangelog', {
+			variant: 'compare',
+			tab: undefined,
+			includeWorkingTree: false,
+		});
 		this.state.compareGenerateChangelogBusy.set(true);
 		void this.services.graphInspect.generateChangelogCompare(repoPath, fromSha, toSha).finally(() => {
 			this.state.compareGenerateChangelogBusy.set(false);
@@ -1400,16 +1862,40 @@ export class DetailsActions {
 		const refs = this.getCompareAIRefs();
 		if (!repoPath || !refs) return;
 
+		const telemetryData = {
+			variant: 'branchCompare' as const,
+			hasCustomPrompt: (prompt?.length ?? 0) > 0,
+			tab: this.state.branchCompareActiveTab.get(),
+			includeWorkingTree: this.state.branchCompareIncludeWorkingTree.get(),
+		};
+		this.sendTelemetryEvent('graphDetails/compare/explain', telemetryData);
 		this.state.compareExplainBusy.set(true);
-		void this.services.graphInspect.explainCompare(repoPath, refs.fromRef, refs.toRef, prompt).finally(() => {
-			this.state.compareExplainBusy.set(false);
-		});
+		void this.services.graphInspect
+			.explainCompare(repoPath, refs.fromRef, refs.toRef, prompt)
+			.then(
+				result => {
+					if ('error' in result && result.error) {
+						this.sendTelemetryEvent('graphDetails/compare/explain/failed', telemetryData);
+					} else {
+						this.sendTelemetryEvent('graphDetails/compare/explain/completed', telemetryData);
+					}
+				},
+				() => this.sendTelemetryEvent('graphDetails/compare/explain/failed', telemetryData),
+			)
+			.finally(() => {
+				this.state.compareExplainBusy.set(false);
+			});
 	}
 
 	branchCompareGenerateChangelog(repoPath: string | undefined): void {
 		const refs = this.getCompareAIRefs();
 		if (!repoPath || !refs) return;
 
+		this.sendTelemetryEvent('graphDetails/compare/generateChangelog', {
+			variant: 'branchCompare',
+			tab: this.state.branchCompareActiveTab.get(),
+			includeWorkingTree: this.state.branchCompareIncludeWorkingTree.get(),
+		});
 		this.state.compareGenerateChangelogBusy.set(true);
 		void this.services.graphInspect.generateChangelogCompare(repoPath, refs.fromRef, refs.toRef).finally(() => {
 			this.state.compareGenerateChangelogBusy.set(false);
@@ -1649,6 +2135,11 @@ export class DetailsActions {
 			currentRef,
 		);
 		if (!result) {
+			this.sendTelemetryEvent('graphDetails/compare/refChanged', {
+				side: side,
+				changed: false,
+				refType: undefined,
+			});
 			// Picker cancelled — restore state for the unchanged identity. For the right side
 			// specifically we already cleared `rightRefWorktreePath` synchronously above, which
 			// hid the IWT toggle. Without this refetch the toggle would stay hidden permanently
@@ -1659,6 +2150,11 @@ export class DetailsActions {
 			return;
 		}
 
+		this.sendTelemetryEvent('graphDetails/compare/refChanged', {
+			side: side,
+			changed: true,
+			refType: result.refType,
+		});
 		// Write both the ref name AND its type so the panel's branch button renders the correct
 		// icon (branch / tag / commit) after the pick — previously only the name was updated, so
 		// picking a tag when a branch was set kept the branch icon next to the new tag name.
@@ -1683,6 +2179,10 @@ export class DetailsActions {
 		const rightRef = this.state.branchCompareRightRef.get();
 		if (!leftRef || !rightRef) return;
 
+		this.sendTelemetryEvent('graphDetails/compare/openedInSearchAndCompare', {
+			tab: this.state.branchCompareActiveTab.get(),
+			includeWorkingTree: this.state.branchCompareIncludeWorkingTree.get(),
+		});
 		// S&C's `compare(repoPath, ref1, ref2)` contract is `(head/Compare, compareWith/Base)`
 		// (see `searchAndCompareView.compare` + `selectForCompare` flow). Our convention is the
 		// opposite — `leftRef = Base, rightRef = Compare`. Swap on the wire so the S&C node opens
@@ -1737,6 +2237,15 @@ export class DetailsActions {
 	}
 
 	switchCompareTab(tab: 'all' | 'ahead' | 'behind', repoPath: string | undefined): void {
+		const previousTab = this.state.branchCompareActiveTab.get();
+		if (previousTab !== tab) {
+			this.sendTelemetryEvent('graphDetails/compare/tabChanged', {
+				'tab.new': tab,
+				'tab.old': previousTab,
+				'ahead.count': this.state.branchCompareAheadCount.get(),
+				'behind.count': this.state.branchCompareBehindCount.get(),
+			});
+		}
 		this.state.branchCompareActiveTab.set(tab);
 		// Re-validate counts/all-files/mergeBase on every tab switch — if the underlying repo
 		// changed since the last fetch (a new commit landed, a fetch ran, a branch was rebased),
@@ -2114,11 +2623,21 @@ export class DetailsActions {
 			}
 		}
 
-		// Late-arriving branch commits: if we entered a WIP review/compose mode before commits
-		// loaded, the default scope may have been computed without them. Re-derive only if the
-		// current scope still looks like the "deferred" default — i.e. no working/staged files
-		// were selected and includeShas is empty. Once the user drags or working changes are
-		// included, we leave it alone.
+		this.rederiveDeferredDefaultScope(repoPath);
+	}
+
+	/**
+	 * Finalize a "deferred" default scope once fresh data for `repoPath` arrives. Runs after both
+	 * the WIP fetch and the branch-commits fetch, in either completion order: a mode entry that
+	 * couldn't see this repo's data yet (cold load, or a cross-repo mode entry where the state
+	 * still held the outgoing repo's) leaves the deferred default (no flags, no shas), and this
+	 * re-derives it with buildDefaultScope's priority: working/staged changes → unpushed commits →
+	 * HEAD. Only acts while the scope still looks deferred — once the user drags or working
+	 * changes are included, it's left alone. Only trusts WIP/commits that belong to `repoPath`;
+	 * the commits fallback additionally waits for fresh WIP so a clean tree is a fact, not a
+	 * stale read.
+	 */
+	private rederiveDeferredDefaultScope(repoPath: string): void {
 		const activeMode = this.state.activeMode.get();
 		const activeContext = this.state.activeModeContext.get();
 		if (activeContext !== 'wip' || (activeMode !== 'review' && activeMode !== 'compose')) return;
@@ -2128,18 +2647,34 @@ export class DetailsActions {
 		if (currentScope.includeStaged || currentScope.includeUnstaged) return;
 		if ((currentScope.includeShas?.length ?? 0) > 0) return;
 
-		// Mirror buildDefaultScope's priority: unpushed commits → most recent commit (HEAD).
-		const commits = this.state.branchCommits.get();
-		const unpushedShas = commits?.filter(c => !c.pushed).map(c => c.sha) ?? [];
-		const refreshedIncludeShas = unpushedShas.length > 0 ? unpushedShas : commits?.length ? [commits[0].sha] : [];
-		if (refreshedIncludeShas.length === 0) return;
+		const wip = this.state.wip.get();
+		const wipFresh = wip != null && normalizePath(wip.repo.path) === normalizePath(repoPath);
+		const wipFiles = wipFresh ? (wip.changes?.files ?? []) : [];
+		const hasUnstaged = wipFiles.some(f => !f.staged);
+		const hasStaged = wipFiles.some(f => f.staged);
 
-		const refreshedScope: ScopeSelection = {
-			type: 'wip',
-			includeStaged: false,
-			includeUnstaged: false,
-			includeShas: refreshedIncludeShas,
-		};
+		let refreshedScope: ScopeSelection;
+		if (hasUnstaged || hasStaged) {
+			refreshedScope = { type: 'wip', includeUnstaged: hasUnstaged, includeStaged: hasStaged, includeShas: [] };
+		} else {
+			const commitsFresh =
+				this._branchCommitsFetchedRepoPath != null &&
+				normalizePath(this._branchCommitsFetchedRepoPath) === normalizePath(repoPath);
+			if (!wipFresh || !commitsFresh) return;
+
+			const commits = this.state.branchCommits.get();
+			const unpushedShas = commits?.filter(c => !c.pushed).map(c => c.sha) ?? [];
+			const refreshedIncludeShas =
+				unpushedShas.length > 0 ? unpushedShas : commits?.length ? [commits[0].sha] : [];
+			if (refreshedIncludeShas.length === 0) return;
+
+			refreshedScope = {
+				type: 'wip',
+				includeStaged: false,
+				includeUnstaged: false,
+				includeShas: refreshedIncludeShas,
+			};
+		}
 
 		this.state.scope.set(refreshedScope);
 		void this.resources.scopeFiles.fetch(repoPath, refreshedScope);
@@ -2179,6 +2714,28 @@ export class DetailsActions {
 				this._branchCommitsLoadMoreController = undefined;
 				this.state.branchCommitsLoadingMore.set(false);
 			}
+		}
+	}
+
+	/** Ensure the seeded recompose shas are all present in the loaded branch commits so the scope
+	 *  picker can display them; pages back (bounded) when they fall past the first page. */
+	async ensureBranchCommitsCover(repoPath: string | undefined, shas: readonly string[]): Promise<void> {
+		if (!repoPath || shas.length === 0) return;
+
+		const fetchedFresh =
+			this._branchCommitsFetchedRepoPath != null &&
+			normalizePath(this._branchCommitsFetchedRepoPath) === normalizePath(repoPath);
+		if (!fetchedFresh) {
+			await this.fetchBranchCommits(repoPath);
+		}
+		const covered = (): boolean => {
+			const loaded = new Set(this.state.branchCommits.get()?.map(c => c.sha) ?? []);
+			return shas.every(s => loaded.has(s));
+		};
+		let guard = 0;
+		while (!covered() && this.state.branchCommitsHasMore.get() && guard < 10) {
+			guard++;
+			await this.loadMoreBranchCommits(repoPath);
 		}
 	}
 
@@ -2326,10 +2883,18 @@ export class DetailsActions {
 			.map(i => i.id);
 
 		if (current.type === 'wip') {
+			// Compose-only: a selection containing unstaged must also carry staged — unstaged diffs
+			// are index-relative, so composing unstaged without staged is ill-defined. The picker
+			// enforces this for compose; normalize here as a backstop. Review has no such
+			// restriction — its diff calls handle staged/unstaged independently.
+			const includeUnstaged = selectedIds.has('unstaged');
+			const isCompose = this.state.activeMode.get() === 'compose';
 			return {
 				type: 'wip',
-				includeStaged: selectedIds.has('staged'),
-				includeUnstaged: selectedIds.has('unstaged'),
+				includeStaged:
+					selectedIds.has('staged') ||
+					(isCompose && includeUnstaged && scopeItems.some(i => i.id === 'staged')),
+				includeUnstaged: includeUnstaged,
 				includeShas: pickedShas,
 			};
 		}
@@ -2382,33 +2947,35 @@ export class DetailsActions {
 			});
 			if ('error' in result && result.error) {
 				this.resources.compose.mutate({ error: { message: result.error.message } });
-			} else {
-				// Engagement teardown — mirrors the full `hideMode` clear so a stale
-				// `activeModeRepoPath`/`Sha`/`Shas`/`scope`/`aiExcludedFiles` can't bleed into the
-				// next action via `currentAnchor()`. (Registry-entry removal is handled by the
-				// controller's `applyPlan` wrapper since the action has no controller reference.)
-				this.state.activeMode.set(null);
-				this.state.activeModeContext.set(null);
-				this.state.activeModeRepoPath.set(undefined);
-				this.state.activeModeSha.set(undefined);
-				this.state.activeModeShas.set(undefined);
-				this.state.scope.set(undefined);
-				this.state.aiExcludedFiles.set(undefined);
-				// Match `hideMode`'s fetch-generation bump so a slow `fetchAiExcludedFiles` RPC
-				// from the prior `toggleMode` tail can't write its result back into the
-				// just-cleared signal after the apply completes.
-				this.invalidateAiExcludedFilesFetch();
-				this.state.wipStale.set(false);
-				this.resources.compose.reset();
-				this.state.composeForwardAvailable.set(false);
-				this.state.composeBackPreview.set(undefined);
-				this.state.composePreErrorValue.set(undefined);
-				this.state.composeLastFailedAction.set(undefined);
-				this.state.composeLastCommitAllIncludedIds.set(undefined);
-				void this.refreshScopedAiModel();
-				this.refreshWip();
-				void this.fetchDetails(sha, repoPath, graphReachability);
+				return;
 			}
+
+			// Engagement teardown — mirrors the full `hideMode` clear so a stale
+			// `activeModeRepoPath`/`Sha`/`Shas`/`scope`/`aiExcludedFiles` can't bleed into the
+			// next action via `currentAnchor()`. (Registry-entry removal is handled by the
+			// controller's `applyPlan` wrapper since the action has no controller reference.)
+			this.state.activeMode.set(null);
+			this.state.activeModeContext.set(null);
+			this.state.activeModeRepoPath.set(undefined);
+			this.state.activeModeSha.set(undefined);
+			this.state.activeModeShas.set(undefined);
+			this.state.scope.set(undefined);
+			this.state.aiExcludedFiles.set(undefined);
+			// Match `hideMode`'s fetch-generation bump so a slow `fetchAiExcludedFiles` RPC
+			// from the prior `toggleMode` tail can't write its result back into the
+			// just-cleared signal after the apply completes.
+			this.invalidateAiExcludedFilesFetch();
+			this.state.wipStale.set(false);
+			this.resources.compose.reset();
+			this.state.composeForwardAvailable.set(false);
+			this.state.composeBackPreview.set(undefined);
+			this.state.composePreErrorValue.set(undefined);
+			this.state.composeLastFailedAction.set(undefined);
+			this.state.composeLastCommitAllIncludedIds.set(undefined);
+			this.state.composeCurrentCacheKey.set(undefined);
+			void this.refreshScopedAiModel();
+			this.refreshWip();
+			void this.fetchDetails(sha, repoPath, graphReachability);
 		} catch {
 			this.resources.compose.mutate({ error: { message: 'Failed to commit plan.' } });
 		} finally {
@@ -2416,33 +2983,39 @@ export class DetailsActions {
 		}
 	}
 
-	openComposer(repoPath: string | undefined): void {
-		if (!repoPath) return;
-
-		void this.services.commands.execute('gitlens.composeCommits', { repoPath: repoPath, source: 'graph' });
+	/** Emits the real-commit/compare file open/diff engagement signal. The virtual-FS opens
+	 *  (compose/resolve proposed commits) are tracked separately via {@link runVirtualFileOpen}. */
+	private trackFileOpened(action: GraphDetailsFileAction, filesCount = 1): void {
+		this.sendTelemetryEvent('graphDetails/file/opened', { action: action, 'files.count': filesCount });
 	}
 
 	openFile(detail: FileChangeListItemDetail, ref?: { ref: string; stash?: boolean }): void {
+		this.trackFileOpened('open');
 		fileActions.openFile(this.services.files, detail, detail.showOptions, ref);
 	}
 
 	openFileOnRemote(detail: FileChangeListItemDetail, ref?: { ref: string; stash?: boolean }): void {
+		this.trackFileOpened('openOnRemote');
 		fileActions.openFileOnRemote(this.services.files, detail, ref);
 	}
 
 	openFileCompareWorking(detail: FileChangeListItemDetail, ref?: { ref: string; stash?: boolean }): void {
+		this.trackFileOpened('compareWorking');
 		fileActions.openFileCompareWorking(this.services.files, detail, detail.showOptions, ref);
 	}
 
 	openFileComparePrevious(detail: FileChangeListItemDetail, ref?: { ref: string; stash?: boolean }): void {
+		this.trackFileOpened('comparePrevious');
 		fileActions.openFileComparePrevious(this.services.files, detail, detail.showOptions, ref);
 	}
 
 	openFileCompareWipChanges(detail: FileChangeListItemDetail): void {
+		this.trackFileOpened('compareWip');
 		fileActions.openFileCompareWipChanges(this.services.files, detail, detail.showOptions);
 	}
 
 	openFileCompareBetween(detail: FileChangeListItemDetail, fromRef?: string, toRef?: string): void {
+		this.trackFileOpened('compareBetween');
 		fileActions.openFileCompareBetween(this.services.files, detail, detail.showOptions, fromRef, toRef);
 	}
 
@@ -2457,6 +3030,14 @@ export class DetailsActions {
 	openVirtualFileComparePrevious(detail: FileChangeListItemDetail, ref: fileActions.VirtualRefShape): void {
 		void this.runVirtualFileOpen('comparePrevious', 1, () =>
 			this.services.files.openVirtualFileComparePrevious(ref, detail, detail.showOptions),
+		);
+	}
+
+	/** Diff a resolved file's AI content against its conflicted snapshot via the virtual FS — no
+	 *  disk write. The `resolve` virtual session pairs `resolved` (rhs) with `conflicted` (lhs). */
+	openResolutionDiff(file: GitFileChangeShape, ref: fileActions.VirtualRefShape): void {
+		void this.runVirtualFileOpen('comparePrevious', 1, () =>
+			this.services.files.openVirtualFileComparePrevious(ref, file),
 		);
 	}
 
@@ -2493,10 +3074,12 @@ export class DetailsActions {
 	}
 
 	executeFileAction(detail: FileChangeListItemDetail, ref?: { ref: string; stash?: boolean }): void {
+		this.trackFileOpened('defaultAction');
 		fileActions.executeFileAction(this.services.files, detail, detail.showOptions, ref);
 	}
 
 	openMultipleChanges(args: OpenMultipleChangesArgs): void {
+		this.trackFileOpened('multiDiff', args.files.length);
 		fileActions.openMultipleChanges(this.services.files, args);
 	}
 
@@ -2504,9 +3087,25 @@ export class DetailsActions {
 		fireAndForget(this.services.drafts.copyWipPatchToClipboard(repoPath, scope, uris), 'copy WIP patch');
 	}
 
+	/**
+	 * Copy a commit's (or stash's) full diff to the system clipboard.
+	 * `to` is the commit sha, `from` the parent (undefined for a root commit).
+	 */
+	copyCommitPatchToClipboard(repoPath: string, to: string, from?: string): void {
+		fireAndForget(this.services.drafts.copyCommitPatchToClipboard(repoPath, to, from), 'copy commit patch');
+	}
+
 	stageFile(detail: FileChangeListItemDetail): void {
-		this.optimisticallyUpdateFileStaged(detail.path, true);
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.stageFile(detail), 'stage file');
+		// Conflicted files may hit a host prompt the user can cancel (we can't check markers here), so
+		// skip optimism and let the host's working-tree push reflect the real result.
+		if (!isConflictStatus(detail.status)) {
+			this.optimisticallyUpdateFileStaged(detail.path, true);
+		}
+		this.sendStagingTelemetry('stage', 'file', 1);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.stageFile(detail), 'stage file', {
+			operation: 'stage',
+			scope: 'file',
+		});
 	}
 
 	openConflictChanges(detail: FileChangeListItemDetail, side: 'current' | 'incoming'): void {
@@ -2516,77 +3115,168 @@ export class DetailsActions {
 	resolveAllConflicts(repoPath: string | undefined, resolution: 'current' | 'incoming'): void {
 		if (!repoPath) return;
 
+		this.sendTelemetryEvent('graph/wip/staging/resolveConflict', { scope: 'all', side: resolution });
 		this._pendingStagingOp = this.runStagingOp(
 			this.services.repository.resolveAllConflicts(repoPath, resolution),
 			'resolve all conflicts',
+			{ operation: 'resolveConflict', scope: 'all' },
 		);
+	}
+
+	/** Lazy fetch of per-side conflict details for the WIP Conflict Details sheet. */
+	getConflictDetails(repoPath: string, filePath: string, status: string): Promise<ConflictDetails | undefined> {
+		return this.services.repository.getConflictDetails(repoPath, filePath, status);
+	}
+
+	/** Resolve a single conflicted file by taking one side, then stage it. */
+	stageConflictSide(repoPath: string, filePath: string, status: string, side: 'current' | 'incoming'): void {
+		this.sendTelemetryEvent('graph/wip/staging/resolveConflict', { scope: 'file', side: side });
+		this._pendingStagingOp = this.runStagingOp(
+			this.services.repository.stageConflictResolution(
+				{ repoPath: repoPath, path: filePath, status: status as GitFileConflictStatus },
+				side,
+			),
+			'stage conflict side',
+			{ operation: 'resolveConflict', scope: 'file' },
+		);
+	}
+
+	/** Open the diff a single commit made to the conflicted file (commit^ → commit). */
+	openConflictCommit(repoPath: string, filePath: string, sha: string): void {
+		this.openFileByPath(filePath, repoPath, { lhs: `${sha}^`, rhs: sha });
 	}
 
 	unstageFile(detail: FileChangeListItemDetail): void {
 		this.optimisticallyUpdateFileStaged(detail.path, false);
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.unstageFile(detail), 'unstage file');
+		this.sendStagingTelemetry('unstage', 'file', 1);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.unstageFile(detail), 'unstage file', {
+			operation: 'unstage',
+			scope: 'file',
+		});
 	}
 
 	stageFiles(files: GitFileChangeShape[]): void {
 		for (const file of files) {
 			this.optimisticallyUpdateFileStaged(file.path, true);
 		}
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.stageFiles(files), 'stage files');
+		this.sendStagingTelemetry('stage', 'files', files.length);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.stageFiles(files), 'stage files', {
+			operation: 'stage',
+			scope: 'files',
+		});
 	}
 
 	unstageFiles(files: GitFileChangeShape[]): void {
 		for (const file of files) {
 			this.optimisticallyUpdateFileStaged(file.path, false);
 		}
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.unstageFiles(files), 'unstage files');
+		this.sendStagingTelemetry('unstage', 'files', files.length);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.unstageFiles(files), 'unstage files', {
+			operation: 'unstage',
+			scope: 'files',
+		});
 	}
 
 	stageAll(repoPath: string | undefined): void {
 		if (!repoPath) return;
 
-		this.optimisticallyUpdateAllFilesStaged(true);
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.stageAll(repoPath), 'stage all');
+		const wip = this.state.wip.get();
+		const hasConflicts = wip?.changes?.hasConflicts ?? false;
+		// Same as stageFile — skip optimism when the repo has conflicts (host may prompt + cancel).
+		if (!hasConflicts) {
+			this.optimisticallyUpdateAllFilesStaged(true);
+		}
+		this.sendStagingTelemetry('stage', 'all', wip?.changes?.files?.length ?? 0, hasConflicts);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.stageAll(repoPath), 'stage all', {
+			operation: 'stage',
+			scope: 'all',
+		});
 	}
 
 	unstageAll(repoPath: string | undefined): void {
 		if (!repoPath) return;
 
 		this.optimisticallyUpdateAllFilesStaged(false);
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.unstageAll(repoPath), 'unstage all');
+		this.sendStagingTelemetry('unstage', 'all', this.state.wip.get()?.changes?.files?.length ?? 0);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.unstageAll(repoPath), 'unstage all', {
+			operation: 'unstage',
+			scope: 'all',
+		});
 	}
 
 	discardFile(detail: FileChangeListItemDetail): void {
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.discardFile(detail), 'discard file');
+		this.sendDiscardTelemetry('file', 1);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.discardFile(detail), 'discard file', {
+			operation: 'discard',
+			scope: 'file',
+		});
 	}
 
 	discardFiles(files: GitFileChangeShape[]): void {
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.discardFiles(files), 'discard files');
+		this.sendDiscardTelemetry('files', files.length);
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.discardFiles(files), 'discard files', {
+			operation: 'discard',
+			scope: 'files',
+		});
 	}
 
 	stashFile(detail: FileChangeListItemDetail): void {
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.stashFile(detail), 'stash file');
+		this.sendTelemetryEvent('graph/wip/staging/stash', { scope: 'file', 'files.count': 1 });
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.stashFile(detail), 'stash file', {
+			operation: 'stash',
+			scope: 'file',
+		});
 	}
 
 	stashFiles(files: GitFileChangeShape[]): void {
-		this._pendingStagingOp = this.runStagingOp(this.services.repository.stashFiles(files), 'stash files');
+		this.sendTelemetryEvent('graph/wip/staging/stash', { scope: 'files', 'files.count': files.length });
+		this._pendingStagingOp = this.runStagingOp(this.services.repository.stashFiles(files), 'stash files', {
+			operation: 'stash',
+			scope: 'files',
+		});
 	}
 
 	discardUnstagedFiles(repoPath: string | undefined): void {
 		if (!repoPath) return;
 
+		this.sendDiscardTelemetry('unstaged', undefined);
 		this._pendingStagingOp = this.runStagingOp(
 			this.services.repository.discardUnstagedFiles(repoPath),
 			'discard unstaged files',
+			{ operation: 'discard', scope: 'unstaged' },
 		);
 	}
 
 	discardStagedFiles(repoPath: string | undefined): void {
 		if (!repoPath) return;
 
+		this.sendDiscardTelemetry('staged', undefined);
 		this._pendingStagingOp = this.runStagingOp(
 			this.services.repository.discardStagedFiles(repoPath),
 			'discard staged files',
+			{ operation: 'discard', scope: 'staged' },
 		);
+	}
+
+	private sendStagingTelemetry(
+		action: 'stage' | 'unstage',
+		scope: GraphWipStagingScope,
+		filesCount: number,
+		hasConflicts?: boolean,
+	): void {
+		if (action === 'stage') {
+			this.sendTelemetryEvent('graph/wip/staging/stage', {
+				scope: scope,
+				'files.count': filesCount,
+				hasConflicts: hasConflicts ?? this.state.wip.get()?.changes?.hasConflicts ?? false,
+			});
+		} else {
+			this.sendTelemetryEvent('graph/wip/staging/unstage', { scope: scope, 'files.count': filesCount });
+		}
+	}
+
+	private sendDiscardTelemetry(scope: GraphWipStagingDiscardScope, filesCount: number | undefined): void {
+		this.sendTelemetryEvent('graph/wip/staging/discard', { scope: scope, 'files.count': filesCount });
 	}
 
 	/**
@@ -2596,11 +3286,18 @@ export class DetailsActions {
 	 * push directly. The optimistic update (already fired by the caller) covers the brief
 	 * window between RPC dispatch and the push arriving.
 	 */
-	private async runStagingOp(op: Promise<void>, context: string): Promise<void> {
+	private async runStagingOp(
+		op: Promise<void>,
+		context: string,
+		telemetry?: { operation: GraphWipStagingOperation; scope: string },
+	): Promise<void> {
 		try {
 			await op;
 		} catch (ex) {
 			Logger.error(ex, `Staging op failed (${context})`);
+			if (telemetry != null) {
+				this.sendTelemetryEvent('graph/wip/staging/failed', telemetry);
+			}
 		}
 	}
 
@@ -2622,13 +3319,33 @@ export class DetailsActions {
 		const result = this.resources.wip.value.get();
 		if (result == null) return;
 
-		this.applyWipPayload(result.wip, repoPath);
-		// Reseed the header/row badge source from the SAME `git status` the panel just applied.
-		// Stats travel embedded as `result.wip.stats` (one git-authoritative object), so the
-		// panel's file list and the header counts can't disagree.
-		if (result.wip.stats != null) {
-			this.graphState?.setWorkingTreeStats(repoPath, result.wip.stats);
-		}
+		// `applyWipPayload` enforces the ordering: if a push reflecting a LATER working tree landed while this
+		// refresh was in flight, this (older) result is dropped — and if this refresh is the newer read, it wins.
+		// Bail on drop so the badge isn't reseeded from a payload the panel didn't apply.
+		if (!this.applyWipPayload(result.wip, repoPath)) return;
+
+		// Write the accepted response back to the graph cache, like every other fetch site. Skipping it leaves the
+		// cache holding an OLDER revision than the panel just applied, so re-selecting this repo later seeds a
+		// payload its own gate then rejects — a blank panel until the next push. `ingestWip` also reseeds the
+		// header/row badge from the SAME `git status` the panel just applied: stats travel embedded as
+		// `result.wip.stats` (one git-authoritative object), so the file list and the counts can't disagree.
+		this.graphState?.ingestWip(repoPath, result.wip);
+	}
+
+	/**
+	 * Re-fetch the displayed commit's details with a genuinely fresh round-trip, bypassing the
+	 * `fetchDetails` dedup. Mirrors {@link refetchWipQuiet} for the commit Refresh button —
+	 * enrichment chips stay visible (hydrated from cache) while the body + enrichment re-query.
+	 */
+	async refetchCommitQuiet(
+		sha: string,
+		repoPath: string,
+		graphReachability?: GitCommitReachability,
+		commitLite?: CommitDetails,
+	): Promise<void> {
+		// Bypass the fetch dedup so a same-selection click always re-queries the host.
+		this._lastFetchedKey = undefined;
+		await this.fetchDetails(sha, repoPath, graphReachability, { commitLite: commitLite });
 	}
 
 	/**
@@ -2651,16 +3368,50 @@ export class DetailsActions {
 		this.applyWipPayload(wip, repoPath);
 	}
 
-	private applyWipPayload(wip: Wip, repoPath: string): void {
+	/**
+	 * Gates every `state.wip` write on the host's per-repo freshness marker ({@link Wip.revision}), recording it on
+	 * accept. Payloads race: a debounced/delayed push can land after a newer push or a forced refresh, and a fetch
+	 * can resolve after a newer push. Ordering by arrival would let any of those revert newer state, so we compare
+	 * the host's marker instead and drop anything reflecting an older working tree than what's already applied.
+	 * Payloads without a revision (non-Graph producers) are always accepted — they have no ordering to enforce.
+	 */
+	private acceptWipRevision(wip: Wip, repoPath: string): boolean {
+		if (wip.revision == null) return true;
+
+		const lastApplied = this._lastAppliedWipRevision.get(repoPath);
+		if (lastApplied != null && wip.revision < lastApplied) return false;
+
+		this._lastAppliedWipRevision.set(repoPath, wip.revision);
+		return true;
+	}
+
+	/** @returns `false` if the payload was dropped as older than what's already applied (see {@link acceptWipRevision}). */
+	private applyWipPayload(wip: Wip, repoPath: string): boolean {
+		if (!this.acceptWipRevision(wip, repoPath)) return false;
+
 		const prev = this.state.wip.get();
 		this.state.wip.set(wip);
 		if (this.state.activeMode.get() != null) {
 			this.state.wipStale.set(true);
+
+			// A working-tree change can move the files inside the current wip scope (or drop a
+			// staged/unstaged row entirely). Refetch the scoped file list so the curation list and
+			// the eventual run stay in agreement with the picker. Scoped to the active mode's repo so
+			// a background repo's wip tick can't clobber the foreground scope's file list, and to wip
+			// scopes since commit/compare scopes don't shift on a working-tree tick. (The picker
+			// separately re-emits scope-change when its selection can no longer be honored, which
+			// reconciles the stored scope *identity*; this covers identity-stable ticks whose file
+			// set moved.)
+			const scope = this.state.scope.get();
+			if (scope?.type === 'wip' && repoPath === this.state.activeModeRepoPath.get()) {
+				void this.resources.scopeFiles.fetch(repoPath, scope);
+			}
 		}
 		const branchName = wip.branch?.name;
 		if (branchName != null && prev?.branch?.name !== branchName) {
 			this.fetchWipBranchEnrichment(repoPath, branchName, this.resetEnrichment());
 		}
+		return true;
 	}
 
 	private optimisticallyUpdateFileStaged(filePath: string, newStaged: boolean): void {
@@ -2768,6 +3519,19 @@ export class DetailsActions {
 
 		const all = !hasStagedFiles && smartCommit;
 
+		// Shared commit composition — emitted on both success and failure so they form a
+		// comparable funnel. Privacy-safe: counts/booleans + message length only.
+		const files = wip?.changes?.files;
+		const composition = {
+			amend: isAmend,
+			all: all,
+			smartCommit: smartCommit,
+			hasStagedFiles: hasStagedFiles,
+			'files.staged.count': files?.filter(f => f.staged).length ?? 0,
+			'files.total.count': files?.length ?? 0,
+			'message.length': message?.length ?? 0,
+		};
+
 		// Clear any prior error and enter the in-flight state (spinner + input lock).
 		this.state.commitError.set(undefined);
 		this.state.committing.set(true);
@@ -2786,13 +3550,14 @@ export class DetailsActions {
 				this.optimisticallyClearCommittedFiles(all);
 				this.refreshWip();
 				void this.fetchDetails(sha, repoPath);
+				this.sendTelemetryEvent('graph/wip/commit/succeeded', composition);
 			} else {
 				// Message + amend are intentionally preserved so the user can fix and retry.
 				this.state.commitError.set(result.summary);
 				this.sendTelemetryEvent('graph/wip/commit/failed', {
+					...composition,
 					reason: result.reason,
 					hasOutput: result.hasOutput,
-					amend: isAmend,
 				});
 			}
 		} finally {
@@ -2811,6 +3576,8 @@ export class DetailsActions {
 			this.state.commitMessage.get() || undefined,
 		);
 		if (coauthors == null) return; // cancelled — leave the message untouched
+
+		this.sendTelemetryEvent('graph/wip/commit/coauthorsAdded', { count: coauthors.length });
 
 		// Append against the live message so text typed before opening the picker is preserved.
 		this.state.commitMessage.set(appendCoauthorsToMessage(this.state.commitMessage.get(), coauthors));
@@ -2938,11 +3705,13 @@ export class DetailsActions {
 }
 
 /**
- * Maps the active details mode to the AI model scope it owns. Compose and review each
+ * Maps the active details mode to the AI model scope it owns. Compose, review, and resolve each
  * maintain their own remembered model; compare (and `null`) read the global default.
  */
 function scopeForActiveMode(
-	mode: 'review' | 'compose' | 'compare' | null | undefined,
-): 'compose' | 'review' | undefined {
-	return mode === 'compose' || mode === 'review' ? mode : undefined;
+	mode: 'review' | 'compose' | 'resolve' | 'compare' | null | undefined,
+): 'compose' | 'review' | 'resolve' | undefined {
+	// Compose, review, and resolve each maintain their own remembered model; compare (and `null`)
+	// read the global default.
+	return mode === 'compose' || mode === 'review' || mode === 'resolve' ? mode : undefined;
 }

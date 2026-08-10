@@ -1,7 +1,6 @@
 import type { PropertyValueMap, TemplateResult } from 'lit';
 import { css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
-import { repeat } from 'lit/directives/repeat.js';
 import { when } from 'lit/directives/when.js';
 import type { AgentSessionPhase } from '@gitlens/agents/types.js';
 import { isActiveAgentPhase } from '@gitlens/agents/types.js';
@@ -10,14 +9,10 @@ import { uncommitted } from '@gitlens/git/models/revision.js';
 import { canStageCurrent, canStageIncoming } from '@gitlens/git/utils/conflictResolution.utils.js';
 import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
 import { isDescendant, normalizePath, relative } from '@gitlens/utils/path.js';
-import { equalsIgnoreCase } from '@gitlens/utils/string.js';
 import type { AgentSessionState } from '../../../../agents/models/agentSessionState.js';
-import type { Draft } from '../../../../plus/drafts/models/drafts.js';
-import { createCommandLink } from '../../../../system/commands.js';
 import { serializeWebviewItemContext } from '../../../../system/webview.js';
-import type { DetailsItemTypedContext, DraftState, Wip } from '../../../commitDetails/protocol.js';
+import type { DetailsItemTypedContext, Wip } from '../../../commitDetails/protocol.js';
 import { buildFolderContext } from '../../../commitDetails/protocol.js';
-import type { ComposerCommandArgs } from '../../../plus/composer/registration.js';
 import type { Change } from '../../../plus/patchDetails/protocol.js';
 import type { TreeItemAction, TreeItemBase, TreeItemCheckedDetail } from '../../shared/components/tree/base.js';
 import { detailsBaseStyles } from './gl-details-base.css.js';
@@ -25,19 +20,24 @@ import type { File } from './gl-details-base.js';
 import { GlDetailsBase } from './gl-details-base.js';
 import { detailsWipPanelStyles } from './gl-details-wip-panel.css.js';
 import type { CreatePatchState, GenerateState } from './gl-inspect-patch.js';
+import '../../plus/graph/components/gl-details-wip-empty-pane.js';
+import '../../plus/shared/components/merge-rebase-status.js';
+import '../../shared/components/actions/action-nav.js';
+import '../../shared/components/avatar/avatar.js';
+import '../../shared/components/branch-name.js';
 import '../../shared/components/button.js';
 import '../../shared/components/button-container.js';
-import '../../shared/components/branch-name.js';
-import '../../shared/components/code-icon.js';
-import '../../shared/components/panes/pane-group.js';
-import '../../shared/components/avatar/avatar.js';
 import '../../shared/components/chips/action-chip.js';
+import '../../shared/components/code-icon.js';
 import '../../shared/components/commit/commit-stats.js';
+import '../../shared/components/formatted-date.js';
+import '../../shared/components/panes/pane-group.js';
 import '../../shared/components/pills/tracking.js';
+import '../../shared/components/rich/issue-pull-request.js';
 import '../../shared/components/tree/gl-wip-tree-pane.js';
-import '../../plus/shared/components/merge-rebase-status.js';
-import '../../plus/graph/components/gl-details-wip-empty-pane.js';
-import './gl-inspect-patch.js';
+import '../../shared/components/tree/tree.js';
+import '../../shared/components/tree/tree-item.js';
+import '../../shared/components/webview-pane.js';
 
 // Stable references for the inline tree-item actions so each render reuses the same objects
 // instead of allocating fresh ones per file. Lit's array diffing in gl-tree-item is identity-
@@ -114,12 +114,43 @@ const stashAction: TreeItemAction = {
 	multiBehavior: 'batch',
 };
 
+// `single`: opens the conflicted row's two-sided details sheet — meaningless fanned out to other rows.
+const openConflictDetailsAction: TreeItemAction = {
+	icon: 'eye',
+	label: 'Conflict Details',
+	action: 'file-conflict-details',
+	multiBehavior: 'single',
+};
+// Per-row resolve action on a conflicted file — enters AI resolve mode focused on just that file.
+// `single`: resolve is row-specific; fanning it out would scope the wrong files.
+const resolveFileAction: TreeItemAction = {
+	icon: 'gl-merge',
+	label: 'Resolve Conflicts',
+	action: 'file-resolve-conflict',
+	multiBehavior: 'single',
+};
 const conflictedCheckboxActions: TreeItemAction[] = [
-	openFileAction,
+	openConflictDetailsAction,
 	openCurrentChangesAction,
 	openIncomingChangesAction,
 ];
 const conflictedActions: TreeItemAction[] = [...conflictedCheckboxActions, stageConflictAction];
+// Graph host opt-in (`conflict-details`): adds the "Conflict Details" chip before Stage so the
+// stage action stays rightmost. Separate stable arrays keep gl-tree-item's identity diffing happy.
+const conflictedCheckboxActionsWithDetails: TreeItemAction[] = [...conflictedCheckboxActions];
+const conflictedActionsWithDetails: TreeItemAction[] = [...conflictedCheckboxActions, stageConflictAction];
+// Resolve-enabled (graph host + aiEnabled): the resolve action sits right after the eye, keeping "Conflict
+// Details" leftmost and Stage rightmost.
+const conflictedCheckboxActionsWithDetailsResolve: TreeItemAction[] = [
+	openConflictDetailsAction,
+	resolveFileAction,
+	openCurrentChangesAction,
+	openIncomingChangesAction,
+];
+const conflictedActionsWithDetailsResolve: TreeItemAction[] = [
+	...conflictedCheckboxActionsWithDetailsResolve,
+	stageConflictAction,
+];
 const checkboxDiscardOnly: TreeItemAction[] = [openFileAction, stashAction, discardAction];
 const checkboxMixedActions: TreeItemAction[] = [
 	openFileAction,
@@ -155,12 +186,6 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 	@property({ type: Object })
 	pullRequest?: PullRequestShape;
 
-	@property({ type: Array })
-	codeSuggestions?: Omit<Draft, 'changesets'>[];
-
-	@property({ type: Object })
-	draftState?: DraftState;
-
 	@property({ type: Object })
 	generate?: GenerateState;
 
@@ -175,6 +200,16 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 	 * vouch that bulk resolve is supported (currently graph WIP + paused rebase). */
 	@property({ type: Boolean, attribute: 'bulk-conflict-actions' })
 	bulkConflictActions = false;
+
+	/** Opt-in for the per-row "Conflict Details" chip that opens the two-sided conflict sheet.
+	 *  Set true only by the graph host, which mounts the sheet and wires `file-conflict-details`. */
+	@property({ type: Boolean, attribute: 'conflict-details' })
+	conflictDetails = false;
+
+	/** Opt-in for the AI Resolve Conflicts entry points (toolbar button + per-row resolve action). Set true
+	 *  only by the graph host when `aiEnabled`; gates the affordances that route into resolve mode. */
+	@property({ type: Boolean, attribute: 'resolve-enabled' })
+	resolveEnabled = false;
 
 	/** Active agent sessions matched to this worktree (already filtered by the graph host).
 	 *  Used to compute per-file editing decorations — see {@link _agentTouchedFiles}. */
@@ -346,15 +381,14 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		}
 	}
 
-	@state()
-	get inReview(): boolean {
-		return this.draftState?.inReview ?? false;
-	}
-
 	get isUnpublished(): boolean {
 		const branch = this.wip?.branch;
 		return branch?.upstream == null || branch.upstream.missing === true;
 	}
+
+	/** Inline Cloud Patch creation is showing. Parked: no trigger sets this yet. */
+	@state()
+	private creatingPatch = false;
 
 	get draftsEnabled(): boolean {
 		return this.orgSettings?.drafts === true;
@@ -420,92 +454,11 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		}
 	}
 
-	protected override renderChangedFilesSlottedContent(): TemplateResult<1> | typeof nothing {
-		if (this.variant === 'embedded' || !this.files?.length) return nothing;
-
-		return html`<div slot="before-tree" class="section section--actions">
-			<button-container>
-				<gl-button
-					full
-					.href=${createCommandLink<ComposerCommandArgs>('gitlens.composeCommits', {
-						repoPath: this.wip?.repo.path,
-						source: 'inspect',
-					})}
-					><code-icon icon="wand" slot="prefix"></code-icon>Compose Commits...<span slot="tooltip"
-						><strong>Compose Commits</strong> (Preview)<br /><i
-							>Automatically or interactively organize changes into meaningful commits</i
-						></span
-					></gl-button
-				>
-				<gl-button appearance="secondary" href="command:workbench.view.scm" tooltip="Commit via SCM"
-					><code-icon rotate="45" icon="arrow-up"></code-icon
-				></gl-button>
-			</button-container>
-		</div>`;
-	}
-
 	private renderSecondaryAction(hasPrimary = true) {
-		if (!this.draftsEnabled || this.inReview) return undefined;
+		if (!this.draftsEnabled || this.creatingPatch) return undefined;
 
-		let label = 'Share as Cloud Patch';
-		let action = 'create-patch';
-		const pr = this.pullRequest;
-		if (pr?.state === 'opened' && equalsIgnoreCase(pr.provider.domain, 'github.com')) {
-			// const isMe = pr.author.name.endsWith('(you)');
-			// if (isMe) {
-			// 	label = 'Share with PR Participants';
-			// 	action = 'create-patch';
-			// } else {
-			// 	label = `Start Review for PR #${pr.id}`;
-			// 	action = 'create-patch';
-			// }
-
-			if (!this.inReview) {
-				label = 'Suggest Changes for PR';
-				action = 'start-patch-review';
-			} else {
-				label = 'Close Suggestion for PR';
-				action = 'end-patch-review';
-			}
-
-			if ((this.wip?.changes?.files.length ?? 0) === 0) {
-				return html`
-					<gl-button
-						?full=${!hasPrimary}
-						appearance="secondary"
-						data-action="${action}"
-						@click=${() => this.onToggleReviewMode(!this.inReview)}
-						.tooltip=${hasPrimary ? label : undefined}
-					>
-						<code-icon icon="gl-code-suggestion" .slot=${!hasPrimary ? 'prefix' : nothing}></code-icon
-						>${!hasPrimary ? label : nothing}
-					</gl-button>
-				`;
-			}
-
-			return html`
-				<gl-button
-					?full=${!hasPrimary}
-					appearance="secondary"
-					data-action="${action}"
-					.tooltip=${hasPrimary ? label : undefined}
-					@click=${() => this.onToggleReviewMode(!this.inReview)}
-				>
-					<code-icon icon="gl-code-suggestion" .slot=${!hasPrimary ? 'prefix' : nothing}></code-icon
-					>${!hasPrimary ? label : nothing}
-				</gl-button>
-				<gl-button
-					appearance="secondary"
-					density="compact"
-					data-action="create-patch"
-					tooltip="Share as Cloud Patch"
-					@click=${() => this.onDataActionClick('create-patch')}
-				>
-					<code-icon icon="gl-cloud-patch-share"></code-icon>
-				</gl-button>
-			`;
-		}
-
+		const label = 'Share as Cloud Patch';
+		const action = 'create-patch';
 		if ((this.wip?.changes?.files.length ?? 0) === 0) return undefined;
 
 		return html`
@@ -566,41 +519,6 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		</div>`;
 	}
 
-	private renderSuggestedChanges() {
-		if (!this.codeSuggestions?.length) return nothing;
-		// src="${this.issue!.author.avatarUrl}"
-		// title="${this.issue!.author.name} (author)"
-		return html`
-			<gl-tree>
-				<gl-tree-item branch .expanded=${true} .level=${0}>
-					<code-icon slot="icon" icon="gl-code-suggestion"></code-icon>
-					Code Suggestions
-				</gl-tree-item>
-				${repeat(
-					this.codeSuggestions,
-					draft => draft.id,
-					draft => html`
-						<gl-tree-item
-							.expanded=${true}
-							.level=${1}
-							@gl-tree-item-selected=${() => this.onShowCodeSuggestion(draft.id)}
-						>
-							<gl-avatar
-								class="author-icon"
-								src="${draft.author.avatarUri}"
-								name="${draft.author.name} (author)"
-							></gl-avatar>
-							${draft.title}
-							<span slot="description"
-								><formatted-date .date=${new Date(draft.updatedAt)}></formatted-date
-							></span>
-						</gl-tree-item>
-					`,
-				)}
-			</gl-tree>
-		`;
-	}
-
 	private renderPullRequest() {
 		if (this.pullRequest == null) return nothing;
 
@@ -636,13 +554,15 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 						url="${this.pullRequest.url}"
 						identifier="#${this.pullRequest.id}"
 						status="${this.pullRequest.state}"
+						.stack=${this.pullRequest.stack}
+						.author=${this.pullRequest.author?.name}
+						date-label="updated"
 						.date=${this.pullRequest.updatedDate}
 						.dateFormat="${this.preferences?.dateFormat}"
 						.dateStyle="${this.preferences?.dateStyle}"
 						details
 					></issue-pull-request>
 				</div>
-				${this.renderSuggestedChanges()}
 			</webview-pane>
 		`;
 	}
@@ -670,7 +590,13 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 	}
 
 	private renderPatchCreation() {
-		if (!this.inReview) return nothing;
+		if (!this.creatingPatch) return nothing;
+
+		// NOTE: `gl-inspect-patch` is deliberately NOT imported by this module. Nothing sets
+		// `creatingPatch`, so a top-level side-effect import pulled that element and its patch-create tree
+		// into every bundle rendering working changes, to draw something that can never appear. Whoever
+		// un-parks this feature must import it again — an unregistered element renders inert — and should
+		// do it lazily here rather than at module scope.
 
 		return html`<gl-inspect-patch
 			.orgSettings=${this.orgSettings}
@@ -678,7 +604,7 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 			.generate=${this.generate}
 			.createState=${this.patchCreateState}
 			@gl-patch-create-patch=${(e: CustomEvent) => {
-				void this.dispatchEvent(new CustomEvent('gl-inspect-create-suggestions', { detail: e.detail }));
+				void this.dispatchEvent(new CustomEvent('gl-inspect-create-patch', { detail: e.detail }));
 			}}
 		></gl-inspect-patch>`;
 	}
@@ -691,7 +617,7 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		}
 
 		const hasFiles = (this.files?.length ?? 0) > 0;
-		if (!hasFiles && !this.inReview) {
+		if (!hasFiles && !this.creatingPatch) {
 			return html`
 				${this.renderActions()} ${this.renderPausedOpStatus()}
 				<gl-details-wip-empty-pane
@@ -714,7 +640,7 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 			${this.renderActions()} ${this.renderPausedOpStatus()}
 			<webview-pane-group flexible>
 				${this.renderPullRequest()}
-				${when(this.inReview === false, () => this.renderChangedFiles('wip'))}${this.renderPatchCreation()}
+				${when(this.creatingPatch === false, () => this.renderChangedFiles('wip'))}${this.renderPatchCreation()}
 			</webview-pane-group>
 		`;
 	}
@@ -726,6 +652,8 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		return html`<div class="paused-op">
 			<gl-merge-rebase-status
 				?conflicts=${this.wip?.changes?.hasConflicts ?? false}
+				.conflictsCount=${this.wip?.stats?.conflictsCount}
+				?continuing=${this.wip?.changes?.pausedOpContinuing ?? false}
 				.pausedOpStatus=${pausedOpStatus}
 			></gl-merge-rebase-status>
 		</div>`;
@@ -755,10 +683,12 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				?checkable=${this.checkboxMode}
 				?multi-selectable=${true}
 				?bulk-conflict-actions=${this.bulkConflictActions}
+				?resolve-enabled=${this.resolveEnabled}
 				.showSearchBox=${this.showSearchBox}
 				.searchBoxFilter=${this.searchBoxFilter}
 				.fileActions=${this._getFileActions}
 				.fileContext=${this._getFileContext}
+				.contextRevision=${this.fileContextRevision}
 				.folderContext=${this._getFolderContext}
 				.searchContext=${this.searchContext}
 				.multiDiff=${this.getMultiDiffRefs()}
@@ -843,11 +773,15 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				<div class="header__identity-left">
 					<span class="header__wip-title">Working Changes</span>
 					<span class="header__wip-subtitle">
-						${this.worktreePath
-							? html`<code-icon icon="folder"></code-icon> ${this.worktreePath}`
-							: html`${stagedCount > 0 || unstagedCount > 0
-									? `${stagedCount} staged · ${unstagedCount} unstaged`
-									: 'No changes'}`}
+						${
+							this.worktreePath
+								? html`<code-icon icon="folder"></code-icon> ${this.worktreePath}`
+								: html`${
+										stagedCount > 0 || unstagedCount > 0
+											? `${stagedCount} staged · ${unstagedCount} unstaged`
+											: 'No changes'
+									}`
+						}
 					</span>
 				</div>
 				<div class="header__identity-right">
@@ -863,16 +797,20 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 				</div>
 			</div>
 			<div class="header__branch-row">
-				${branchName
-					? html`<gl-branch-name
-							class="header__branch-pill"
-							appearance="pill"
-							.name=${branchName}
-						></gl-branch-name>`
-					: nothing}
-				${filesCount > 0
-					? html`<commit-stats modified="${filesCount}" symbol="icons" appearance="pill"></commit-stats>`
-					: nothing}
+				${
+					branchName
+						? html`<gl-branch-name
+								class="header__branch-pill"
+								appearance="pill"
+								.name=${branchName}
+							></gl-branch-name>`
+						: nothing
+				}
+				${
+					filesCount > 0
+						? html`<commit-stats modified="${filesCount}" symbol="icons" appearance="pill"></commit-stats>`
+						: nothing
+				}
 			</div>
 			${this.renderPausedOpStatus()}
 		</div>`;
@@ -884,6 +822,14 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		// performs staging. Stage routes through the existing `file-stage` event, which prompts
 		// when unresolved conflict markers remain.
 		if (isConflictStatus(file.status)) {
+			if (this.conflictDetails) {
+				if (this.resolveEnabled) {
+					return this.checkboxMode
+						? conflictedCheckboxActionsWithDetailsResolve
+						: conflictedActionsWithDetailsResolve;
+				}
+				return this.checkboxMode ? conflictedCheckboxActionsWithDetails : conflictedActionsWithDetails;
+			}
 			return this.checkboxMode ? conflictedCheckboxActions : conflictedActions;
 		}
 
@@ -902,7 +848,14 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 		return buildFolderContext(this.wip?.repo?.path, folder);
 	}
 
-	override getFileContext(file: File): string | undefined {
+	/** `getFileContext` returns nothing until the repo path is known, and the working-changes payload
+	 *  arrives after the files do — without this the rows keep those empty contexts and no per-file menu
+	 *  ever gates on, since the callback cannot invalidate the tree's cached model by itself. */
+	protected override get fileContextRevision(): unknown {
+		return this.wip?.repo?.path;
+	}
+
+	override getFileContext(file: File, options?: Partial<TreeItemBase>): string | undefined {
 		if (!this.wip?.repo?.path) return undefined;
 
 		// Two-char `XY` conflict statuses (UU/AA/UD/DU/AU/UA/DD) carry the side semantics
@@ -923,6 +876,12 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 			webviewItem = `gitlens:file${modifiers.join('')}`;
 		} else {
 			webviewItem = file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged';
+			// Checkbox mode dedupes a mixed file (staged + unstaged) to its unstaged row; gl-wip-tree-pane
+			// flags that row via `options.mixed` (same source as the inline Stage/Unstage actions) so the
+			// context menu can offer the staged/combined diffs the single row otherwise can't reach.
+			if (options?.mixed) {
+				webviewItem += '+mixed';
+			}
 		}
 
 		const context: DetailsItemTypedContext = {
@@ -942,14 +901,6 @@ export class GlDetailsWipPanel extends GlDetailsBase {
 
 	private onDataActionClick(name: string) {
 		void this.dispatchEvent(new CustomEvent('data-action', { detail: { name: name } }));
-	}
-
-	private onToggleReviewMode(inReview: boolean) {
-		this.dispatchEvent(new CustomEvent('draft-state-changed', { detail: { inReview: inReview } }));
-	}
-
-	private onShowCodeSuggestion(id: string) {
-		this.dispatchEvent(new CustomEvent('gl-show-code-suggestion', { detail: { id: id } }));
 	}
 }
 

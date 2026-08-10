@@ -4,8 +4,12 @@ import type { IssueOrPullRequest, IssueOrPullRequestState } from './issueOrPullR
 import type { ProviderReference } from './remoteProvider.js';
 import type { RepositoryIdentityDescriptor } from './repositoryIdentities.js';
 
+/** Selects which issue states a read should include. `all` covers open + closed. */
+export type IssueStateFilter = 'open' | 'closed' | 'all';
+
 export interface IssueShape extends IssueOrPullRequest {
-	author: IssueMember;
+	/** `undefined` when the provider can't resolve the author, e.g. a deleted GitHub account */
+	author: IssueMember | undefined;
 	assignees: IssueMember[];
 	repository?: IssueRepository;
 	labels?: IssueLabel[];
@@ -27,7 +31,7 @@ export class Issue implements IssueShape {
 		public readonly updatedDate: Date,
 		public readonly closed: boolean,
 		public readonly state: IssueOrPullRequestState,
-		public readonly author: IssueMember,
+		public readonly author: IssueMember | undefined,
 		public readonly assignees: IssueMember[],
 		public readonly repository?: IssueRepository,
 		public readonly closedDate?: Date,
@@ -61,6 +65,10 @@ export interface IssueLabel {
 export interface IssueMember {
 	id: string;
 	name: string;
+	/** The provider's handle for this person, when it has one — GitHub's login, Azure's `uniqueName` (a UPN,
+	 *  so an email), Bitbucket's mutable `nickname`. Display/labelling only: it is neither guaranteed present
+	 *  (GitLab's native mapper has none) nor a stable identity, so never key a match off it. */
+	username?: string;
 	avatarUrl?: string;
 	url?: string;
 }

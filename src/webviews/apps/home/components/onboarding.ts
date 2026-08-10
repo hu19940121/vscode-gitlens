@@ -1,5 +1,5 @@
-import { consume } from '@lit/context';
 import { SignalWatcher } from '@lit-labs/signals';
+import { consume } from '@lit/context';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement } from 'lit/decorators.js';
 import { walkthroughProgressSteps } from '../../../../constants.walkthroughs.js';
@@ -25,22 +25,27 @@ export class GlOnboarding extends SignalWatcher(LitElement) {
 			.walkthrough-progress__label {
 				margin-block: 0;
 			}
+
 			.walkthrough-progress__steps {
-				margin-block: 0;
 				padding-inline-start: 0;
+				margin-block: 0;
 			}
+
 			.walkthrough-progress__step {
-				list-style: none;
 				margin-block-start: 0.3rem;
+				list-style: none;
 			}
+
 			.walkthrough-progress__step-label {
 				margin-inline-start: 0.3rem;
 			}
+
 			code-icon[icon='circle-large'] {
 				color: var(--color-foreground--50);
 			}
+
 			code-icon[icon='pass'] {
-				color: #00dd00;
+				color: #0d0;
 			}
 		`,
 	];
@@ -54,16 +59,18 @@ export class GlOnboarding extends SignalWatcher(LitElement) {
 		const progress = this._onboarding.walkthroughProgress.get();
 		if (progress == null) return undefined;
 
-		return html`${this.isWalkthroughComplete
-				? html`<gl-button
-						@click=${this.onDismissWalkthrough}
-						class="walkthrough-progress__button"
-						appearance="toolbar"
-						tooltip="Dismiss"
-						aria-label="Dismiss"
-						><code-icon icon="x"></code-icon
-					></gl-button>`
-				: nothing}
+		return html`${
+				this.isWalkthroughComplete
+					? html`<gl-button
+							@click=${this.onDismissWalkthrough}
+							class="walkthrough-progress__button"
+							appearance="toolbar"
+							tooltip="Dismiss"
+							aria-label="Dismiss"
+							><code-icon icon="x"></code-icon
+						></gl-button>`
+					: nothing
+			}
 			<gl-tooltip placement="bottom">
 				<a class="walkthrough-progress" href=${createCommandLink('gitlens.showWelcomeView')}>
 					<header class="walkthrough-progress__title">

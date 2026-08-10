@@ -1,97 +1,42 @@
 # GitLens Development Guide
 
-This workspace contains **GitLens** - a powerful VS Code extension that supercharges Git functionality. It provides blame annotations, commit history visualization, repository exploration, and many advanced Git workflows. The codebase supports both desktop VS Code (Node.js) and VS Code for Web (browser/webworker) environments.
+This workspace contains **GitLens** - a powerful VS Code extension that supercharges Git functionality. It provides blame annotations, commit history visualization, repository exploration, and many advanced Git workflows. The codebase supports both desktop VS Code (Node.js) and VS Code for Web (browser/webworker) environments — shared code with abstractions in `src/env/`; test both during development.
 
 ## Working Style Expectations
 
-1. **Accuracy over speed** — Read the actual code before proposing changes. Do not guess at method names, decorator behaviors, or class interfaces. Verify they exist first by searching the codebase.
-2. **Simplicity over abstraction** — Prefer the simplest correct solution. Do not introduce new types, enums, marker interfaces, migration flags, or wrapper abstractions unless they serve multiple consumers. When the user simplifies your approach, adopt it immediately.
-3. **Completeness over iteration** — Before presenting a multi-file change as complete, audit ALL affected locations: call sites, subclass overrides, both Node.js and browser code paths, and sub-providers.
-4. **Fixing over disabling** — When asked to fix a feature, fix the root cause. Do not disable, remove, or work around it unless explicitly asked. "Fix" and "disable" are different instructions.
-5. **Confirming over assuming** — When debugging, present your hypothesis with evidence before implementing. If a request is ambiguous, ask for clarification. Do not silently start editing on non-trivial changes without stating your approach.
-6. **Purposeful changes** — Refactoring and renaming to improve clarity, maintainability, and codebase health are encouraged. Explain what you're changing and why. Do not make silent drive-by changes unrelated to the task at hand.
-7. **Branch ownership** — The current branch owns ALL of its issues, not just those from your current task. Do not dismiss build errors, type errors, or test failures as "pre-existing" without verifying against the base branch (`git diff main --stat` or similar). If an issue exists on this branch but not on the base branch, it is the branch's responsibility regardless of when it was introduced. After completing your current task, address any remaining branch issues. If the scope of remaining issues is too large to handle, ask the user how to proceed.
+1. **Accuracy over speed** — Do not guess at method names, decorator behaviors, or class interfaces. Verify they exist first by searching the codebase.
+2. **Simplicity over abstraction** — Prefer the simplest correct solution; no new types, enums, or wrapper abstractions unless they serve multiple consumers.
+3. **Fixing over disabling** — Fix the root cause. "Fix" and "disable" are different instructions. This includes tests: when one fails, find and fix the cause — do NOT simplify the test or change its intent to make it pass.
+4. **Hypothesis before implementation** — When debugging, present your hypothesis with evidence before implementing against it. On any non-trivial change, state your approach before editing; if the request is ambiguous, ask rather than assume.
+5. **Branch ownership** — The current branch owns ALL of its issues, not just those from your current task. An error that exists on this branch but not on the base branch is the branch's responsibility regardless of when it was introduced (verify with `git diff main --stat` or similar; issues that also exist on the base branch are truly pre-existing and can be noted, not prioritized). After completing your task, address remaining branch build/type/test failures — or if the scope is too large, ask the user how to proceed. A task is not complete until the code builds cleanly and related tests pass.
 
-## Issue Accountability During Work
-
-### Branch vs. Repository Issues
-
-- **Branch issues**: Errors that exist on the current branch but NOT on the base branch. These are the branch's responsibility regardless of which task or session introduced them.
-- **Repository issues**: Errors that also exist on the base branch. These are truly pre-existing and can be noted but not prioritized.
-
-### Workflow
-
-1. **Focus first** — Complete your current task
-2. **Then fix** — After your task is done, address any remaining build errors, type errors, or test failures on the branch
-3. **Ask if too large** — If the remaining issues are extensive or unclear, inform the user and ask how to proceed rather than ignoring them
-
-### Completion Criteria
-
-A task is not complete until:
-
-- The code compiles cleanly (`pnpm run build` or relevant build command succeeds)
-- Related tests pass
-- Any remaining branch issues have been either fixed or raised to the user
+> For the rules these summarize plus the ones not listed here — complexity limits, the completeness checklist (call sites, subclass overrides, Node.js _and_ browser paths), fix vs. disable, scope of changes, and error handling: see `docs/coding-standards.md`
 
 ## Development Environment
 
 - **Node.js** ≥ 22.12.0, **pnpm** ≥ 10.x (install via corepack: `corepack enable`), **Corepack** ≥ 0.31.0, **Git** ≥ 2.7.2
-- GitLens supports **Node.js** (desktop) and **Web Worker** (browser/vscode.dev) environments — shared code with abstractions in `src/env/`
-- Test both environments during development
-
-### Performance Considerations
-
-- Use lazy loading for heavy services
-- Leverage caching layers (GitCache, PromiseCache, @memoize)
-- Debounce expensive operations
-- Consider webview refresh performance
-- Monitor telemetry for performance regressions
 
 ## Development Commands
 
 ```bash
 pnpm install              # Install dependencies
-```
-
-### Build & Development
-
-```bash
+pnpm run build            # Full development build (runs `check` itself — don't chain both)
 pnpm run rebuild          # Complete rebuild from scratch
-pnpm run build            # Full development build (everything including e2e and unit tests)
 pnpm run bundle           # Production bundle
-pnpm run bundle:e2e       # E2E tests production bundle (with DEBUG for account simulation)
-```
-
-### Testing
-
-```bash
 pnpm run test             # Run unit tests (VS Code extension tests)
-pnpm run test:e2e         # Run Playwright E2E tests
+pnpm run test:e2e         # Run Playwright E2E tests (production bundle via `bundle:e2e`)
+pnpm run check            # Type-checking and lint rules
+pnpm run check:fix        # Same, with auto-fix (prefer this)
+pnpm run fmt              # Format code
 ```
 
-> For detailed test running patterns, output interpretation, and debugging: see `docs/testing.md`
+Generation commands (`generate:contributions`, `generate:commandTypes`, `build:icons`, …) run automatically during build/watch — see Critical Rules.
 
-### Quality
-
-```bash
-pnpm run check            # Run type-checking and lint rules (also run automatically as part of `pnpm run build`)
-pnpm run check:fix        # Run type-checking and lint rules with auto-fix (better to use so you don't have to deal with auto-fixable issues)
-pnpm run pretty           # Format code with Prettier
-pnpm run pretty:check     # Check formatting
-```
-
-### Specialized Commands (typically not needed during normal development as they are part of build/watch)
-
-```bash
-pnpm run generate:contributions  # Generate package.json contributions from contributions.json
-pnpm run extract:contributions   # Extract contributions from package.json to contributions.json
-pnpm run generate:commandTypes   # Generate command types from contributions
-pnpm run build:icons             # Build icon font from SVG sources
-```
+> For test running patterns, output interpretation, and debugging: see `docs/testing.md`
 
 ## Git & Repository Guidelines
 
-For commit message format and workflow, use `/commit`. For CHANGELOG format and entry guidelines, use `/audit-commits`. For code reviewing, use `/review` or `/deep-review`. For debugging methodology and common misdiagnosis patterns, use `/investigate`.
+For commit message format and workflow, use `/commit`. For CHANGELOG format and entry guidelines, use `/audit-commits`. For code reviewing, use `/review` or `/deep-review`. For debugging methodology and common misdiagnosis patterns, use `/investigate`. Additional workflow skills live in `.claude/skills/`.
 
 ### Branching Guidelines
 
@@ -104,97 +49,58 @@ For commit message format and workflow, use `/commit`. For CHANGELOG format and 
 
 ### Directory Structure
 
-```
-src/
-├── extension.ts              # Extension entry point, activation logic
-├── container.ts              # Service Locator - manages all services (singleton)
-├── @types/                   # TypeScript type definitions
-├── annotations/              # Editor decoration providers
-├── autolinks/                # Auto-linking issues/PRs in commit messages & branch names
-├── codelens/                 # Editor CodeLens providers
-├── commands/                 # 100+ command implementations
-│   ├── git/                  # Git-wizard sub-commands
-│   └── *.ts                  # Individual command files
-├── env/                             # Environment-specific implementations
-│   ├── node/                        # Node.js (desktop) implementations
-│   │   └── git/
-│   │       ├── git.ts               # Git command execution
-│   │       ├── localGitProvider.ts  # Local Git provider (child_process)
-│   │       ├── vslsGitProvider.ts   # Local Live Share Git provider
-│   │       └── sub-providers/       # Local sub-providers for specific Git operations
-│   │           ├── branches.ts
-│   │           ├── commits.ts
-│   │           └── ... (15 total)
-│   └── browser/              # Browser/webworker implementations
-├── git/                      # Git abstraction layer
-│   ├── gitProvider.ts        # Git provider interface
-│   ├── gitProviderService.ts # Manages multiple Git providers
-│   ├── models/               # Git model types (Branch, Commit, etc.)
-│   ├── parsers/              # Output parsers for Git command results
-│   ├── remotes/              # Remote provider and integration management
-│   └── sub-providers/        # Shared sub-providers for specific Git operations
-├── hovers/                   # Editor hover providers
-├── plus/                     # Pro features (non-OSS, see LICENSE.plus)
-│   ├── ai/                   # AI features (commit messages, explanations, changelogs)
-│   ├── gk/                   # GitKraken-specific features (account, subscription, etc.)
-│   └── integrations/         # Rich Git host & issue tracker integrations (GitHub, GitLab, Jira, etc.)
-│       └── providers/
-│           └── github/
-│               ├── githubGitProvider.ts
-│               └── sub-providers/  # 11 GitHub-specific sub-providers
-├── quickpicks/               # Quick pick/input (quick menus) implementations
-├── statusbar/                # Status bar item management
-├── system/                   # Utility libraries
-│   ├── utils/                # Utilities usable in both host and webviews
-│   └── utils/-webview/       # Extension host-specific utilities
-├── telemetry/                # Usage analytics and error reporting
-├── terminal/                 # Terminal integration providers
-├── trackers/                 # Tracks document state and blames
-├── uris/                     # Deep link uri handling
-├── views/                    # Tree view providers (sidebar views)
-│   ├── commitsView.ts
-│   ├── branchesView.ts
-│   └── ...
-├── vsls/                     # Live Share support
-└── webviews/                 # Webview implementations
-    ├── apps/                 # Webview UI apps (Lit only)
-    │   ├── shared/           # Common UI components using Lit
-    │   ├── commitDetails/
-    │   ├── rebase/
-    │   ├── settings/
-    │   └── plus/             # Pro webview apps
-    │       ├── home/
-    │       ├── graph/
-    │       ├── timeline/
-    │       ├── patchDetails/
-    │       └── composer/
-    ├── protocol.ts           # IPC protocol for webview communication
-    └── webviewController.ts  # Base controller for all webviews
-tests/                        # E2E and Unit tests
-walkthroughs/                 # Welcome and tips walkthroughs
-custom-elements.json          # Custom Elements Manifest - generated web component metadata
-```
+Most of the layout is self-describing — browse `packages/`, `src/`, and `tests/`. What the folder names do _not_ tell you:
 
-> For detailed architecture (patterns, services, environment abstraction, webviews, build config): see `docs/architecture.md`
+- **`packages/` (`@gitlens/*`) vs `src/`** — `packages/git` holds the git domain (models, parsers, per-operation providers) and `packages/git-cli` runs the CLI; `src/git` is the orchestration layer over them (`gitProviderService.ts`, actions, formatters). `packages/utils` is the only utility layer webviews may import; `src/system` is host-only, and `src/system/-webview/` is extension-host-specific.
+- **`src/env/node/` vs `src/env/browser/`** — the same feature must work in desktop VS Code and VS Code for Web. Shared code imports through the `@env/` alias, which resolves per build target. Changing one path means checking the other.
+- **`src/plus/` and `packages/plus/` are non-OSS** — licensed separately, see `LICENSE.plus`.
+- **`src/container.ts`** — the service locator; nearly every service is reached through it.
+- **`src/commands/git/`** — sub-commands of the git wizard, not standalone commands.
+- **`src/trackers/`** — tracks document state and blame, not git refs.
+- **`src/vsls/`** — VS Live Share support. **`src/uris/`** — deep-link URI handling.
+- **`custom-elements.json`** — generated web component metadata; never hand-edit.
+
+> For detailed architecture (patterns, services, environment abstraction, webviews, IPC, caching, build config): see `docs/architecture.md`
 
 ## Coding Standards & Style Rules
 
+Not caught by any linter — get these right by hand:
+
 - **Strict TypeScript** — no `any` usage (exceptions only for external APIs)
 - **Explicit return types** for public methods; **prefer `type` over `interface`** for unions
-- **Use path aliases**: `@env/` for environment-specific code
+- **No default exports**; use `import type` for type-only imports
+- **No barrel files** — no `index.ts` or re-export-only modules. When splitting a file, delete the original and update consumers to import from where things actually live; do NOT leave a re-exporting shim.
+- **No inline `import('./x.js').Type`** — add a top-of-file `import type { … }` and reference the type by name. Lint permits the inline form (`disallowTypeAnnotations: false`), so this one is on you: it ducks the import-order rule and hides the dependency.
+- **Naming**: Classes PascalCase (no `I` prefix), methods/variables camelCase, constants camelCase (**not** SCREAMING_SNAKE_CASE), files camelCase.ts
 - **Import order**: node built-ins → external → internal → relative
-- **No default exports** use `import type` for type-only imports
-- **Always use `.js` extension** in imports (ESM requirement)
-- **Naming**: Classes PascalCase (no `I` prefix), methods/variables camelCase, constants camelCase (not SCREAMING_SNAKE_CASE), files camelCase.ts
-- **Folders**: Models under `models/`, utilities under `utils/` (both host + webview), host-specific in `utils/-webview/`, webview apps under `webviews/apps/`
+- **Folders**: Models under `models/`, shared utilities in `packages/utils/`, host-specific in `src/system/-webview/`, webview apps under `src/webviews/apps/`
 
-> For error handling patterns, implementation quality rules, and completeness checklist: see `docs/coding-standards.md`
+### Custom Lint Rules
+
+The repo enforces its own rules from `scripts/eslint-rules/`. Write conforming code up front rather than relying on `pnpm run check:fix` — these show up in diffs and reviews:
+
+| Rule                               | Enforces                                                                                                                                                                                                                                           |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `require-block-body`               | Block bodies for `if`/`while`/`for`/`for-in`/`for-of`. A single-line `if` is allowed ONLY when its body is control flow — `return`, `break`, `continue`, `throw`, `yield`. Loops always need braces. `else if` branches are checked independently. |
+| `require-js-extension`             | An explicit `.js` extension on local (`@env/` and relative) imports                                                                                                                                                                                |
+| `one-var`                          | One variable per declaration statement                                                                                                                                                                                                             |
+| `newline-after-control-flow`       | A blank line after a control flow statement                                                                                                                                                                                                        |
+| `no-instanceof-cancellation-error` | `isCancellationError()` instead of `instanceof CancellationError`                                                                                                                                                                                  |
+| `scoped-logger-usage`              | Correct `getScopedLogger()` usage — see the decorator note below                                                                                                                                                                                   |
+| `no-scss-in-css-template`          | No SCSS syntax inside `css` tagged templates                                                                                                                                                                                                       |
+| `no-src-imports`                   | No import specifiers starting with `src/`                                                                                                                                                                                                          |
+| `no-self-package-imports`          | Same-package imports use a relative path, not the workspace package name                                                                                                                                                                           |
+| `valid-package-imports`            | `@gitlens/*` imports name a subpath the target package's `exports` exposes                                                                                                                                                                         |
+
+> For webview styling — prefix conventions, the `1rem = 10px` base, the `--gl-*` design tokens, and the elevation (z-index + shadow) system: see `docs/webview-styling.md`
 >
 > For webview accessibility requirements: see `docs/accessibility.md`
+>
+> For the Commit Graph keyboard architecture — focus scopes, the Esc overlay stack, the chord vocabulary, and how to add a binding: see `docs/graph-keyboard.md`
 
 ### Decorator System
 
-The codebase uses method decorators (`src/system/decorators/`) that significantly alter runtime behavior:
+The codebase uses method decorators (defined in `packages/utils/src/decorators/`; `@command` and a `@gate` wrapper live in `src/system/`) that significantly alter runtime behavior:
 
 | Decorator                           | Purpose                                              | Key Gotcha                                                                 |
 | ----------------------------------- | ---------------------------------------------------- | -------------------------------------------------------------------------- |
@@ -211,57 +117,20 @@ For detailed decorator behavior and investigation methodology, use `/investigate
 
 ## Quick Lookup
 
-Reference examples and critical rules for common tasks.
-
-### Available Skills
-
-Skills provide detailed, step-by-step workflows for common tasks. Invoke with `/{skill-name}`.
-
-| Skill              | Purpose                                                                     |
-| ------------------ | --------------------------------------------------------------------------- |
-| `/triage`          | Triage GitHub issues — verdicts, confidence levels, recommended actions     |
-| `/investigate`     | Structured bug investigation with root cause analysis                       |
-| `/prioritize`      | Prioritize triaged issues — shortlist, backlog, won't fix, community        |
-| `/update-issues`   | Update GitHub issues from triage/investigation/prioritization reports       |
-| `/dev-scope`       | Scope work into a goals doc — defines what and why, not how                 |
-| `/deep-planning`   | Design implementation approach — investigates codebase, presents trade-offs |
-| `/challenge-plan`  | Stress-test a proposed plan or architecture decision                        |
-| `/analyze`         | Deep design/implementation analysis, devil's advocate                       |
-| `/review`          | Code review against standards + impact completeness audit                   |
-| `/deep-review`     | Deep merge-blocking review — traces code paths for correctness              |
-| `/ux-review`       | UX review — traces user flows against goals doc                             |
-| `/a11y-audit`      | Audit a component/file/directory for WCAG 2.1 AA accessibility              |
-| `/a11y-flow-audit` | Audit a page or flow for WCAG 2.1 AA composition-level compliance           |
-| `/a11y-remediate`  | Turn /a11y-audit findings into a leader-facing remediation proposal         |
-| `/modern-css`      | Guide CSS authoring/review — modern patterns, tokens, shadow DOM safety     |
-| `/commit`          | Git commit with GitLens conventions                                         |
-| `/create-issue`    | Create GitHub issues from code changes                                      |
-| `/audit-commits`   | Audit commit range for issues and CHANGELOG entries                         |
-| `/worktree`        | Create isolated git worktrees for feature work                              |
-| `/add-command`     | Scaffold a new VS Code command                                              |
-| `/add-webview`     | Scaffold a new webview with IPC, Lit app, registration                      |
-| `/add-test`        | Generate unit or E2E test files                                             |
-| `/add-icon`        | Add icon to GL Icons font                                                   |
-| `/add-ai-provider` | Add a new AI provider integration                                           |
-| `/live-inspect`    | Launch VS Code with GitLens via Playwright inspect UI/logs                  |
-| `/live-exercise`   | Live operation + audit + fix loop for UI-bearing work                       |
-| `/live-perf`       | Live performance measurement + improvement with three-tier discipline       |
-| `/live-pair`       | Interactive pair-programming with a live instance (user-driven feedback)    |
-
 ### Canonical Examples
 
 When implementing something new, look at these files first:
 
-| Task                            | Example File                                   |
-| ------------------------------- | ---------------------------------------------- |
-| Simple command                  | `src/commands/copyCurrentBranch.ts`            |
-| Complex command (multi-command) | `src/commands/gitWizard.ts`                    |
-| IPC protocol                    | `src/webviews/rebase/protocol.ts`              |
-| Webview provider                | `src/webviews/rebase/rebaseWebviewProvider.ts` |
-| Webview app (Lit)               | `src/webviews/apps/rebase/`                    |
-| Unit test                       | `src/system/__tests__/iterable.test.ts`        |
-| E2E test                        | `tests/e2e/specs/smoke.test.ts`                |
-| E2E page object                 | `tests/e2e/pageObjects/gitLensPage.ts`         |
+| Task                            | Example File                                    |
+| ------------------------------- | ----------------------------------------------- |
+| Simple command                  | `src/commands/copyCurrentBranch.ts`             |
+| Complex command (multi-command) | `src/commands/gitWizard.ts`                     |
+| IPC protocol                    | `src/webviews/rebase/protocol.ts`               |
+| Webview provider                | `src/webviews/rebase/rebaseWebviewProvider.ts`  |
+| Webview app (Lit)               | `src/webviews/apps/rebase/`                     |
+| Unit test                       | `packages/utils/src/__tests__/iterable.test.ts` |
+| E2E test                        | `tests/e2e/specs/smoke.test.ts`                 |
+| E2E page object                 | `tests/e2e/pageObjects/gitLensPage.ts`          |
 
 ### Critical Rules
 
@@ -271,17 +140,4 @@ When implementing something new, look at these files first:
 - Run `pnpm run generate:contributions` after editing (or let the watcher handle it)
 - Run `pnpm run generate:commandTypes` after adding commands (or let the watcher handle it)
 
-**Imports**
-
-- Always use `.js` extension in imports (ESM requirement)
-- Use named exports only (no `default` exports)
-
-**IPC**
-
-- `IpcCommand` = fire-and-forget (no response)
-- `IpcRequest` = expects a response (use `await`)
-- `IpcNotification` = extension → webview state updates
-
-**Testing**
-
-- When debugging test failures, DON'T simplify NOR change the intent of the tests just to get them to pass. Instead, INVESTIGATE and UNDERSTAND the root cause of the failure and address that directly, or raise an issue to the user if you can't resolve it.
+**IPC** — see `docs/architecture.md` for the webview IPC protocol (`IpcCommand` / `IpcRequest` / `IpcNotification`)

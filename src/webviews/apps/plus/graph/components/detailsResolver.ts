@@ -19,6 +19,7 @@ export async function resolveDetailsActions(
 	state: DetailsState,
 ): Promise<DetailsActions> {
 	const [
+		agents,
 		files,
 		drafts,
 		graphInspect,
@@ -34,6 +35,7 @@ export async function resolveDetailsActions(
 		ai,
 		telemetry,
 	] = await Promise.all([
+		services.agents,
 		services.files,
 		services.drafts,
 		services.graphInspect,
@@ -51,6 +53,7 @@ export async function resolveDetailsActions(
 	]);
 
 	const resolved: ResolvedServices = {
+		agents: agents,
 		files: files,
 		drafts: drafts,
 		graphInspect: graphInspect,
@@ -73,6 +76,9 @@ export async function resolveDetailsActions(
 		),
 		wip: createResource((signal, repoPath: string, force?: boolean) =>
 			graphInspect.getWip(repoPath, signal, force),
+		),
+		pastAgentSessions: createResource((signal, worktreePath: string) =>
+			agents.getPastSessionsForWorktree(worktreePath, { limit: 3 }, signal),
 		),
 		compare: createResource((signal, repoPath: string, fromSha: string, toSha: string) =>
 			graphInspect.getCompareDiff(repoPath, fromSha, toSha, signal),
@@ -109,6 +115,14 @@ export async function resolveDetailsActions(
 				excludedFiles: string[] | undefined,
 				aiExcludedFiles: string[] | undefined,
 			) => graphInspect.composeChanges(repoPath, scope, instructions, excludedFiles, aiExcludedFiles, signal),
+		),
+		resolve: createResource(
+			(
+				signal,
+				repoPath: string,
+				focusedFilePaths: readonly string[] | undefined,
+				instructions: string | undefined,
+			) => graphInspect.resolveConflicts(repoPath, focusedFilePaths, instructions, signal),
 		),
 		scopeFiles: createResource((signal, repoPath: string, scope: ScopeSelection) =>
 			graphInspect.getScopeFiles(repoPath, scope, signal),

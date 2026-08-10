@@ -1,4 +1,6 @@
+import type { PastAgentSessionsResult } from '../../../agents/models/agentSessionState.js';
 import type { AgentSessionPhase } from '../../../agents/provider.js';
+import { createCommandLink } from '../../../system/commands.js';
 import type { AgentSessionState } from '../../home/protocol.js';
 import type { OverviewBranch } from '../../shared/overviewBranches.js';
 
@@ -6,14 +8,17 @@ const phaseRank: Record<AgentSessionPhase, number> = {
 	waiting: 0,
 	working: 1,
 	idle: 2,
+	// Terminal sessions sort last so live agents always lead the list.
+	completed: 3,
 };
 
-export type AgentSessionCategory = 'working' | 'needs-input' | 'idle';
+export type AgentSessionCategory = 'working' | 'needs-input' | 'idle' | 'completed';
 
 export const agentPhaseToCategory: Record<AgentSessionPhase, AgentSessionCategory> = {
 	working: 'working',
 	waiting: 'needs-input',
 	idle: 'idle',
+	completed: 'completed',
 };
 
 export function getAgentCategoryLabel(category: AgentSessionCategory): string {
@@ -24,7 +29,81 @@ export function getAgentCategoryLabel(category: AgentSessionCategory): string {
 			return 'Working';
 		case 'idle':
 			return 'Idle';
+		case 'completed':
+			return 'Completed';
 	}
+}
+
+/** Corner-badge glyph overlaid on the `robot` identity icon. `idle` has no badge — the bare robot
+ *  in its color carries the meaning. Shared by the graph's WIP row indicator and the file tree's
+ *  agent decoration so both read the same. Callers holding an `AgentSessionPhase` must map through
+ *  {@link agentPhaseToCategory} first (`waiting` → `needs-input`). Pair `working`'s `sync` with
+ *  `modifier="spin"`. */
+export function agentSuffixIconFor(category: AgentSessionCategory): string | undefined {
+	switch (category) {
+		case 'needs-input':
+			return 'warning';
+		case 'working':
+			return 'sync';
+		case 'idle':
+			return undefined;
+		case 'completed':
+			return 'pass';
+	}
+}
+
+/** The "open" affordance for an agent session — `Open Session` for every live phase, `Resume
+ *  Session` for a completed one that has a directory to resume into. */
+export type AgentSessionOpenAction =
+	| {
+			label: 'Open Session';
+			icon: 'link-external';
+			command: 'gitlens.agents.openSession';
+			/** Args exactly as the command receives them — the sidebar passes this array straight
+			 *  through; the href surfaces feed `args[0]` to `createCommandLink`. */
+			args: [string];
+	  }
+	| {
+			label: 'Resume Session';
+			icon: 'debug-restart';
+			command: 'gitlens.agents.resumeSession';
+			args: [{ sessionId: string; cwd: string }];
+	  };
+
+/** Picks between `Open Session` (there's a live process to attach to) and `Resume Session`
+ *  (the process is gone, but the transcript can be replayed into a fresh one). Only a completed
+ *  session with a resolvable cwd gets `Resume Session` — a completed session with nowhere to
+ *  resume from has nothing to offer but the openSession modal's terminal fallback.
+ *
+ *  cwd resolution mirrors {@link toResumableSessionRef}'s cascade (`claudeResume.ts`): live `cwd`
+ *  wins over `initialCwd` because Claude migrates the transcript file to follow the session's
+ *  current directory, not its launch directory. */
+export function getAgentSessionOpenAction(session: AgentSessionState): AgentSessionOpenAction {
+	if (session.phase === 'completed') {
+		const cwd = session.cwd ?? session.initialCwd ?? session.worktreePath ?? session.workspacePath;
+		if (cwd != null) {
+			return {
+				label: 'Resume Session',
+				icon: 'debug-restart',
+				command: 'gitlens.agents.resumeSession',
+				args: [{ sessionId: session.id, cwd: cwd }],
+			};
+		}
+	}
+
+	return { label: 'Open Session', icon: 'link-external', command: 'gitlens.agents.openSession', args: [session.id] };
+}
+
+/** `createCommandLink` form of {@link getAgentSessionOpenAction}, for `href=` surfaces. The two
+ *  commands take asymmetric arg shapes: openSession's existing link form passes the session id as
+ *  a bare JSON-stringified string, while resumeSession passes the `{ sessionId, cwd }` object
+ *  directly (see `gl-details-agent-status.ts`'s past-row resume chip). */
+export function createAgentSessionOpenHref(session: AgentSessionState): string {
+	const action = getAgentSessionOpenAction(session);
+	if (action.command === 'gitlens.agents.resumeSession') return createCommandLink(action.command, action.args[0]);
+
+	// A bare string reaches the command link unquoted, which isn't valid JSON for the arg parser.
+	return createCommandLink(action.command, JSON.stringify(action.args[0]));
 }
 
 /** Kind-aware label for a needs-input phase. Surfaces "Plan ready" / "Question" / "Input needed"
@@ -52,21 +131,38 @@ export function getAgentPhaseLabel(
 
 /** "Last active …" granularity helper used by the graph details panel and the graph agents
  *  sidebar panel — short-and-stable formatting (no seconds past 1 minute). Accepts either a
- *  `Date` (the wire-shape's `phaseSince`/`lastActivity` fields) or a numeric timestamp. The
- *  agent-status pill has its own slightly more granular variant inline. */
-export function formatAgentElapsed(value: Date | number | undefined): string | undefined {
+ *  `Date` (the wire-shape's `phaseSince`/`lastActivity` fields) or a numeric timestamp. Rolls the
+ *  top unit over as it crosses each boundary (`m → h → d → w`) so an hours-old completed session
+ *  reads `2d 3h` rather than `51h`. The agent-status pill has its own slightly more granular
+ *  variant inline. `now` defaults to `Date.now()`; pass it to pin the instant (a caller deriving
+ *  `value` from its own clock read otherwise sits one unpredictable tick away from the bucket it
+ *  expects). */
+export function formatAgentElapsed(value: Date | number | undefined, now: number = Date.now()): string | undefined {
 	if (value == null) return undefined;
 
 	const timestamp = typeof value === 'number' ? value : value.getTime();
-	const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+	const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
 	if (seconds < 60) return `${seconds}s`;
 
 	const minutes = Math.floor(seconds / 60);
 	if (minutes < 60) return `${minutes}m`;
 
 	const hours = Math.floor(minutes / 60);
-	const remainingMinutes = minutes % 60;
-	return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+	if (hours < 24) {
+		const remainingMinutes = minutes % 60;
+		return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+	}
+
+	// Past sessions can be days or weeks old; keep rolling so "3d" beats "72h".
+	const days = Math.floor(hours / 24);
+	if (days < 7) {
+		const remainingHours = hours % 24;
+		return remainingHours > 0 ? `${days}d ${remainingHours}h` : `${days}d`;
+	}
+
+	const weeks = Math.floor(days / 7);
+	const remainingDays = days % 7;
+	return remainingDays > 0 ? `${weeks}w ${remainingDays}d` : `${weeks}w`;
 }
 
 /** Per-session "what is it doing" line. Mirrors the contract used by the graph details panel:
@@ -128,7 +224,7 @@ function describePendingPermission(
 }
 
 /** Canonical sort order for agent sessions across every UI surface. Category-actionability first
- *  (needs-input → working → idle), then most-recent phase entry within a category, then
+ *  (needs-input → working → idle → completed), then most-recent phase entry within a category, then
  *  alphabetical by name. Applied once at each state-entry point so all consumers — banners,
  *  pills, cards, hovers — render the same order. Actionable always wins: a fresh idle session
  *  never outranks a session that's actually waiting on you.
@@ -435,6 +531,74 @@ export function createStickyDetailResolver(options?: { holdMs?: number }): Stick
 		prune: prune,
 		get size(): number {
 			return cache.size;
+		},
+	};
+}
+
+/** Reconciles a cached past-session list against the live session list — see
+ *  {@link createPastAgentSessionsResolver}. */
+export interface PastAgentSessionsResolver {
+	/** The past result to both gate visibility on and render, with rows dropped for sessions that
+	 *  are currently tracked and for those that have departed the tracked set. `total` is reduced by
+	 *  what was dropped so the "N more" footer stays honest. Side-effecting: records departures. */
+	resolve(
+		past: PastAgentSessionsResult | undefined,
+		live: readonly AgentSessionState[] | undefined,
+	): PastAgentSessionsResult | undefined;
+}
+
+/**
+ * Past sessions are a pull-only resource, fetched once per worktree — the host never re-pushes them
+ * when the session list changes. So a session that leaves the tracked set (archived, or a pruned
+ * record) is still in the cached list, and the live-id dedup that had been masking it stops the
+ * instant it departs — painting a just-archived session as a "Past" row, which reads as the archive
+ * having failed.
+ *
+ * Callers resolve ONCE per cycle and use the result for both the visibility/sizing gate and the
+ * rendered rows: filtering only at render (inside `gl-details-agent-status`) would let a parent
+ * decide to show a section from the unfiltered count that the child then renders as empty.
+ *
+ * Departures are tracked against the FULL tracked set rather than a worktree-matched subset, so
+ * changing which worktree is displayed isn't mistaken for sessions disappearing. A freshly
+ * delivered result (the host filters archived ids at fetch time) retires every suppression.
+ */
+export function createPastAgentSessionsResolver(): PastAgentSessionsResolver {
+	let seenIds: Set<string> | undefined;
+	let lastPast: PastAgentSessionsResult | undefined;
+	const departed = new Set<string>();
+
+	return {
+		resolve: (past, live) => {
+			if (past !== lastPast) {
+				lastPast = past;
+				departed.clear();
+			}
+
+			// `undefined` means "not loaded" (context not yet populated, or a graph-state reset),
+			// which is NOT the same as "no sessions". Treating it as an empty set would retire every
+			// seen id as departed and permanently suppress the matching Past rows, so hold the prior
+			// snapshot and only diff against a real list.
+			if (live != null) {
+				const nextIds = new Set(live.map(s => s.id));
+				if (seenIds != null) {
+					for (const id of seenIds) {
+						if (!nextIds.has(id)) {
+							departed.add(id);
+						}
+					}
+				}
+				seenIds = nextIds;
+			}
+			const liveIds = seenIds;
+
+			if (past == null) return undefined;
+
+			const sessions = past.sessions.filter(p => !liveIds?.has(p.id) && !departed.has(p.id));
+			const dropped = past.sessions.length - sessions.length;
+			// Preserve reference identity when nothing was dropped — the common case.
+			if (dropped === 0) return past;
+
+			return { sessions: sessions, total: Math.max(0, past.total - dropped) };
 		},
 	};
 }

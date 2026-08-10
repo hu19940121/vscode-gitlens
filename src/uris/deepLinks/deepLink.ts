@@ -6,6 +6,7 @@ import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { GlCommands } from '../../constants.commands.js';
 import type { GlRepository } from '../../git/models/repository.js';
 import type { OpenWorkspaceLocation } from '../../system/-webview/vscode/workspaces.js';
+import type { GraphShowAction } from '../../webviews/plus/graph/protocol.js';
 
 export type UriTypes = 'link';
 
@@ -55,12 +56,19 @@ export const DeepLinkCommandTypeToCommand = new Map<DeepLinkCommandType, GlComma
 	[DeepLinkCommandType.InstallMCP, 'gitlens.ai.mcp.install'],
 ]);
 
+/** Optional `mode` param on a `link/command/graph` deep link — opens the Commit Graph straight into
+ *  compose or review instead of its default view. Neither action needs a repository: the graph
+ *  applies them to whichever repo it resolves on its own. */
+export const DeepLinkGraphModeToShowAction = new Map<string, GraphShowAction>([
+	['compose', 'enter-compose'],
+	['review', 'enter-review'],
+]);
+
 export enum DeepLinkActionType {
 	DeleteBranch = 'delete-branch',
 	Switch = 'switch',
 	SwitchToPullRequest = 'switch-to-pr',
 	SwitchToPullRequestWorktree = 'switch-to-pr-worktree',
-	SwitchToAndSuggestPullRequest = 'switch-to-and-suggest-pr',
 }
 
 export const AccountDeepLinkTypes: DeepLinkType[] = [DeepLinkType.Draft, DeepLinkType.Workspace];
@@ -264,7 +272,7 @@ export const enum DeepLinkServiceState {
 	OpenDraft,
 	OpenWorkspace,
 	OpenFile,
-	OpenInspect,
+	OpenWorkingChanges,
 	SwitchToRef,
 	RunCommand,
 	OpenAllPrChanges,
@@ -303,7 +311,7 @@ export const enum DeepLinkServiceAction {
 	OpenGraph,
 	OpenComparison,
 	OpenFile,
-	OpenInspect,
+	OpenWorkingChanges,
 	OpenSwitch,
 	OpenAllPrChanges,
 	DeleteBranch,
@@ -464,7 +472,7 @@ export const deepLinkStateTransitionTable: Record<string, Record<string, DeepLin
 		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
 	},
-	[DeepLinkServiceState.OpenInspect]: {
+	[DeepLinkServiceState.OpenWorkingChanges]: {
 		[DeepLinkServiceAction.OpenAllPrChanges]: DeepLinkServiceState.OpenAllPrChanges,
 		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
@@ -476,7 +484,7 @@ export const deepLinkStateTransitionTable: Record<string, Record<string, DeepLin
 		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
 	},
 	[DeepLinkServiceState.SwitchToRef]: {
-		[DeepLinkServiceAction.OpenInspect]: DeepLinkServiceState.OpenInspect,
+		[DeepLinkServiceAction.OpenWorkingChanges]: DeepLinkServiceState.OpenWorkingChanges,
 		[DeepLinkServiceAction.DeepLinkResolved]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkErrored]: DeepLinkServiceState.Idle,
 		[DeepLinkServiceAction.DeepLinkCancelled]: DeepLinkServiceState.Idle,
@@ -538,7 +546,7 @@ export const deepLinkStateToProgress: Record<string, DeepLinkProgress> = {
 	[DeepLinkServiceState.OpenDraft]: { message: 'Opening cloud patch...', increment: 90 },
 	[DeepLinkServiceState.OpenWorkspace]: { message: 'Opening workspace...', increment: 90 },
 	[DeepLinkServiceState.OpenFile]: { message: 'Opening file...', increment: 90 },
-	[DeepLinkServiceState.OpenInspect]: { message: 'Opening inspect...', increment: 90 },
+	[DeepLinkServiceState.OpenWorkingChanges]: { message: 'Opening working changes...', increment: 90 },
 	[DeepLinkServiceState.SwitchToRef]: { message: 'Switching to ref...', increment: 90 },
 	[DeepLinkServiceState.RunCommand]: { message: 'Running command...', increment: 90 },
 	[DeepLinkServiceState.OpenAllPrChanges]: { message: 'Opening all PR changes...', increment: 90 },

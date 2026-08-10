@@ -44,7 +44,7 @@ suite('createResource Test Suite', () => {
 
 			await resource.fetch();
 
-			// eslint-disable-next-line @typescript-eslint/no-confusing-void-expression -- testing that undefined is stored correctly
+			// oxlint-disable-next-line typescript/no-confusing-void-expression -- testing that undefined is stored correctly
 			assert.strictEqual(resource.value.get(), undefined);
 			assert.strictEqual(resource.status.get(), 'success');
 		});
@@ -292,6 +292,28 @@ suite('createResource Test Suite', () => {
 			await resource.fetch();
 
 			assert.strictEqual(aborted, false, 'successful fetch should not emit abort');
+		});
+
+		// A superseded fetch resolves SILENTLY rather than throwing, and `value` is a shared slot holding
+		// whichever fetch won. So awaiting a cancelled fetch tells the caller nothing about whose answer it
+		// is now looking at — consumers must re-verify the value belongs to what they asked for (see
+		// `detailsActions.revalidateWipIfStale`, which checks the payload's own repo path). Pinning the
+		// behaviour here so a future change to it can't silently reintroduce cross-argument application.
+		test('awaiting a superseded fetch resolves, and leaves the WINNER in value', async () => {
+			const resource = createResource<string, [string]>(async (signal, arg) => {
+				await new Promise(r => setTimeout(r, arg === 'A' ? 60 : 5));
+				if (signal.aborted) throw new Error('aborted');
+				return arg;
+			});
+
+			const first = resource.fetch('A');
+			const second = resource.fetch('B');
+
+			await Promise.all([first, second]);
+
+			assert.strictEqual(resource.value.get(), 'B', 'the newest fetch owns the shared slot');
+			assert.strictEqual(resource.status.get(), 'success');
+			assert.strictEqual(resource.error.get(), undefined, 'a superseded fetch must not surface as an error');
 		});
 	});
 });

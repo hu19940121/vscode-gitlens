@@ -5,7 +5,7 @@ import '../code-icon.js';
 
 declare const CloseWatcher: CloseWatcher;
 interface CloseWatcher extends EventTarget {
-	// oxlint-disable-next-line @typescript-eslint/no-misused-new
+	// oxlint-disable-next-line typescript/no-misused-new
 	new (options?: CloseWatcherOptions): CloseWatcher;
 	requestClose(): void;
 	close(): void;
@@ -25,6 +25,10 @@ declare global {
 
 	interface GlobalEventHandlersEventMap {
 		'gl-detail-sheet-close': CustomEvent<void>;
+		/** Fired the moment the sheet starts its animated exit — before `gl-detail-sheet-close`, which
+		 *  only fires once the exit animation finishes. Lets a host that maximized itself for this
+		 *  sheet start its own restore glide in parallel instead of waiting for the sheet to fully close. */
+		'gl-detail-sheet-closing': CustomEvent<void>;
 	}
 }
 
@@ -38,8 +42,11 @@ declare global {
  * remain fully interactive while the sheet is open. This is intentional for selection-decoupled
  * content (e.g. compare) where the user benefits from continued navigation in the broader UI.
  *
- * Esc and the built-in close button emit `gl-detail-sheet-close`. Custom toolbar actions go
- * through the `actions` slot. Focus is restored to the previously-focused element on close.
+ * Esc and the built-in close button emit `gl-detail-sheet-close`. By default Esc closes via a
+ * `CloseWatcher` plus a document-capture keydown listener (so it fires even when focus never
+ * entered the sheet). When `escManaged` is set, neither is registered — the host's keymap Esc
+ * overlay stack owns Esc and calls back into this component to close it. Custom toolbar actions
+ * go through the `actions` slot. Focus is restored to the previously-focused element on close.
  */
 @customElement('gl-detail-sheet')
 export class GlDetailSheet extends LitElement {
@@ -47,112 +54,142 @@ export class GlDetailSheet extends LitElement {
 		css`
 			:host {
 				/* Scoped to the parent host (e.g. .details-host) — sheet covers the details-panel
-				   area only, leaving the graph as a sibling beside it. The scrim darkens just the
-				   details panel; clicks on the scrim close the sheet. z-index sits above the
-				   sticky details-header (z-index 10) so the sheet renders OVER the underlying
-				   panel header, not behind it. */
+		   area only, leaving the graph as a sibling beside it. The scrim darkens just the
+		   details panel; clicks on the scrim close the sheet. The sheet tier sits above the
+		   sticky tier used by the details-header so the sheet renders OVER the underlying
+		   panel header, not behind it. */
 				position: absolute;
 				inset: 0;
+				z-index: var(--gl-z-sheet);
 				display: flex;
 				flex-direction: column;
 				pointer-events: none;
-				z-index: 20;
 			}
 
 			.scrim {
 				position: absolute;
 				inset: 0;
-				background-color: rgba(0, 0, 0, 0.55);
-				backdrop-filter: blur(0.3rem);
 				pointer-events: auto;
-				animation: gl-sheet-scrim-fade 0.18s ease-out;
+				background-color: rgb(0 0 0 / 55%);
+				backdrop-filter: blur(0.3rem);
+				animation: gl-sheet-scrim-fade var(--gl-duration-medium) var(--gl-ease-out);
 			}
 
 			:host([closing]) .scrim {
 				/* Mirror the entry: fade scrim out alongside the sheet's slide-down. The forwards
-				   fill-mode pins the final opacity so there's no flash back to full opacity between
-				   the animation ending and the host removing the sheet from the DOM. Distinct
-				   animation name (vs. the entry's gl-sheet-scrim-fade) so the browser starts a
-				   fresh run instead of treating it as a continuation of the finished entry. */
-				animation: gl-sheet-scrim-fade-out 0.18s ease-in forwards;
+		   fill-mode pins the final opacity so there's no flash back to full opacity between
+		   the animation ending and the host removing the sheet from the DOM. Distinct
+		   animation name (vs. the entry's gl-sheet-scrim-fade) so the browser starts a
+		   fresh run instead of treating it as a continuation of the finished entry. */
+				animation: gl-sheet-scrim-fade-out var(--gl-duration-medium) var(--gl-ease-in) forwards;
 			}
 
 			.sheet {
 				position: relative;
 				display: flex;
-				flex-direction: column;
 				flex: 1 1 auto;
-				min-height: 0;
+				flex-direction: column;
+
 				/* Fills the host area so the sheet occupies the entire details panel — the
-				   underlying content stays under the scrim, not peeking through above. */
+		   underlying content stays under the scrim, not peeking through above. */
 				width: 100%;
 				height: 100%;
-				background: var(--vscode-sideBar-background, var(--color-background));
-				border-top: 0.1rem solid var(--vscode-widget-border, var(--color-foreground--25));
-				box-shadow: 0 -0.4rem 1.2rem -0.2rem var(--vscode-widget-shadow);
+				min-height: 0;
 				pointer-events: auto;
-				animation: gl-sheet-slide-up 0.2s ease-out;
+				background: var(--vscode-sideBar-background, var(--color-background));
+				border-top: var(--gl-border-width) solid var(--vscode-widget-border, var(--color-foreground--25));
+
+				/* Bottom-anchored sheet: directional top-only border (it fills the panel, flush on the
+		   other edges), so it can't use the full-border elevatedSurface helper. The top border
+		   survives high-contrast where the --gl-shadow-sheet upward cast vanishes. */
+				/* stylelint-disable-next-line declaration-property-value-disallowed-list */
+				box-shadow: var(--gl-shadow-sheet);
+				animation: gl-sheet-slide-up var(--gl-duration-medium) var(--gl-ease-out);
 			}
 
 			:host([closing]) .sheet {
 				/* Slide down off the bottom edge. The forwards fill-mode pins translateY(100%)
-				   so the sheet stays parked off-screen until the host removes it. Distinct
-				   animation name (vs. the entry's gl-sheet-slide-up) so the browser starts a
-				   fresh run instead of treating it as a continuation of the finished entry. */
-				animation: gl-sheet-slide-down 0.2s ease-in forwards;
+		   so the sheet stays parked off-screen until the host removes it. Distinct
+		   animation name (vs. the entry's gl-sheet-slide-up) so the browser starts a
+		   fresh run instead of treating it as a continuation of the finished entry. */
+				animation: gl-sheet-slide-down var(--gl-duration-medium) var(--gl-ease-in) forwards;
+			}
+
+			/* The sheet is programmatically focused on open — suppress the ring for pointer-driven
+		   opens and show a themed one only for true keyboard focus. */
+			.sheet:focus {
+				outline: none;
+			}
+
+			.sheet:focus-visible {
+				outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+				outline-offset: -0.2rem;
 			}
 
 			.sheet__header {
-				flex: 0 0 auto;
+				box-sizing: border-box;
 				display: flex;
-				align-items: center;
-				justify-content: space-between;
-				gap: 0.8rem;
-				padding: 0.8rem 0.8rem 0.8rem 1.6rem;
-				border-bottom: 0.1rem solid var(--vscode-widget-border, var(--color-foreground--25));
-				min-height: 4.2rem;
-				background: var(--vscode-sideBarSectionHeader-background, var(--vscode-sideBar-background));
+				flex: 0 0 auto;
+				flex-direction: column;
+				padding: var(--gl-space-8) var(--gl-space-8) var(--gl-space-8) var(--gl-space-16);
 				color: var(--vscode-sideBar-foreground, var(--vscode-foreground));
+				background: var(--vscode-sideBarSectionHeader-background, var(--vscode-sideBar-background));
+				border-bottom: var(--gl-border-width) solid var(--vscode-widget-border, var(--color-foreground--25));
 				border-top-left-radius: 0.4rem;
 				border-top-right-radius: 0.4rem;
-				box-sizing: border-box;
+			}
+
+			.sheet__header-row {
+				display: flex;
+				gap: var(--gl-space-8);
+				align-items: center;
+				justify-content: space-between;
+				min-height: 2.6rem;
 			}
 
 			.sheet__title {
 				flex: 1 1 auto;
 				min-width: 0;
-				font-size: 1.4rem;
-				font-weight: 600;
-				color: var(--vscode-sideBarTitle-foreground, var(--vscode-foreground));
 				overflow: hidden;
 				text-overflow: ellipsis;
+				font-size: var(--gl-font-lg);
+				font-weight: 600;
+				color: var(--vscode-sideBarTitle-foreground, var(--vscode-foreground));
 				white-space: nowrap;
 			}
+
 			.sheet__title:empty {
 				display: none;
 			}
 
+			/* No open/closed gating: an unslotted subtitle renders at zero height, so unconverted
+			   sheets pay nothing. Any spacing belongs to the slotted content itself. */
+			.sheet__subtitle {
+				display: flex;
+				min-width: 0;
+			}
+
 			.sheet__actions {
-				flex: 0 0 auto;
 				display: inline-flex;
+				flex: 0 0 auto;
+				gap: var(--gl-space-2);
 				align-items: center;
-				gap: 0.2rem;
 			}
 
 			.sheet__body {
-				flex: 1 1 auto;
-				min-height: 0;
 				display: flex;
+				flex: 1 1 auto;
 				flex-direction: column;
+				min-height: 0;
 				overflow: hidden;
 			}
 
 			.sheet__footer {
-				flex: 0 0 auto;
 				display: flex;
-				gap: 0.8rem;
-				padding: 0.6rem 1.2rem;
-				border-top: 0.1rem solid var(--vscode-widget-border, var(--color-foreground--25));
+				flex: 0 0 auto;
+				gap: var(--gl-space-8);
+				padding: var(--gl-space-6) var(--gl-space-12);
+				border-top: var(--gl-border-width) solid var(--vscode-widget-border, var(--color-foreground--25));
 			}
 
 			.sheet__footer:empty {
@@ -163,6 +200,7 @@ export class GlDetailSheet extends LitElement {
 				from {
 					transform: translateY(100%);
 				}
+
 				to {
 					transform: translateY(0);
 				}
@@ -172,6 +210,7 @@ export class GlDetailSheet extends LitElement {
 				from {
 					transform: translateY(0);
 				}
+
 				to {
 					transform: translateY(100%);
 				}
@@ -181,6 +220,7 @@ export class GlDetailSheet extends LitElement {
 				from {
 					opacity: 0;
 				}
+
 				to {
 					opacity: 1;
 				}
@@ -190,6 +230,7 @@ export class GlDetailSheet extends LitElement {
 				from {
 					opacity: 1;
 				}
+
 				to {
 					opacity: 0;
 				}
@@ -228,6 +269,18 @@ export class GlDetailSheet extends LitElement {
 	 *  scrim, X close) leaves this `false` so focus correctly returns to the trigger element. */
 	skipFocusRestore = false;
 
+	/** When `true`, the sheet does NOT auto-focus itself on open, leaving focus on the trigger — e.g. a
+	 *  graph ref pill acting as a toggle (Enter opens, Enter again closes, without ever moving focus into
+	 *  the sheet). Focus can still be moved in with Tab; Esc still closes (document-level listener). */
+	@property({ type: Boolean, attribute: 'preserve-trigger-focus' })
+	preserveTriggerFocus = false;
+
+	/** When `true`, Esc ownership belongs to the host's keymap overlay stack instead of this component:
+	 *  skips creating the `CloseWatcher` and skips the document-capture keydown listener in
+	 *  `connectedCallback`. Everything else (scrim click, close/back chip) is unchanged. */
+	@property({ type: Boolean, attribute: 'esc-managed' })
+	escManaged = false;
+
 	@query('.sheet')
 	private sheetEl!: HTMLElement;
 
@@ -238,29 +291,39 @@ export class GlDetailSheet extends LitElement {
 		super.connectedCallback?.();
 		this.previouslyFocused = (document.activeElement as HTMLElement) ?? null;
 
-		if ('CloseWatcher' in window) {
-			this.closeWatcher = new CloseWatcher();
-			// Match the dismissibility guard on the polyfill keydown path / scrim click — a
-			// non-dismissible sheet must NOT close on Esc via the native CloseWatcher either.
-			this.closeWatcher.onclose = () => {
-				if (!this.dismissible) return;
+		// `escManaged` sheets cede Esc entirely to the host's keymap overlay stack — neither path
+		// below is registered, so a raw Esc reaches the stack's dispatcher instead of closing here.
+		if (!this.escManaged) {
+			if ('CloseWatcher' in window) {
+				this.closeWatcher = new CloseWatcher();
+				// Match the dismissibility guard on the polyfill keydown path / scrim click — a
+				// non-dismissible sheet must NOT close on Esc via the native CloseWatcher either.
+				this.closeWatcher.onclose = () => {
+					if (!this.dismissible) return;
 
-				this.requestClose();
-			};
-		} else {
+					this.requestClose();
+				};
+			}
+			// ALWAYS listen at document capture too (not just as a CloseWatcher polyfill): the sheet
+			// doesn't trap focus, so Esc must close it even when focus never entered it (e.g. still on
+			// the graph after the opening pill click) or when the focused component consumes Escape
+			// before the CloseWatcher sees it. `requestClose` is re-entrancy-guarded, so the two paths
+			// can't double-fire.
 			document.addEventListener('keydown', this.handleDocumentKeyDown, true);
 		}
 
-		// Focus the sheet itself so keyboard users land here on open. We do NOT trap focus —
-		// sibling elements outside the host parent (e.g. the graph beside the details panel)
-		// remain fully interactive. Guard against a rapid open/close cycle: if the sheet
-		// disconnects within the frame, the rAF still fires; the `isConnected` check drops `this`
-		// for GC instead of holding it for an extra frame.
-		requestAnimationFrame(() => {
-			if (!this.isConnected) return;
+		// Focus the sheet itself so keyboard users land here on open (unless `preserveTriggerFocus`, where a
+		// toggle trigger like a graph ref pill keeps focus so a second activation can CLOSE the sheet). We do
+		// NOT trap focus — sibling elements outside the host parent (e.g. the graph beside the details panel)
+		// remain fully interactive. Guard against a rapid open/close cycle: if the sheet disconnects within
+		// the frame the rAF still fires; the `isConnected` check drops `this` for GC.
+		if (!this.preserveTriggerFocus) {
+			requestAnimationFrame(() => {
+				if (!this.isConnected) return;
 
-			this.sheetEl?.focus({ preventScroll: true });
-		});
+				this.sheetEl?.focus({ preventScroll: true });
+			});
+		}
 	}
 
 	override disconnectedCallback(): void {
@@ -305,20 +368,27 @@ export class GlDetailSheet extends LitElement {
 				tabindex="-1"
 			>
 				<header class="sheet__header" part="header">
-					<div class="sheet__title" part="title">
-						<slot name="title">${this.sheetTitle ?? nothing}</slot>
+					<div class="sheet__header-row">
+						<div class="sheet__title" part="title">
+							<slot name="title">${this.sheetTitle ?? nothing}</slot>
+						</div>
+						<div class="sheet__actions" part="actions">
+							<slot name="actions"></slot>
+							${
+								this.dismissible
+									? html`<gl-action-chip
+											icon="close"
+											label=${this.closeLabel}
+											overlay="tooltip"
+											aria-label=${this.closeLabel}
+											@click=${this.requestClose}
+										></gl-action-chip>`
+									: nothing
+							}
+						</div>
 					</div>
-					<div class="sheet__actions" part="actions">
-						<slot name="actions"></slot>
-						${this.dismissible
-							? html`<gl-action-chip
-									icon="close"
-									label=${this.closeLabel}
-									overlay="tooltip"
-									aria-label=${this.closeLabel}
-									@click=${this.requestClose}
-								></gl-action-chip>`
-							: nothing}
+					<div class="sheet__subtitle" part="subtitle">
+						<slot name="subtitle"></slot>
 					</div>
 				</header>
 				<div class="sheet__body" part="body">
@@ -362,6 +432,7 @@ export class GlDetailSheet extends LitElement {
 		}
 
 		this.closing = true;
+		this.dispatchEvent(new CustomEvent('gl-detail-sheet-closing', { bubbles: true, composed: true }));
 		// Wait for Lit to apply the [closing] attribute and the CSS rule to install the new
 		// animation. Read getAnimations() on the next frame so the reverse animation we care
 		// about is present, then dispatch on its `finished` Promise. Falls back to a hard

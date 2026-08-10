@@ -13,6 +13,7 @@ import { Logger } from '@gitlens/utils/logger.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import type { Container } from '../../container.js';
+import { showPausedOperationStatus } from '../../git/actions/pausedOperation.js';
 import { getActionablePauseAction, readAndParseRebaseDoneFile } from '../../git/utils/-webview/rebase.parsing.utils.js';
 import {
 	getRepoUriFromRebaseTodo,
@@ -129,17 +130,44 @@ export class RebaseEditorProvider implements CustomTextEditorProvider, Disposabl
 		const openOnPausedRebase = configuration.get('rebaseEditor.openOnPausedRebase');
 		if (!openOnPausedRebase || !isRebaseTodoEditorEnabled()) return;
 
+		// While an automatic rebase is running it resolves/continues each pause itself (escalating
+		// when it can't), so auto-opening on the intermediate pauses would fight its UX. Terminal
+		// phases (escalated/failed/…) don't suppress — those pauses are the user's to handle.
+		const autoRebasePhase = this.container.autoRebase.getSession(repoPath)?.phase;
+		switch (autoRebasePhase) {
+			case 'starting':
+			case 'resolving':
+			case 'applying':
+			case 'continuing':
+				return;
+		}
+
 		// Only open if the rebase is actually paused (waiting for user action), not just running
 		const svc = this.container.git.getRepositoryService(repoPath);
 		const status = await svc.pausedOps?.getPausedOperationStatus?.();
 		if (status?.type !== 'rebase' || !status.isPaused) return;
 		if (openOnPausedRebase === 'interactive' && !status.isInteractive) return;
 
+		// 'auto' only opens for operations started from (or adopted by) GitLens — external
+		// rebases (terminals, agents, other tools) surface via the paused-operation UI instead
+		if (openOnPausedRebase === 'auto' && !this.container.operationOrigins.isGitLensInitiated(repoPath)) return;
+
 		// `isPaused` is true while REBASE_HEAD exists — but that file lingers briefly while
 		// `.git/rebase-merge/` is being torn down at the end of a successful rebase, producing
 		// false positives that flicker the editor open with an empty/stale state. Confirm there
 		// is actually user-actionable work to display before opening.
-		if (!(await hasActionableRebaseState(svc))) return;
+		const { actionable, hasConflicts } = await getActionableRebaseState(svc);
+		if (!actionable) return;
+
+		// A conflict pause follows the unified paused-operation surfacing rule (Graph WIP details
+		// when accessible, rebase editor otherwise); only interactive pauses (todo editing /
+		// edit / reword / break) always open the rebase editor below.
+		if (hasConflicts) {
+			await showPausedOperationStatus(this.container, repoPath, {
+				source: { source: 'rebaseEditor', detail: 'auto-open' },
+			});
+			return;
+		}
 
 		// `openBehavior` controls the viewColumn:
 		//   - 'auto': reuse an existing non-active editor group if one exists; otherwise open in the
@@ -264,17 +292,19 @@ export class RebaseEditorProvider implements CustomTextEditorProvider, Disposabl
 }
 
 /**
- * Returns true when the rebase has user-actionable state to display:
- *  - active conflicts in the index, or
+ * Determines whether the rebase has user-actionable state to display:
+ *  - active conflicts in the index (also reported via `hasConflicts`), or
  *  - remaining entries in the rebase-todo file, or
  *  - the last completed action was `edit`/`reword`/`break`/`exec` (a deliberate stop point).
  *
  * Used by the auto-open path to filter out the transient teardown window where REBASE_HEAD
  * still exists but the rebase has effectively finished.
  */
-async function hasActionableRebaseState(svc: ReturnType<Container['git']['getRepositoryService']>): Promise<boolean> {
+async function getActionableRebaseState(
+	svc: ReturnType<Container['git']['getRepositoryService']>,
+): Promise<{ actionable: boolean; hasConflicts: boolean }> {
 	const gitDir = await svc.config.getGitDir?.();
-	if (gitDir == null) return false;
+	if (gitDir == null) return { actionable: false, hasConflicts: false };
 
 	const todoUri = Uri.joinPath(gitDir.uri, 'rebase-merge', 'git-rebase-todo');
 
@@ -284,11 +314,13 @@ async function hasActionableRebaseState(svc: ReturnType<Container['git']['getRep
 		readAndParseRebaseDoneFile(todoUri),
 	]);
 
-	if ((getSettledValue(conflictsResult)?.length ?? 0) > 0) return true;
+	if ((getSettledValue(conflictsResult)?.length ?? 0) > 0) return { actionable: true, hasConflicts: true };
 
 	const todoContent = getSettledValue(todoContentResult);
-	if (todoContent != null && parseRebaseTodo(todoContent).entries.length > 0) return true;
+	if (todoContent != null && parseRebaseTodo(todoContent).entries.length > 0) {
+		return { actionable: true, hasConflicts: false };
+	}
 
 	const lastAction = getSettledValue(doneResult)?.entries.at(-1)?.action;
-	return getActionablePauseAction(lastAction) != null;
+	return { actionable: getActionablePauseAction(lastAction) != null, hasConflicts: false };
 }

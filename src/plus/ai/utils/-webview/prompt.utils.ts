@@ -12,7 +12,6 @@ import {
 	generateCommitMessage,
 	generateCommits,
 	generateCreateCloudPatch,
-	generateCreateCodeSuggest,
 	generateCreatePullRequest,
 	generateSearchQuery,
 	generateStashMessage,
@@ -20,6 +19,7 @@ import {
 	reviewDetail,
 	reviewOverview,
 	reviewPullRequest,
+	reviewRefine,
 	startWorkFromIssue,
 } from '@gitlens/ai/prompts.js';
 import { estimatedCharactersPerToken } from '@gitlens/ai/utils/ai.utils.js';
@@ -63,8 +63,6 @@ export function getLocalPromptTemplate<T extends PromptTemplateType>(
 			return generateChangelog as PromptTemplate<T>;
 		case 'generate-create-cloudPatch':
 			return generateCreateCloudPatch as PromptTemplate<T>;
-		case 'generate-create-codeSuggestion':
-			return generateCreateCodeSuggest as PromptTemplate<T>;
 		case 'generate-create-pullRequest':
 			return generateCreatePullRequest as PromptTemplate<T>;
 		case 'generate-searchQuery':
@@ -79,6 +77,8 @@ export function getLocalPromptTemplate<T extends PromptTemplateType>(
 			return reviewOverview as PromptTemplate<T>;
 		case 'review-detail':
 			return reviewDetail as PromptTemplate<T>;
+		case 'review-refine':
+			return reviewRefine as PromptTemplate<T>;
 		case 'address-review-findings':
 			return addressReviewFindings as PromptTemplate<T>;
 		case 'start-review-pullRequest':

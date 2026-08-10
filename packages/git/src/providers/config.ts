@@ -13,6 +13,14 @@ export type GitCoreConfigKeys =
 	| 'gpg.ssh.program'
 	| 'gpg.ssh.allowedSignersFile'
 	| 'init.defaultBranch'
+	/** `merge.autoStash` — whether `git merge` (and so a merging `git pull`) stashes and reapplies uncommitted changes */
+	| 'merge.autoStash'
+	/** `pull.autoStash` — overrides `merge.autoStash`/`rebase.autoStash` for `git pull`, in either mode */
+	| 'pull.autoStash'
+	/** `pull.rebase` — whether `git pull` rebases instead of merging; also accepts `merges`/`interactive` */
+	| 'pull.rebase'
+	/** `rebase.autoStash` — whether `git rebase` (and so a rebasing `git pull`) stashes and reapplies uncommitted changes */
+	| 'rebase.autoStash'
 	| 'user.email'
 	| 'user.name'
 	| 'user.signingkey';
@@ -22,7 +30,9 @@ export type GitConfigKeys =
 	/** `vscode-merge-base` — value determined by VS Code that is used to determine the merge base for the current branch. Once `gk-merge-base` is determined, we stop using `vscode-merge-base` */
 	| `branch.${string}.vscode-merge-base`
 	/** `github-pr-owner-number` — value determined by VS Code/GitHub PR extension that is used to determine the PR number for the current branch */
-	| `branch.${string}.github-pr-owner-number`;
+	| `branch.${string}.github-pr-owner-number`
+	/** `rebase` — per-branch override of `pull.rebase`; takes precedence over the repository-wide setting */
+	| `branch.${string}.rebase`;
 
 export type GkConfigKeys =
 	/** `gk-merge-base` — the branch that the current branch was created from (the original base at branch creation time) */
@@ -96,6 +106,16 @@ export interface GitConfigSubProvider {
 		value: string | undefined,
 		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[] },
 	): Promise<void>;
+	/**
+	 * Drops every gk key stored for `ref` — call when a branch stops existing under that name. Deliberately
+	 * includes user-owned values (`gk-merge-target-user`, `gk-disposition`, `gk-associated-issues`): the
+	 * branch is confirmed gone, and leaving them would hand the next branch reusing that name a dead one's
+	 * starred state and issue links. Only call where git guarantees the name is free —
+	 * a completed delete.
+	 */
+	removeGkConfigBranchSection?(repoPath: string, ref: string): Promise<void>;
+	/** Moves every gk key stored for `oldRef` to `newRef` — call when a branch is renamed. */
+	renameGkConfigBranchSection?(repoPath: string, oldRef: string, newRef: string): Promise<void>;
 
 	getSigningConfig?(repoPath: string): Promise<SigningConfig>;
 	getSigningConfigFlags?(config: SigningConfig): string[];

@@ -1,6 +1,6 @@
-import type { GraphRow } from '@gitkraken/gitkraken-components';
 import { css, html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
+import type { GitGraphRow } from '@gitlens/git/models/graph.js';
 import type {
 	GraphDownstreams,
 	GraphMinimapMarkerTypes,
@@ -8,7 +8,7 @@ import type {
 	GraphRowStats,
 	GraphSearchResults,
 	GraphSearchResultsError,
-	GraphWipMetadataBySha,
+	GraphWipRowsById,
 } from '../../../../plus/graph/protocol.js';
 import { GlElement, observe } from '../../../shared/components/element.js';
 import '../../../shared/components/code-icon.js';
@@ -42,8 +42,8 @@ export interface GraphMinimapConfigChangeEventDetail {
 export class GlGraphMinimapContainer extends GlElement {
 	static override styles = css`
 		:host {
-			display: block;
 			position: relative;
+			display: block;
 			container-type: size;
 		}
 
@@ -54,8 +54,8 @@ export class GlGraphMinimapContainer extends GlElement {
 			z-index: 2;
 			display: flex;
 			flex-direction: column;
-			align-items: flex-end;
 			gap: 0.125rem;
+			align-items: flex-end;
 		}
 
 		@container (max-height: 4rem) {
@@ -70,14 +70,14 @@ export class GlGraphMinimapContainer extends GlElement {
 		}
 
 		.minimap-settings__trigger {
+			padding: 0.125rem;
+			line-height: 1;
+			color: var(--color-foreground--75);
 			appearance: none;
+			cursor: pointer;
 			background: transparent;
 			border: none;
-			color: var(--color-foreground--75);
-			cursor: pointer;
-			padding: 0.125rem;
 			border-radius: 0.1875rem;
-			line-height: 1;
 		}
 
 		.minimap-settings__trigger:hover {
@@ -87,18 +87,18 @@ export class GlGraphMinimapContainer extends GlElement {
 
 		[slot='content'] gl-radio,
 		[slot='content'] gl-checkbox {
-			--checkbox-foreground: currentColor;
+			--checkbox-foreground: currentcolor;
 		}
 
 		.minimap-datatype__label {
 			display: inline-flex;
+			gap: var(--gl-space-6);
 			align-items: center;
-			gap: 0.6rem;
 		}
 
 		.minimap-datatype__info {
+			font-size: var(--gl-font-base);
 			color: var(--color-foreground--50);
-			font-size: 1.3rem;
 		}
 
 		.minimap-datatype__info:hover {
@@ -109,10 +109,10 @@ export class GlGraphMinimapContainer extends GlElement {
 			display: inline-block;
 			width: 1rem;
 			height: 1rem;
+			margin-right: var(--gl-space-10);
+			margin-left: 0.3rem;
 			border-radius: 0.125rem;
 			transform: scale(1.6);
-			margin-left: 0.3rem;
-			margin-right: 1rem;
 		}
 
 		.minimap-marker-swatch[data-marker='localBranches'] {
@@ -226,7 +226,7 @@ export class GlGraphMinimapContainer extends GlElement {
 	refMetadata?: GraphRefsMetadata | null;
 
 	@property({ type: Array })
-	rows: GraphRow[] = [];
+	rows: GitGraphRow[] = [];
 
 	@property({ type: Object })
 	rowsStats?: Record<string, GraphRowStats>;
@@ -244,7 +244,10 @@ export class GlGraphMinimapContainer extends GlElement {
 	scopeWindow?: { start: number; end: number };
 
 	@property({ type: Object })
-	wipMetadataBySha?: GraphWipMetadataBySha;
+	wipRowsById?: GraphWipRowsById;
+
+	@property({ type: String })
+	primaryWipRowId?: string;
 
 	@state()
 	private markersByDay = new Map<number, GraphMinimapMarker[]>();
@@ -268,7 +271,8 @@ export class GlGraphMinimapContainer extends GlElement {
 		'rows',
 		'rowsStats',
 		'rowsStatsLoading',
-		'wipMetadataBySha',
+		'wipRowsById',
+		'primaryWipRowId',
 	])
 	private handleDataChanged(changedKeys: PropertyKey[]) {
 		// If only rowsStats changed and we're not in lines mode, stats output is unchanged
@@ -299,10 +303,10 @@ export class GlGraphMinimapContainer extends GlElement {
 			return;
 		}
 
-		// If only wipMetadataBySha changed and the worktree marker type is not enabled, markers are unchanged
+		// If only the WIP planes changed and the worktree marker type is not enabled, markers are unchanged
 		if (
 			changedKeys.length === 1 &&
-			changedKeys[0] === 'wipMetadataBySha' &&
+			(changedKeys[0] === 'wipRowsById' || changedKeys[0] === 'primaryWipRowId') &&
 			!this.markerTypes.includes('worktree')
 		) {
 			return;
@@ -351,7 +355,7 @@ export class GlGraphMinimapContainer extends GlElement {
 				@gl-graph-minimap-zoom-change=${this.handleZoomChanged}
 			></gl-graph-minimap>
 			<div class="minimap-settings-wrapper">
-				<gl-popover placement="bottom-end" trigger="hover focus click" ?arrow=${false} distance=${0} hoist>
+				<gl-popover placement="bottom-end" trigger="hover focus click" ?arrow=${false} .distance=${0}>
 					<button type="button" class="minimap-settings__trigger" aria-label="Minimap Options" slot="anchor">
 						<code-icon
 							icon=${this.dataType === 'lines' ? 'request-changes' : 'git-commit'}
@@ -449,29 +453,31 @@ export class GlGraphMinimapContainer extends GlElement {
 						</menu-item>
 					</div>
 				</gl-popover>
-				${this.zoomed
-					? html`<gl-tooltip placement="left" content="Exit Zoom">
-							<button
-								type="button"
-								class="minimap-settings__trigger"
-								aria-label="Exit Zoom"
-								@click=${this.handleExitZoom}
-							>
-								<code-icon icon="zoom-out" size="16"></code-icon>
-							</button>
-						</gl-tooltip>`
-					: this.scopeWindow != null
-						? html`<gl-tooltip placement="left" content="Zoom to Scope">
+				${
+					this.zoomed
+						? html`<gl-tooltip placement="left" content="Exit Zoom">
 								<button
 									type="button"
 									class="minimap-settings__trigger"
-									aria-label="Zoom to Scope"
-									@click=${this.handleEnterZoom}
+									aria-label="Exit Zoom"
+									@click=${this.handleExitZoom}
 								>
-									<code-icon icon="zoom-in" size="16"></code-icon>
+									<code-icon icon="zoom-out" size="16"></code-icon>
 								</button>
 							</gl-tooltip>`
-						: nothing}
+						: this.scopeWindow != null
+							? html`<gl-tooltip placement="left" content="Zoom to Scope">
+									<button
+										type="button"
+										class="minimap-settings__trigger"
+										aria-label="Zoom to Scope"
+										@click=${this.handleEnterZoom}
+									>
+										<code-icon icon="zoom-in" size="16"></code-icon>
+									</button>
+								</gl-tooltip>`
+							: nothing
+				}
 			</div>`;
 	}
 
@@ -520,6 +526,11 @@ export class GlGraphMinimapContainer extends GlElement {
 	}
 
 	private handleExitZoom() {
+		this.resetZoom();
+	}
+
+	/** Exits the minimap's brush/scope zoom. Public so `graph-app` can drive it from the Esc overlay stack. */
+	resetZoom(): void {
 		this.minimap?.resetZoom();
 	}
 
@@ -557,7 +568,8 @@ export class GlGraphMinimapContainer extends GlElement {
 			downstreams: this.downstreams,
 			markerTypes: this.markerTypes,
 			dataType: effectiveDataType,
-			wipMetadataBySha: this.wipMetadataBySha,
+			wipRowsById: this.wipRowsById,
+			primaryWipRowId: this.primaryWipRowId,
 		});
 
 		this.statsByDay = statsByDay;

@@ -1,5 +1,5 @@
 import type { ExtensionContext } from 'vscode';
-import { version as codeVersion, env, ExtensionMode, LogLevel, Uri, window, workspace } from 'vscode';
+import { version as codeVersion, commands, env, ExtensionMode, LogLevel, Uri, window, workspace } from 'vscode';
 import { isWeb } from '@env/platform.js';
 import { defaultResolver as envDefaultResolver } from '@env/resolver.js';
 import { getBranchNameWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
@@ -37,14 +37,15 @@ import {
 } from './messages.js';
 import { registerPartnerActionRunners } from './partners.js';
 import { needsCursorMcpCleanupNotice } from './plus/gk/utils/-webview/mcp.utils.js';
-import { executeCommand, registerCommands } from './system/-webview/command.js';
+import { settingsMigrations } from './settingsMigrations.js';
+import { executeCommand, executeCoreCommand, registerCommands } from './system/-webview/command.js';
 import { configuration, Configuration } from './system/-webview/configuration.js';
 import { setContext } from './system/-webview/context.js';
 import { Storage } from './system/-webview/storage.js';
+import { deviceCohortGroup, getExtensionModeLabel } from './system/-webview/vscode.js';
 import { isTextDocument } from './system/-webview/vscode/documents.js';
 import { isTextEditor } from './system/-webview/vscode/editors.js';
 import { isWorkspaceFolder } from './system/-webview/vscode/workspaces.js';
-import { deviceCohortGroup, getExtensionModeLabel } from './system/-webview/vscode.js';
 import './commands.js';
 
 export async function activate(context: ExtensionContext): Promise<GitLensApi | undefined> {
@@ -197,7 +198,7 @@ export async function activate(context: ExtensionContext): Promise<GitLensApi | 
 		}),
 	);
 
-	// await migrateSettings(context, previousVersion);
+	await migrateSettings(storage);
 
 	const container = Container.create(context, storage, prerelease, gitlensVersion, previousVersion);
 	once(container.onReady)(() => {
@@ -216,6 +217,7 @@ export async function activate(context: ExtensionContext): Promise<GitLensApi | 
 
 		void showWhatsNew(container, gitlensVersion, prerelease, previousVersion);
 		showMcp(container, gitlensVersion, previousVersion);
+		void applyPendingLegacyViewHiding(container);
 
 		void storage.store(prerelease ? 'preVersion' : 'version', gitlensVersion).catch();
 
@@ -263,6 +265,7 @@ export async function activate(context: ExtensionContext): Promise<GitLensApi | 
 		upgrade: previousVersion != null && gitlensVersion !== previousVersion,
 		upgradedFrom: previousVersion != null && gitlensVersion !== previousVersion ? previousVersion : undefined,
 	});
+	setFeatureFlagTelemetryGlobalAttributes(container);
 
 	const api = new Api(container);
 	const mode = container.mode;
@@ -297,21 +300,153 @@ export function deactivate(): void {
 	Container.instance.deactivate();
 }
 
-// async function migrateSettings(context: ExtensionContext, previousVersion: string | undefined) {
-// 	if (previousVersion === undefined) return;
+/** Consumes the one-shot flag set by the `views.legacy:hidden` migration, hiding Home, Cloud Patches
+ *  and Cloud Workspaces for upgraded profiles. Best-effort by design: each hide command acts only
+ *  while the container currently holding its view is the active composite of that container's
+ *  location (verified — a programmatic call resolves without doing anything otherwise, so command
+ *  resolution proves nothing). Views dragged into an inactive container are therefore left alone;
+ *  ones dragged into a simultaneously-active location (e.g. an open secondary side bar) may still be
+ *  hidden — harmless for the hide's intent either way. */
+async function applyPendingLegacyViewHiding(container: Container): Promise<void> {
+	if (!container.storage.get('views:pendingLegacyHide')) return;
 
-// 	const previous = fromString(previousVersion);
+	try {
+		// Ephemeral/automation profiles opt out of onboarding-style UI — don't force-reveal anything there
+		if (configuration.get('advanced.skipOnboarding')) {
+			Logger.debug('applyPendingLegacyViewHiding: skipped (advanced.skipOnboarding)');
+			await container.storage.delete('views:pendingLegacyHide');
 
-// 	try {
-// 		if (compare(previous, from(11, 0, 0)) !== 1) {
-// 		}
-// 	} catch (ex) {
-// 		Logger.error(ex, 'migrateSettings');
-// 	}
-// }
+			return;
+		}
+
+		// Profiles that disabled Plus features may have no Graph to land on (its `when` hangs off
+		// `gitlens:plus:disabled`) — Home stays their main surface, so don't hide anything. Read the
+		// SETTING, not the context: `gitlens:plus:disabled` is computed debounced-async after ready and
+		// cannot be set yet here. The flag stays ARMED (not consumed): if Plus features come back later,
+		// the next activation performs the hide.
+		if (configuration.get('plusFeatures.enabled', undefined, true) === false) {
+			Logger.debug('applyPendingLegacyViewHiding: deferred (plus features disabled)');
+
+			return;
+		}
+
+		// Untrusted windows and any open virtual (GitHub) folder keep Cloud Patches/Workspaces
+		// `when`-excluded, so their hide commands can never register here — defer (flag stays armed) until
+		// a window where they can. The scheme test approximates `gitlens:hasVirtualFolders` (repo-based,
+		// set async after discovery — unreadable here); the mismatch fails safe in both directions
+		if (!workspace.isTrusted || workspace.workspaceFolders?.some(f => f.uri.scheme === 'vscode-vfs')) {
+			Logger.debug('applyPendingLegacyViewHiding: deferred (untrusted or virtual workspace)');
+
+			return;
+		}
+
+		// Claim the flag before acting: on a multi-window upgrade every window activates with it armed,
+		// and one forced reveal is enough
+		await container.storage.delete('views:pendingLegacyHide');
+
+		// The hide commands only act while the GitLens container's composite is materialized (their own
+		// metadata: "…if it is visible and the view container it is located in is visible") — verified:
+		// without this they resolve as silent no-ops. Focus commands can't materialize it reliably —
+		// they open whichever container holds their view (a hand-placed Graph would open that one) and
+		// resolve `null` instead of rejecting when the view isn't active. The container command is a
+		// TOGGLE, but at activation it only closes when the whole GitLens container was dragged into a
+		// currently-focused bottom panel — for a layout that curated, the hides bailing (so the views
+		// stay) is the directive-compliant outcome anyway. (In the side bars the already-visible-and-
+		// focused case just moves focus to the editor group — harmless, hides still work.) Note the
+		// reveal itself resolves the Graph webview (the pane is declared visible and starts expanded) —
+		// that cost is inherent to the hide.
+		await executeCoreCommand('workbench.view.extension.gitlens');
+
+		// Two passes so a late-resolving `when` can't stall the rest past the reveal (Cloud Patches
+		// waits on the org's drafts entitlement): hide whatever is ready now, then poll for stragglers.
+		// A `when` that never comes true isn't showing its view anyway — the common case (no drafts
+		// entitlement) burns the full budget for it; accepted, this runs voided off the critical path,
+		// once per install.
+		let remaining: ('home' | 'drafts' | 'workspaces')[] = ['home', 'drafts', 'workspaces'];
+		const deadline = Date.now() + 15000;
+		while (remaining.length) {
+			const cmds = await commands.getCommands(true);
+			const pending: typeof remaining = [];
+			for (const view of remaining) {
+				if (!cmds.includes(`gitlens.views.${view}.removeView`)) {
+					pending.push(view);
+					continue;
+				}
+
+				try {
+					await executeCoreCommand(`gitlens.views.${view}.removeView`);
+				} catch (ex) {
+					Logger.debug(`applyPendingLegacyViewHiding: hiding '${view}' failed (${String(ex)})`);
+				}
+			}
+
+			remaining = pending;
+			if (remaining.length === 0 || Date.now() > deadline) {
+				if (remaining.length) {
+					Logger.debug(
+						`applyPendingLegacyViewHiding: skipped '${remaining.join("', '")}' (never registered)`,
+					);
+				}
+				break;
+			}
+
+			await new Promise<void>(resolve => setTimeout(resolve, 1000));
+		}
+
+		// Land on the Graph LAST: its focus activates whichever container holds the view, so running it
+		// before the hides would deactivate the GitLens composite for anyone who hand-placed the Graph
+		// in another side-bar container, silently no-opping every hide. `preserveFocus` keeps the
+		// keyboard where it is; resolves as a harmless no-op if the Graph isn't available. Skipped for
+		// editor-layout profiles — not to avoid the webview (the reveal above already resolved it), but
+		// to avoid un-hiding or expanding a Graph pane they may have deliberately collapsed.
+		if (configuration.get('graph.layout') !== 'editor') {
+			await executeCoreCommand('gitlens.views.graph.focus', { preserveFocus: true });
+		}
+	} catch (ex) {
+		Logger.error(ex, 'applyPendingLegacyViewHiding');
+	}
+}
+
+async function migrateSettings(storage: Storage): Promise<void> {
+	const applied = new Set(storage.get('settings:migrated'));
+
+	let changed = false;
+	for (const migration of settingsMigrations) {
+		if (applied.has(migration.id)) continue;
+
+		try {
+			await migration.migrate(storage);
+			// Mark only on success — leave a failed migration unmarked so it retries next activation
+			// (migrations are idempotent).
+			applied.add(migration.id);
+			changed = true;
+		} catch (ex) {
+			Logger.error(ex, 'migrateSettings', migration.id);
+		}
+	}
+
+	if (changed) {
+		await storage.store('settings:migrated', [...applied]);
+	}
+}
 
 function setKeysForSync(context: ExtensionContext, ...keys: (SyncedStorageKeys | string)[]) {
-	context.globalState?.setKeysForSync([...keys, SyncedStorageKeys.Version, SyncedStorageKeys.PreReleaseVersion]);
+	context.globalState?.setKeysForSync([
+		...keys,
+		SyncedStorageKeys.ApprovedAvatarRemoteTemplates,
+		SyncedStorageKeys.Version,
+		SyncedStorageKeys.PreReleaseVersion,
+	]);
+}
+
+function setFeatureFlagTelemetryGlobalAttributes(container: Container): void {
+	const flags = container.featureFlags.getAllFlags();
+	if (Object.keys(flags).length === 0) return;
+
+	container.telemetry.setGlobalAttribute(
+		'featureFlags',
+		JSON.stringify(Object.fromEntries(Object.entries(flags).sort(([a], [b]) => a.localeCompare(b)))),
+	);
 }
 
 function registerBuiltInActionRunners(container: Container): void {

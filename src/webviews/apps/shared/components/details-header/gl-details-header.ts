@@ -1,24 +1,35 @@
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { classMap } from 'lit/directives/class-map.js';
+import { ifDefined } from 'lit/directives/if-defined.js';
+import type { OnboardingKeys } from '../../../../../constants.onboarding.js';
 import type { RunningOperationExecState } from '../../../plus/graph/components/detailsState.js';
 import { chipStateSuffix, statusIconFor } from '../../../plus/graph/components/runningOperationStatus.js';
 import { elementBase } from '../styles/lit/base.css.js';
 import { modeHeaderStyles, modeToggleStyles } from '../styles/lit/mode.css.js';
+import { renderDetailsMaximizeChip } from './details-maximize-chip.js';
 import { detailsHeaderStyles } from './gl-details-header.css.js';
 import '../chips/action-chip.js';
 import '../code-icon.js';
+import '../indicators/new-indicator.js';
 import '../progress.js';
 
 /** Compose/review live in the details panel as toggle modes. Compare is rendered here too,
  *  as a grouped entry-point chip alongside the toggles (for visual grouping + responsive
  *  label-collapse parity), but it is NOT a `Mode`: it has no active/close state — clicking
  *  it opens a compare sheet over the panel (dispatches `toggle-mode`/'compare'). */
-type Mode = 'review' | 'compose';
+type Mode = 'review' | 'compose' | 'resolve';
 
 const modeConfig: Record<
 	Mode,
-	{ icon: string; label: string; closeLabel: string; text: string; collapsible: boolean }
+	{
+		icon: string;
+		label: string;
+		closeLabel: string;
+		text: string;
+		collapsible: boolean;
+		onboardingKey?: OnboardingKeys;
+	}
 > = {
 	compose: {
 		icon: 'wand',
@@ -26,12 +37,22 @@ const modeConfig: Record<
 		closeLabel: 'Close',
 		text: 'Compose',
 		collapsible: true,
+		onboardingKey: 'details:compose:buttonCallout',
 	},
 	review: {
 		icon: 'checklist',
 		label: 'Review Changes',
 		closeLabel: 'Close',
 		text: 'Review',
+		collapsible: true,
+		onboardingKey: 'details:review:buttonCallout',
+	},
+	resolve: {
+		onboardingKey: 'details:resolve:buttonCallout',
+		icon: 'gl-merge',
+		label: 'Resolve Conflicts',
+		closeLabel: 'Close',
+		text: 'Resolve Conflicts',
 		collapsible: true,
 	},
 };
@@ -48,6 +69,12 @@ export class GlDetailsHeader extends LitElement {
 	 *  action group, after the mode toggles. Not a `Mode` — see the `Mode` type comment. */
 	@property({ type: Boolean }) compareEnabled = false;
 
+	/** When true, render the details-panel maximize/restore chip in the active-mode close cluster
+	 *  (only bottom-docked graph panels opt in; the standalone Inspect view never sets this). */
+	@property({ type: Boolean, attribute: 'show-maximize' }) showMaximize = false;
+	/** Drives the maximize chip's icon/label when `showMaximize` is true. */
+	@property({ type: Boolean }) maximized = false;
+
 	/** Per-mode execState + has-result of any running operation at the engaged anchor — drives
 	 *  the status-overlay suffix icon on compose/review toggle chips (parallel to the WIP-row
 	 *  adornment buttons). `hasResult` distinguishes a `'backed'` entry with a viewable result
@@ -55,7 +82,7 @@ export class GlDetailsHeader extends LitElement {
 	 *  Go Back) so the chip doesn't falsely advertise a completed run. Set even when `activeMode`
 	 *  is null so a toggled-out-but-still-running operation keeps its chip overlay. */
 	@property({ attribute: false }) modeStatus?: Partial<
-		Record<'review' | 'compose', { execState: RunningOperationExecState; hasResult: boolean }>
+		Record<Mode, { execState: RunningOperationExecState; hasResult: boolean }>
 	>;
 
 	/** True when the mode is in its drilled-in "results" sub-state (e.g. review showing
@@ -72,24 +99,51 @@ export class GlDetailsHeader extends LitElement {
 
 	override render() {
 		const isModeActive = this.activeMode != null;
+		// The mode toggles + Compare form a "center" group, gap-centered between the title and the
+		// right-anchored actions slot via two flex spacers. Only render the scaffold when there's
+		// something to center; an empty center between two spacers would leave a phantom gap.
+		const hasCenter = !isModeActive && ((this.modes?.length ?? 0) >= 1 || this.compareEnabled);
 
 		return html`<div class="details-header mode-header ${isModeActive ? 'mode-header--active' : ''}">
 			<div class="details-header__row">
 				<div class="details-header__content">
 					<slot></slot>
 				</div>
-				<div class="details-header__actions">
-					${isModeActive
-						? this.renderCloseButton()
-						: html`${this.renderModeToggles()}${this.renderCompareToggle()}<slot
+				${
+					isModeActive
+						? html`<div class="details-header__spacer"></div>
+								<div class="details-header__actions">${this.renderCloseButton()}</div>`
+						: html`<div class="details-header__spacer"></div>
+								${
+									hasCenter
+										? html`<div class="details-header__center">
+													${
+														this.modes?.length
+															? html`<div class="details-header__modes">
+																	${this.renderModeToggles()}
+																</div>`
+															: nothing
+													}${this.renderCompareToggle()}
+												</div>
+												${
+													// Trailing spacer only when the actions slot has content — otherwise the
+													// center group right-aligns against the empty anchor (comparison panel)
+													// instead of floating center-right against zero width.
+													this.hasActions
+														? html`<div class="details-header__spacer"></div>`
+														: nothing
+												}`
+										: nothing
+								}
+								<slot
 									name="actions"
 									class=${classMap({
 										'details-header__actions-secondary': true,
 										'has-actions': this.hasActions,
 									})}
 									@slotchange=${this.onActionsSlotChange}
-								></slot>`}
-				</div>
+								></slot>`
+				}
 			</div>
 			<slot name="secondary"></slot>
 			<progress-indicator position="bottom" ?active=${this.loading}></progress-indicator>
@@ -131,7 +185,7 @@ export class GlDetailsHeader extends LitElement {
 			const mainIcon = showText && overlayIcon != null ? overlayIcon : config.icon;
 			const showSuffixOverlay = !showText && overlayIcon != null;
 
-			return html`<gl-action-chip
+			const chip = html`<gl-action-chip
 				icon=${mainIcon}
 				label="${label}"
 				overlay="tooltip"
@@ -144,14 +198,18 @@ export class GlDetailsHeader extends LitElement {
 				@click=${() => this.handleToggleMode(mode)}
 			>
 				${showText ? html`<span class="mode-toggle__text">${config.text}</span>` : nothing}
-				${showSuffixOverlay
-					? html`<code-icon
-							slot="suffix"
-							icon=${overlayIcon}
-							modifier=${overlayIcon === 'loading' ? 'spin' : ''}
-						></code-icon>`
-					: nothing}
+				${
+					showSuffixOverlay
+						? html`<code-icon
+								slot="suffix"
+								icon=${overlayIcon}
+								modifier=${overlayIcon === 'loading' ? 'spin' : ''}
+							></code-icon>`
+						: nothing
+				}
 			</gl-action-chip>`;
+
+			return html`<gl-new-indicator key=${ifDefined(config.onboardingKey)}>${chip}</gl-new-indicator>`;
 		});
 	}
 
@@ -168,15 +226,17 @@ export class GlDetailsHeader extends LitElement {
 		// Grouped with the mode toggles for layout + label-collapse parity, but Compare is not
 		// a mode (no active/close state) — it just opens the compare sheet. Its label collapses
 		// first (widest `@container` breakpoint in `gl-details-header.css.ts`).
-		return html`<gl-action-chip
-			icon="compare-changes"
-			label="Compare"
-			overlay="tooltip"
-			class="mode-toggle mode-toggle--compare"
-			@click=${this.handleCompare}
-		>
-			<span class="mode-toggle__text">Compare</span>
-		</gl-action-chip>`;
+		return html`<gl-new-indicator key="details:compare:buttonCallout">
+			<gl-action-chip
+				icon="compare-changes"
+				label="Compare"
+				overlay="tooltip"
+				class="mode-toggle mode-toggle--compare"
+				@click=${this.handleCompare}
+			>
+				<span class="mode-toggle__text">Compare</span>
+			</gl-action-chip>
+		</gl-new-indicator>`;
 	}
 
 	private handleCompare = (): void => {
@@ -193,6 +253,9 @@ export class GlDetailsHeader extends LitElement {
 		if (this.activeMode == null) return nothing;
 
 		const config = modeConfig[this.activeMode];
+		// Maximize/restore rides at the left of the cluster in every active-mode sub-state so it's
+		// available whether or not a Refresh chip is shown. Only bottom-docked graph panels opt in.
+		const maximizeChip = this.showMaximize ? renderDetailsMaximizeChip(this.maximized, false) : nothing;
 		const closeChip = html`<gl-action-chip
 			icon="close"
 			label=${config.closeLabel}
@@ -205,7 +268,7 @@ export class GlDetailsHeader extends LitElement {
 		// can re-run with a different scope without losing the result (back() snapshots it for
 		// forward()). Close still exits the mode entirely.
 		if (this.inResultsView) {
-			return html`<gl-action-chip
+			return html`${maximizeChip}<gl-action-chip
 					icon="debug-restart"
 					label="Restart"
 					overlay="tooltip"
@@ -222,9 +285,9 @@ export class GlDetailsHeader extends LitElement {
 		// run is locked to the scope it started with) or race with the result, so the chip
 		// would be misleading.
 		const isGenerating = this.modeStatus?.[this.activeMode]?.execState === 'generating';
-		if (isGenerating) return closeChip;
+		if (isGenerating) return html`${maximizeChip}${closeChip}`;
 
-		return html`<gl-action-chip
+		return html`${maximizeChip}<gl-action-chip
 				icon="refresh"
 				label="Refresh"
 				overlay="tooltip"

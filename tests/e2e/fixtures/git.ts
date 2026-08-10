@@ -1,4 +1,4 @@
-/* eslint-disable no-restricted-globals */
+/* oxlint-disable no-restricted-globals */
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -41,6 +41,15 @@ export class GitFixture {
 	 */
 	async clean(): Promise<void> {
 		await this.git('clean', undefined, '-fd');
+	}
+
+	/**
+	 * Set a repository-local git config value (e.g. `commit.gpgsign`, `true`).
+	 */
+	async config(key: string, value: string): Promise<void> {
+		// `--local` makes the documented repository scope explicit rather than relying on git's
+		// cwd-based default, so this never writes to global/system config if the environment shifts.
+		await this.git('config', undefined, '--local', key, value);
 	}
 
 	/**
@@ -132,6 +141,21 @@ export class GitFixture {
 		return this.git('rev-parse', undefined, '--short', ref);
 	}
 
+	/**
+	 * Unmerged (conflicted) paths in the index. Worth asserting after any merge a test EXPECTS to
+	 * conflict: such a merge exits non-zero, so the caller has to swallow the rejection, and that
+	 * equally swallows a merge git declined to start at all. Pair it with {@link isMergeInProgress} —
+	 * unmerged paths alone can also come from a failed `stash pop` or `checkout --merge`, which leave
+	 * no `MERGE_HEAD` and so no paused-operation state for the UI to show.
+	 */
+	async getUnmergedPaths(): Promise<string[]> {
+		const out = await this.git('diff', undefined, '--name-only', '--diff-filter=U');
+		return out
+			.split('\n')
+			.map(l => l.trim())
+			.filter(l => l.length > 0);
+	}
+
 	async init(): Promise<void> {
 		await fs.mkdir(this.repoPath, { recursive: true });
 		await this.git('init', undefined, '-b', 'main');
@@ -140,6 +164,18 @@ export class GitFixture {
 		await this.git('config', undefined, 'user.name', 'Your Name');
 		// Initial commit to have a HEAD
 		await this.commit('Initial commit');
+	}
+
+	/**
+	 * Check if a merge is in progress by looking for MERGE_HEAD
+	 */
+	async isMergeInProgress(): Promise<boolean> {
+		try {
+			await this.git('rev-parse', undefined, '--verify', 'MERGE_HEAD');
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -170,6 +206,13 @@ export class GitFixture {
 			args.push('-m', message);
 		}
 		await this.git('merge', undefined, ...args);
+	}
+
+	/**
+	 * Abort an in-progress merge (e.g., to clear a conflicted merge state)
+	 */
+	async mergeAbort(): Promise<void> {
+		await this.git('merge', undefined, '--abort');
 	}
 
 	/**
@@ -261,6 +304,9 @@ export class GitFixture {
 		}
 		args.push('-i', onto);
 
+		// Where `rebase -i` always puts the todo file, so the signal helpers below can still reach an
+		// editor for a test that failed before reading the `.ready` file
+		const expectedTodoPath = path.join(this.repoPath, '.git', 'rebase-merge', 'git-rebase-todo');
 		// The todo file path - we'll get the actual path from the .ready file
 		let todoFilePath: string | undefined;
 
@@ -268,8 +314,6 @@ export class GitFixture {
 
 		const waitForTodoFile = async (): Promise<string> => {
 			// Poll for the .ready file which contains the todo file path
-			const rebaseMergeDir = path.join(this.repoPath, '.git', 'rebase-merge');
-			const expectedTodoPath = path.join(rebaseMergeDir, 'git-rebase-todo');
 			const readyFile = `${expectedTodoPath}.ready`;
 
 			const maxWait = 10000;
@@ -289,20 +333,12 @@ export class GitFixture {
 		};
 
 		const signalEditorDone = async (): Promise<void> => {
-			if (!todoFilePath) {
-				throw new Error('Must call waitForTodoFile first');
-			}
-
-			const doneFile = `${todoFilePath}.done`;
+			const doneFile = `${todoFilePath ?? expectedTodoPath}.done`;
 			await fs.writeFile(doneFile, 'done');
 		};
 
 		const signalEditorAbort = async (): Promise<void> => {
-			if (!todoFilePath) {
-				throw new Error('Must call waitForTodoFile first');
-			}
-
-			const abortFile = `${todoFilePath}.abort`;
+			const abortFile = `${todoFilePath ?? expectedTodoPath}.abort`;
 			await fs.writeFile(abortFile, 'abort');
 		};
 
@@ -353,10 +389,25 @@ export class GitFixture {
 		await this.git('worktree', undefined, 'add', worktreePath, branch);
 	}
 
+	/**
+	 * Prune stale worktree administrative entries left behind by a failed `worktree add`.
+	 */
+	async pruneWorktrees(): Promise<void> {
+		await this.git('worktree', undefined, 'prune');
+	}
+
 	private async git(command: string, options?: { configs?: string[] }, ...args: string[]): Promise<string> {
 		const fullArgs = [...(options?.configs ?? []), command, ...args];
 		return new Promise((resolve, reject) => {
-			const child = spawn('git', fullArgs, { cwd: this.repoPath, env: process.env });
+			// Fixture repos must not inherit the developer's global/system git config. A `merge.ff=only`,
+			// `rerere.enabled`, `merge.autostash` or a global `hooksPath` silently changes what these
+			// commands do, so a fixture passes on one machine and fails on another (or on CI) for reasons
+			// no test states. Pointing both scopes at `/dev/null` makes every repo built here depend only
+			// on what these methods set explicitly.
+			const child = spawn('git', fullArgs, {
+				cwd: this.repoPath,
+				env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+			});
 
 			let stdout = '';
 			child.stdout.on('data', (data: string | Buffer) => (stdout += data.toString()));

@@ -3,7 +3,7 @@ import type { GitServiceContext } from '@gitlens/git/context.js';
 import { BranchError } from '@gitlens/git/errors.js';
 import type { BranchDisposition, BranchMetadata } from '@gitlens/git/models/branch.js';
 import { GitBranch } from '@gitlens/git/models/branch.js';
-import type { ConflictDetectionResult } from '@gitlens/git/models/mergeConflicts.js';
+import type { ConflictDetectionErrorReason, ConflictDetectionResult } from '@gitlens/git/models/mergeConflicts.js';
 import type { GitBranchReference } from '@gitlens/git/models/reference.js';
 import type {
 	BranchContributionsOverview,
@@ -41,6 +41,7 @@ import type { CliGitProviderInternal } from '../cliGitProvider.js';
 import type { GitResult } from '../exec/exec.types.js';
 import type { Git } from '../exec/git.js';
 import { getGitCommandError, gitConfigsBranch, gitConfigsLog, GitError, GitErrors, GitWarnings } from '../exec/git.js';
+import type { GitMergeConflict } from '../parsers/mergeTreeParser.js';
 import { parseMergeTreeConflict } from '../parsers/mergeTreeParser.js';
 
 /** Minimum time between writes to the config for last accessed/modified dates */
@@ -184,6 +185,14 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 
 				// If we don't get any data, assume the repo doesn't have any commits yet so check if we have a current branch
 				if (!records.length) {
+					// Never CACHE that conclusion. `getRefs` reports a failed enumeration the same way as a
+					// genuinely ref-less repo — an empty array (it invalidates its own entry but doesn't
+					// throw) — so a transient `for-each-ref` failure would otherwise pin this degraded
+					// current-branch-only list in a map with no TTL, and every branch consumer would see a
+					// one-branch repo for the session. A truly empty repo re-reads cheaply, so refusing the
+					// entry costs nothing in the case this is actually meant to serve.
+					cacheable?.invalidate();
+
 					const current = await this.getCurrentBranch(
 						commonPath,
 						metadataMap,
@@ -360,7 +369,9 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		repoPath: string,
 		ref: string,
 		options?: {
-			associatedPullRequest?: Promise<{ refs?: { base?: { branch: string } } } | undefined>;
+			associatedPullRequest?: Promise<
+				{ refs?: { base?: { branch: string } }; stack?: { position: number } } | undefined
+			>;
 			priority?: GitCommandPriority;
 		},
 		cancellation?: AbortSignal,
@@ -478,14 +489,20 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 					if (branch == null) return undefined;
 
 					mergeTarget = `${branch.remoteName}/${pr.refs.base.branch}`;
-					// Store for future reuse — turns the next call into a Tier 1 path. Skip the
-					// `branchOverviews` invalidation that the write would otherwise trigger: we're
-					// about to populate `${ref}|${mergeTarget}` with this exact target, so evicting
-					// it would just force the next caller to redo the body. (gk-merge-target writes
-					// do not affect `baseBranchName`, so no need to skip that target.)
-					void this.storeMergeTargetBranchName(repoPath, ref, mergeTarget, {
-						skipInvalidation: ['branchOverviews'],
-					});
+					// A stacked PR's base is the layer below it, which is deleted when the stack merges.
+					// Storing it would leave a stored target naming a branch that no longer exists — and
+					// a stored target beats every other tier, so it would keep winning until cleared by
+					// hand. Use it for this lookup, but don't persist it.
+					if (pr.stack == null) {
+						// Store for future reuse — turns the next call into a Tier 1 path. Skip the
+						// `branchOverviews` invalidation that the write would otherwise trigger: we're
+						// about to populate `${ref}|${mergeTarget}` with this exact target, so evicting
+						// it would just force the next caller to redo the body. (gk-merge-target writes
+						// do not affect `baseBranchName`, so no need to skip that target.)
+						void this.storeMergeTargetBranchName(repoPath, ref, mergeTarget, {
+							skipInvalidation: ['branchOverviews'],
+						});
+					}
 				}
 			}
 
@@ -693,7 +710,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 							'--',
 						);
 
-						if (result.cancelled || signal?.aborted) {
+						if (result.completion.status === 'cancelled' || signal?.aborted) {
 							throw new CancellationError();
 						}
 
@@ -727,7 +744,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 	async getDefaultBranchName(
 		repoPath: string | undefined,
 		remote?: string,
-		options?: { priority?: GitCommandPriority },
+		options?: { priority?: GitCommandPriority; local?: boolean },
 		cancellation?: AbortSignal,
 	): Promise<string | undefined> {
 		if (repoPath == null) return undefined;
@@ -736,55 +753,116 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		const priority = options?.priority;
 		const priorityOpts = priority != null ? { priority: priority } : undefined;
 
-		return this.cache.getDefaultBranchName(repoPath, remote, async commonPath => {
-			let retried = false;
-			while (true) {
-				try {
-					const result = await this.git.run(
-						{ cwd: commonPath, cancellation: cancellation, ...priorityOpts },
-						'symbolic-ref',
-						'--short',
-						`refs/remotes/${remote}/HEAD`,
-					);
-					return result.stdout.trim() || undefined;
-				} catch (ex) {
-					if (/is not a symbolic ref/.test(ex.stderr)) {
-						try {
-							if (!retried) {
-								retried = true;
-								await this.git.run(
-									{ cwd: commonPath, cancellation: cancellation, ...priorityOpts },
-									'remote',
-									'set-head',
-									'-a',
-									remote,
-								);
-								continue;
-							}
+		// Local-only: read just the existing local symref, never contacting the remote. Cached under a
+		// `${remote}:local` key — a colon can't appear in a refname component, so it can never collide
+		// with a real remote name used by the networked variant below. Invalidated by the same
+		// remotes/branches cache cascades as the networked lookup.
+		if (options?.local) {
+			return this.cache.getDefaultBranchName(
+				repoPath,
+				`${remote}:local`,
+				async (commonPath, cacheable, signal) => {
+					try {
+						// Bind to the aggregate `signal` (fires only when ALL current callers abort), not
+						// this-caller's `cancellation` — otherwise a superseded caller's abort would kill the
+						// shared command and reject concurrent riders that never cancelled.
+						const result = await this.git.run(
+							{ cwd: commonPath, cancellation: signal ?? cancellation, ...priorityOpts },
+							'symbolic-ref',
+							'--short',
+							`refs/remotes/${remote}/HEAD`,
+						);
+						return result.stdout.trim() || undefined;
+					} catch (ex) {
+						if (isCancellationError(ex)) throw ex;
 
-							const result = await this.git.run(
-								{ cwd: commonPath, cancellation: cancellation, ...priorityOpts },
-								'ls-remote',
-								'--symref',
-								remote,
-								'HEAD',
-							);
-							if (result.stdout) {
-								const match = /ref:\s(\S+)\s+HEAD/m.exec(result.stdout);
-								if (match != null) {
-									const [, branch] = match;
-									return `${remote}/${branch.substring('refs/heads/'.length).trim()}`;
-								}
-							}
-						} catch {
-							if (isCancellationError(ex)) throw ex;
-						}
+						// `symbolic-ref` on an absent `refs/remotes/<remote>/HEAD` exits fatal rather than
+						// empty, and that message matches no `GitWarnings` entry, so it arrives here as a
+						// throw. It is still an ANSWER — the ref genuinely isn't set — and the overwhelmingly
+						// common one, so cache it. Invalidating instead means every caller re-probes and the
+						// whole point of caching this lookup is lost.
+						const stderr = (ex as { stderr?: string }).stderr ?? '';
+						if (stderr.includes('is not a symbolic ref')) return undefined;
+
+						// Anything else never produced an answer (spawn failure, queue rejection). This entry
+						// has no TTL, so caching that would pin "no default branch" for the session.
+						cacheable.invalidate();
+						return undefined;
 					}
+				},
+				cancellation,
+			);
+		}
 
-					return undefined;
+		return this.cache.getDefaultBranchName(
+			repoPath,
+			remote,
+			async (commonPath, cacheable, signal) => {
+				let retried = false;
+				while (true) {
+					try {
+						const result = await this.git.run(
+							{ cwd: commonPath, cancellation: signal ?? cancellation, ...priorityOpts },
+							'symbolic-ref',
+							'--short',
+							`refs/remotes/${remote}/HEAD`,
+						);
+						return result.stdout.trim() || undefined;
+					} catch (ex) {
+						// Only "no HEAD ref configured" is an ANSWER here; every other throw means the lookup
+						// never happened. This entry has no TTL, so caching a failure — an offline `ls-remote`
+						// being the likely one — would pin "no default branch" for the session.
+						let answered = false;
+						if (/is not a symbolic ref/.test(ex.stderr)) {
+							try {
+								if (!retried) {
+									retried = true;
+									await this.git.run(
+										{ cwd: commonPath, cancellation: signal ?? cancellation, ...priorityOpts },
+										'remote',
+										'set-head',
+										'-a',
+										remote,
+									);
+									// This just created `refs/remotes/<remote>/HEAD`, which the `local` variant
+									// may already have cached a miss for. The watcher would also catch the new
+									// ref, but evict directly so consumers of this package that don't wire up a
+									// watcher aren't stuck with that miss.
+									this.cache.deleteDefaultBranchName(commonPath, `${remote}:local`);
+									continue;
+								}
+
+								const result = await this.git.run(
+									{ cwd: commonPath, cancellation: signal ?? cancellation, ...priorityOpts },
+									'ls-remote',
+									'--symref',
+									remote,
+									'HEAD',
+								);
+								if (result.stdout) {
+									const match = /ref:\s(\S+)\s+HEAD/m.exec(result.stdout);
+									if (match != null) {
+										const [, branch] = match;
+										return `${remote}/${branch.substring('refs/heads/'.length).trim()}`;
+									}
+								}
+
+								// `ls-remote` ran and the remote advertised no HEAD — a real "none".
+								answered = true;
+							} catch {
+								if (isCancellationError(ex)) throw ex;
+							}
+						}
+
+						if (!answered) {
+							cacheable.invalidate();
+						}
+						return undefined;
+					}
 				}
-			}
-		});
+			},
+			cancellation,
+		);
 	}
 
 	@debug()
@@ -795,6 +873,12 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		}
 		try {
 			await this.git.run({ cwd: repoPath }, ...args);
+			// Evict the cached base so the new branch re-derives its own. The PERSISTED `branch.<ref>.gk-*`
+			// keys are left alone: they're dropped when GitLens deletes a branch, never when one is created.
+			// Removing them here would mean treating a reused name as proof of a different branch, which
+			// nothing can establish — so the trade is that a branch reusing a name deleted outside GitLens
+			// inherits the orphaned section.
+			this.cache.deleteBaseBranchName(repoPath, name);
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
 		} catch (ex) {
@@ -821,9 +905,23 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		const args = ['branch', options?.force ? '-D' : '-d', ...branches];
 		try {
 			await this.git.run({ cwd: repoPath }, ...args);
+			for (const branch of branches) {
+				this.cache.deleteBaseBranchName(repoPath, branch);
+				// Drop the persisted gk metadata too, not just the cached resolution. `getBaseBranchName`
+				// reads `branch.<ref>.gk-merge-base` before falling back to the reflog, so leaving it behind
+				// would hand a later branch reusing this name its predecessor's base — evicting the cache
+				// alone just forces a re-derivation that reads the same stale value back.
+				await this.provider.config.removeGkConfigBranchSection(repoPath, branch);
+			}
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
 		} catch (ex) {
+			// A multi-name delete partially succeeds: `git branch -d a bad c` removes `a` and `c`, refuses
+			// `bad`, and still exits non-zero — so the loop above never ran for the branches that did go.
+			// Clean those up here rather than leave persisted gk metadata behind for a name a later branch
+			// can reuse.
+			await this.cleanupDeletedBranchMetadata(repoPath, branches);
+
 			if (ex instanceof BranchError) {
 				throw ex.update({
 					action: options?.force ? 'force delete' : 'delete',
@@ -840,6 +938,54 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 				},
 				ex,
 			);
+		}
+	}
+
+	/**
+	 * Drops the cached and persisted per-branch metadata for whichever of `names` no longer exists. Only
+	 * for the partial-failure path — one extra `for-each-ref` is cheap while already handling an error,
+	 * and keeps the success path free of it.
+	 */
+	private async cleanupDeletedBranchMetadata(repoPath: string, names: string[]): Promise<void> {
+		try {
+			const result = await this.git.run(
+				{ cwd: repoPath, errors: 'ignore' },
+				'for-each-ref',
+				// Full refname, stripped here rather than by git. NOT `%(refname:short)`: that yields the
+				// shortest UNAMBIGUOUS name, so a branch with a same-named tag comes back as `heads/<name>`,
+				// never matches the requested name, and would read as deleted — wiping a live branch's
+				// metadata. `%(refname:strip=2)` also solves that, but `%(refname)` is the oldest, plainest
+				// field and needs no assumption about which git version gained `strip`.
+				'--format=%(refname)',
+				...names.map(n => `refs/heads/${n}`),
+			);
+			// `errors: 'ignore'` means a failed probe RESOLVES empty, which is indistinguishable from "none
+			// of them survived" — and would delete every name's metadata, including user-owned keys like
+			// `gk-disposition` and `gk-associated-issues`. Only act on a genuine answer.
+			//
+			// BOTH conditions: `exitCode !== 0` catches a probe git ran and rejected, `status !== 'exited'`
+			// catches one that never produced an answer — a spawn failure or queue rejection (no exit code at
+			// all), or a swallowed warning (which carries git's real code, so the exit-code test alone can
+			// still read it as "none survived").
+			if (result.completion.status !== 'exited' || result.exitCode !== 0) return;
+
+			const prefix = 'refs/heads/';
+			const surviving = new Set(
+				result.stdout
+					.split('\n')
+					.map(l => l.trim())
+					.filter(l => l.startsWith(prefix))
+					.map(l => l.substring(prefix.length)),
+			);
+
+			for (const name of names) {
+				if (surviving.has(name)) continue;
+
+				this.cache.deleteBaseBranchName(repoPath, name);
+				await this.provider.config.removeGkConfigBranchSection(repoPath, name);
+			}
+		} catch {
+			// Best-effort bookkeeping while already unwinding a failure — never mask the original error.
 		}
 	}
 
@@ -868,20 +1014,32 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 	}
 
 	@debug()
-	getBranchMergedStatus(
+	async getBranchMergedStatus(
 		repoPath: string,
 		branch: GitBranchReference,
 		into: GitBranchReference,
 		cancellation?: AbortSignal,
 	): Promise<GitBranchMergedStatus> {
 		if (branch.name === into.name || branch.upstream?.name === into.name) {
-			return Promise.resolve({ merged: false });
+			return { merged: false };
 		}
 
+		// Hoisted so it can feed the cache key below (its tip is a 3rd key input) and the mapper
+		// below reuses it instead of resolving it a second time.
+		const localInto = into.remote
+			? await this.getLocalBranchByUpstream(repoPath, into.name, cancellation)
+			: undefined;
+
 		// Cache key omits repoPath so worktrees of the same common repo share the cached answer.
-		// Branch refs (`refs/heads/*` / `refs/remotes/*`) are unique within a common repo, so
-		// `name` + `remote` flag is the minimal stable identity.
-		const cacheKey = `${branch.remote ? 'r' : 'l'}:${branch.name}|${into.remote ? 'r' : 'l'}:${into.name}`;
+		// Content-keyed on the involved tip shas (the result is a pure function of them), so tip
+		// movement mints a new key instead of relying on eviction; falls back to the name-only
+		// identity when a sha is missing (defensive — the sole caller always supplies both tips).
+		const cacheKey =
+			branch.sha != null && into.sha != null
+				? `${branch.remote ? 'r' : 'l'}:${branch.name}@${branch.sha}|${into.remote ? 'r' : 'l'}:${into.name}@${into.sha}${
+						localInto?.sha != null ? `|L:${localInto.name}@${localInto.sha}` : ''
+					}`
+				: `${branch.remote ? 'r' : 'l'}:${branch.name}|${into.remote ? 'r' : 'l'}:${into.name}`;
 
 		return this.cache.getBranchMergedStatus(
 			repoPath,
@@ -890,38 +1048,29 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 				const result = await this.getBranchMergedStatusCore(commonPath, branch, into, signal);
 				if (result.merged) return result;
 
-				// If the branch we are checking is a remote branch, check if it has been merged into its local branch (if there is one)
-				if (into.remote) {
-					const localIntoBranch = await this.getLocalBranchByUpstream(commonPath, into.name, signal);
-					// If there is a local branch and it is not the branch we are checking, check if it has been merged into it
-					if (localIntoBranch != null && localIntoBranch.name !== branch.name) {
-						// Skip the second full merge-check cycle when the local branch points at the same commit as the remote —
-						// the merge-base/cherry/diff/apply pipeline would produce the same answer we already got for `into` above
-						if (localIntoBranch.sha != null && localIntoBranch.sha === into.sha) {
-							return { merged: false };
-						}
+				// If there is a local branch and it is not the branch we are checking, check if it has been merged into it
+				if (localInto != null && localInto.name !== branch.name) {
+					// Skip the second full merge-check cycle when the local branch points at the same commit as the remote —
+					// the merge-base/cherry/diff/apply pipeline would produce the same answer we already got for `into` above
+					if (localInto.sha != null && localInto.sha === into.sha) {
+						return { merged: false };
+					}
 
-						const result = await this.getBranchMergedStatusCore(
-							commonPath,
-							branch,
-							localIntoBranch,
-							signal,
-						);
-						if (result.merged) {
-							// `localBranchOnly` is built against `commonPath` here; the cache mapper rewrites
-							// `repoPath`/`id` to the requesting worktree on retrieval.
-							return {
-								...result,
-								localBranchOnly: createReference(localIntoBranch.ref, localIntoBranch.repoPath, {
-									id: localIntoBranch.id,
-									refType: 'branch',
-									name: localIntoBranch.name,
-									remote: localIntoBranch.remote,
-									upstream: localIntoBranch.upstream,
-									sha: localIntoBranch.sha,
-								}),
-							};
-						}
+					const result = await this.getBranchMergedStatusCore(commonPath, branch, localInto, signal);
+					if (result.merged) {
+						// `localBranchOnly` is built against `commonPath` here; the cache mapper rewrites
+						// `repoPath`/`id` to the requesting worktree on retrieval.
+						return {
+							...result,
+							localBranchOnly: createReference(localInto.ref, commonPath, {
+								id: getBranchId(commonPath, localInto.remote, localInto.name),
+								refType: 'branch',
+								name: localInto.name,
+								remote: localInto.remote,
+								upstream: localInto.upstream,
+								sha: localInto.sha,
+							}),
+						};
 					}
 				}
 
@@ -1139,7 +1288,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 				if (!data) return { status: 'clean' };
 
 				const mergeConflict = parseMergeTreeConflict(data);
-				if (!mergeConflict.conflicts.length) return { status: 'clean' };
+				if (!mergeConflict.conflicts.length) return { status: 'clean', treeOid: mergeConflict.treeOid };
 
 				return {
 					status: 'conflicts',
@@ -1150,10 +1299,135 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 						files: mergeConflict.conflicts,
 						shas: undefined, // Merge conflicts don't have a specific commit SHA
 					},
+					treeOid: mergeConflict.treeOid,
 				};
 			},
 			{ cancellation: cancellation },
 		);
+	}
+
+	/** Detects conflicts when an autostash is reapplied onto the tree an integration produced */
+	@debug()
+	async getPotentialStashReapplyConflicts(
+		repoPath: string,
+		ontoTreeOid: string,
+		cancellation?: AbortSignal,
+	): Promise<ConflictDetectionResult> {
+		// Requires Git v2.38+ for --write-tree with 3-arg form
+		if (!(await this.git.supports('git:merge-tree:write-tree'))) {
+			return createConflictDetectionError('unsupported');
+		}
+
+		// git stash create writes commit objects but touches neither the working tree nor the stash ref, and
+		// captures tracked changes only — which is exactly what autostash does
+		let stashSha: string;
+		try {
+			const result = await this.git.run(
+				{ cwd: repoPath, cancellation: cancellation, errors: 'throw' },
+				'stash',
+				'create',
+			);
+			stashSha = result.stdout.trim();
+		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
+			return createConflictDetectionError('other');
+		}
+
+		if (!stashSha) return { status: 'clean' };
+
+		// Key on what the simulation actually consumes — the stash's tree and its first parent (the HEAD it was
+		// taken against, and so the merge base). The stash SHA itself embeds a commit timestamp, so two runs over
+		// an identical tree produce different SHAs and a SHA-keyed entry could never be hit.
+		let stashTree: string;
+		let stashParent: string;
+		try {
+			const result = await this.git.run(
+				{ cwd: repoPath, cancellation: cancellation, errors: 'throw' },
+				'rev-parse',
+				`${stashSha}^{tree}`,
+				`${stashSha}^`,
+			);
+			[stashTree, stashParent] = result.stdout.trim().split('\n');
+		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
+			return createConflictDetectionError('other');
+		}
+
+		const cacheKey: ConflictDetectionCacheKey = `reapply:${ontoTreeOid}:${stashTree}.${stashParent}`;
+		return this.cache.conflictDetection.getOrCreate(
+			repoPath,
+			cacheKey,
+			async (_cacheable, signal) => {
+				// The stash commit's first parent is the HEAD it was taken against, which is the correct merge
+				// base for a reapply — ours is the post-integration tree, theirs is the stash
+				const step = await this.runMergeTreeStep(repoPath, `${stashSha}^`, ontoTreeOid, stashSha, signal);
+				if (!step.ok) return createConflictDetectionError(step.reason);
+
+				if (!step.result.conflicts.length) return { status: 'clean', treeOid: step.result.treeOid };
+
+				return {
+					status: 'conflicts',
+					conflict: {
+						repoPath: repoPath,
+						branch: stashSha,
+						target: ontoTreeOid,
+						files: step.result.conflicts,
+						shas: undefined,
+					},
+					treeOid: step.result.treeOid,
+				};
+			},
+			{ cancellation: cancellation },
+		);
+	}
+
+	private async runMergeTreeStep(
+		repoPath: string,
+		base: string,
+		ours: string,
+		theirs: string,
+		cancellation?: AbortSignal,
+	): Promise<{ ok: true; result: GitMergeConflict } | { ok: false; reason: ConflictDetectionErrorReason }> {
+		const scope = getScopedLogger();
+
+		let data;
+		try {
+			const result = await this.git.run(
+				{ cwd: repoPath, cancellation: cancellation, errors: 'throw' },
+				'merge-tree',
+				'--write-tree',
+				'-z',
+				'--name-only',
+				'--no-messages',
+				`--merge-base=${base}`,
+				ours,
+				theirs,
+			);
+			data = result.stdout;
+		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
+			const msg: string = ex?.toString() ?? '';
+			if (GitErrors.notAValidObjectName.test(msg)) {
+				scope?.error(ex, `'${ours}' or '${theirs}' not found - ensure the branches/commits exist`);
+				return { ok: false, reason: 'refNotFound' };
+			} else if (GitErrors.badRevision.test(msg)) {
+				scope?.error(ex, `Invalid revision: ${msg.slice(msg.indexOf("'"))}`);
+				return { ok: false, reason: 'refNotFound' };
+			} else if (GitErrors.noMergeBase.test(msg)) {
+				scope?.error(ex, `Unable to merge '${ours}' and '${theirs}' as they have no common ancestor`);
+				return { ok: false, reason: 'noMergeBase' };
+			} else if (ex instanceof GitError) {
+				data = ex.stdout;
+			} else {
+				scope?.error(ex, 'Failed to execute merge-tree for conflict check');
+				return { ok: false, reason: 'other' };
+			}
+		}
+
+		return { ok: true, result: parseMergeTreeConflict(data ?? '') };
 	}
 
 	private async checkForPotentialConflicts(
@@ -1192,56 +1466,16 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		for (const commit of commits) {
 			if (cancellation?.aborted) throw new CancellationError();
 
-			let data;
-			try {
-				// Use merge-tree --write-tree with --merge-base to simulate cherry-pick:
-				// merge-tree --write-tree --merge-base=<commit-parent> <current-tree> <commit>
-				// This performs a 3-way merge where:
-				//   - base = commit.parent (where the commit started)
-				//   - ours = currentTreeOid (current state of the target)
-				//   - theirs = commit.sha (what we're cherry-picking)
-				const result = await this.git.run(
-					{ cwd: repoPath, cancellation: cancellation, errors: 'throw' },
-					'merge-tree',
-					'--write-tree',
-					'-z',
-					'--name-only',
-					'--no-messages',
-					`--merge-base=${commit.parent}`,
-					currentTreeOid,
-					commit.sha,
-				);
-				data = result.stdout;
-			} catch (ex) {
-				if (isCancellationError(ex)) throw ex;
+			// Use merge-tree --write-tree with --merge-base to simulate cherry-pick:
+			// merge-tree --write-tree --merge-base=<commit-parent> <current-tree> <commit>
+			// This performs a 3-way merge where:
+			//   - base = commit.parent (where the commit started)
+			//   - ours = currentTreeOid (current state of the target)
+			//   - theirs = commit.sha (what we're cherry-picking)
+			const step = await this.runMergeTreeStep(repoPath, commit.parent, currentTreeOid, commit.sha, cancellation);
+			if (!step.ok) return createConflictDetectionError(step.reason);
 
-				const msg: string = ex?.toString() ?? '';
-				if (GitErrors.notAValidObjectName.test(msg)) {
-					scope?.error(
-						ex,
-						`'${targetBranch}' or '${commit.sha}' not found - ensure the branches/commits exist`,
-					);
-					return createConflictDetectionError('refNotFound');
-				} else if (GitErrors.badRevision.test(msg)) {
-					scope?.error(ex, `Invalid revision: ${msg.slice(msg.indexOf("'"))}`);
-					return createConflictDetectionError('refNotFound');
-				} else if (GitErrors.noMergeBase.test(msg)) {
-					scope?.error(
-						ex,
-						`Unable to merge '${commit.sha}' and '${targetBranch}' as they have no common ancestor`,
-					);
-					return createConflictDetectionError('noMergeBase');
-				} else if (ex instanceof GitError) {
-					data = ex.stdout;
-				} else {
-					scope?.error(ex, 'Failed to execute merge-tree for conflict check');
-					return createConflictDetectionError('other');
-				}
-			}
-
-			if (!data) continue;
-
-			const mergeConflict = parseMergeTreeConflict(data);
+			const mergeConflict = step.result;
 
 			if (mergeConflict.conflicts.length) {
 				conflictingShas.push(commit.sha);
@@ -1260,6 +1494,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 							shas: [commit.sha],
 						},
 						stoppedOnFirstConflict: true,
+						treeOid: mergeConflict.treeOid || undefined,
 					};
 				}
 			}
@@ -1282,10 +1517,11 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 					shas: conflictingShas,
 				},
 				stoppedOnFirstConflict: false,
+				treeOid: currentTreeOid,
 			};
 		}
 
-		return { status: 'clean' };
+		return { status: 'clean', treeOid: currentTreeOid };
 	}
 
 	@debug({ exit: true })
@@ -1301,7 +1537,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		return this.cache.getBaseBranchName(
 			repoPath,
 			ref,
-			async (commonPath, signal) => {
+			async (commonPath, cacheable, signal) => {
 				try {
 					// getGkConfig has built-in fallback to regular config for backward compatibility
 					let mergeBase = await this.provider.config.getGkConfig(commonPath, `branch.${ref}.gk-merge-base`);
@@ -1333,18 +1569,25 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 					}
 				} catch {}
 
-				const branch = await this.getBaseBranchFromReflog(
+				const reflog = await this.getBaseBranchFromReflog(
 					commonPath,
 					ref,
 					{ upstream: true, priority: priority },
 					signal,
 				);
-				if (branch != null) {
+				if (reflog.branch != null) {
 					// Self-write: see comment on the migration path above.
-					void this.storeBaseBranchName(commonPath, ref, branch, {
+					void this.storeBaseBranchName(commonPath, ref, reflog.branch, {
 						skipInvalidation: ['branchOverviews', 'baseBranchName'],
 					});
-					return branch;
+					return reflog.branch;
+				}
+
+				// This entry has no TTL and the `'branches'` cascade no longer clears it (a tip move can't
+				// change a base), so a failed read cached as `undefined` would read as "no base branch" for
+				// the rest of the session. Only a reflog that actually RAN and found nothing is an answer.
+				if (reflog.failed) {
+					cacheable.invalidate();
 				}
 
 				return undefined;
@@ -1353,12 +1596,16 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		);
 	}
 
+	/**
+	 * `failed` separates "the reflog ran and had no answer" from "the read never happened" — the caller
+	 * caches the former forever and must not cache the latter.
+	 */
 	private async getBaseBranchFromReflog(
 		repoPath: string,
 		ref: string,
 		options?: { upstream: true; priority?: GitCommandPriority },
 		cancellation?: AbortSignal,
-	): Promise<string | undefined> {
+	): Promise<{ branch: string | undefined; failed: boolean }> {
 		const priority = options?.priority;
 		const priorityOpts = priority != null ? { priority: priority } : undefined;
 
@@ -1371,7 +1618,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 			);
 
 			let entries = result.stdout.split('\n').filter(entry => Boolean(entry));
-			if (entries.length !== 1) return undefined;
+			if (entries.length !== 1) return { branch: undefined, failed: false };
 
 			// Check if branch created from an explicit branch
 			let match = entries[0].match(/branch: Created from (.*)$/);
@@ -1384,11 +1631,11 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 							`${name}@{u}`,
 							priorityOpts,
 						);
-						if (upstream) return upstream;
+						if (upstream) return { branch: upstream, failed: false };
 					}
 
 					name = await this.provider.refs.getSymbolicReferenceName(repoPath, name, priorityOpts);
-					if (name) return name;
+					if (name) return { branch: name, failed: false };
 				}
 			}
 
@@ -1401,7 +1648,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 			);
 
 			entries = result.stdout.split('\n').filter(entry => Boolean(entry));
-			if (!entries.length) return undefined;
+			if (!entries.length) return { branch: undefined, failed: false };
 
 			match = entries.at(-1)!.match(/checkout: moving from ([^\s]+)\s/);
 			if (match?.length === 2) {
@@ -1412,17 +1659,21 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 						`${name}@{u}`,
 						priorityOpts,
 					);
-					if (upstream) return upstream;
+					if (upstream) return { branch: upstream, failed: false };
 				}
 
 				name = await this.provider.refs.getSymbolicReferenceName(repoPath, name, priorityOpts);
-				if (name) return name;
+				if (name) return { branch: name, failed: false };
 			}
 		} catch (ex) {
 			if (isCancellationError(ex)) throw ex;
+
+			// The reads use default error handling, so a spawn failure, queue rejection or swallowed
+			// `GitWarnings` match lands here rather than producing an empty answer.
+			return { branch: undefined, failed: true };
 		}
 
-		return undefined;
+		return { branch: undefined, failed: false };
 	}
 
 	@debug({ exit: true })
@@ -1484,6 +1735,13 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		const args = ['branch', '-m', oldName, newName];
 		try {
 			await this.git.run({ cwd: repoPath }, ...args);
+			// The branch keeps its identity across a rename, so move its stored gk metadata with it —
+			// otherwise the new name re-derives a base it already had, and the old name is left holding
+			// metadata for a branch that no longer exists under it.
+			await this.provider.config.renameGkConfigBranchSection(repoPath, oldName, newName);
+			// Old name's entry is now orphaned; the new name must not inherit a predecessor's base
+			this.cache.deleteBaseBranchName(repoPath, oldName);
+			this.cache.deleteBaseBranchName(repoPath, newName);
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
 		} catch (ex) {

@@ -50,6 +50,17 @@ export function createGitProviderContext(container: Container): GitServiceContex
 				maxSearchItems: configuration.get('graph.searchItemLimit'),
 			};
 		},
+		get push() {
+			return {
+				useForceWithLease: configuration.getCore('git.useForcePushWithLease') ?? true,
+				useForceIfIncludes: configuration.getCore('git.useForcePushIfIncludes') ?? true,
+			};
+		},
+		get signing() {
+			return {
+				enabled: configuration.getCore('git.enableCommitSigning'),
+			};
+		},
 	};
 
 	return {
@@ -82,6 +93,13 @@ export function createGitProviderContext(container: Container): GitServiceContex
 			},
 			operations: {
 				onConflicted: command => container.telemetry.sendEvent('gitCommand/conflict', { command: command }),
+				onRebaseCapableOperation: (repoPath, command, phase) => {
+					if (phase === 'started') {
+						container.operationOrigins.markStarted(repoPath, command);
+					} else {
+						void container.operationOrigins.onOperationEnded(repoPath);
+					}
+				},
 				onGitDirResolveFailed: (repoPath, gitDir, errorMessage) =>
 					container.telemetry.sendEvent('op/git/gitDirResolve/failed', {
 						'repository.path': repoPath,
@@ -104,11 +122,12 @@ export function createGitProviderContext(container: Container): GitServiceContex
 		},
 
 		remotes: {
-			getCustomProviders: async (repoPath: string) => {
+			getCustomProviders: (repoPath: string) => {
 				const repo = container.git.getRepository(repoPath);
 				const configuredRemotes = configuration.get('remotes', repo?.folder?.uri ?? null);
-				const configuredIntegrations = await container.integrations.getConfigured();
-				return buildRemoteProviderConfigs(configuredRemotes, configuredIntegrations);
+				const configuredIntegrations = container.integrations.getConfigured();
+				// `getConfigured` is synchronous; the RemotesProvider port is Promise-typed, so bridge here.
+				return Promise.resolve(buildRemoteProviderConfigs(configuredRemotes, configuredIntegrations));
 			},
 
 			getRepositoryInfo: (providerId, targetDesc) =>

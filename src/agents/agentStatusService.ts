@@ -1,15 +1,31 @@
 import type { Disposable, QuickPickItem } from 'vscode';
 import { commands, EventEmitter, Uri, window, workspace } from 'vscode';
 import { Logger } from '@gitlens/utils/logger.js';
+import { arePathsEqual } from '@gitlens/utils/path.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import type { Container } from '../container.js';
 import { createQuickPickSeparator } from '../quickpicks/items/common.js';
 import { registerCommand } from '../system/-webview/command.js';
-import type { AgentSessionState, AgentSessionWorktreeMetadata } from './models/agentSessionState.js';
-import { getSessionDisplayName, serializeAgentSession } from './models/agentSessionState.js';
-import type { AgentSession, AgentSessionProvider, PermissionDecision, PermissionSuggestion } from './provider.js';
+import type {
+	AgentSessionState,
+	AgentSessionWorktreeMetadata,
+	PastAgentSessionsResult,
+	PastAgentSessionState,
+} from './models/agentSessionState.js';
+import { getSessionDisplayName, serializeAgentSession, serializePastAgentSession } from './models/agentSessionState.js';
+import type {
+	AgentSession,
+	AgentSessionProvider,
+	PermissionDecision,
+	PermissionSuggestion,
+	ResumableSessionsResult,
+} from './provider.js';
 import { isClaudeExtensionAvailable, tryOpenClaudeSession } from './utils/-webview/claudeExtension.js';
-import { canResumeSession, resumeClaudeSessionInTerminal } from './utils/-webview/claudeResume.js';
+import {
+	canResumeSession,
+	resumeClaudeSessionInTerminal,
+	toResumableSessionRef,
+} from './utils/-webview/claudeResume.js';
 
 export class AgentStatusService implements Disposable {
 	private readonly _onDidChange = new EventEmitter<void>();
@@ -30,7 +46,28 @@ export class AgentStatusService implements Disposable {
 	 */
 	readonly onDidChangeSessions = this._onDidChangeSessions.event;
 
-	private _lastSerialized: string = '';
+	/**
+	 * Per-session serialization memo, keyed by the session OBJECT. Providers replace a session
+	 * immutably on every change (never mutate fields in place), so identity is a sound proxy for
+	 * content: a cache hit means nothing about that session changed.
+	 *
+	 * This exists because the change-detect below runs on every `onDidChangeSessions` — which fires
+	 * per hook event (each tool call) — while `_sessions` also holds every `completed` session in the
+	 * CLI's 30-day window. Re-serializing and stringifying that whole set per event scales the live
+	 * path by total history rather than by what's actually running. Terminal rows never change, so
+	 * they land here once and cost a lookup thereafter.
+	 *
+	 * `generation` tracks {@link _worktreeMetadataGeneration}: the serialized shape also embeds
+	 * host-resolved worktree metadata, which changes independently of the session (branch rename,
+	 * checkout), so a bump invalidates every entry.
+	 */
+	private readonly _sessionStateCache = new WeakMap<
+		AgentSession,
+		{ state: AgentSessionState; key: string; generation: number }
+	>();
+	private _worktreeMetadataGeneration = 0;
+	/** `sessionId -> change-detect key` from the last published snapshot. */
+	private _lastSessionKeys = new Map<string, string>();
 
 	/**
 	 * Transient cache of `worktreePath -> live GitWorktree metadata`. Populated by
@@ -40,6 +77,12 @@ export class AgentStatusService implements Disposable {
 	 * `git checkout` / worktree renames / upstream changes flow to the UI without restarting.
 	 */
 	private readonly _worktreeNameByPath = new Map<string, AgentSessionWorktreeMetadata>();
+	/** Worktree paths a refresh has already attempted, resolved or not. Gates the deferred-publish
+	 *  branch in the `onDidChangeSessions` trigger: a path no open repo owns — a completed session
+	 *  from a repo this window doesn't have open — never resolves, and without this every phase tick
+	 *  would take the deferral and re-run the (ungated) refresh. Repos opening later still resolve
+	 *  it: `onDidChangeRepositories` re-runs the refresh regardless of this set. */
+	private readonly _attemptedWorktreePaths = new Set<string>();
 	private _worktreeRefreshPromise: Promise<boolean> | undefined;
 	/** Stable signature of the session worktree path set resolved by the last refresh. Lets the
 	 *  noisy `onDidChangeSessions` trigger skip the refresh when only phase/activity changed. */
@@ -47,10 +90,16 @@ export class AgentStatusService implements Disposable {
 
 	private readonly _disposables: Disposable[] = [];
 	private readonly _providers: AgentSessionProvider[];
+	/** Timer for the deferred initial hooks-installed push; cleared on dispose if it hasn't fired. */
+	private _initialHooksPushTimer: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(
 		private readonly container: Container,
 		providers: AgentSessionProvider[],
+		/** Commands are a process-wide singleton surface — VS Code throws on a duplicate id — so an
+		 *  instance beyond the container's own (tests) must opt out of claiming them. Everything else
+		 *  about the service is per-instance and safe to stand up more than once. */
+		options?: { registerCommands?: boolean },
 	) {
 		this._providers = providers;
 
@@ -105,13 +154,31 @@ export class AgentStatusService implements Disposable {
 				// pending; existing repos may have been removed. Refresh either way.
 				void this.refreshWorktreeNameCache();
 			}),
-			...this.registerCommands(),
+			...((options?.registerCommands ?? true) ? this.registerCommands() : []),
 		);
 
 		this.startProviders();
-		// Resolve hooks-installed state once (async, off the providers' poll interval) and push it
-		// down so providers can gate their reconciliation poll from the start.
-		void this.pushHooksInstalledToProviders();
+		// Resolve the host's hooks-installed state once and push it to providers so they can gate
+		// their reconciliation poll. Deferred out of the first-render window — like the CLI version
+		// probe in GkCliService — so the `gk agents list` subprocess doesn't contend with Graph/Home
+		// webview bootstrap on slower filesystems (e.g. WSL). Providers fail-open (keep polling) until
+		// this lands, so the delay never suppresses session discovery.
+		this._disposables.push(
+			container.onReady(() => {
+				this._initialHooksPushTimer = setTimeout(() => {
+					this._initialHooksPushTimer = undefined;
+					void this.pushHooksInstalledToProviders();
+				}, 3000);
+			}),
+			{
+				dispose: () => {
+					if (this._initialHooksPushTimer != null) {
+						clearTimeout(this._initialHooksPushTimer);
+						this._initialHooksPushTimer = undefined;
+					}
+				},
+			},
+		);
 	}
 
 	dispose(): void {
@@ -136,28 +203,27 @@ export class AgentStatusService implements Disposable {
 
 	/** Resolves the host's Claude hooks-installed state and pushes it to all providers so they can
 	 *  gate their reconciliation poll (the CLI `list-sessions` call). Resolves to `false` when the
-	 *  agent can't be detected (e.g. the browser stub's `getClaudeAgent()` returns `undefined`); fails
-	 *  *open* (`installed = true`) only if env resolution throws unexpectedly, so a transient failure
+	 *  agent can't be detected (e.g. the browser stub's `getClaude()` returns `undefined`); fails
+	 *  *open* (`installed = true`) only if detection throws unexpectedly, so a transient failure
 	 *  never wrongly suppresses polling. The browser has no providers to receive the push regardless.
 	 *  Pass `invalidate` after an install/uninstall so the stale agent cache is dropped before re-reading.
 	 *
 	 *  Note: an external `gk ai hook install` (run outside GitLens) isn't observed here until
 	 *  something else re-reads — acceptable per the staleness window documented in
-	 *  `src/env/node/gk/cli/agents.ts`, and the poll gate opens anyway the moment any session
+	 *  `src/agents/agentService.ts`, and the poll gate opens anyway the moment any session
 	 *  appears (a non-empty session list always polls). */
 	private async pushHooksInstalledToProviders(options?: { invalidate?: boolean }): Promise<void> {
 		let installed = true;
 		try {
-			const env = await import('@env/providers.js');
 			if (options?.invalidate) {
-				env.invalidateAgentsCache();
+				this.container.agents.invalidateCache();
 			}
-			const claude = await env.getClaudeAgent();
+			const claude = await this.container.agents.getClaude();
 			installed = claude?.hooksInstalled ?? false;
 		} catch {
-			// Unexpected env-resolution/detection failure — leave fail-open (assume installed) so a
-			// transient error doesn't wrongly suppress polling. (The browser stub doesn't throw; it
-			// returns undefined above, yielding installed=false, and has no providers anyway.)
+			// Unexpected detection failure — leave fail-open (assume installed) so a transient error
+			// doesn't wrongly suppress polling. (The browser stub returns an empty list above, yielding
+			// installed=false, and has no providers anyway.)
 		}
 		for (const provider of this._providers) {
 			provider.setClaudeHooksInstalled?.(installed);
@@ -169,7 +235,22 @@ export class AgentStatusService implements Disposable {
 	}
 
 	getSerializedSessions(): AgentSessionState[] {
-		return this.sessions.map(s => serializeAgentSession(s, this.getWorktreeMetadataForSession(s)));
+		return this.sessions.map(s => this.getSessionStateEntry(s).state);
+	}
+
+	/** Memoized {@link serializeAgentSession} + its change-detect key — see {@link _sessionStateCache}. */
+	private getSessionStateEntry(session: AgentSession): { state: AgentSessionState; key: string; generation: number } {
+		const cached = this._sessionStateCache.get(session);
+		if (cached != null && cached.generation === this._worktreeMetadataGeneration) return cached;
+
+		const state = serializeAgentSession(session, this.getWorktreeMetadataForSession(session));
+		const entry = {
+			state: state,
+			key: JSON.stringify(state, coarsenVolatileTimestamps),
+			generation: this._worktreeMetadataGeneration,
+		};
+		this._sessionStateCache.set(session, entry);
+		return entry;
 	}
 
 	private getWorktreeMetadataForSession(session: AgentSession): AgentSessionWorktreeMetadata | undefined {
@@ -177,13 +258,220 @@ export class AgentStatusService implements Disposable {
 		return this._worktreeNameByPath.get(session.worktreePath);
 	}
 
-	private maybeFireSessionsChanged(): void {
-		const serialized = this.getSerializedSessions();
-		const stringified = JSON.stringify(serialized);
-		if (stringified === this._lastSerialized) return;
+	/** Resolves a worktree's display name on demand — `_worktreeNameByPath` only tracks worktrees
+	 *  with live sessions (and prunes them when the last one ends), so worktrees with only past
+	 *  sessions need a direct lookup or they'd surface nameless (e.g. in the resume picker title). */
+	private async getWorktreeName(worktreePath: string): Promise<string | undefined> {
+		const cached = this._worktreeNameByPath.get(worktreePath)?.name;
+		if (cached != null) return cached;
 
-		this._lastSerialized = stringified;
-		this._onDidChangeSessions.fire(serialized);
+		try {
+			const worktrees = await this.container.git.getRepositoryService(worktreePath).worktrees?.getWorktrees();
+			return worktrees?.find(wt => arePathsEqual(wt.path, worktreePath))?.name;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Lists the past, resumable sessions for `worktreePath`, most-recently-active first.
+	 *
+	 * Excludes sessions that are still live (working/idle) — those already flow to consumers through
+	 * {@link onDidChangeSessions} and are opened, not resumed. Terminal `completed` sessions are kept
+	 * by default: they're themselves resumable-past sessions, so they fall through and pick up a
+	 * proper `displayName` from the transcript store below. Archived sessions ARE excluded — the
+	 * tracked row is gone, but the transcript on disk survives and would otherwise resurface. The
+	 * exclude set is passed down via `excludeSessionIds` so a provider excludes it before its own
+	 * `limit` applies, rather than this method dropping them from an already-limited slice.
+	 *
+	 * `excludeCompleted` is for callers that already render tracked completed sessions themselves
+	 * (the webviews show them as cards). Without it those sessions occupy the `limit` slots here and
+	 * are then deduped away at render, so a worktree whose newest transcripts are all tracked can
+	 * show NO past rows — and no "N more" footer — while older ones exist. The resume picker leaves
+	 * it off: it drops completed from its live group precisely so they surface here instead.
+	 */
+	async getPastSessions(
+		worktreePath: string,
+		options?: { limit?: number; excludeCompleted?: boolean },
+	): Promise<PastAgentSessionsResult> {
+		const excludeIds = new Set(
+			this.sessions
+				.filter(
+					s =>
+						s.status !== 'completed' ||
+						// Scoped to the ones the caller actually renders a card for HERE. A completed
+						// session whose worktree never resolved (an old CLI record with no worktree
+						// data) matches no worktree, so it has no card — excluding it would make it
+						// invisible rather than merely deduped, and this list is its only surface.
+						(options?.excludeCompleted === true &&
+							s.worktreePath != null &&
+							arePathsEqual(s.worktreePath, worktreePath)),
+				)
+				.map(s => s.id),
+		);
+
+		// Archiving drops the tracked row, but the CLI's transcript survives on disk — without this,
+		// an archived session would resurface here on every subsequent listing. Run alongside the
+		// worktree-name lookup: the archived-id query spawns a CLI process, and serializing the two
+		// would put that latency in front of every panel open.
+		const [archivedSettled, worktreeNameResult] = await Promise.all([
+			Promise.allSettled(
+				this._providers.map(provider => provider.getArchivedSessionIds?.() ?? Promise.resolve([])),
+			),
+			this.getWorktreeName(worktreePath),
+		]);
+		for (const result of archivedSettled) {
+			const ids = getSettledValue(result);
+			if (ids == null) continue;
+
+			for (const id of ids) {
+				excludeIds.add(id);
+			}
+		}
+
+		const worktreeName = worktreeNameResult;
+
+		const sessions: PastAgentSessionState[] = [];
+		let total = 0;
+
+		// Providers with no durable per-directory store omit `listResumableSessions` entirely.
+		const pending: Promise<ResumableSessionsResult>[] = [];
+		for (const provider of this._providers) {
+			const listing = provider.listResumableSessions?.(worktreePath, {
+				limit: options?.limit,
+				excludeSessionIds: excludeIds,
+			});
+			if (listing != null) {
+				pending.push(listing);
+			}
+		}
+
+		const settled = await Promise.allSettled(pending);
+		for (const result of settled) {
+			if (result.status !== 'fulfilled') continue;
+
+			total += result.value.total;
+			for (const session of result.value.sessions) {
+				// Safety net: `listResumableSessions` is optional on the interface, and a future
+				// provider may not honor `excludeSessionIds` — re-check here regardless.
+				if (excludeIds.has(session.id)) continue;
+
+				sessions.push(serializePastAgentSession(session, worktreePath, worktreeName));
+			}
+		}
+
+		// Providers are ordered, so re-sort across them.
+		sessions.sort((a, b) => b.lastActivity - a.lastActivity);
+		// Re-apply the limit across the merged, sorted result — a no-op with a single provider, but
+		// honors the contract once 2+ providers each return up to `limit`.
+		const limited = options?.limit != null && options.limit > 0 ? sessions.slice(0, options.limit) : sessions;
+		return { sessions: limited, total: total };
+	}
+
+	/** The worktree's sessions as the resume picker shows them: the live ones it can open, then the
+	 *  past ones it can resume. `completed` sessions are excluded from `live` — they're resumable-past,
+	 *  not open-able, so they're picked up by {@link getPastSessions} instead. */
+	async getResumableSessions(
+		worktreePath: string,
+		options?: { limit?: number },
+	): Promise<{ live: AgentSession[]; past: PastAgentSessionState[]; total: number }> {
+		const live = this.sessions.filter(
+			s => !s.isSubagent && s.status !== 'completed' && s.worktreePath === worktreePath,
+		);
+		const { sessions, total } = await this.getPastSessions(worktreePath, options);
+		return { live: live, past: sessions, total: total };
+	}
+
+	/**
+	 * Resumes a past session by starting a fresh process against its transcript.
+	 *
+	 * `'default'` uses the Claude Code extension only when `cwd` is itself one of this window's
+	 * workspace folders, and otherwise falls back to a terminal. The extension's open command takes a
+	 * session id and no cwd, so it resolves the session against the window's own folder — right only
+	 * when that folder IS the session's directory. An ancestor folder won't do: the transcript is
+	 * homed under the exact cwd, so the extension would look elsewhere and come up empty. A terminal
+	 * is anchored at `cwd`, so it stays correct for any worktree.
+	 */
+	private async resumeSession(
+		sessionId: string,
+		cwd: string,
+		target: 'default' | 'terminal',
+		source: 'webview' | 'quickpick',
+		name?: string,
+	): Promise<void> {
+		const useExtension =
+			target === 'default' &&
+			this.getWorkspacePaths().some(p => arePathsEqual(p, cwd)) &&
+			(await isClaudeExtensionAvailable());
+		const resumedInExtension = useExtension && (await tryOpenClaudeSession(sessionId));
+		if (!resumedInExtension) {
+			await resumeClaudeSessionInTerminal({ id: sessionId, cwd: cwd, name: name }, this.container);
+		}
+
+		this.container.telemetry.sendEvent('agents/sessionResumed', {
+			'agent.provider': 'claudeCode',
+			'agent.resume.source': source,
+			'agent.resume.target': resumedInExtension ? 'extension' : 'terminal',
+		});
+	}
+
+	private async showResumeSessionPicker(worktreePath: string): Promise<void> {
+		const { showResumableSessionPicker } = await import(
+			/* webpackChunkName: "agents" */ '../quickpicks/resumableSessionPicker.js'
+		);
+
+		const { live, past, total } = await this.getResumableSessions(worktreePath, { limit: 100 });
+		const worktreeName = await this.getWorktreeName(worktreePath);
+		const pick = await showResumableSessionPicker(live, past, total, worktreeName);
+		if (pick == null) return;
+
+		if (pick.live != null) {
+			if (pick.target === 'resume-terminal') {
+				await resumeClaudeSessionInTerminal(toResumableSessionRef(pick.live), this.container);
+				return;
+			}
+
+			await this.dispatchSessionAction(pick.live);
+			return;
+		}
+
+		if (pick.past == null) return;
+
+		await this.resumeSession(
+			pick.past.id,
+			pick.past.cwd,
+			pick.target === 'resume-terminal' ? 'terminal' : 'default',
+			'quickpick',
+			pick.past.displayName,
+		);
+	}
+
+	private maybeFireSessionsChanged(): void {
+		// Compared PER SESSION rather than as one stringified snapshot: the memo hands back the same
+		// key instance for a session that didn't change, making the comparison a pointer check, so a
+		// long tail of terminal rows costs a lookup each instead of being re-stringified on every
+		// hook event. Only a session whose object identity changed pays a real `JSON.stringify`, and
+		// only its own (~1KB) worth. Session ORDER is deliberately not part of the comparison —
+		// consumers sort for themselves, so a reorder alone is not a change worth pushing.
+		const states: AgentSessionState[] = [];
+		const keys = new Map<string, string>();
+		let changed = false;
+		for (const session of this.sessions) {
+			const entry = this.getSessionStateEntry(session);
+			states.push(entry.state);
+			keys.set(session.id, entry.key);
+			if (!changed && this._lastSessionKeys.get(session.id) !== entry.key) {
+				changed = true;
+			}
+		}
+		// Catches removals (an addition already differs above, and a swap adds an unseen id).
+		if (!changed && keys.size !== this._lastSessionKeys.size) {
+			changed = true;
+		}
+		if (!changed) return;
+
+		this._lastSessionKeys = keys;
+		this._onDidChangeSessions.fire(states);
 	}
 
 	/** True iff at least one session has a `worktreePath` we haven't resolved metadata for yet.
@@ -191,7 +479,14 @@ export class AgentStatusService implements Disposable {
 	 *  cold-fallback name first; resolved paths skip the deferral and publish immediately. */
 	private hasUnresolvedWorktreePaths(): boolean {
 		for (const s of this.sessions) {
-			if (s.worktreePath != null && !this._worktreeNameByPath.has(s.worktreePath)) return true;
+			// `_attemptedWorktreePaths` keeps a path that can't resolve from deferring every tick.
+			if (
+				s.worktreePath != null &&
+				!this._worktreeNameByPath.has(s.worktreePath) &&
+				!this._attemptedWorktreePaths.has(s.worktreePath)
+			) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -241,27 +536,41 @@ export class AgentStatusService implements Disposable {
 				// this run was in-flight (it snapshots `this.sessions` synchronously below).
 				this._resolvedWorktreePathsKey = this.getSessionWorktreePathsKey();
 
-				// Group by `commonPath` (set together with `worktreePath` by `resolveGitInfo`) so
-				// every worktree sharing a common path queries `getWorktrees()` once. Falling back
-				// to `worktreePath` for the cold-cache window keeps sessions resolvable even
-				// before `resolveGitInfo` populates `commonPath` — `git worktree list` works from
-				// any worktree dir. Deliberately NOT keyed by `workspacePath`: that's the matched
-				// workspace folder (or undefined), not a repo identity.
-				const worktreePathsByParent = new Map<string, Set<string>>();
+				// Query worktrees once per REPO IDENTITY: each session's `commonPath` (authoritative,
+				// set together with `worktreePath` by `resolveGitInfo`) UNION the open repositories.
+				// Deliberately NOT keyed by `workspacePath`: that's the matched workspace folder (or
+				// undefined), not a repo identity.
+				//
+				// Keying by the session's `worktreePath` when `commonPath` is missing would be a real
+				// fan-out: `getWorktrees()` dedupes by common path, and an UNREGISTERED worktree dir
+				// resolves to itself — one `git worktree list` per path. Completed sessions read from
+				// the CLI's durable store are exactly that case (they carry a `worktreePath` but never
+				// a `commonPath`, since they're never git-probed) and can span a 30-day history.
+				//
+				// Folding in the open repos costs nothing — their worktree lists are already cached
+				// and drive the graph itself — and it's what lets those probe-less sessions resolve
+				// both their display name AND their repo identity. A session whose worktree belongs
+				// to no open repo stays unresolved, which is correct: the surfaces that gate on repo
+				// identity can only ever act on a repo the graph shows.
+				//
+				// An open repo contributes `commonPath ?? path` — the same formula the consumers'
+				// family check uses — NOT `repo.path`. When the repo IS a linked worktree those
+				// differ, and querying by `repo.path` would both miss the shared cache entry and come
+				// back with every `GitWorktree.repoPath` rewritten to that worktree dir (the cache
+				// maps `w.withRepoPath(callerPath)` whenever the caller path isn't the common path),
+				// so the identity below would be a worktree dir that no family check can match.
+				const repoPaths = new Set<string>();
 				const referencedWorktreePaths = new Set<string>();
 				for (const s of this.sessions) {
 					if (s.worktreePath == null) continue;
 
-					const parent = s.commonPath ?? s.worktreePath;
-
-					let set = worktreePathsByParent.get(parent);
-					if (set == null) {
-						set = new Set<string>();
-						worktreePathsByParent.set(parent, set);
-					}
-
-					set.add(s.worktreePath);
 					referencedWorktreePaths.add(s.worktreePath);
+					if (s.commonPath != null) {
+						repoPaths.add(s.commonPath);
+					}
+				}
+				for (const repo of this.container.git.openRepositories) {
+					repoPaths.add(repo.commonPath ?? repo.path);
 				}
 
 				// Prune entries for worktrees no session lives in anymore.
@@ -271,13 +580,18 @@ export class AgentStatusService implements Disposable {
 						changed = true;
 					}
 				}
+				for (const key of this._attemptedWorktreePaths) {
+					if (!referencedWorktreePaths.has(key)) {
+						this._attemptedWorktreePaths.delete(key);
+					}
+				}
 
 				const results = await Promise.allSettled(
-					Array.from(worktreePathsByParent, async ([parentPath, paths]) => {
+					Array.from(repoPaths, async repoPath => {
 						const worktrees = await this.container.git
-							.getRepositoryService(parentPath)
+							.getRepositoryService(repoPath)
 							.worktrees?.getWorktrees();
-						return { paths: paths, worktrees: worktrees ?? [] };
+						return { repoPath: repoPath, worktrees: worktrees ?? [] };
 					}),
 				);
 
@@ -286,12 +600,17 @@ export class AgentStatusService implements Disposable {
 					if (value == null) continue;
 
 					for (const wt of value.worktrees) {
-						if (!value.paths.has(wt.path)) continue;
+						if (!referencedWorktreePaths.has(wt.path)) continue;
 
 						const next: AgentSessionWorktreeMetadata = {
 							name: wt.name,
 							type: wt.type,
 							isDefault: wt.isDefault,
+							// The owning repo — the identity a probe-less completed session lacks. Taken
+							// from the path we QUERIED, not `wt.repoPath`: the cache rewrites that to the
+							// caller's path whenever it differs from the common path, so it can't be
+							// trusted as an identity.
+							repoPath: value.repoPath,
 							branch:
 								wt.type === 'branch' && wt.branch != null
 									? {
@@ -313,7 +632,25 @@ export class AgentStatusService implements Disposable {
 					}
 				}
 
+				// A path counts as attempted once it either resolved, or failed to resolve in a run where
+				// every query SUCCEEDED (so its absence is real, not an artifact of a failed query).
+				// Marking an unresolved path after a partial failure would permanently stop the deferred
+				// publish from waiting on it — pinning the cold-fallback name — even though the repo that
+				// owns it was never actually queried. Rejections come from the repo the path belongs to,
+				// but the result carries no worktree list to attribute it, so any rejection holds back
+				// every still-unresolved path; they retry on the next refresh.
+				const allQueriesSucceeded = results.every(r => r.status === 'fulfilled');
+				for (const path of referencedWorktreePaths) {
+					if (allQueriesSucceeded || this._worktreeNameByPath.has(path)) {
+						this._attemptedWorktreePaths.add(path);
+					}
+				}
+
 				if (changed) {
+					// Worktree metadata is embedded in every serialized session, so a change here has to
+					// invalidate the per-session memo — otherwise a branch rename/checkout would never
+					// reach consumers, since the session objects themselves are untouched.
+					this._worktreeMetadataGeneration++;
 					this.maybeFireSessionsChanged();
 				}
 			} finally {
@@ -389,11 +726,21 @@ export class AgentStatusService implements Disposable {
 				}
 			}),
 			registerCommand('gitlens.agents.openSession', (sessionId?: string) => this.openSession(sessionId)),
+			registerCommand('gitlens.agents.resumeSession', (args?: { sessionId: string; cwd: string }) => {
+				if (args?.sessionId == null) return Promise.resolve();
+
+				return this.resumeSession(args.sessionId, args.cwd, 'default', 'webview');
+			}),
+			registerCommand('gitlens.agents.showResumeSessionPicker', (args?: { worktreePath: string }) => {
+				if (args?.worktreePath == null) return Promise.resolve();
+
+				return this.showResumeSessionPicker(args.worktreePath);
+			}),
 			registerCommand('gitlens.agents.switchDefaultAgent', async () => {
 				const { pickAndSetDefaultAgent } = await import(
 					/* webpackChunkName: "agents" */ '../plus/agents/agentPicker.js'
 				);
-				await pickAndSetDefaultAgent();
+				await pickAndSetDefaultAgent(this.container);
 			}),
 			registerCommand('gitlens.agents.openPlanFile', async (planFilePath?: string) => {
 				if (!planFilePath) return;
@@ -424,7 +771,34 @@ export class AgentStatusService implements Disposable {
 					this.resolvePermission(args.sessionId, args.decision, updatedPermissions);
 				},
 			),
+			registerCommand('gitlens.agents.archiveSession', (sessionId?: string) => this.archiveSession(sessionId)),
 		];
+	}
+
+	private async archiveSession(sessionId?: string): Promise<void> {
+		if (!sessionId) return;
+
+		for (const provider of this._providers) {
+			if (provider.sessions.find(s => s.id === sessionId) == null) continue;
+
+			try {
+				// The CLI archive is keyed by session id and machine-global, so archiving succeeds
+				// regardless of which window discovered the (completed) session. Only record the
+				// telemetry when the provider actually archived — it returns `false` when it refused a
+				// row that resumed out of `completed` since the click.
+				const archived = await provider.archiveSession?.(sessionId);
+				if (archived) {
+					this.container.telemetry.sendEvent('agents/session/archived', { 'agent.provider': provider.id });
+				}
+			} catch (ex) {
+				Logger.error(ex, 'AgentStatusService.archiveSession');
+				void window.showErrorMessage(
+					`Failed to archive session: ${ex instanceof Error ? ex.message : String(ex)}`,
+				);
+			}
+
+			return;
+		}
 	}
 
 	private async openSession(sessionId?: string): Promise<void> {
@@ -507,6 +881,17 @@ export class AgentStatusService implements Disposable {
 		// its array between the user's pick and this dispatch.
 		const provider = this._providers.find(p => p.sessions.some(s => s.id === session.id));
 
+		// A completed session has no live process — its retained `pid` is a dead (and, across the
+		// 30-day retention window, potentially reused) process id, so it must NOT reach the
+		// classify/focus dispatch below. Trigger lazy title/prompt resolution (the poll skips it),
+		// then route straight to resume: `canResumeSession` includes `completed`, so the user gets a
+		// "Resume in Terminal" prompt instead of a focus attempt on an unrelated process.
+		if (session.status === 'completed') {
+			provider?.resolveCompletedSessionDetails?.(session.id);
+			await this.offerResumeOrWarn(session, 'This agent session has ended.');
+			return;
+		}
+
 		const { classifyClaudeSessionHost } = await import(
 			/* webpackChunkName: "agents" */ '@env/agents/claudeSessionFile.js'
 		);
@@ -579,9 +964,25 @@ export class AgentStatusService implements Disposable {
 
 		const action = 'Resume in Terminal';
 		const choice = await window.showWarningMessage(`${warning} Resume it in a terminal?`, action);
-		if (choice === action) {
-			await resumeClaudeSessionInTerminal(session);
+		if (choice !== action) return;
+
+		// Re-read after the prompt: it can sit unanswered indefinitely, and a resume reuses the SAME
+		// session id, so acting on the captured snapshot could start a second `claude --resume` against
+		// a transcript another window is already writing. A row that's gone (archived, or reconciled
+		// away) is still safe to resume — its transcript is on disk and nothing is holding it.
+		//
+		// The test is that status AND pid are unchanged, not merely that it's still resumable. A
+		// resume elsewhere revives a `completed` row to `idle`, which `canResumeSession` accepts, so
+		// a resumability check alone would wave the second process straight through; and a reconnect
+		// can swap the pid while HOLDING `idle`, which a status-only check would miss. Either move
+		// means the situation the user agreed to no longer holds.
+		const current = this.sessions.find(s => s.id === session.id);
+		if (current != null && (current.status !== session.status || current.pid !== session.pid)) {
+			void window.showInformationMessage('That agent session changed state, so it was not resumed.');
+			return;
 		}
+
+		await resumeClaudeSessionInTerminal(toResumableSessionRef(current ?? session), this.container);
 	}
 
 	/** Routes a session that's owned by another VS Code window. Notifies the owning peer (if it
@@ -704,9 +1105,25 @@ export class AgentStatusService implements Disposable {
 /** Field-by-field equality for the worktree metadata cache. Keeps the refresh's `changed` flag
  *  precise (and `maybeFireSerializedChange`'s JSON-diff downstream rare) without paying for
  *  per-worktree `JSON.stringify` round-trips on the host hot path. */
+/** `JSON.stringify` replacer for the change-detect key: coarsens the volatile timestamps to minute
+ *  buckets. `lastActivity` moves on every provider tick, so comparing it raw defeats the gate and
+ *  storms every webview with a full push every few seconds for as long as any session is live.
+ *  Consumers render elapsed against local `now`, so minute-granularity refreshes are enough for
+ *  drift; real changes (phase/status/membership/permission/worktree) still differ in the key and
+ *  push immediately. The timestamps stay full-precision in the payload itself.
+ *
+ *  Dates reach this already converted by `toJSON`, hence the `string` check. */
+function coarsenVolatileTimestamps(key: string, value: unknown): unknown {
+	return (key === 'lastActivity' || key === 'phaseSince') && typeof value === 'string'
+		? `${Math.floor(Date.parse(value) / 60000)}`
+		: value;
+}
+
 function isSameWorktreeMetadata(a: AgentSessionWorktreeMetadata | undefined, b: AgentSessionWorktreeMetadata): boolean {
 	if (a == null) return false;
-	if (a.name !== b.name || a.type !== b.type || a.isDefault !== b.isDefault) return false;
+	if (a.name !== b.name || a.type !== b.type || a.isDefault !== b.isDefault || a.repoPath !== b.repoPath) {
+		return false;
+	}
 	if (a.branch == null) return b.branch == null;
 	if (b.branch == null) return false;
 	return a.branch.name === b.branch.name && a.branch.upstreamName === b.branch.upstreamName;

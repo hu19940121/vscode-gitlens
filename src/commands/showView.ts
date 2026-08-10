@@ -1,6 +1,6 @@
 import { window } from 'vscode';
 import type { Container } from '../container.js';
-import { command, executeCoreCommand } from '../system/-webview/command.js';
+import { command, executeCommand, executeCoreCommand } from '../system/-webview/command.js';
 import type { HomeWebviewShowingArgs } from '../webviews/home/registration.js';
 import type { GraphWebviewShowingArgs } from '../webviews/plus/graph/registration.js';
 import type { WelcomeWebviewShowingArgs } from '../webviews/welcome/registration.js';
@@ -66,10 +66,8 @@ export class ShowViewCommand extends GlCommandBase {
 		const command = context.command;
 		switch (command) {
 			case 'gitlens.showAccountView':
-				return this.container.views.home.show(
-					undefined,
-					...([{ focusAccount: true }, ...args] as HomeWebviewShowingArgs),
-				);
+				// The account surface lives in the Settings webview's Account category now.
+				return executeCommand('gitlens.showSettingsPage!account');
 			case 'gitlens.showBranchesView':
 				await this.waitForRepo();
 				return this.container.views.showView('branches');
@@ -88,7 +86,10 @@ export class ShowViewCommand extends GlCommandBase {
 				await this.waitForRepo();
 				return this.container.views.showView('fileHistory');
 			case 'gitlens.showGraphView':
-				await this.waitForRepoOrNotify('the Commit Graph');
+				// The Commit Graph shows its own in-view empty state (Open a Folder / Clone / Start a New
+				// Project) when there's no repo, so skip the redundant "No repository detected" notification —
+				// just wait for discovery so we don't flash the empty state before repos are known.
+				await this.waitForRepo();
 				return this.container.views.graph.show(undefined, ...(args as GraphWebviewShowingArgs));
 			case 'gitlens.showHomeView':
 				return this.container.views.home.show(undefined, ...(args as HomeWebviewShowingArgs));

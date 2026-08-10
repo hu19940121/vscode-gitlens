@@ -28,6 +28,15 @@ export function compareSubscriptionPlans(
 	return getSubscriptionPlanOrder(planA) - getSubscriptionPlanOrder(planB);
 }
 
+/**
+ * Whether the account itself blocks access — none connected, or one whose email isn't verified.
+ * Surfaces gated on this (e.g. the Commit Graph) replace their entire content with an account screen,
+ * so callers routing work to one must treat it as unusable ahead of any plan/visibility check.
+ */
+export function isAccountAccessRequired(subscription: Subscription): boolean {
+	return subscription.account == null || subscription.account.verified === false;
+}
+
 export function computeSubscriptionState(subscription: Optional<Subscription, 'state'>): SubscriptionState {
 	const {
 		account,
@@ -208,6 +217,26 @@ export function getSubscriptionStateString(state: SubscriptionState | undefined)
 			return 'paid';
 		default:
 			return 'unknown';
+	}
+}
+
+/**
+ * Which entitlement is currently active, collapsing the finer states: unverified, expired, and
+ * reactivation-eligible all mean Pro isn't active. `undefined` when the state isn't known yet — callers
+ * should treat that as "don't assert anything" rather than as unpaid.
+ */
+export function getSubscriptionEntitlement(
+	state: SubscriptionState | undefined,
+): 'unpaid' | 'trial' | 'paid' | undefined {
+	switch (getSubscriptionStateString(state)) {
+		case 'paid':
+			return 'paid';
+		case 'trial':
+			return 'trial';
+		case 'unknown':
+			return undefined;
+		default:
+			return 'unpaid';
 	}
 }
 

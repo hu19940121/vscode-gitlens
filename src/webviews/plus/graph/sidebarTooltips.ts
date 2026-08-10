@@ -1,8 +1,10 @@
 import { shortenRevision } from '@gitlens/git/utils/revision.utils.js';
 import { formatIndicators, formatTrackingTooltip } from '@gitlens/git/utils/tooltip.utils.js';
 import { formatDate, fromNow } from '@gitlens/utils/date.js';
+import { pluralize } from '@gitlens/utils/string.js';
 import type {
 	GraphSidebarBranch,
+	GraphSidebarPullRequest,
 	GraphSidebarRemote,
 	GraphSidebarStash,
 	GraphSidebarTag,
@@ -41,6 +43,47 @@ export function branchTooltip(b: GraphSidebarBranch, dateFormat?: string | null)
 	}
 
 	return tooltip;
+}
+
+/** Mirrors `getPullRequestTooltip`'s voice — title, then a `#N by @author` byline — so a pull request
+ *  reads the same here as it does everywhere else in GitLens. */
+export function pullRequestTooltip(pr: GraphSidebarPullRequest, dateFormat?: string | null): string {
+	const icon = pr.isDraft ? '$(git-pull-request-draft)' : '$(git-pull-request)';
+	let tooltip = `${icon} ${pr.title.trim()}${pr.isDraft ? formatIndicators(['draft']) : ''}`;
+
+	let byline = `#${pr.number}`;
+	if (pr.authorName) {
+		byline += ` by @${pr.authorName}`;
+	}
+	if (pr.date != null) {
+		// State, not just recency: the panel lists open pull requests, so a merged or closed one only ever
+		// arrives through the search-by-number fallback — where "updated 3 days ago" reads exactly like an
+		// open one. Same wording the pull request node uses.
+		const verb = pr.state === 'merged' ? 'merged' : pr.state === 'closed' ? 'closed' : 'updated';
+		byline += `, ${verb} ${formatDateWithFromNow(pr.date, dateFormat)}`;
+	}
+	tooltip += `\\\n${byline}`;
+
+	return tooltip;
+}
+
+/** The `Merges <head> into <base>` sentence, split from {@link pullRequestTooltip} so the hover's Lit half
+ *  can place the pull request's size above it — size belongs with the byline, and keeping it out of the
+ *  state block leaves the grouping line and the signals that explain it contiguous. */
+export function pullRequestMergesTooltip(pr: GraphSidebarPullRequest): string | undefined {
+	// A sentence rather than `head → base`: the arrow reads as ambiguous direction, and which side is
+	// the target is the whole point of the line.
+	if (pr.headBranch == null || pr.baseBranch == null) return undefined;
+
+	// A fork's branch name alone is ambiguous — two pull requests can both be `patch-1` — so it's qualified
+	// the way GitHub names a cross-repository head, `<owner>:<branch>`. Same form the Launchpad quick pick
+	// uses, so one pull request reads the same in both places.
+	const head = `$(git-branch) \`${pr.headOwner != null ? `${pr.headOwner}:` : ''}${pr.headBranch}\``;
+	// Base before head, in GitHub's own order, minus its author clause — the row already says who. The count
+	// is dropped rather than reordered around when a provider doesn't report one, so the two halves of the
+	// sentence never swap places between rows.
+	const commits = pr.commitCount ? ` ${pluralize('commit', pr.commitCount)}` : '';
+	return `Merges${commits} into $(git-branch) \`${pr.baseBranch}\` from ${head}`;
 }
 
 export function tagTooltip(t: GraphSidebarTag, dateFormat?: string | null): string {

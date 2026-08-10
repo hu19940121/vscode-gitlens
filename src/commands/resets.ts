@@ -1,18 +1,22 @@
 import type { MessageItem } from 'vscode';
-import { ConfigurationTarget, window } from 'vscode';
-import { resetAvatarCache } from '../avatars.js';
+import { window } from 'vscode';
+import { resetApprovedAvatarTemplates, resetAvatarCache } from '../avatars.js';
 import type { Container } from '../container.js';
+import { clearTrialResetSessionAttempts } from '../plus/gk/trialAutoReset.js';
 import type { QuickPickItemOfT } from '../quickpicks/items/common.js';
 import { createQuickPickSeparator } from '../quickpicks/items/common.js';
-import { command } from '../system/-webview/command.js';
+import { settingsMigrations } from '../settingsMigrations.js';
+import { command, executeCoreCommand } from '../system/-webview/command.js';
 import { configuration } from '../system/-webview/configuration.js';
 import { GlCommandBase } from './commandBase.js';
 
 const resetTypes = [
 	'ai',
-	'ai:confirmations',
+	'ai:models',
 	'avatars',
+	'cli',
 	'integrations',
+	'migrations',
 	'onboarding',
 	'previews',
 	'promoOptIns',
@@ -38,14 +42,19 @@ export class ResetCommand extends GlCommandBase {
 				item: 'ai',
 			},
 			{
-				label: 'AI Confirmations...',
-				detail: 'Clears any accepted AI confirmations',
-				item: 'ai:confirmations',
+				label: 'AI Models...',
+				detail: 'Resets the AI provider/model to defaults for all AI features',
+				item: 'ai:models',
 			},
 			{
 				label: 'Avatars...',
-				detail: 'Clears the stored avatar cache',
+				detail: 'Clears the stored avatar cache and any approvals granted to custom remote avatar URL templates',
 				item: 'avatars',
+			},
+			{
+				label: 'GitKraken CLI (Installation)...',
+				detail: "Removes the downloaded CLI and clears its install state, so it's reinstalled when next needed",
+				item: 'cli',
 			},
 			{
 				label: 'Integrations (Authentication)...',
@@ -85,6 +94,11 @@ export class ResetCommand extends GlCommandBase {
 			items.push(
 				createQuickPickSeparator('DEBUG'),
 				{
+					label: 'Reset Migrations...',
+					detail: 'Re-arms selected one-time migrations, so they run again on the next reload',
+					item: 'migrations',
+				},
+				{
 					label: 'Reset Subscription...',
 					detail: 'Resets the stored subscription',
 					item: 'subscription',
@@ -123,17 +137,27 @@ export class ResetCommand extends GlCommandBase {
 				confirmationMessage = 'Are you sure you want to reset all of the stored AI keys?';
 				confirm.title = 'Reset AI Keys';
 				break;
-			case 'ai:confirmations':
-				confirmationMessage = 'Are you sure you want to reset all AI confirmations?';
-				confirm.title = 'Reset AI Confirmations';
+			case 'ai:models':
+				confirmationMessage =
+					'Are you sure you want to reset the AI provider/model to defaults for all AI features? This also clears the related settings.';
+				confirm.title = 'Reset AI Models';
 				break;
 			case 'avatars':
-				confirmationMessage = 'Are you sure you want to reset the avatar cache?';
+				confirmationMessage =
+					'Are you sure you want to reset the avatar cache and all approvals for custom remote avatar URL templates? Approvals are synced, so this will affect your other devices.';
 				confirm.title = 'Reset Avatars';
+				break;
+			case 'cli':
+				confirmationMessage = 'Are you sure you want to reset the GitKraken CLI installation?';
+				confirm.title = 'Reset GitKraken CLI';
 				break;
 			case 'integrations':
 				confirmationMessage = 'Are you sure you want to reset all of the stored integrations?';
 				confirm.title = 'Reset Integrations';
+				break;
+			case 'migrations':
+				// No modal — the multi-select in `reset` is the deliberate step, and re-running
+				// idempotent migrations is recoverable, unlike the data wipes above
 				break;
 			case 'onboarding':
 				confirmationMessage =
@@ -187,27 +211,79 @@ export class ResetCommand extends GlCommandBase {
 		switch (reset) {
 			case 'all':
 				for (const r of resetTypes) {
+					// Interactive picker; the `storage.reset` below wipes `settings:migrated` anyway
+					if (r === 'migrations') continue;
+
 					await this.reset(r);
 				}
 
+				// Secrets can't be enumerated, so anything not covered by a sub-reset must be named here
+				await this.container.storage.deleteSecret('deepLinks:pending');
+
 				await this.container.storage.reset();
+
+				// Services cache their state in memory and write it back (feature flags, graph columns, ...),
+				// so without a reload the wipe partially undoes itself
+				void this.promptToReload(
+					'All GitLens data has been reset. Reload the window to finish clearing any state still held in memory.',
+				);
 				break;
 
 			case 'ai':
-				await this.container.ai.reset(true);
+				// Silent: a data wipe must not copy every key it's deleting to the clipboard
+				await this.container.ai.reset({ all: true, silent: true });
 				break;
 
-			case 'ai:confirmations':
-				this.container.ai.resetConfirmations();
+			case 'ai:models':
+				await this.container.ai.resetModels();
 				break;
 
 			case 'avatars':
+				// Approvals first — it clears only failed entries, so the full cache reset must follow it
+				await resetApprovedAvatarTemplates();
 				resetAvatarCache('all');
+				break;
+
+			case 'cli':
+				await this.container.gkCli?.reset();
 				break;
 
 			case 'integrations':
 				await this.container.integrations.reset();
 				break;
+
+			case 'migrations': {
+				const applied = this.container.storage.get('settings:migrated');
+				if (!applied?.length) {
+					void window.showInformationMessage('There are no completed migrations to reset.');
+					break;
+				}
+
+				const picks = await window.showQuickPick(
+					applied.map(id => {
+						const migration = settingsMigrations.find(m => m.id === id);
+						return {
+							label: id,
+							description: migration?.status?.(this.container.storage),
+							detail: migration?.description ?? 'Unknown migration — no longer exists in this version',
+						};
+					}),
+					{
+						title: 'Reset Migrations',
+						placeHolder: 'Choose migrations to re-run on the next reload',
+						canPickMany: true,
+					},
+				);
+				if (!picks?.length) break;
+
+				await this.container.storage.store(
+					'settings:migrated',
+					applied.filter(id => !picks.some(p => p.label === id)),
+				);
+
+				void this.promptToReload('The selected migrations will run again once the window is reloaded.');
+				break;
+			}
 
 			case 'onboarding':
 				await this.container.onboarding.resetAll();
@@ -233,7 +309,8 @@ export class ResetCommand extends GlCommandBase {
 				break;
 
 			case 'suppressedWarnings':
-				await configuration.update('advanced.messages', undefined, ConfigurationTarget.Global);
+				// Clear every target — a workspace/folder override would otherwise keep a warning suppressed
+				await configuration.clear('advanced.messages');
 				break;
 
 			case 'workspace':
@@ -244,6 +321,8 @@ export class ResetCommand extends GlCommandBase {
 					switch (reset) {
 						case 'subscription':
 							await this.container.storage.delete('premium:subscription');
+							await this.container.storage.deleteWithPrefix('plus:trialReset');
+							clearTrialResetSessionAttempts();
 							break;
 						case 'previews':
 							await this.container.storage.deleteWithPrefix('plus:preview');
@@ -252,5 +331,16 @@ export class ResetCommand extends GlCommandBase {
 				}
 				break;
 		}
+	}
+
+	private async promptToReload(message: string): Promise<void> {
+		const reload: MessageItem = { title: 'Reload' };
+		const result = await window.showInformationMessage(message, reload, {
+			title: 'Later',
+			isCloseAffordance: true,
+		});
+		if (result !== reload) return;
+
+		void executeCoreCommand('workbench.action.reloadWindow');
 	}
 }

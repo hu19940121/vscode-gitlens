@@ -110,9 +110,11 @@ export class GitDocumentTracker implements Disposable {
 
 		const docs = workspace.textDocuments
 			.filter(d => this.container.git.supportedSchemes.has(d.uri.scheme))
-			.map<
-				[TextDocument, visible: boolean, active: boolean]
-			>(d => [d, isVisibleTextDocument(d), activeDocument === d]);
+			.map<[TextDocument, visible: boolean, active: boolean]>(d => [
+				d,
+				isVisibleTextDocument(d),
+				activeDocument === d,
+			]);
 
 		// Sort by active and then by visible
 		docs.sort(([, aVisible, aActive], [, bVisible, bActive]) => {
@@ -139,7 +141,7 @@ export class GitDocumentTracker implements Disposable {
 
 	private onConfigurationChanged(e?: ConfigurationChangeEvent) {
 		// Only rest the cached state if we aren't initializing
-		if (e != null && configuration.changed(e, 'blame.ignoreWhitespace')) {
+		if (e != null && configuration.changed(e, ['blame.ignoreWhitespace', 'advanced.blame.customArguments'])) {
 			void this.refreshDocuments();
 		}
 
@@ -162,7 +164,8 @@ export class GitDocumentTracker implements Disposable {
 
 	private onRepositoryChanged(e: RepositoryChangeEvent) {
 		if (e.changed('index', 'heads', 'pausedOp', 'unknown')) {
-			void this.refreshDocuments({ addedOrChangedRepoPaths: new Set([e.repository.path]) });
+			// Lowercased to match `refreshDocuments`, which compares against a lowercased repo path
+			void this.refreshDocuments({ addedOrChangedRepoPaths: new Set([e.repository.path.toLowerCase()]) });
 		}
 	}
 
@@ -487,7 +490,8 @@ export class GitDocumentTracker implements Disposable {
 
 		for (const d of this._documentMap.values()) {
 			const doc = await d;
-			const repoPath = doc.uri.repoPath?.toLocaleLowerCase();
+			// `toLowerCase` (not `toLocaleLowerCase`) to match the producers — a Turkish locale maps `I` to `ı`
+			const repoPath = doc.uri.repoPath?.toLowerCase();
 			if (repoPath == null) continue;
 
 			if (changed?.removedRepoPaths?.has(repoPath)) {

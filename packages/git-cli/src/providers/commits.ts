@@ -10,7 +10,7 @@ import type { GitLog } from '@gitlens/git/models/log.js';
 import type { GitReflog } from '@gitlens/git/models/reflog.js';
 import type { GitRevisionRange } from '@gitlens/git/models/revision.js';
 import type { SearchQuery, SearchQueryFilters } from '@gitlens/git/models/search.js';
-import type { CommitSignature } from '@gitlens/git/models/signature.js';
+import type { CommitSignature, SshSignedCommit } from '@gitlens/git/models/signature.js';
 import type { GitUser } from '@gitlens/git/models/user.js';
 import type {
 	GitCommitReachability,
@@ -24,11 +24,13 @@ import type {
 	SearchCommitsResult,
 } from '@gitlens/git/providers/commits.js';
 import type { DiffRange } from '@gitlens/git/providers/types.js';
+import type { GitCommandPriority } from '@gitlens/git/run.types.js';
 import { createUncommittedChangesCommit } from '@gitlens/git/utils/commit.utils.js';
 import { isRevisionRange, isSha, isUncommitted, isUncommittedStaged } from '@gitlens/git/utils/revision.utils.js';
 import { parseSearchQueryGitCommand } from '@gitlens/git/utils/search.utils.js';
 import { compareReachableRefs } from '@gitlens/git/utils/sorting.js';
 import { isUserMatch } from '@gitlens/git/utils/user.utils.js';
+import { chunk as chunkArray } from '@gitlens/utils/array.js';
 import { CancellationError, isCancellationError } from '@gitlens/utils/cancellation.js';
 import { debug, trace } from '@gitlens/utils/decorators/log.js';
 import { createDisposable } from '@gitlens/utils/disposable.js';
@@ -37,7 +39,7 @@ import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { isFolderGlob, normalizePath, splitPath, stripFolderGlob } from '@gitlens/utils/path.js';
 import type { CacheController } from '@gitlens/utils/promiseCache.js';
 import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
-import { escapeRegex } from '@gitlens/utils/string.js';
+import { escapeRegex, iterateByDelimiter } from '@gitlens/utils/string.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import { fileUri, joinUriPath, toFsPath } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
@@ -58,11 +60,17 @@ import {
 } from '../parsers/logParser.js';
 import { getReflogParser, parseGitRefLog } from '../parsers/reflogParser.js';
 import { parseSignatureOutput, signatureFormat } from '../parsers/signatureParser.js';
+import {
+	extractCommitterFromCommitObject,
+	extractSshPublicKeyFromCommitObject,
+} from '../parsers/sshSignatureParser.js';
 import { createCommitFileset } from './commitFilesetUtils.js';
 import { convertStashesToStdin } from './stash.js';
 
 const emptyPromise: Promise<GitBlame | ParsedGitDiffHunks | GitLog | undefined> = Promise.resolve(undefined);
 const reflogCommands = ['merge', 'pull'];
+/** Keeps `filterUnpublishedShas` well inside Windows' ~32K command-line cap (40 hex chars + separator each). */
+const maxShasPerRevListSpawn = 500;
 
 export class CommitsGitSubProvider implements GitCommitsSubProvider {
 	constructor(
@@ -110,23 +118,134 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 	}
 
 	@debug({ exit: true })
-	async getCommitCount(repoPath: string, rev: string, cancellation?: AbortSignal): Promise<number | undefined> {
+	getCommitCount(repoPath: string, rev: string, cancellation?: AbortSignal): Promise<number | undefined> {
+		return this.cache.commitCount.getOrCreate(
+			repoPath,
+			rev,
+			async (cacheable, signal) => {
+				// Bind the shared spawn to the aggregate `signal` (fires only when ALL current callers
+				// abort), not this-caller's `cancellation` — otherwise a superseded caller's abort would
+				// kill the shared command and reject concurrent riders that never cancelled.
+				const result = await this.git.run(
+					{ cwd: repoPath, cancellation: signal ?? cancellation, errors: 'ignore' },
+					'rev-list',
+					'--count',
+					rev,
+					'--',
+				);
+				if (result.completion.status === 'cancelled' || signal?.aborted) {
+					throw new CancellationError();
+				}
+
+				// `errors: 'ignore'` turns a failed run (unknown rev, a transient `index.lock`) into an
+				// empty stdout rather than a throw. That's indistinguishable from a real answer here, so
+				// don't let it become a cached one — this entry has a sliding hour-long TTL, and repeated
+				// access would keep a transient failure alive indefinitely. The pre-cache implementation
+				// simply retried on the next call; invalidating restores that.
+				//
+				// BOTH conditions, not either alone. `exitCode !== 0` catches "git ran and said no" (a bad
+				// rev exits 128); `status !== 'exited'` catches "git never answered" — a queue rejection or
+				// spawn failure (no exit code at all), or a swallowed `GitWarnings` match, which carries git's
+				// real code and so can slip past the exit-code test on its own.
+				if (result.completion.status !== 'exited' || result.exitCode !== 0) {
+					cacheable.invalidate();
+					return undefined;
+				}
+
+				const data = result.stdout.trim();
+				if (!data) return undefined;
+
+				const count = parseInt(data, 10);
+				return isNaN(count) ? undefined : count;
+			},
+			{ cancellation: cancellation },
+		);
+	}
+
+	@debug({ exit: true })
+	async hasUnpublishedCommits(
+		repoPath: string,
+		rev: string,
+		cancellation?: AbortSignal,
+	): Promise<boolean | undefined> {
+		// `<rev> --not --remotes` = commits reachable from `rev` but not from any remote-tracking ref.
+		// `--max-count=1` early-exits at the first such commit, so this is a presence probe, not a count.
 		const result = await this.git.run(
 			{ cwd: repoPath, cancellation: cancellation, errors: 'ignore' },
 			'rev-list',
-			'--count',
+			'--max-count=1',
 			rev,
+			'--not',
+			'--remotes',
 			'--',
 		);
-		if (result.cancelled || cancellation?.aborted) {
+		if (result.completion.status === 'cancelled' || cancellation?.aborted) {
 			throw new CancellationError();
 		}
 
-		const data = result.stdout.trim();
-		if (!data) return undefined;
+		return result.stdout.trim().length > 0;
+	}
 
-		const count = parseInt(data, 10);
-		return isNaN(count) ? undefined : count;
+	@debug({
+		args: (repoPath, shas) => ({ repoPath: repoPath, shas: `${shas.length} value(s)` }),
+		exit: r => `${r.size} unpublished`,
+	})
+	async filterUnpublishedShas(
+		repoPath: string,
+		shas: readonly string[],
+		options?: { priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<Set<string>> {
+		const unpublished = new Set<string>();
+		if (!shas.length) return unpublished;
+
+		// One walk answers every sha: `<shas…> --not --remotes` yields the commits reachable from any of them
+		// but not from any remote-tracking ref, so a sha is unpublished exactly when it appears in the output.
+		// Callers pass tips from sibling worktrees — safe from a single `cwd` because the object store and
+		// `refs/remotes` are shared across a repo's worktrees (unlike the index/working tree, which are not).
+		//
+		// NOT `--no-walk`: it "has no effect if a range is specified", and `--not --remotes` makes this a range,
+		// so it would silently walk anyway and return the whole unpublished history instead of just these tips.
+		// The walk is bounded by divergence from the remotes, not by repo size; callers skip this entirely when
+		// the repo has no remotes (where every local commit would qualify).
+		// Chunked so a repo with a very large number of worktrees can't overflow the platform's argument
+		// limit (Windows' `CreateProcess` caps the whole command line at ~32K characters).
+		// Deliberately NOT `errors: 'ignore'`: this answers for EVERY sha at once, so a swallowed failure
+		// would return an empty set the caller can't distinguish from "nothing is unpublished", publishing a
+		// confident `hasUnpushed: false` across every worktree in the batch. Letting it throw degrades the
+		// caller to "unknown", which omits the field and leaves the client's last-known value in place.
+		for (const chunk of chunkArray([...shas], maxShasPerRevListSpawn)) {
+			const result = await this.git.run(
+				{
+					cwd: repoPath,
+					cancellation: cancellation,
+					...(options?.priority != null ? { priority: options.priority } : undefined),
+				},
+				'rev-list',
+				...chunk,
+				'--not',
+				'--remotes',
+				'--',
+			);
+			// Anything but a clean exit leaves empty stdout, which this function would otherwise read as
+			// "every sha is published" — publishing a definite, wrong `hasUnpushed: false` for the whole
+			// batch. Dropping `errors: 'ignore'` was not enough on its own: a stderr matching `GitWarnings`
+			// (a repo path that briefly vanished, an unknown rev) is swallowed by the default handler and
+			// resolves rather than throwing. Rethrow so the caller degrades to "unknown".
+			if (result.completion.status !== 'exited') throw result.completion.error;
+			if (cancellation?.aborted) throw new CancellationError();
+
+			const candidates = new Set(chunk);
+			for (const line of iterateByDelimiter(result.stdout, '\n')) {
+				const sha = line.trim();
+				// The walk emits ancestors too; keep only the tips we were asked about.
+				if (sha.length && candidates.has(sha)) {
+					unpublished.add(sha);
+				}
+			}
+		}
+
+		return unpublished;
 	}
 
 	@debug({ exit: true })
@@ -154,7 +273,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			...parser.arguments,
 			rev,
 		);
-		if (result.cancelled || cancellation?.aborted) return undefined;
+		if (result.completion.status === 'cancelled' || cancellation?.aborted) return undefined;
 
 		for (const entry of parser.parse(result.stdout)) {
 			const authorSeconds = Number(entry.authorDate);
@@ -307,9 +426,9 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 				return { refs: refs };
 			} catch (ex) {
 				cacheable?.invalidate();
-				debugger;
 				if (isCancellationError(ex)) throw ex;
 
+				debugger;
 				scope?.error(ex);
 
 				return undefined;
@@ -416,7 +535,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 					'HEAD',
 					'--',
 				);
-				if (result.cancelled || cancellation?.aborted) {
+				if (result.completion.status === 'cancelled' || cancellation?.aborted) {
 					throw new CancellationError();
 				}
 
@@ -451,7 +570,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 				range,
 				'--',
 			);
-			if (result.cancelled || cancellation?.aborted) {
+			if (result.completion.status === 'cancelled' || cancellation?.aborted) {
 				throw new CancellationError();
 			}
 			if (!result.stdout) return undefined;
@@ -863,7 +982,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 						}
 						return moreLog.commits;
 					},
-					// eslint-disable-next-line no-loop-func
+					// oxlint-disable-next-line no-loop-func
 					query: (limit: number | undefined) =>
 						this.getLogCore(log.repoPath, rev, { ...options, limit: limit }),
 				};
@@ -1231,6 +1350,10 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			rev1,
 			rev2,
 		);
+		// A cancelled check has no answer. `completion` now keeps that distinct from a real "is an ancestor"
+		// result — the missing `exitCode` alone already makes the check below `false` — but callers branch on
+		// `isCancellationError`, so this still has to throw rather than quietly answer "no".
+		if (cancellation?.aborted) throw new CancellationError();
 		return result.exitCode === 0;
 	}
 
@@ -1280,8 +1403,30 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			let stashes: Map<string, GitStashCommit> | undefined;
 			let stdin: string | undefined;
 
+			let resolvedShas: Set<string> | undefined;
 			if (shas?.size) {
-				stdin = join(shas, '\n');
+				resolvedShas = await this.provider.revision.resolveShas(repoPath, shas, cancellation);
+				if (cancellation?.aborted) throw new CancellationError();
+				// Short SHA(s) matched no commit: return empty (empty stdin to `--no-walk --stdin`
+				// would return HEAD, so we must not fall through to git).
+				if (!resolvedShas.size) {
+					return {
+						search: search,
+						log: {
+							repoPath: repoPath,
+							commits: new Map(),
+							sha: undefined,
+							searchFilters: filters,
+							count: 0,
+							limit: options?.limit ?? cfg?.search?.maxItems ?? 0,
+							hasMore: false,
+						},
+					};
+				}
+			}
+
+			if (resolvedShas?.size) {
+				stdin = join(resolvedShas, '\n');
 				args.push('--no-walk');
 			} else if (!filters.refs) {
 				// Don't include stashes when using ref: filter, as they would add unrelated commits
@@ -1451,6 +1596,69 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			scope?.error(ex);
 			return false;
 		}
+	}
+
+	@debug()
+	async getCommitsSshSigners(repoPath: string, shas: string[]): Promise<Map<string, SshSignedCommit>> {
+		const scope = getScopedLogger();
+
+		const result = new Map<string, SshSignedCommit>();
+		if (shas.length === 0) return result;
+
+		try {
+			// Read every commit object in a single `cat-file --batch` process (the SHAs are piped to stdin) rather than
+			// spawning one `git` per commit — the embedded SSH signature and committer identity are then parsed from
+			// each raw object, avoiding a separate (and far heavier) `git log` pass to enumerate identities.
+			const data = await this.git.run<Buffer>(
+				{ cwd: repoPath, errors: 'ignore', stdin: `${shas.join('\n')}\n`, encoding: 'buffer' },
+				'cat-file',
+				'--batch',
+			);
+			parseCatFileBatchForSshSigners(data.stdout, new Set(shas), result);
+		} catch (ex) {
+			scope?.error(ex);
+		}
+		return result;
+	}
+}
+
+/**
+ * Parses `git cat-file --batch` output, extracting the embedded SSH public key (if any) from each requested commit
+ * object. Each record is `<sha> <type> <size>` LF `<content>` LF (or `<sha> missing` LF), and the object's bytes are
+ * consumed using the header's `<size>` rather than scanned line-by-line — so a commit/tag body line that happens to
+ * look like an object header can never be misread as a boundary. Operates on the raw `Buffer` because `<size>` counts
+ * bytes, not decoded characters.
+ *
+ * Exported for unit testing.
+ */
+export function parseCatFileBatchForSshSigners(
+	stdout: Buffer,
+	requestedShas: Set<string>,
+	out: Map<string, SshSignedCommit>,
+): void {
+	const headerRegex = /^([0-9a-f]{40,64}) (commit|tag|blob|missing)(?: (\d+))?$/;
+
+	let offset = 0;
+	while (offset < stdout.length) {
+		const newline = stdout.indexOf(0x0a, offset);
+		if (newline === -1) break;
+
+		const match = headerRegex.exec(stdout.toString('utf8', offset, newline));
+		offset = newline + 1;
+		// A missing object (or an unrecognizable header) has no content body following its header line.
+		if (match == null || match[2] === 'missing') continue;
+
+		const sha = match[1];
+		const object = stdout.toString('utf8', offset, offset + Number(match[3]));
+		offset += Number(match[3]) + 1; // consume the object's bytes and the trailing newline that separates records
+
+		if (!requestedShas.has(sha)) continue;
+
+		const key = extractSshPublicKeyFromCommitObject(object);
+		if (key == null) continue;
+
+		const committer = extractCommitterFromCommitObject(object);
+		out.set(sha, { key: key, name: committer?.name, email: committer?.email });
 	}
 }
 

@@ -5,22 +5,39 @@ import { OpenAICompatibleProviderBase } from './openAICompatibleProviderBase.js'
 type GeminiModel = AIModel<typeof provider.id>;
 const models: GeminiModel[] = [
 	{
+		id: 'gemini-3.6-flash',
+		name: 'Gemini 3.6 Flash',
+		maxTokens: { input: 1048576, output: 65536 },
+		provider: provider,
+		temperature: null, // Gemini 3.x reasoning is tuned for its default temperature; don't override
+	},
+	{
+		id: 'gemini-3.5-flash',
+		name: 'Gemini 3.5 Flash',
+		maxTokens: { input: 1048576, output: 65536 },
+		provider: provider,
+		temperature: null, // Gemini 3.x reasoning is tuned for its default temperature; don't override
+	},
+	{
+		id: 'gemini-3.5-flash-lite',
+		name: 'Gemini 3.5 Flash-Lite',
+		maxTokens: { input: 1048576, output: 65536 },
+		provider: provider,
+		temperature: null, // Gemini 3.x reasoning is tuned for its default temperature; don't override
+	},
+	{
 		id: 'gemini-3.1-pro-preview',
 		name: 'Gemini 3.1 Pro Preview',
 		maxTokens: { input: 1048576, output: 65536 },
 		provider: provider,
+		temperature: null, // Gemini 3.x reasoning is tuned for its default temperature; don't override
 	},
 	{
-		id: 'gemini-3.1-flash-lite-preview',
-		name: 'Gemini 3.1 Flash-Lite Preview',
+		id: 'gemini-3.1-flash-lite',
+		name: 'Gemini 3.1 Flash-Lite',
 		maxTokens: { input: 1048576, output: 65536 },
 		provider: provider,
-	},
-	{
-		id: 'gemini-3-pro-preview',
-		name: 'Gemini 3 Pro Preview',
-		maxTokens: { input: 1048576, output: 65536 },
-		provider: provider,
+		temperature: null, // Gemini 3.x reasoning is tuned for its default temperature; don't override
 	},
 	{
 		id: 'gemini-3-flash-preview',
@@ -28,12 +45,14 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 1048576, output: 65536 },
 		provider: provider,
 		default: true,
+		temperature: null, // Gemini 3.x reasoning is tuned for its default temperature; don't override
 	},
 	{
 		id: 'gemini-2.5-pro',
 		name: 'Gemini 2.5 Pro',
 		maxTokens: { input: 1048576, output: 65536 },
 		provider: provider,
+		hidden: true,
 	},
 	{
 		id: 'gemini-2.5-flash',
@@ -123,6 +142,10 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 2097152, output: 8192 },
 		provider: provider,
 		hidden: true,
+		// The OpenAI-compat endpoint's `response_format: json_schema` postdates these frozen
+		// pre-GA snapshots and the 1.5 generation (this and every entry below); GA 2.x+ models
+		// stay on by default and rely on strip-and-retry for the shapes its converter rejects
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-2.0-flash-thinking-exp-01-21',
@@ -130,6 +153,7 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 1048576, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-2.0-flash-exp',
@@ -137,6 +161,7 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 1048576, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-exp-1206',
@@ -144,6 +169,7 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 2097152, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-exp-1121',
@@ -151,6 +177,7 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 2097152, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-1.5-pro',
@@ -158,6 +185,7 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 2097152, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-1.5-flash',
@@ -165,6 +193,7 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 1048576, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'gemini-1.5-flash-8b',
@@ -172,12 +201,14 @@ const models: GeminiModel[] = [
 		maxTokens: { input: 1048576, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 ];
 
 export class GeminiProvider extends OpenAICompatibleProviderBase<typeof provider.id> {
 	readonly id = provider.id;
 	readonly name = provider.name;
+	readonly supportsTools = true;
 	protected readonly descriptor = provider;
 	protected readonly config = {
 		keyUrl: 'https://aistudio.google.com/app/apikey',

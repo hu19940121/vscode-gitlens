@@ -1,4 +1,10 @@
 import type { AIActionType, AIModel } from '../models/model.js';
+import type { AIFinishReason } from '../models/provider.js';
+
+/** Whether the model declined to fulfill the request (refused or content-filtered) */
+export function didModelDecline(finishReason: AIFinishReason | undefined): boolean {
+	return finishReason === 'refusal' || finishReason === 'content_filter';
+}
 
 export function getActionName(action: AIActionType): string {
 	switch (action) {
@@ -11,17 +17,17 @@ export function getActionName(action: AIActionType): string {
 		case 'generate-stashMessage':
 			return 'Generate Stash Message';
 		case 'generate-changelog':
-			return 'Generate Changelog (Preview)';
+			return 'Generate Changelog';
 		case 'generate-create-cloudPatch':
 			return 'Create Cloud Patch Details';
-		case 'generate-create-codeSuggestion':
-			return 'Create Code Suggestion Details';
 		case 'generate-create-pullRequest':
-			return 'Create Pull Request Details (Preview)';
+			return 'Create Pull Request Details';
 		case 'generate-commits':
-			return 'Generate Commits (Preview)';
+			return 'Generate Commits';
+		case 'conflict-resolution':
+			return 'Resolve Conflicts (Preview)';
 		case 'generate-searchQuery':
-			return 'Generate Search Query (Preview)';
+			return 'Generate Search Query';
 	}
 }
 
@@ -32,6 +38,14 @@ export function getValidatedTemperature(
 	modelTemperature?: number | null,
 	defaultTemperature?: number,
 ): number | undefined {
+	// `temperature: null` on the model is a capability statement, not a default: the model rejects the
+	// parameter (reasoning models, Anthropic Opus 4.7+/Sonnet 5, Gemini 3.x) or the catalog can't
+	// promise it accepts one (every GitKraken-proxy and OpenRouter model). It therefore has to win over
+	// a caller-supplied value — callers merge as `modelOptions?.temperature ?? model.temperature`, and
+	// `0 ?? null` is `0`, so an explicit 0 would otherwise defeat the opt-out and be sent anyway.
+	// It also covers upstreams the id check below can't see: a proxy model is `openai:gpt-5.6-…`, not
+	// `gpt-5.6-…`, so `startsWith` misses it while the upstream still 400s on a non-default value.
+	if (model.temperature === null) return undefined;
 	if (modelTemperature === null) return undefined;
 	// GPT5 doesn't support anything but the default temperature
 	if (model.id.startsWith('gpt-5')) return undefined;

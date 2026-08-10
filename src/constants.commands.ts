@@ -35,6 +35,7 @@ export type GlCommandsDeprecated =
 type InternalGraphWebviewCommands =
 	| 'gitlens.deleteBranchOrWorktree:graph'
 	| 'gitlens.git.branch.setMergeTarget:graph'
+	| 'gitlens.git.branch.setUpstream:graph'
 	| 'gitlens.mergeIntoCurrent:graph'
 	| 'gitlens.openMergeTargetComparison:graph'
 	| 'gitlens.pausedOperation.abort:graph'
@@ -84,7 +85,10 @@ type InternalAgentCommands =
 	| 'gitlens.agents.installClaudeHook'
 	| 'gitlens.agents.uninstallClaudeHook'
 	| 'gitlens.agents.resolvePermission'
-	| 'gitlens.agents.openPlanFile';
+	| 'gitlens.agents.openPlanFile'
+	| 'gitlens.agents.resumeSession'
+	| 'gitlens.agents.showResumeSessionPicker'
+	| 'gitlens.agents.archiveSession';
 
 type InternalLaunchPadCommands = 'gitlens.launchpad.indicator.action';
 
@@ -135,6 +139,7 @@ type InternalWalkthroughCommands =
 type InternalWelcomeCommands =
 	| 'gitlens.welcome.openCommunityVsPro'
 	| 'gitlens.welcome.openHelpCenter'
+	| 'gitlens.welcome.openKepler'
 	| 'gitlens.welcome.plus.login'
 	| 'gitlens.welcome.plus.reactivate'
 	| 'gitlens.welcome.plus.signUp'
@@ -166,7 +171,6 @@ type InternalGlCommands =
 	| 'gitlens.regenerateMarkdownDocument'
 	| 'gitlens.runPromptInAgent'
 	| 'gitlens.sendToChat'
-	| 'gitlens.showComposerPage'
 	| 'gitlens.showInCommitGraphView'
 	| 'gitlens.onboarding.dismiss'
 	| 'gitlens.showQuickCommitDetails'
@@ -235,7 +239,6 @@ export type CoreCommands =
 	| 'workbench.action.chat.open'
 	| 'workbench.action.closeActiveEditor'
 	| 'workbench.action.closeAllEditors'
-	| 'workbench.action.closePanel'
 	| 'workbench.action.closeWindow'
 	| 'workbench.action.moveEditorToNewWindow'
 	| 'workbench.action.focusFirstEditorGroup'
@@ -257,7 +260,6 @@ export type CoreCommands =
 	| 'workbench.action.reloadWindow'
 	| 'workbench.action.terminal.paste'
 	| 'workbench.action.terminal.sendSequence'
-	| 'workbench.action.toggleMaximizedPanel'
 	| 'workbench.action.focusPanel'
 	| 'workbench.action.togglePanel'
 	| 'workbench.extensions.action.extensionUpdates'
@@ -267,6 +269,7 @@ export type CoreCommands =
 	| 'workbench.extensions.uninstallExtension'
 	| 'workbench.files.action.focusFilesExplorer'
 	| 'workbench.view.explorer'
+	| 'workbench.view.extension.gitlens'
 	| 'workbench.view.extension.gitlensInspect'
 	| 'workbench.view.scm'
 	| VendorChatCommands

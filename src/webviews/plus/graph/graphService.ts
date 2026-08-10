@@ -1,11 +1,16 @@
 import type { AIReviewDetailResult, AIReviewResult } from '@gitlens/ai/models/results.js';
+import type { GitDiffFileStats } from '@gitlens/git/models/diff.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
+import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
 import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
+import type { ConflictKind } from '@gitlens/git/utils/conflictResolution.utils.js';
 import type { GlCommands } from '../../../constants.commands.js';
-import type { LaunchpadSummaryResult } from '../../../plus/launchpad/launchpadIndicator.js';
+import type { ConsultedTool } from '../../../plus/coretools/conflict/consultation.js';
+import type { LaunchpadSummaryError, LaunchpadSummaryResult } from '../../../plus/launchpad/launchpadIndicator.js';
 import type { ExplainResult } from '../../commitDetails/commitDetailsService.js';
 import type { SharedWebviewServices } from '../../rpc/services/common.js';
 import type { RpcEventSubscription } from '../../rpc/services/types.js';
+import type { WalkthroughProgressPayload } from '../../rpc/walkthroughService.js';
 import type {
 	ChoosePathParams,
 	DidChoosePathParams,
@@ -19,10 +24,158 @@ import type {
 	DidGetCountParams,
 	DidGetSidebarDataParams,
 	GraphSidebarPanel,
+	GraphSidebarPullRequest,
 	SidebarWorktreeChange,
 } from './protocol.js';
 
 export type ComposeProgressUpdate = { phase: string; message: string };
+
+export type ResolveProgressUpdate = { phase: string; message: string };
+
+/** How a conflicted file was resolved — mirrors `@gitkraken/conflict-tools`' `ResolutionStrategy`. */
+export type ConflictResolutionStrategy = 'ai' | 'take-ours' | 'take-theirs' | 'deleted' | 'skipped';
+
+/** Serializable per-file resolution summary surfaced to the webview. The full resolved content stays
+ *  host-side (in the cached resolve session) until the user applies; `virtualRef` points at the
+ *  AI-resolved virtual snapshot so "View diff" can show resolved-vs-conflicted without writing. */
+export type ResolvedFileSummary = {
+	filePath: string;
+	strategy: ConflictResolutionStrategy;
+	/** The AI's reasoning for this file (conflict-tools `Resolution.description`). */
+	reasoning: string;
+	confidence: number;
+	note?: string;
+	/** What AI consulted in the repository before deciding, when the hunk alone was ambiguous — the
+	 *  evidence behind `reasoning`. Absent when it resolved from the conflict's own context. */
+	consulted?: ConsultedTool[];
+	virtualRef?: VirtualRefShape;
+};
+
+/** Conflict-type info + which sides can be staged, attached to skipped/errored files so the resolve
+ *  panel can label them and offer the right manual take-side fallback actions. Optional throughout —
+ *  populated from `getConflictFileInfos`; absent when the file is no longer conflicted. */
+export type ConflictFallbackInfo = {
+	conflictStatus?: GitFileConflictStatus;
+	kind?: ConflictKind;
+	canStageCurrent?: boolean;
+	canStageIncoming?: boolean;
+	/** Original (pre-rename) path, for rename labels. */
+	renameOf?: string;
+};
+
+export type ResolveFileError = { filePath: string; message: string } & ConflictFallbackInfo;
+
+/** A conflicted file the resolver couldn't auto-resolve (e.g. binary or a marker-less conflict) —
+ *  it still needs manual attention, but distinct from a failure: retrying won't help. */
+export type ResolveSkippedFile = { filePath: string; message: string } & ConflictFallbackInfo;
+
+/** Side to take when manually resolving a conflict from the resolve panel's fallback actions. */
+export type ConflictSide = 'current' | 'incoming' | 'delete';
+
+/** A queued take-side resolution — the file and the strategy it will be applied with on Apply. */
+export type QueuedTakeSide = {
+	filePath: string;
+	strategy: Extract<ConflictResolutionStrategy, 'take-ours' | 'take-theirs' | 'deleted'>;
+};
+
+/** Result of queuing a manual take-side resolution. `resolved` lists every file queued (the chosen
+ *  file, plus the losing target deleted for a rename/rename) so the panel can promote the matching
+ *  rows. Nothing is applied to the working tree until the user clicks Apply. */
+export type TakeConflictSideResult = { result: { resolved: QueuedTakeSide[] } } | { error: { message: string } };
+
+export type ResolveResult =
+	| {
+			result: {
+				resolutions: ResolvedFileSummary[];
+				errors?: ResolveFileError[];
+				skipped?: ResolveSkippedFile[];
+				/** Present only when seeded from an automatic-rebase escalation — tells the panel the
+				 *  run is mid-rebase so it can offer "Apply & Resume with AI" instead of a plain Apply. */
+				autoRebase?: { sessionId: string; stepNumber?: number; totalSteps?: number };
+			};
+	  }
+	| { error: { message: string } }
+	| { cancelled: true };
+
+/** Result of re-resolving a single file with user feedback — the replacement summary for that file. */
+export type ReresolveFileResult =
+	| { result: ResolvedFileSummary }
+	| { error: { message: string } }
+	| { cancelled: true };
+
+/** One paused step of an automatic rebase run — the commit it stopped on and how each conflicted
+ *  file was resolved. `empty-skipped`: the resolution made the commit empty and it was skipped. */
+export type AutoRebaseSummaryStep = {
+	step: number;
+	totalSteps: number;
+	commit: { sha?: string; message?: string };
+	kind: 'conflicts' | 'empty-skipped' | 'manual';
+	files: ResolvedFileSummary[];
+};
+
+/** Serializable summary of an automatic rebase session for the summary sheet. The per-file
+ *  before/after contents stay host-side; each file's `virtualRef` points at its step's virtual
+ *  diff session (namespace `auto-rebase`). */
+export type AutoRebaseSummary = {
+	sessionId: string;
+	branch?: string;
+	upstream?: string;
+	preRebaseSha: string;
+	postRebaseSha?: string;
+	totalSteps: number;
+	outcome: 'completed' | 'escalated' | 'aborted' | 'failed' | 'undone';
+	/** Undo passes validation right now (branch tip still at `postRebaseSha`, tree clean enough, …) */
+	undoable: boolean;
+	/** Undo is available but will stash the working tree first (the dirt is the autostash, which
+	 *  `undo()` recovers) — the confirm prompt warns about this */
+	undoWillStash?: boolean;
+	/** Why undo is unavailable — tooltip for the disabled Undo button */
+	undoRefusal?: string;
+	/** `left-in-stash` must be surfaced before offering undo: the autostash re-apply conflicted
+	 *  and the user's changes remain in the stash */
+	autostash?: 'none' | 'reapplied' | 'left-in-stash';
+	steps: AutoRebaseSummaryStep[];
+};
+
+export type AutoRebaseSummaryResult = { summary: AutoRebaseSummary } | { error: { message: string } };
+
+/** Lifecycle phase of an automatic rebase run — mirrors `AutoRebasePhase` (autoRebase.types.ts). */
+export type AutoRebaseRunPhase =
+	| 'starting'
+	| 'resolving'
+	| 'applying'
+	| 'continuing'
+	| 'completed'
+	| 'escalated'
+	| 'aborted'
+	| 'failed'
+	| 'undone';
+
+/** Live state of an automatic rebase run, pushed to the Resolve panel so the run shows its own steps and
+ *  progress there. Terminal phases are pushed too, so the panel knows to stop rendering the run. */
+export type AutoRebaseRunUpdate = {
+	sessionId: string;
+	repoPath: string;
+	branch?: string;
+	upstream?: string;
+	phase: AutoRebaseRunPhase;
+	/** The step the run is at — the one in flight while running, or the one it escalated on. Absent for
+	 *  the other terminal phases, and for a run that never paused. */
+	step?: { current: number; total: number };
+	/** Human-readable progress line, e.g. `Step 3/7 · Resolving 2 conflicts with AI…`. */
+	message?: string;
+	/** Why automation stopped, when it escalated — lets the panel distinguish a user-requested stop
+	 *  (`stopped`) from a genuine escalation. */
+	escalation?: { reason: string; message: string };
+	/** Steps recorded so far — only paused (conflicted/skipped) steps surface; clean picks never do.
+	 *  Files carry no `virtualRef` while running: before/after diffs stay a summary-sheet affordance so
+	 *  no virtual sessions are registered per progress tick. */
+	steps: AutoRebaseSummaryStep[];
+};
+
+export type UndoAutoRebaseResult =
+	| { result: { restoredTo: string; warning?: string } }
+	| { error: { message: string } };
 
 export type ScopeSelection =
 	| { type: 'commit'; sha: string }
@@ -40,6 +193,16 @@ export type ScopeSelection =
 	  };
 
 export type ReviewResult = { result: AIReviewResult } | { error: { message: string } };
+
+/**
+ * Continuation knobs for {@link GraphInspectService.reviewChanges}. `mode: 'refine'` means
+ * "follow up on the host-cached review conversation" — the prompt becomes a refine turn layered
+ * on the prior exchanges instead of a fresh run. Absent (or no cached conversation) means a
+ * fresh review.
+ */
+export type ReviewChangesOptions = {
+	mode?: 'refine';
+};
 
 export type ReviewDetailResult = { result: AIReviewDetailResult } | { error: { message: string } };
 
@@ -99,15 +262,57 @@ export type ComposeBaseCommit = {
 	selectedShas?: string[];
 };
 
+/**
+ * Refinement knobs for {@link composeChanges}. Present means "refine the cached plan
+ * identified by `priorCacheKey`" — the webview passes back the cache key tracked locally,
+ * plus any commits the user has locked in the UI. Absent means cold-start compose.
+ */
+export type ComposeChangesOptions = {
+	priorCacheKey?: string;
+	/** Mode marker — currently `'refine'` only. Reserved as a discriminator if other
+	 *  continuation flavors are added later. */
+	mode?: 'refine';
+	/** Commit ids the user has locked in the UI. Forwarded to the library's `refinePlan` as
+	 *  `lockedCommits` so the AI preserves them verbatim across the refinement. Ignored on
+	 *  cold start. */
+	excludedCommitIds?: readonly string[];
+};
+
 export type ComposeResult =
-	| { result: { commits: ProposedCommit[]; baseCommit: ComposeBaseCommit } }
+	| { result: { commits: ProposedCommit[]; baseCommit: ComposeBaseCommit; cacheKey?: string } }
+	| {
+			error: {
+				message: string;
+				/** `invalid-scope` = the selected scope cannot be rewritten (e.g. interior forks);
+				 *  retrying identically fails, so the UI offers scope adjustment instead. */
+				kind?: 'invalid-scope';
+			};
+	  }
+	| { cancelled: true };
+
+/** Result of {@link GraphInspectService.regenerateProposedCommitMessage}. On success the host has
+ *  already mutated its cached plan; the new message is returned for the webview to swap into its
+ *  rendered resource. */
+export type RegenerateProposedCommitMessageResult =
+	| { result: { commitId: string; message: string } }
 	| { error: { message: string } }
 	| { cancelled: true };
+
+/** Result of {@link GraphInspectService.reorderProposedCommits}. On success the host has already
+ *  reordered its cached plan to match; the webview keeps its optimistically-reordered array. */
+export type ReorderProposedCommitsResult = { result: true } | { error: { message: string } };
+
+/** Result of {@link GraphInspectService.moveComposeFile}. Unlike reorder, moving a file changes the
+ *  affected commits' content (and may drop an emptied commit), so the host returns the re-derived
+ *  `ProposedCommit[]` (display order) for the webview to swap in wholesale. */
+export type MoveComposeFileResult = { result: { commits: ProposedCommit[] } } | { error: { message: string } };
 
 export type ComposeCommitPlan = {
 	commits: ProposedCommit[];
 	base: ComposeBaseCommit;
-	/** When provided, only commits whose `id` is in this list are applied. `undefined` means all. */
+	/** When provided, only commits whose `id` is in this list are applied. Undefined means all.
+	 *  Excluded commits' hunks stay in the workdir as uncommitted changes (the library lays them
+	 *  back via `git apply` from its leftover-patch path). */
 	includedCommitIds?: readonly string[];
 };
 
@@ -155,6 +360,11 @@ export type BranchComparisonCommit = {
 	author: string;
 	authorEmail?: string;
 	avatarUrl?: string;
+	/** Committer identity (avatar overlay + hover) — set only when the committer differs from the author. */
+	committerAvatarUrl?: string;
+	committerName?: string;
+	committerEmail?: string;
+	committerDate?: string;
 	date: string;
 	additions?: number;
 	deletions?: number;
@@ -241,6 +451,14 @@ export interface GraphInspectService {
 		signal?: AbortSignal,
 	): Promise<ExplainResult>;
 	generateChangelogCompare(repoPath: string, fromRef: string, toRef: string, signal?: AbortSignal): Promise<void>;
+	/** Resolve the newest tag reachable from — and older than — the given tag, for a
+	 *  previous-tag → this-tag changelog default. Returns `undefined` when there's no prior tag. */
+	getPreviousTag(
+		repoPath: string,
+		tagName: string,
+		tagSha: string,
+		signal?: AbortSignal,
+	): Promise<string | undefined>;
 	getScopeFiles(repoPath: string, scope: ScopeSelection, signal?: AbortSignal): Promise<GitFileChangeShape[]>;
 	reviewChanges(
 		repoPath: string,
@@ -248,6 +466,7 @@ export interface GraphInspectService {
 		prompt?: string,
 		excludedFiles?: string[],
 		signal?: AbortSignal,
+		options?: ReviewChangesOptions,
 	): Promise<ReviewResult>;
 	reviewFocusArea(
 		repoPath: string,
@@ -286,11 +505,114 @@ export interface GraphInspectService {
 		excludedFiles?: string[],
 		aiExcludedFiles?: string[],
 		signal?: AbortSignal,
+		options?: ComposeChangesOptions,
 	): Promise<ComposeResult>;
 	commitCompose(repoPath: string, plan: ComposeCommitPlan): Promise<CommitResult>;
+	/**
+	 * Regenerate the commit message for a single draft commit in the cached plan identified
+	 * by `cacheKey`. Uses GitLens's internal `ai.actions.generateCommitMessage` against a patch
+	 * rebuilt from the cached hunks (with AI-excluded file content re-masked, matching the
+	 * convention of the original compose run). The host mutates the cached plan's
+	 * `allOrderedCommits[i].message` in place so subsequent refines pick up the new message
+	 * via the locked-commit substitution path, and so apply uses the regenerated message.
+	 *
+	 * Independent of hunk assignments and other commits' messages — only the targeted commit's
+	 * message field changes.
+	 */
+	regenerateProposedCommitMessage(
+		repoPath: string,
+		cacheKey: string,
+		commitId: string,
+		signal?: AbortSignal,
+	): Promise<RegenerateProposedCommitMessageResult>;
+	/**
+	 * Reorder the draft commits in the cached plan identified by `cacheKey`. `orderedCommitIds`
+	 * is the full set of the plan's commit ids in the new **library** order (tip last). The host
+	 * reorders `allOrderedCommits` and the per-branch id lists in place so apply and any
+	 * subsequent refine honor the new sequence. Pure in-memory reorder — no AI, no git.
+	 */
+	reorderProposedCommits(
+		repoPath: string,
+		cacheKey: string,
+		orderedCommitIds: string[],
+	): Promise<ReorderProposedCommitsResult>;
+	/**
+	 * Move the files in `paths` from the `fromCommitId` draft commit to `toCommitId` in the cached
+	 * plan identified by `cacheKey` (reassigns those files' hunks in a single mutation). Emptied
+	 * source commits are pruned. The host re-derives and returns the affected plan's `ProposedCommit[]`
+	 * in display order.
+	 */
+	moveComposeFile(
+		repoPath: string,
+		cacheKey: string,
+		fromCommitId: string,
+		toCommitId: string,
+		paths: string[],
+	): Promise<MoveComposeFileResult>;
 	/** Streams human-readable progress messages while {@link composeChanges} runs. `undefined`
 	 *  fires when no compose is in flight (entry/exit clearing). */
 	readonly onComposeProgress: RpcEventSubscription<ComposeProgressUpdate | undefined>;
+	/**
+	 * Resolves the repo's merge/rebase/cherry-pick conflicts with AI via `@gitkraken/conflict-tools`.
+	 * When `focusedFilePaths` is set, only those conflicted files are resolved; otherwise all conflicts.
+	 * The resolved content is cached host-side (keyed by repo) for a later {@link applyResolutions}.
+	 */
+	resolveConflicts(
+		repoPath: string,
+		focusedFilePaths: readonly string[] | undefined,
+		instructions?: string,
+		signal?: AbortSignal,
+	): Promise<ResolveResult>;
+	/** Re-resolves a single cached-session file with user `feedback` (rendered as the resolver's
+	 *  `userGuidance`), replacing that file's resolution in place. The other files are untouched. */
+	reresolveFile(
+		repoPath: string,
+		filePath: string,
+		feedback: string,
+		signal?: AbortSignal,
+	): Promise<ReresolveFileResult>;
+	/** Writes the cached AI resolutions to the working tree and stages them. When `includedFilePaths`
+	 *  is set, only those files are applied; `undefined` applies all (skipped files are never applied). */
+	applyResolutions(repoPath: string, includedFilePaths?: readonly string[]): Promise<CommitResult>;
+	/** Drops the host-side cached resolve session for the repo without writing anything. */
+	discardResolutions(repoPath: string): Promise<void>;
+	/** Queues a manual take-side resolution for a single conflicted file — the fallback for files the
+	 *  AI resolver skipped or errored on. Like AI resolutions, it's cached as pending and only written
+	 *  to the working tree on {@link applyResolutions} (and dropped by {@link discardResolutions}); it
+	 *  does NOT touch the working tree immediately. Returns every file queued so the panel can promote
+	 *  the matching rows without re-running the AI. */
+	takeConflictSide(repoPath: string, filePath: string, side: ConflictSide): Promise<TakeConflictSideResult>;
+	/** Streams human-readable progress messages while {@link resolveConflicts} runs. `undefined`
+	 *  fires when no resolve is in flight (entry/exit clearing). */
+	readonly onResolveProgress: RpcEventSubscription<ResolveProgressUpdate | undefined>;
+	/**
+	 * One-shot pickup of an automatic rebase's escalation handoff: when automation stopped
+	 * mid-step, this seeds the repo's resolve session with the step's already-computed resolutions
+	 * (adopting the run's AI conversation) and returns them so the panel opens in its ready state.
+	 * `undefined` when there's nothing to hand off.
+	 */
+	getSeededResolveSession(repoPath: string): Promise<ResolveResult | undefined>;
+	/**
+	 * Builds the automatic rebase summary for the repo's session (validating undo eligibility at
+	 * fetch time) and lazily registers the per-step virtual diff sessions backing each file's
+	 * `virtualRef`. `undefined` when the repo has no session.
+	 */
+	getAutoRebaseSummary(repoPath: string): Promise<AutoRebaseSummaryResult | undefined>;
+	/** Rolls the branch back to its pre-rebase tip — validated (refuses if the branch has moved).
+	 *  `sessionId` guards against acting on a different run than the summary being shown. */
+	undoAutoRebase(repoPath: string, sessionId: string): Promise<UndoAutoRebaseResult>;
+	/** Re-engages automatic rebase (takeover) to finish the remaining steps after an escalation was
+	 *  resolved manually — resumes the same session in place. Fire-and-forget: returns once triggered,
+	 *  not when the resumed rebase finishes. */
+	resumeAutoRebase(repoPath: string): Promise<void>;
+	/** Streams the live state of an automatic rebase run so the Resolve panel can show its steps and
+	 *  progress. `undefined` fires when the repo has no session left (dismissed). */
+	readonly onAutoRebaseProgress: RpcEventSubscription<AutoRebaseRunUpdate | undefined>;
+	/** Aborts a running automatic rebase, restoring the branch to its pre-rebase state. */
+	cancelAutoRebase(repoPath: string): Promise<void>;
+	/** Releases the auto-rebase summary's virtual diff sessions when its sheet closes — keeps
+	 *  sessions alive for any diff still open in an editor tab. Fire-and-forget. */
+	endAutoRebaseSummarySession(): Promise<void>;
 	/** Phase 1 of the branch-compare progressive load — counts + All Files only. Triggered on
 	 *  refs/wip change. Per-side commit + file data is fetched separately via {@link getBranchComparisonSide}. */
 	getBranchComparisonSummary(
@@ -330,9 +652,33 @@ export interface GraphInspectService {
 }
 
 export interface GraphSidebarService {
-	getSidebarData(panel: GraphSidebarPanel, signal?: AbortSignal): Promise<DidGetSidebarDataParams>;
+	/** `displayed` reports whether the sidebar is actually on screen. The panel data itself is cheap
+	 *  (~7ms, assembled from the loaded graph session) and is ALWAYS returned; the flag only suppresses the
+	 *  per-worktree git fan-out the worktrees branch kicks off, which is the expensive part. Omitted/undefined
+	 *  fails OPEN (compute), so a caller that doesn't know stays on the old behavior. */
+	getSidebarData(
+		panel: GraphSidebarPanel,
+		options?: { displayed?: boolean },
+		signal?: AbortSignal,
+	): Promise<DidGetSidebarDataParams>;
 	getSidebarCounts(): Promise<DidGetCountParams>;
+	/**
+	 * On-demand working-tree breakdown for ONE worktree, driven by its row tooltip opening. `null` means
+	 * "settled, no data" (no status available) — distinct from a rejection, so the tooltip can land on a
+	 * terminal state instead of spinning.
+	 *
+	 * Deliberately NOT `GetWipStatsRequest`: that handler skips the primary repo path and collapses
+	 * config-off into an empty response, neither of which suits a tooltip the user explicitly opened. This
+	 * goes straight to the shared 10s status cache instead, so it still joins any concurrent read for the
+	 * same worktree. (Those batches no longer cross-cancel — each owns its token — but they still answer a
+	 * different question than a single deliberate hover.)
+	 */
+	getWorktreeWipStats(path: string, signal?: AbortSignal): Promise<GitDiffFileStats | null>;
+	/** Looks up one pull request by number, for the Focus pane's search fallback — the panel lists only
+	 *  open PRs, so a pasted URL for a merged or closed one isn't in the loaded set. */
+	findPullRequest(number: string): Promise<GraphSidebarPullRequest | undefined>;
 	toggleLayout(panel: GraphSidebarPanel): void;
+	toggleShowRemoteBranches(): void;
 	refresh(panel: GraphSidebarPanel): void;
 	executeAction(command: GlCommands, context?: string, args?: unknown[]): void;
 
@@ -382,11 +728,26 @@ export interface GraphTreemapService {
 export interface GraphServices extends SharedWebviewServices {
 	readonly graphInspect: GraphInspectService;
 	readonly launchpad: GraphLaunchpadService;
+	readonly walkthrough: GraphWalkthroughService;
 	readonly sidebar: GraphSidebarService;
 	readonly graphTimeline: GraphTimelineService;
 	readonly graphTreemap: GraphTreemapService;
 }
 
 export interface GraphLaunchpadService {
-	getSummary(): Promise<LaunchpadSummaryResult | { error: Error } | undefined>;
+	/** Fires when Launchpad items change (PR status updates, integration connection changes, etc.).
+	 *  The host impl (`LaunchpadService`) already exposes this; consumed by the graph header's
+	 *  Launchpad indicator to keep its counts fresh. */
+	readonly onLaunchpadChanged: RpcEventSubscription<undefined>;
+	getSummary(options?: {
+		force?: boolean;
+	}): Promise<LaunchpadSummaryResult | { error: LaunchpadSummaryError } | undefined>;
+}
+
+export interface GraphWalkthroughService {
+	/** Fires when either walkthrough's progress changes — the payload carries both the main
+	 *  (7-step) and graph-specific (6-step) walkthroughs. The host impl (`WalkthroughService`)
+	 *  already exposes this. */
+	readonly onProgressChanged: RpcEventSubscription<WalkthroughProgressPayload>;
+	getProgress(): Promise<WalkthroughProgressPayload | undefined>;
 }

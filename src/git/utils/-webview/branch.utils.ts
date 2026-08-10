@@ -2,6 +2,7 @@ import type { BranchDisposition, BranchTargetInfo, GitBranch } from '@gitlens/gi
 import type { PullRequest, PullRequestState } from '@gitlens/git/models/pullRequest.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { GitWorktree } from '@gitlens/git/models/worktree.js';
+import { getBranchNameWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
 import { createRevisionRange } from '@gitlens/git/utils/revision.utils.js';
 import { CancellationError } from '@gitlens/utils/cancellation.js';
 import type { MaybePausedResult } from '@gitlens/utils/promise.js';
@@ -80,6 +81,18 @@ export async function getBranchMergeTargetInfo(
 	};
 }
 
+/**
+ * True when the merge-target fallback chain landed on the focal branch itself — the default branch has no
+ * other branch to target.
+ *
+ * `targetName` is remote-qualified on desktop and bare from the GitHub provider, hence both comparisons.
+ * Only the target is stripped: `getBranchNameWithoutRemote` cuts at the first `/`, so stripping the focal
+ * side too would turn `feature/x` into `x`.
+ */
+export function isSelfMergeTarget(targetName: string, branchName: string): boolean {
+	return targetName === branchName || getBranchNameWithoutRemote(targetName) === branchName;
+}
+
 export async function getBranchMergeTargetName(
 	container: Container,
 	branch: GitBranch,
@@ -156,6 +169,13 @@ async function getBranchMergeTargetNameWithoutFallback(
 			if (pr?.refs?.base == null) return undefined;
 
 			const name = `${branch.remoteName}/${pr.refs.base.branch}`;
+
+			// A stacked PR's base is the layer below it — an ephemeral branch that is deleted when the
+			// stack merges. Persisting it would outlive the branch it names, and because a stored target
+			// wins over every other source it would keep winning, silently, until cleared by hand. Return
+			// it for display (per-layer diffs are what makes a stack reviewable) but never write it.
+			if (pr.stack != null) return name;
+
 			// Same self-write semantics as `getBranchContributionsOverview`'s Tier 2: the value
 			// being stored is the canonical mergeTarget any future overview lookup will resolve
 			// to, so skip the wholesale `branchOverviews` invalidation that would otherwise

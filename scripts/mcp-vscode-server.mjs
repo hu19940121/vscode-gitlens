@@ -34,13 +34,22 @@ let electronApp = null;
 let page = null;
 let evaluateFn = null;
 let tempDir = null;
+// Set only for named (persisted) sessions — see `launch`'s `session` arg. Unlike `tempDir` this is
+// NEVER deleted by cleanup(); it holds the signed-in account that makes the session worth persisting.
+let sessionDir = null;
 let userDataDir = null;
 let launchTime = null;
 let sessionConfig = {};
+// Last simulated plan applied via `set_account`, re-applied after an extension-host restart (the
+// simulator only ever calls changeSubscription with `{ store: false }`, so a restart drops it).
+let lastAccount = null;
 let xvfbProcess = null;
 let consoleBuffer = [];
 let originalWindowSize = null;
 const MAX_CONSOLE_ENTRIES = 500;
+// Default tail applied to read_logs / read_console when no explicit last_n is given, so an
+// unfiltered read can't dump tens of KB (~10K tokens) in a single call.
+const DEFAULT_READ_LIMIT = 200;
 
 // =============================================================================
 // Load optional .vscode-agent.json config
@@ -113,8 +122,25 @@ function findVSCode(explicit, flavor = 'stable') {
 const XVFB_DISPLAY = ':99';
 
 function ensureDisplay(screenResolution = '1920x1080x24') {
-	if (process.platform !== 'linux' || process.env.DISPLAY) {
+	if (process.platform !== 'linux') {
 		return process.env.DISPLAY;
+	}
+	// A set DISPLAY (e.g. an SSH-forwarded ":10.0") can be dead — trusting it blindly makes
+	// electron.launch fail with "Missing X server" and triggers relaunch storms. Validate it
+	// with xdpyinfo and fall through to Xvfb when unreachable. If xdpyinfo isn't installed we
+	// can't validate, so trust the set display (preserves prior behavior).
+	if (process.env.DISPLAY) {
+		try {
+			execFileSync('which', ['xdpyinfo'], { stdio: 'ignore' });
+		} catch {
+			return process.env.DISPLAY;
+		}
+		try {
+			execFileSync('xdpyinfo', ['-display', process.env.DISPLAY], { stdio: 'ignore' });
+			return process.env.DISPLAY;
+		} catch {
+			// Dead display — fall through to the Xvfb fallback below.
+		}
 	}
 	try {
 		execFileSync('which', ['Xvfb'], { stdio: 'ignore' });
@@ -133,6 +159,128 @@ function ensureDisplay(screenResolution = '1920x1080x24') {
 		return XVFB_DISPLAY;
 	} catch {
 		return undefined;
+	}
+}
+
+// Descendant PIDs of an Electron main process — used to find crashpad/gsettings/helper
+// processes that detach from Electron and outlive electronApp.close().
+function listDescendants(rootPid) {
+	try {
+		const out = execFileSync('ps', ['-eo', 'pid=,ppid='], { encoding: 'utf8' });
+		const childrenByPpid = new Map();
+		for (const line of out.split('\n')) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			const [pid, ppid] = trimmed.split(/\s+/).map(Number);
+			if (!childrenByPpid.has(ppid)) childrenByPpid.set(ppid, []);
+			childrenByPpid.get(ppid).push(pid);
+		}
+		const result = [];
+		const queue = [...(childrenByPpid.get(rootPid) ?? [])];
+		while (queue.length) {
+			const pid = queue.shift();
+			result.push(pid);
+			for (const child of childrenByPpid.get(pid) ?? []) queue.push(child);
+		}
+		return result;
+	} catch {
+		return [];
+	}
+}
+
+// Reads /proc/<pid>/<name> (e.g. "cmdline", "environ") as text, NUL-delimited fields
+// replaced with spaces so cmdline/environ read like a normal string.
+function readProcFile(pid, name) {
+	try {
+		return readFileSync(`/proc/${pid}/${name}`, 'utf8').replace(/\0/g, ' ');
+	} catch {
+		return null;
+	}
+}
+
+// TERM then KILL a set of pids, but only ones whose cmdline matches an expected pattern —
+// guards against killing an unrelated process that happens to reuse a leaked pid.
+async function killPids(pids, expectedPatterns) {
+	const matches = pid => {
+		const cmdline = readProcFile(pid, 'cmdline');
+		if (!cmdline) return false;
+		return expectedPatterns.some(p => (p instanceof RegExp ? p.test(cmdline) : cmdline.includes(p)));
+	};
+
+	const targets = pids.filter(matches);
+	for (const pid of targets) {
+		try {
+			process.kill(pid, 'SIGTERM');
+		} catch {
+			// Already gone
+		}
+	}
+
+	if (!targets.length) return;
+
+	await new Promise(resolve => setTimeout(resolve, 500));
+
+	for (const pid of targets) {
+		try {
+			process.kill(pid, 0); // Throws if the process is gone
+			process.kill(pid, 'SIGKILL');
+		} catch {
+			// Already gone
+		}
+	}
+}
+
+// Sweep processes leaked by a prior inspector run that got SIGKILLed before cleanup() could reap
+// its descendants (crashpad_handler / the gsettings proxy-monitor watcher). Runs before every
+// launch so leaks don't accumulate across sessions. Only touches processes reparented to init
+// whose args match our own leak signatures — never a live inspector's children (those still have
+// an electron/code/.vscode-test parent) and never Xvfb itself.
+function sweepOrphans() {
+	try {
+		const out = execFileSync('ps', ['-eo', 'pid=,ppid=,args='], { encoding: 'utf8' });
+		const procs = [];
+		const argsByPid = new Map();
+		for (const line of out.split('\n')) {
+			const m = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+			if (!m) continue;
+			const pid = Number(m[1]);
+			const ppid = Number(m[2]);
+			const args = m[3];
+			procs.push({ pid, ppid, args });
+			argsByPid.set(pid, args);
+		}
+
+		const hasVSCodeParent = ppid => {
+			const parentArgs = argsByPid.get(ppid);
+			if (!parentArgs) return false;
+			const lower = parentArgs.toLowerCase();
+			return lower.includes('electron') || lower.includes('code') || lower.includes('.vscode-test');
+		};
+
+		const toKill = [];
+		for (const { pid, ppid, args } of procs) {
+			if (args.includes('Xvfb')) continue;
+			if (hasVSCodeParent(ppid)) continue; // Has a live VS Code/Electron parent — not orphaned
+
+			const isCrashpad =
+				args.includes('chrome_crashpad_handler') &&
+				args.includes('--database=') &&
+				args.includes('/.vscode-test/');
+			const isGsettingsProxyMonitor =
+				args.includes('gsettings') && args.includes('monitor') && args.includes('org.gnome.system.proxy');
+			if (isCrashpad) {
+				toKill.push(pid);
+			} else if (isGsettingsProxyMonitor) {
+				const environ = readProcFile(pid, 'environ');
+				if (environ?.includes('DISPLAY=:99')) toKill.push(pid);
+			}
+		}
+
+		if (toKill.length) {
+			void killPids(toKill, ['chrome_crashpad_handler', 'gsettings', '.vscode-test/', 'vscode-agent-']);
+		}
+	} catch {
+		// Best-effort — never block a launch over this
 	}
 }
 
@@ -453,13 +601,33 @@ async function cleanup() {
 				// Window may already be closing — safe to ignore
 			}
 		}
+		// electronApp.close() only exits the Electron main process. crashpad_handler and the
+		// gsettings proxy-monitor watcher are grandchildren that detach and reparent to init —
+		// they never exit on their own, so reap them explicitly (Linux only).
+		let electronPid;
+		try {
+			electronPid = electronApp?.process?.()?.pid;
+		} catch {
+			electronPid = undefined;
+		}
+		const descendants = electronPid ? listDescendants(electronPid) : [];
 		await electronApp?.close().catch(() => {});
+		if (process.platform === 'linux') {
+			await killPids(
+				[...descendants, ...(electronPid ? [electronPid] : [])],
+				['chrome_crashpad_handler', 'gsettings', '.vscode-test/', 'vscode-agent-'],
+			).catch(() => {});
+		}
 	} finally {
 		electronApp = null;
 		page = null;
 		evaluateFn = null;
+		// Only the throwaway dir is removed — a persisted session's user data (and its signed-in
+		// account) must survive teardown, which is the entire point of naming it.
 		if (tempDir) await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 		tempDir = null;
+		sessionDir = null;
+		lastAccount = null;
 		userDataDir = null;
 		launchTime = null;
 		consoleBuffer = [];
@@ -486,41 +654,60 @@ function textResult(text) {
 	return { content: [{ type: 'text', text }] };
 }
 
-const MAX_SCREENSHOT_DIMENSION = 1920;
-
-/**
- * Read PNG width/height from the IHDR chunk (bytes 16-23).
- */
-function pngDimensions(buf) {
-	if (buf.length < 24 || buf.readUInt32BE(0) !== 0x89504e47) return null;
-	if (buf.readUInt32BE(12) !== 0x49484452) return null; // Verify IHDR chunk
-	return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+// Soft cap on evaluate/evaluate_in_webview returns — the bridge doesn't cap output, so a stray
+// innerHTML/whole-DOM return can blow up token cost. Project only needed fields in the expression.
+const MAX_EVALUATE_RESULT_CHARS = 20000;
+function evaluateResult(value) {
+	let json = JSON.stringify(value, null, 2);
+	if (typeof json === 'string' && json.length > MAX_EVALUATE_RESULT_CHARS) {
+		const dropped = json.length - MAX_EVALUATE_RESULT_CHARS;
+		json = `${json.slice(0, MAX_EVALUATE_RESULT_CHARS)}\n… [truncated ${dropped} chars — return only the fields you need in the expression]`;
+	}
+	return textResult(`Result: ${json}`);
 }
 
+const MAX_SCREENSHOT_DIMENSION = 1920; // hard ceiling (Claude multi-image dimension limit)
+// Image *tokens* scale with pixel count (≈ w×h/750), not file size — so the real cost lever is
+// resolution. Default full-window shots (~1440×900) to a smaller longest side; raise per-call for
+// pixel-detail. Format compression (WebP default) is a secondary bytes-only win (transcript/re-ship).
+const DEFAULT_SCREENSHOT_DIMENSION = 1280;
+const DEFAULT_SCREENSHOT_FORMAT = 'webp';
+const DEFAULT_SCREENSHOT_QUALITY = 80;
+
 /**
- * Enforce the max dimension limit on screenshots. Downscales via sharp
- * (already a project dependency) so images never exceed the 2000px
- * multi-image limit in Claude conversations.
+ * Downscale (image tokens scale with resolution) and encode a screenshot via sharp (already a
+ * project dependency). Always runs so full-window shots shrink to `maxDimension`; PNG is opt-in
+ * for pixel-exact needs.
  */
-async function enforceMaxDimension(buf) {
-	const dims = pngDimensions(buf);
-	if (!dims || (dims.width <= MAX_SCREENSHOT_DIMENSION && dims.height <= MAX_SCREENSHOT_DIMENSION)) return buf;
+async function encodeScreenshot(buffer, opts = {}) {
+	const maxDimension = Math.min(opts.maxDimension || DEFAULT_SCREENSHOT_DIMENSION, MAX_SCREENSHOT_DIMENSION);
+	const format = opts.format ?? DEFAULT_SCREENSHOT_FORMAT;
+	const quality = opts.quality ?? DEFAULT_SCREENSHOT_QUALITY;
 	const sharp = (await import('sharp')).default;
-	return await sharp(buf)
-		.resize({
-			width: MAX_SCREENSHOT_DIMENSION,
-			height: MAX_SCREENSHOT_DIMENSION,
-			fit: 'inside',
-			withoutEnlargement: true,
-		})
-		.png()
-		.toBuffer();
+	let pipeline = sharp(buffer).resize({
+		width: maxDimension,
+		height: maxDimension,
+		fit: 'inside',
+		withoutEnlargement: true,
+	});
+	let mimeType;
+	if (format === 'png') {
+		pipeline = pipeline.png();
+		mimeType = 'image/png';
+	} else if (format === 'jpeg') {
+		pipeline = pipeline.jpeg({ quality });
+		mimeType = 'image/jpeg';
+	} else {
+		pipeline = pipeline.webp({ quality });
+		mimeType = 'image/webp';
+	}
+	return { data: await pipeline.toBuffer(), mimeType };
 }
 
-async function imageResult(buffer) {
-	const resized = await enforceMaxDimension(buffer);
+async function imageResult(buffer, opts) {
+	const { data, mimeType } = await encodeScreenshot(buffer, opts);
 	return {
-		content: [{ type: 'image', data: resized.toString('base64'), mimeType: 'image/png' }],
+		content: [{ type: 'image', data: data.toString('base64'), mimeType }],
 	};
 }
 
@@ -597,6 +784,72 @@ async function findWebviewFrameLocator({ title, url: urlMatch, index, root, exte
 }
 
 // =============================================================================
+// Account / subscription simulation
+// =============================================================================
+// Friendly plan name -> `SimulationState` payload for the `gitlens.plus.simulate.subscription`
+// command (src/plus/gk/__debug__accountDebug.ts).
+//
+// `state` is the numeric `SubscriptionState` const enum (src/constants.subscription.ts). Nothing
+// coerces names to numbers — passing `state: "Paid"` falls through every comparison in
+// getSimulatedCheckInResponse and silently yields TrialExpired. Keeping the mapping here is the
+// whole reason this tool exists, so callers never hand-build the payload.
+const accountPlans = {
+	pro: { state: 6, planId: 'pro' },
+	advanced: { state: 6, planId: 'advanced' },
+	business: { state: 6, planId: 'teams' }, // "Business" is still `teams` on the wire
+	enterprise: { state: 6, planId: 'enterprise' },
+	student: { state: 6, planId: 'student' },
+	'paid-expired': { state: 6, expiredPaid: true },
+	trial: { state: 3 },
+	'trial-advanced': { state: 3, planId: 'advanced' },
+	'trial-student': { state: 3, planId: 'student' },
+	'trial-expired': { state: 4 },
+	'trial-reactivatable': { state: 5 },
+	'verification-required': { state: -1 },
+	community: { state: 0 },
+	none: { state: null },
+};
+const accountPlanNames = Object.keys(accountPlans);
+// Only these accept `reactivatedTrial` — `trial-expired`/`trial-reactivatable` are past-tense states
+const reactivatablePlans = ['trial', 'trial-advanced', 'trial-student'];
+
+function requireEvaluator(toolName) {
+	if (!evaluateFn) {
+		throw new Error(
+			`"${toolName}" needs the evaluator bridge. Relaunch with with_evaluator: true and ensure the E2E runner is built.`,
+		);
+	}
+}
+
+/** Applies a `SimulationState` payload; returns the command's verdict (true = started, false = stopped). */
+async function applyAccountPlan(payload) {
+	return evaluateFn((vscode, p) => vscode.commands.executeCommand('gitlens.plus.simulate.subscription', p), payload);
+}
+
+/** Reads the current account/subscription. Returns null when unavailable (non-debug build, no bridge). */
+async function readAccountStatus() {
+	if (!evaluateFn) return null;
+	try {
+		return (await evaluateFn(vscode => vscode.commands.executeCommand('gitlens.plus.accountStatus'))) ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function formatAccountStatus(status) {
+	if (status == null) return 'unavailable (needs a DEBUG build and the evaluator bridge)';
+
+	const parts = [`${status.planName} (${status.stateName})`];
+	parts.push(status.signedIn ? 'signed in' : 'not signed in');
+	if (status.account != null) {
+		parts.push(`account ${status.account.name}${status.account.email ? ` <${status.account.email}>` : ''}`);
+	}
+	if (status.organization) parts.push(`org ${status.organization}`);
+	if (status.simulating != null) parts.push('simulated');
+	return parts.join(', ');
+}
+
+// =============================================================================
 // MCP Server setup
 // =============================================================================
 const server = new McpServer({
@@ -646,6 +899,18 @@ server.tool(
 			.describe(
 				'VS Code command IDs to run once, in order, after activation (e.g. ["gitlens.showGraph"]). Saves a separate execute_command round-trip + manual wait on every launch.',
 			),
+		session: z
+			.string()
+			.optional()
+			.describe(
+				'Name a persisted session (letters, digits, dash, underscore). Its VS Code user data is kept under .vscode-test/agent-sessions/<name>/ and survives teardown, so a real GitKraken account signed in via the "sign_in" tool carries across runs. Omit for the default throwaway session.',
+			),
+		account: z
+			.enum(accountPlanNames)
+			.optional()
+			.describe(
+				'Simulate a subscription right after activation, so Pro-gated features are usable without a separate set_account round-trip. See the set_account tool for what each plan means.',
+			),
 	},
 	async args => {
 		if (state === 'ready') {
@@ -657,6 +922,10 @@ server.tool(
 
 		state = 'launching';
 		try {
+			// Reap anything a prior SIGKILLed inspector run leaked (crashpad_handler /
+			// gsettings proxy-monitor) before starting a new one.
+			if (process.platform === 'linux') sweepOrphans();
+
 			const extensionPath = path.resolve(args.extension_path ?? process.cwd());
 			const agentConfig = loadAgentConfig(extensionPath);
 			const withEvaluator = args.with_evaluator ?? true;
@@ -681,11 +950,30 @@ server.tool(
 
 			const { _electron } = await import('@playwright/test');
 
-			// Temp directories
-			tempDir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'vscode-agent-')));
-			userDataDir = path.join(tempDir, 'user-data');
+			// Session directories. A named session lives under .vscode-test/ (already gitignored) and
+			// is kept across teardowns so a signed-in account carries between runs; an unnamed one is a
+			// throwaway temp dir that cleanup() removes, which is the long-standing default.
+			let extensionsDir;
+			if (args.session != null) {
+				if (!/^[A-Za-z0-9_-]+$/.test(args.session)) {
+					throw new Error(
+						`Invalid session name "${args.session}" — use only letters, digits, dashes and underscores.`,
+					);
+				}
+
+				sessionDir = path.join(extensionPath, '.vscode-test', 'agent-sessions', args.session);
+				userDataDir = path.join(sessionDir, 'user-data');
+				extensionsDir = path.join(sessionDir, 'extensions');
+			} else {
+				tempDir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'vscode-agent-')));
+				userDataDir = path.join(tempDir, 'user-data');
+				extensionsDir = path.join(tempDir, 'extensions');
+			}
+			sessionConfig.session = args.session ?? null;
+
 			const settingsDir = path.join(userDataDir, 'User');
 			await mkdir(settingsDir, { recursive: true });
+			await mkdir(extensionsDir, { recursive: true });
 
 			// Write settings
 			const settings = {
@@ -704,9 +992,16 @@ server.tool(
 				'--skip-release-notes',
 				'--disable-workspace-trust',
 				`--extensionDevelopmentPath=${extensionPath}`,
-				`--extensions-dir=${path.join(tempDir, 'extensions')}`,
+				`--extensions-dir=${extensionsDir}`,
 				`--user-data-dir=${userDataDir}`,
 			];
+
+			if (sessionDir != null) {
+				// Store secrets in an encrypted file inside the session dir rather than an OS keyring,
+				// which isn't reachable under Xvfb. Without this the signed-in GitKraken session would
+				// not survive teardown, defeating the point of a named session.
+				launchArgs.push('--password-store=basic');
+			}
 
 			if (args.disable_site_isolation) {
 				launchArgs.push('--disable-site-isolation-trials', '--disable-web-security');
@@ -825,6 +1120,27 @@ server.tool(
 				}
 			}
 
+			if (sessionDir != null) parts.push(`Session: "${args.session}" (persisted at ${sessionDir})`);
+
+			if (args.account != null) {
+				if (evaluateFn) {
+					try {
+						const payload = { ...accountPlans[args.account], dismissOnboarding: true };
+						await applyAccountPlan(payload);
+						if (args.account !== 'none') lastAccount = { plan: args.account, payload: payload };
+						parts.push(`Account: ${formatAccountStatus(await readAccountStatus())}`);
+					} catch (e) {
+						parts.push(`Account simulation failed: ${e.message}`);
+					}
+				} else {
+					parts.push('Account simulation skipped: evaluator bridge not available');
+				}
+			} else if (sessionDir != null) {
+				// A persisted session may already hold a signed-in account — say so, since that's the
+				// reason to use one.
+				parts.push(`Account: ${formatAccountStatus(await readAccountStatus())}`);
+			}
+
 			return textResult(parts.join('\n'));
 		} catch (e) {
 			await cleanup();
@@ -854,6 +1170,8 @@ server.tool('get_status', 'Get the current session state.', async () => {
 		extension_path: sessionConfig.extensionPath,
 		extension_id: sessionConfig.extensionId ?? '(not set)',
 		evaluator: !!evaluateFn,
+		session: sessionConfig.session ?? '(throwaway)',
+		account: formatAccountStatus(await readAccountStatus()),
 	};
 	return textResult(JSON.stringify(info, null, 2));
 });
@@ -861,7 +1179,7 @@ server.tool('get_status', 'Get the current session state.', async () => {
 // --- screenshot --------------------------------------------------------------
 server.tool(
 	'screenshot',
-	`Capture a screenshot of the VS Code window or a specific webview. Returns an inline image. Images are automatically capped at ${MAX_SCREENSHOT_DIMENSION}px to stay within Claude's multi-image dimension limit.`,
+	`Capture a screenshot of the VS Code window or a specific webview. Returns an inline image, downscaled to ${DEFAULT_SCREENSHOT_DIMENSION}px longest side and ${DEFAULT_SCREENSHOT_FORMAT}-compressed by default (image cost scales with resolution). Prefer target:"webview" for a scoped shot, or aria_snapshot/evaluate_in_webview for text/geometry when you don't need pixels.`,
 	{
 		target: z.enum(['full', 'webview']).optional().describe('What to capture (default: full)'),
 		webview_title: z.string().optional().describe('Title of the webview to capture (for target: webview)'),
@@ -882,11 +1200,32 @@ server.tool(
 			.enum(['css', 'device'])
 			.optional()
 			.describe('Screenshot scale — "device" for full DPI, "css" for CSS pixels (default: device)'),
+		max_dimension: z
+			.number()
+			.int()
+			.optional()
+			.describe(
+				`Longest-side pixel cap; image tokens scale with resolution (default ${DEFAULT_SCREENSHOT_DIMENSION}, hard max ${MAX_SCREENSHOT_DIMENSION}). Raise toward the max only when you need fine pixel detail.`,
+			),
+		format: z
+			.enum(['webp', 'jpeg', 'png'])
+			.optional()
+			.describe(`Output format (default ${DEFAULT_SCREENSHOT_FORMAT}). Use png only for pixel-exact needs.`),
+		quality: z
+			.number()
+			.int()
+			.min(1)
+			.max(100)
+			.optional()
+			.describe(
+				`Compression quality 1-100 for webp/jpeg (default ${DEFAULT_SCREENSHOT_QUALITY}); ignored for png.`,
+			),
 	},
 	async args => {
 		requireReady();
 		const screenshotOpts = { fullPage: true };
 		if (args.scale) screenshotOpts.scale = args.scale;
+		const encodeOpts = { maxDimension: args.max_dimension, format: args.format, quality: args.quality };
 		try {
 			if (args.target === 'webview' && (args.webview_title || args.webview_url || args.webview_index != null)) {
 				// Try to find and screenshot just the webview
@@ -903,7 +1242,7 @@ server.tool(
 						const opts = {};
 						if (args.scale) opts.scale = args.scale;
 						const buffer = await frameElement.screenshot(opts);
-						return await imageResult(buffer);
+						return await imageResult(buffer, encodeOpts);
 					} catch {
 						// Fall back to full page screenshot
 					}
@@ -911,7 +1250,7 @@ server.tool(
 			}
 			try {
 				const buffer = await page.screenshot(screenshotOpts);
-				return await imageResult(buffer);
+				return await imageResult(buffer, encodeOpts);
 			} catch (screenshotErr) {
 				// Page may be stale after a reload — try re-acquiring.
 				// The stale `page` still has our console/pageerror listeners attached
@@ -924,7 +1263,7 @@ server.tool(
 							page = windows[0];
 							attachConsoleListeners(page);
 							const buffer = await page.screenshot({ fullPage: true });
-							return await imageResult(buffer);
+							return await imageResult(buffer, encodeOpts);
 						}
 					} catch {}
 					// Try firstWindow as last resort
@@ -932,7 +1271,7 @@ server.tool(
 						page = await electronApp.firstWindow();
 						attachConsoleListeners(page);
 						const buffer = await page.screenshot({ fullPage: true });
-						return await imageResult(buffer);
+						return await imageResult(buffer, encodeOpts);
 					} catch {}
 				}
 				throw new Error(`Screenshot failed after recovery attempts: ${screenshotErr.message}`);
@@ -979,6 +1318,145 @@ server.tool(
 			}
 		} catch (e) {
 			return errorResult(`Command failed: ${e.message}`);
+		}
+	},
+);
+
+// --- set_account -------------------------------------------------------------
+server.tool(
+	'set_account',
+	'Simulate a GitKraken subscription so Pro-gated features (Commit Graph beyond local repos, Launchpad, Worktrees, Composer, AI, Drafts, Workspaces) are usable. Without this a session is Community and those surfaces render their paywall — which looks like a broken bundle. Re-applied automatically after rebuild_and_reload. Use "none" to end simulation and fall back to the session\'s real subscription. For a real account instead of a simulated one, see the sign_in tool.',
+	{
+		plan: z
+			.enum(accountPlanNames)
+			.describe(
+				'Subscription to simulate. "pro"/"advanced"/"business"/"enterprise"/"student" are active paid plans; "trial"/"trial-advanced"/"trial-student" are active trials; "trial-expired", "trial-reactivatable", "paid-expired", "verification-required" and "community" are the locked-out states; "none" ends simulation.',
+			),
+		reactivated: z
+			.boolean()
+			.optional()
+			.describe('For the trial plans: simulate a reactivated trial rather than a fresh one.'),
+		feature_preview_day: z
+			.number()
+			.int()
+			.optional()
+			.describe(
+				'For plan "community": which day of the Pro feature-preview window to start on (0 = day 1, 1 = day 2, 2 = day 3, 3 = expired).',
+			),
+		feature_preview_seconds: z
+			.number()
+			.int()
+			.optional()
+			.describe('For plan "community": how long the feature-preview window lasts (default: 30).'),
+		dismiss_onboarding: z
+			.boolean()
+			.optional()
+			.describe(
+				'Pre-dismiss every onboarding tour/banner (default: true). They are full-screen overlays that intercept clicks during automation.',
+			),
+	},
+	async args => {
+		requireReady();
+
+		const base = accountPlans[args.plan];
+		if (args.reactivated && !reactivatablePlans.includes(args.plan)) {
+			return errorResult(`"reactivated" only applies to ${reactivatablePlans.join(', ')} — not "${args.plan}".`);
+		}
+
+		const previewing = args.feature_preview_day != null || args.feature_preview_seconds != null;
+		if (previewing && args.plan !== 'community') {
+			return errorResult(`"feature_preview_*" only applies to plan "community" — not "${args.plan}".`);
+		}
+
+		const payload = { ...base };
+		if (args.plan !== 'none') {
+			payload.dismissOnboarding = args.dismiss_onboarding ?? true;
+			if (args.reactivated) payload.reactivatedTrial = true;
+			if (previewing) {
+				payload.featurePreviews = {
+					day: args.feature_preview_day ?? 0,
+					durationSeconds: args.feature_preview_seconds ?? 30,
+				};
+			}
+		}
+
+		try {
+			requireEvaluator('set_account');
+
+			// The command returns true when a simulation started, false when it stopped//was refused —
+			// report that verdict rather than assuming the call took effect.
+			const started = await applyAccountPlan(payload);
+			lastAccount = args.plan === 'none' ? null : { plan: args.plan, payload: payload };
+
+			if (args.plan === 'none') {
+				return textResult(`Simulation ended. Account: ${formatAccountStatus(await readAccountStatus())}`);
+			}
+			if (started !== true) {
+				return errorResult(
+					`Simulating "${args.plan}" was refused (the command returned ${JSON.stringify(started)}). Is this a DEBUG build?`,
+				);
+			}
+			return textResult(`Simulating "${args.plan}". Account: ${formatAccountStatus(await readAccountStatus())}`);
+		} catch (e) {
+			return errorResult(`set_account failed: ${e.message}`);
+		}
+	},
+);
+
+// --- sign_in -----------------------------------------------------------------
+server.tool(
+	'sign_in',
+	'Sign in to a REAL GitKraken account, for testing against real entitlements and organizations rather than a simulated plan. Requires a named (persisted) session — launch with `session` — so the sign-in carries across later runs; it only has to be done once per session name. This is human-in-the-loop and needs a visible window: it opens a browser, and because the vscode:// callback resolves against the default user-data-dir it will usually land in the user\'s main VS Code, leaving GitLens\' "paste the authorization code" input box as the way to finish. Ask the user to complete it, then wait.',
+	{
+		timeout_ms: z
+			.number()
+			.int()
+			.optional()
+			.describe(
+				"How long to wait for sign-in to complete (default: 120000, matching GitLens' own login window).",
+			),
+	},
+	async args => {
+		requireReady();
+
+		if (sessionDir == null) {
+			return errorResult(
+				'sign_in needs a persisted session, otherwise the account is discarded on teardown. Relaunch with `session: "<name>"`.',
+			);
+		}
+
+		try {
+			requireEvaluator('sign_in');
+
+			const before = await readAccountStatus();
+			if (before?.signedIn) {
+				return textResult(`Already signed in. Account: ${formatAccountStatus(before)}`);
+			}
+
+			// An active simulation overrides the session, which would mask the result.
+			if (before?.simulating != null) {
+				await applyAccountPlan({ state: null });
+				lastAccount = null;
+			}
+
+			// Don't await — the command only resolves once the user finishes, and we want to poll.
+			void evaluateFn(vscode => vscode.commands.executeCommand('gitlens.plus.login')).catch(() => {});
+
+			const timeout = args.timeout_ms ?? 120000;
+			const deadline = Date.now() + timeout;
+			while (Date.now() < deadline) {
+				await page.waitForTimeout(2000);
+				const status = await readAccountStatus();
+				if (status?.signedIn) {
+					return textResult(`Signed in. Account: ${formatAccountStatus(status)}`);
+				}
+			}
+
+			return errorResult(
+				`Sign-in did not complete within ${timeout}ms. GitLens' own login window has closed by now — re-run sign_in to try again.`,
+			);
+		} catch (e) {
+			return errorResult(`sign_in failed: ${e.message}`);
 		}
 	},
 );
@@ -1406,7 +1884,7 @@ server.tool(
 		try {
 			const fn = new Function('vscode', `return (${args.expression})`);
 			const result = await evaluateFn(fn);
-			return textResult(`Result: ${JSON.stringify(result, null, 2)}`);
+			return evaluateResult(result);
 		} catch (e) {
 			return errorResult(`Evaluate failed: ${e.message}`);
 		}
@@ -1461,13 +1939,13 @@ server.tool(
 			}
 			const value = await result.frameLocator.locator('body').evaluate(
 				(body, expr) => {
-					const fn = new Function(`return (${expr})`); // eslint-disable-line no-new-func -- intentional: inspector tool for local dev
+					const fn = new Function(`return (${expr})`); // oxlint-disable-line no-new-func -- intentional: inspector tool for local dev
 					return fn();
 				},
 				args.expression,
 				{ timeout: 5000 },
 			);
-			return textResult(`Result: ${JSON.stringify(value, null, 2)}`);
+			return evaluateResult(value);
 		} catch (e) {
 			return errorResult(`Evaluate in webview failed: ${e.message}`);
 		}
@@ -1558,10 +2036,18 @@ server.tool(
 // --- read_logs ---------------------------------------------------------------
 server.tool(
 	'read_logs',
-	'Search VS Code extension output logs for a pattern.',
+	'Search VS Code extension output logs for a pattern. The search key is `pattern` (a plain substring), NOT `filter` — an unknown key is ignored and you get the noisy default. Always pass a narrow `pattern`.',
 	{
-		pattern: z.string().optional().describe('Text pattern to search for (default: "GitLens")'),
-		last_n: z.number().optional().describe('Only return the last N matching lines'),
+		pattern: z
+			.string()
+			.optional()
+			.describe('Substring to match (default: "GitLens" — matches almost everything, so narrow it)'),
+		last_n: z
+			.number()
+			.optional()
+			.describe(
+				`Return only the last N matching lines (default: ${DEFAULT_READ_LIMIT}). Pass a larger value for more.`,
+			),
 	},
 	async args => {
 		requireReady();
@@ -1569,11 +2055,15 @@ server.tool(
 		try {
 			const pattern = args.pattern ?? 'GitLens';
 			let logs = await findLogs(userDataDir, pattern);
-			if (args.last_n && args.last_n > 0) {
-				logs = logs.slice(-args.last_n);
-			}
+			const total = logs.length;
+			const limit = args.last_n && args.last_n > 0 ? args.last_n : DEFAULT_READ_LIMIT;
+			const capped = total > limit;
+			if (capped) logs = logs.slice(-limit);
 			if (logs.length === 0) return textResult(`No log lines matching "${pattern}".`);
-			return textResult(`Found ${logs.length} matching lines:\n${logs.map(l => l.substring(0, 500)).join('\n')}`);
+			const header = capped
+				? `Showing last ${logs.length} of ${total} matching lines (pass last_n for more):`
+				: `Found ${logs.length} matching lines:`;
+			return textResult(`${header}\n${logs.map(l => l.substring(0, 500)).join('\n')}`);
 		} catch (e) {
 			return errorResult(`Log search failed: ${e.message}`);
 		}
@@ -1588,10 +2078,20 @@ server.tool(
 		level: z
 			.enum(['all', 'error', 'warning', 'log', 'info', 'debug'])
 			.optional()
-			.describe('Filter by log level (default: all)'),
+			.describe('Filter by log level (default: all). Prefer "error" to triage failures cheaply.'),
 		pattern: z.string().optional().describe('Filter messages containing this text'),
-		last_n: z.number().optional().describe('Only return the last N messages'),
-		clear: z.boolean().optional().describe('Clear the buffer after reading (default: false)'),
+		last_n: z
+			.number()
+			.optional()
+			.describe(
+				`Return only the last N messages (default: ${DEFAULT_READ_LIMIT}). Pass a larger value for more.`,
+			),
+		clear: z
+			.boolean()
+			.optional()
+			.describe(
+				'Clear the buffer after reading (default: false). Use as a cheap cursor so the next read only sees new messages.',
+			),
 	},
 	async args => {
 		requireReady();
@@ -1606,10 +2106,11 @@ server.tool(
 			const pat = args.pattern.toLowerCase();
 			entries = entries.filter(e => e.text.toLowerCase().includes(pat));
 		}
-		// Limit to last N
-		if (args.last_n && args.last_n > 0) {
-			entries = entries.slice(-args.last_n);
-		}
+		// Limit to last N (default cap so an unfiltered read can't dump the whole buffer)
+		const matched = entries.length;
+		const limit = args.last_n && args.last_n > 0 ? args.last_n : DEFAULT_READ_LIMIT;
+		const capped = matched > limit;
+		if (capped) entries = entries.slice(-limit);
 		// Clear if requested
 		if (args.clear) {
 			consoleBuffer = [];
@@ -1621,7 +2122,10 @@ server.tool(
 			const src = e.url ? ` (${e.url.substring(0, 80)})` : '';
 			return `[${time}] [${e.type}] ${e.text.substring(0, 500)}${src}`;
 		});
-		return textResult(`${entries.length} messages:\n${lines.join('\n')}`);
+		const header = capped
+			? `Showing last ${entries.length} of ${matched} messages (pass last_n for more):`
+			: `${entries.length} messages:`;
+		return textResult(`${header}\n${lines.join('\n')}`);
 	},
 );
 
@@ -1663,7 +2167,7 @@ server.tool(
 // --- rebuild_and_reload ------------------------------------------------------
 server.tool(
 	'rebuild_and_reload',
-	'Run the build command, then restart the extension host. Reconnects the evaluator bridge. For webview-only changes, build webviews and use the view refresh command (e.g. gitlens.views.home.refresh) instead of restarting the extension host.',
+	'Run the build command, then restart the extension host. For webview-only changes, build webviews and use the view refresh command (e.g. gitlens.views.home.refresh) instead of restarting the extension host. NOTE: the evaluator bridge does not survive the restart (it is the --extensionTestsPath entry, which only runs at workbench startup), so evaluate/set_account and other bridge-backed tools stop working afterwards — teardown + launch to get them back.',
 	{
 		build_command: z
 			.string()
@@ -1696,11 +2200,31 @@ server.tool(
 			}
 			const buildTime = ((Date.now() - startTime) / 1000).toFixed(1);
 
+			// Arm the evaluator reconnect BEFORE restarting, so that if the host ever does re-announce
+			// its "VSCodeTestServer listening on ..." line we catch it — attaching after the waits
+			// below would sit on a line that had already gone by. (skipCache so we can't latch onto
+			// the pre-restart URL.) See the KNOWN LIMITATION note below for why this usually fails.
+			let evaluatorError;
+			const evaluatorPromise = sessionConfig.withEvaluator
+				? connectEvaluator(electronApp, { skipCache: true }).catch(e => {
+						evaluatorError = e;
+						return null;
+					})
+				: null;
+
 			// Restart the extension host (not a full window reload).
 			// This keeps the Playwright page reference alive while reloading
 			// all extensions with the newly-built code. Extension host code
 			// changes take effect immediately. For webview-only changes,
 			// use the view's refresh command instead (e.g. gitlens.views.home.refresh).
+			//
+			// KNOWN LIMITATION: the evaluator bridge does not survive this. It lives in the
+			// `--extensionTestsPath` entry point, which VS Code invokes once per workbench startup, so
+			// the restarted host never re-runs it and never re-announces its (ephemeral) port —
+			// reconnect below fails with "Timeout waiting for VSCodeTestServer". `workbench.action.
+			// reloadWindow` would re-run it, but under `--extensionTestsPath` the host exit is read as
+			// "tests finished" and the whole instance quits ("Process exited"). Until the bridge moves
+			// out of extensionTests, teardown + launch is the only way back to a live evaluator.
 			if (evaluateFn) {
 				try {
 					await evaluateFn(vscode =>
@@ -1726,20 +2250,36 @@ server.tool(
 			const activationWait = agentCfg.activationWait ?? 5000;
 			await new Promise(r => setTimeout(r, activationWait));
 
-			// Reconnect evaluator if it was active (skipCache to avoid stale URL from pre-restart)
-			if (sessionConfig.withEvaluator) {
-				try {
-					const evaluator = await connectEvaluator(electronApp, { skipCache: true });
-					evaluateFn = evaluator.evaluate.bind(evaluator);
-				} catch {
-					evaluateFn = null;
-				}
+			// Reconnect evaluator if it was active (armed above, before the restart)
+			if (evaluatorPromise != null) {
+				const evaluator = await evaluatorPromise;
+				evaluateFn = evaluator != null ? evaluator.evaluate.bind(evaluator) : null;
 			}
 
 			const parts = [`Build succeeded (${buildTime}s). Extension host restarted.`];
 			if (evaluateFn) parts.push('Evaluator: reconnected');
-			else if (sessionConfig.withEvaluator)
-				parts.push('Evaluator: reconnection failed (some tools may be limited)');
+			else if (sessionConfig.withEvaluator) {
+				parts.push(
+					`Evaluator: reconnection failed${evaluatorError ? ` — ${evaluatorError.message}` : ''} (some tools may be limited)`,
+				);
+			}
+
+			// The subscription simulator never persists (`{ store: false }` throughout), so a host
+			// restart silently drops it back to Community. Re-apply so a long inspection session
+			// doesn't quietly lose its Pro gating mid-run. A real signed-in account is persisted and
+			// needs no help here.
+			if (lastAccount != null) {
+				if (evaluateFn) {
+					try {
+						await applyAccountPlan(lastAccount.payload);
+						parts.push(`Account: re-applied "${lastAccount.plan}"`);
+					} catch (e) {
+						parts.push(`Account: failed to re-apply "${lastAccount.plan}" (${e.message})`);
+					}
+				} else {
+					parts.push(`Account: could not re-apply "${lastAccount.plan}" (no evaluator bridge)`);
+				}
+			}
 
 			return textResult(parts.join('\n'));
 		} catch (e) {
