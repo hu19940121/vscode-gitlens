@@ -4,6 +4,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import type { FuzzyMatchResult } from '@gitlens/utils/fuzzy.js';
 import { scrollableBase } from '../styles/lit/base.css.js';
+import { elevatedSurface } from '../styles/lit/elevation.css.js';
 import '../code-icon.js';
 
 export interface CompletionItem<T = any> {
@@ -42,26 +43,30 @@ export class GlAutocomplete extends LitElement {
 			}
 
 			.scrollable {
+				--gl-elevation: var(--gl-shadow-popover);
+				--gl-elevation-border-color: var(--vscode-widget-border);
+
 				position: absolute;
 				top: 100%;
 				left: 0;
+				z-index: var(--gl-z-popover);
 				min-width: min(max(100%, 30rem), var(--_max-width, 100%));
 				max-width: var(--_max-width, none);
-				margin-top: 0.2rem;
-				z-index: 1000;
 				max-height: 20rem;
+				margin-top: var(--gl-space-2);
 				overflow-y: auto;
 				color: var(--vscode-quickInput-foreground);
 				background-color: var(--vscode-quickInput-background);
-				border: 1px solid var(--vscode-widget-border);
-				border-radius: 0.4rem;
-				box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+				border-radius: var(--gl-radius-sm);
+
+				${elevatedSurface}
 			}
 
 			/* Override scrollbar thumb to not inherit the visible border-color */
 			.scrollable::-webkit-scrollbar-thumb {
 				border-color: transparent;
 			}
+
 			:host(:hover) .scrollable::-webkit-scrollbar-thumb,
 			:host(:focus-within) .scrollable::-webkit-scrollbar-thumb {
 				border-color: var(--vscode-scrollbarSlider-background);
@@ -70,16 +75,16 @@ export class GlAutocomplete extends LitElement {
 			.autocomplete-item {
 				display: flex;
 				flex-direction: row;
+				gap: var(--gl-space-8);
 				align-items: center;
-				gap: 0.8rem;
-				padding: 0.2rem 0.8rem;
+				padding: var(--gl-space-2) var(--gl-space-8);
 				cursor: pointer;
 			}
 
 			.autocomplete-item:hover,
 			.autocomplete-item.selected {
-				background-color: var(--vscode-list-activeSelectionBackground);
 				color: var(--vscode-list-activeSelectionForeground);
+				background-color: var(--vscode-list-activeSelectionBackground);
 
 				.autocomplete-item__icon {
 					color: var(--vscode-list-activeSelectionIconForeground);
@@ -89,33 +94,33 @@ export class GlAutocomplete extends LitElement {
 
 			.autocomplete-item__icon {
 				display: flex;
+				flex-shrink: 0;
 				align-items: center;
 				justify-content: center;
 				width: 1.6rem;
 				height: 1.6rem;
-				flex-shrink: 0;
 				opacity: 0.8;
 			}
 
 			.autocomplete-item__content {
 				display: flex;
+				flex: 1;
 				flex-direction: column;
 				gap: 0.1rem;
-				flex: 1;
 				min-width: 0;
 			}
 
 			.autocomplete-item__header {
 				display: flex;
+				gap: var(--gl-space-10);
 				align-items: center;
 				justify-content: space-between;
-				gap: 1rem;
 			}
 
 			.autocomplete-item__primary {
-				font-weight: 600;
 				font-family: var(--vscode-editor-font-family);
 				font-size: 0.9em;
+				font-weight: 600;
 			}
 
 			.autocomplete-item.selected .autocomplete-item__primary {
@@ -123,11 +128,11 @@ export class GlAutocomplete extends LitElement {
 			}
 
 			.autocomplete-item__secondary {
-				font-size: 0.85em;
-				opacity: 0.7;
-				white-space: nowrap;
 				overflow: hidden;
 				text-overflow: ellipsis;
+				font-size: 0.85em;
+				white-space: nowrap;
+				opacity: 0.7;
 			}
 
 			.autocomplete-item.selected .autocomplete-item__secondary {
@@ -145,27 +150,27 @@ export class GlAutocomplete extends LitElement {
 			}
 
 			.autocomplete-item.help {
+				gap: 0.5rem;
+				padding: var(--gl-space-2) var(--gl-space-8);
+				color: var(--vscode-list-inactiveSelectionForeground);
 				cursor: default;
 				background-color: var(--vscode-list-inactiveSelectionBackground) !important;
-				color: var(--vscode-list-inactiveSelectionForeground);
-				padding: 0.2rem 0.8rem;
 				opacity: 1;
-				gap: 0.5rem;
 			}
 
 			.autocomplete-item.help .autocomplete-item__content {
 				flex-direction: column;
-				align-items: flex-start;
 				gap: 0.1rem;
+				align-items: flex-start;
 			}
 
 			.autocomplete-description {
-				padding: 0.6rem 0.8rem;
-				background-color: var(--vscode-list-inactiveSelectionBackground);
-				color: var(--vscode-foreground);
+				padding: var(--gl-space-6) var(--gl-space-8);
 				font-size: 0.85em;
 				line-height: 1.4;
-				border-bottom: 1px solid var(--vscode-widget-border);
+				color: var(--vscode-foreground);
+				background-color: var(--vscode-list-inactiveSelectionBackground);
+				border-bottom: var(--gl-border-width) solid var(--vscode-widget-border);
 			}
 
 			.autocomplete-description:empty {
@@ -174,9 +179,9 @@ export class GlAutocomplete extends LitElement {
 
 			.autocomplete-description__example {
 				display: block;
-				margin-top: 0.4rem;
-				color: var(--vscode-descriptionForeground);
+				margin-top: var(--gl-space-4);
 				font-size: 0.95em;
+				color: var(--vscode-descriptionForeground);
 			}
 
 			.autocomplete-item.help .autocomplete-item__primary {
@@ -235,8 +240,18 @@ export class GlAutocomplete extends LitElement {
 			}
 		}
 
-		if (changedProperties.has('_selectedIndex') && this._selectedIndex >= 0) {
-			this.scrollToSelected();
+		if (changedProperties.has('_selectedIndex')) {
+			if (this._selectedIndex >= 0) {
+				this.scrollToSelected();
+			}
+
+			this.dispatchEvent(
+				new CustomEvent<{ index: number }>('gl-autocomplete-active-change', {
+					detail: { index: this._selectedIndex },
+					bubbles: true,
+					composed: true,
+				}),
+			);
 		}
 	}
 
@@ -398,25 +413,33 @@ export class GlAutocomplete extends LitElement {
 						aria-selected="${isSelected}"
 						@mousedown="${(e: MouseEvent) => this.handleItemMouseDown(e, index, item)}"
 					>
-						${item.icon
-							? html`<div class="autocomplete-item__icon">
-									<code-icon icon="${item.icon}"></code-icon>
-								</div>`
-							: nothing}
+						${
+							item.icon
+								? html`<div class="autocomplete-item__icon">
+										<code-icon icon="${item.icon}"></code-icon>
+									</div>`
+								: nothing
+						}
 						<div class="autocomplete-item__content">
 							<div class="autocomplete-item__header">
 								<div class="autocomplete-item__primary">
-									${item.match
-										? this.highlightMatches(item.label, item.match.matchedIndices)
-										: item.label}
+									${
+										item.match
+											? this.highlightMatches(item.label, item.match.matchedIndices)
+											: item.label
+									}
 								</div>
-								${item.description
-									? html`<div class="autocomplete-item__secondary">${item.description}</div>`
-									: nothing}
+								${
+									item.description
+										? html`<div class="autocomplete-item__secondary">${item.description}</div>`
+										: nothing
+								}
 							</div>
-							${item.detail
-								? html`<div class="autocomplete-item__secondary">${item.detail}</div>`
-								: nothing}
+							${
+								item.detail
+									? html`<div class="autocomplete-item__secondary">${item.detail}</div>`
+									: nothing
+							}
 						</div>
 					</div>`;
 				},

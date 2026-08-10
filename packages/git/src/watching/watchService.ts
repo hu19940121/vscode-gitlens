@@ -11,6 +11,13 @@ import type { WatchGroupHooks } from './watchGroup.js';
 import { WatchGroup } from './watchGroup.js';
 import { RepositoryWatchSession } from './watchSession.js';
 
+/**
+ * Cap on paths held while the gitignore filter loads. Higher than the session's own cap because these are
+ * pre-filter — most of a build's output is typically gitignored and would be discarded on replay, so a
+ * tighter bound here would mark batches incomplete when they filter down to almost nothing.
+ */
+const maxBufferedWorkingTreePaths = 5000;
+
 export interface WatchServiceOptions {
 	readonly watchingProvider: FileWatchingProvider;
 	/** Default debounce for repo changes when subscriber doesn't specify. Default: 250ms */
@@ -69,6 +76,13 @@ export class RepositoryWatchService implements UnifiedDisposable {
 		return this._onDidChangeRepository.event;
 	}
 
+	private readonly _onDidChangeWorkingTree = new Emitter<string>();
+	/** Global multiplexed working-tree change event (repo path) for ALL watched repos. Fires once per
+	 *  debounced flush per session — the single point that drives the cache's status clock for working-tree edits. */
+	get onDidChangeWorkingTree(): Event<string> {
+		return this._onDidChangeWorkingTree.event;
+	}
+
 	private readonly defaultRepoDelayMs?: number;
 	private readonly defaultWorkingTreeDelayMs?: number;
 	private readonly getIgnoreFilter?: (repoPath: string, gitDirPath: string) => GitIgnoreFilter | undefined;
@@ -113,6 +127,7 @@ export class RepositoryWatchService implements UnifiedDisposable {
 		this.wtWatchers.clear();
 
 		this._onDidChangeRepository.dispose();
+		this._onDidChangeWorkingTree.dispose();
 	}
 
 	/**
@@ -163,6 +178,9 @@ export class RepositoryWatchService implements UnifiedDisposable {
 				},
 				onDidFireRepoChange: (event): void => {
 					this._onDidChangeRepository.fire(event);
+				},
+				onDidFireWorkingTreeChange: (repoPath): void => {
+					this._onDidChangeWorkingTree.fire(repoPath);
 				},
 			});
 
@@ -297,6 +315,7 @@ export class RepositoryWatchService implements UnifiedDisposable {
 		// Buffer events while the gitignore filter loads, then replay
 		let filterReady = filter == null;
 		let buffered: string[] | undefined = filter != null ? [] : undefined;
+		let bufferIncomplete = false;
 
 		if (filter != null) {
 			void filter
@@ -305,11 +324,12 @@ export class RepositoryWatchService implements UnifiedDisposable {
 					filterReady = true;
 					if (buffered?.length) {
 						const paths = filterWorkingTreePaths(buffered, repoPath, filter);
-						if (paths.length > 0) {
-							session.pushWorkingTreeChanges(paths);
+						if (paths.length > 0 || bufferIncomplete) {
+							session.pushWorkingTreeChanges(paths, bufferIncomplete);
 						}
 					}
 					buffered = undefined;
+					bufferIncomplete = false;
 				})
 				.catch(() => {
 					filterReady = true;
@@ -331,12 +351,24 @@ export class RepositoryWatchService implements UnifiedDisposable {
 				for (const h of watchHooks) {
 					h.onGitIgnoreChanged?.(repoPath);
 				}
-				// Don't push .gitignore itself as a working tree change
+				// Route the ignore-rule change through the repo channel as an `ignores` change (like `info/exclude`),
+				// so it reaches EVERY session subscriber — including a closed secondary worktree's `watch()` `repoSub`,
+				// which has no `onGitIgnoreChanged` hook and would otherwise keep a stale untracked-file list. Coalesces
+				// with any hook-fired `ignores` above, so open repos don't double. (.gitignore itself is not a WT change.)
+				session.pushRepoChanges(['ignores']);
 				return;
 			}
 
 			if (!filterReady) {
-				// Buffer until gitignore filter is ready
+				// Buffer until the gitignore filter is ready. Capped: `ready()` awaits a `core.excludesFile`
+				// read, which queues behind every other git command, so this window can stay open for a long
+				// time — and these paths haven't been gitignore-filtered yet, so a build's output all lands
+				// here. Past the cap, stop retaining and mark the batch partial rather than growing.
+				if (buffered != null && buffered.length >= maxBufferedWorkingTreePaths) {
+					bufferIncomplete = true;
+					return;
+				}
+
 				buffered?.push(event.path);
 				return;
 			}

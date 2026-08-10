@@ -6,27 +6,28 @@ import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitDiff } from '@gitlens/git/models/diff.js';
 import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
 import { splitCommitMessage } from '@gitlens/git/utils/commit.utils.js';
+import { getFileDiffPathspecs } from '@gitlens/git/utils/fileStatus.utils.js';
 import { isSha, isUncommitted, isUncommittedStaged, shortenRevision } from '@gitlens/git/utils/revision.utils.js';
+import type { IntegrationIds } from '@gitlens/integrations/constants.js';
+import { getProviderIdFromEntityIdentifier } from '@gitlens/integrations/providers/utils.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { map } from '@gitlens/utils/iterable.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { ScmResource } from '../@types/vscode.git.resources.d.js';
 import { ScmResourceGroupType, ScmStatus } from '../@types/vscode.git.resources.enums.js';
 import type { GlCommands } from '../constants.commands.js';
-import type { IntegrationIds } from '../constants.integrations.js';
 import type { Container } from '../container.js';
 import type { GlRepository } from '../git/models/repository.js';
 import { showGitErrorMessage } from '../messages.js';
 import { showPatchesView } from '../plus/drafts/actions.js';
 import type { ProviderAuth } from '../plus/drafts/draftsService.js';
 import type { Draft, LocalDraft } from '../plus/drafts/models/drafts.js';
-import { getProviderIdFromEntityIdentifier } from '../plus/integrations/providers/utils.js';
 import { getRepositoryOrShowPicker } from '../quickpicks/repositoryPicker.js';
 import { command } from '../system/-webview/command.js';
 import { isViewRefFileNode } from '../views/nodes/utils/-webview/node.utils.js';
 import type { Change, CreateDraft } from '../webviews/plus/patchDetails/protocol.js';
 import { ActiveEditorCommand, GlCommandBase } from './commandBase.js';
-import type { CommandContext } from './commandContext.js';
+import type { CommandContext, CommandScmStatesContext } from './commandContext.js';
 import {
 	isCommandContextViewNodeHasCommit,
 	isCommandContextViewNodeHasComparison,
@@ -39,12 +40,63 @@ export interface CreatePatchCommandArgs {
 	to?: string;
 	from?: string;
 	repoPath?: string;
-	uris?: Uri[];
+	/** Pathspec limiting the patch. Repo-relative paths are accepted alongside Uris — a rename needs BOTH
+	 *  of its paths, which `getFileDiffPathspecs` supplies as repo-relative strings. */
+	uris?: (string | Uri)[];
 
 	includeUntracked?: boolean;
 
 	title?: string;
 	description?: string;
+}
+
+export interface ApplyPatchFromClipboardCommandArgs {
+	/** The repository or worktree to apply into. Omitted from the palette, which targets the best/first repo. */
+	repoPath?: string;
+}
+
+/** Builds the patch args for a Source Control multi-resource selection. Exported for testing (mirrors the
+ *  extracted arg builders in `stashSave.ts`). */
+export async function getCreatePatchArgsForScmStates(
+	container: Container,
+	context: CommandScmStatesContext,
+): Promise<CreatePatchCommandArgs> {
+	const groupTypes = new Set<ScmResourceGroupType>();
+	const uris = new Set<string>();
+
+	let includeUntracked = false;
+
+	let repo;
+	for (const resource of context.scmResourceStates as ScmResource[]) {
+		repo ??= await container.git.getOrAddRepository(resource.resourceUri, { opened: false });
+
+		includeUntracked = includeUntracked || resource.type === ScmStatus.UNTRACKED;
+		uris.add(resource.resourceUri.toString());
+		// A rename's `resourceUri` is the new path; `original` is the pre-rename one, which the pathspec
+		// also needs or the patch drops the delete half and reads as a bare add. Renames only — for a COPY
+		// the source still exists, so adding it would drag its own unrelated changes into the patch.
+		if (
+			resource.original != null &&
+			(resource.type === ScmStatus.INDEX_RENAMED || resource.type === ScmStatus.INTENT_TO_RENAME)
+		) {
+			uris.add(resource.original.toString());
+		}
+
+		groupTypes.add(resource.resourceGroupType!);
+	}
+
+	const to = groupTypes.size === 1 && groupTypes.has(ScmResourceGroupType.Index) ? uncommittedStaged : uncommitted;
+	return {
+		repoPath: repo?.path,
+		to: to,
+		// A selection spanning both groups needs HEAD↔working to capture the staged half too; `to:
+		// uncommitted` alone diffs index↔working and would silently drop it. A working-tree-only selection
+		// stays index↔working, which is exactly what those rows represent.
+		from: groupTypes.size > 1 ? 'HEAD' : undefined,
+		uris: [...map(uris, u => Uri.parse(u))],
+		title: to === uncommittedStaged ? 'Staged Changes' : 'Uncommitted Changes',
+		includeUntracked: includeUntracked ? true : undefined,
+	};
 }
 
 abstract class CreatePatchCommandBase extends GlCommandBase {
@@ -58,38 +110,7 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 	protected override async preExecute(context: CommandContext, args?: CreatePatchCommandArgs) {
 		if (args == null) {
 			if (context.type === 'scm-states') {
-				const resourcesByGroup = new Map<ScmResourceGroupType, ScmResource[]>();
-				const uris = new Set<string>();
-
-				let includeUntracked = false;
-
-				let repo;
-				for (const resource of context.scmResourceStates as ScmResource[]) {
-					repo ??= await this.container.git.getOrAddRepository(resource.resourceUri, { opened: false });
-
-					includeUntracked = includeUntracked || resource.type === ScmStatus.UNTRACKED;
-					uris.add(resource.resourceUri.toString());
-
-					let groupResources = resourcesByGroup.get(resource.resourceGroupType!);
-					if (groupResources == null) {
-						groupResources = [];
-						resourcesByGroup.set(resource.resourceGroupType!, groupResources);
-					} else {
-						groupResources.push(resource);
-					}
-				}
-
-				const to =
-					resourcesByGroup.size === 1 && resourcesByGroup.has(ScmResourceGroupType.Index)
-						? uncommittedStaged
-						: uncommitted;
-				args = {
-					repoPath: repo?.path,
-					to: to,
-					uris: [...map(uris, u => Uri.parse(u))],
-					title: to === uncommittedStaged ? 'Staged Changes' : 'Uncommitted Changes',
-					includeUntracked: includeUntracked ? true : undefined,
-				};
+				args = await getCreatePatchArgsForScmStates(this.container, context);
 			} else if (context.type === 'scm-groups') {
 				const group = context.scmResourceGroups[0];
 				if (!group?.resourceStates?.length) return;
@@ -130,7 +151,7 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 						};
 					}
 					if (isCommandContextViewNodeHasFileCommit(context)) {
-						args.uris = [context.node.uri];
+						args.uris = getFileDiffPathspecs(context.node.file);
 					}
 				} else if (isCommandContextViewNodeHasComparison(context)) {
 					args = {
@@ -146,7 +167,7 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 						repoPath: context.node.repoPath,
 						to: context.node.ref2,
 						from: context.node.ref1,
-						uris: [context.node.uri],
+						uris: getFileDiffPathspecs(context.node.file),
 					};
 				} else if (context.node.is('uncommitted-files')) {
 					args = {
@@ -162,7 +183,7 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 							repoPath: context.node.repoPath,
 							to: to,
 							from: context.node.is('uncommitted-file') ? 'HEAD' : undefined,
-							uris: [context.node.uri],
+							uris: getFileDiffPathspecs(context.node.file),
 							title: to === uncommittedStaged ? 'Staged Changes' : 'Uncommitted Changes',
 						};
 					} else {
@@ -170,7 +191,7 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 							repoPath: context.node.repoPath,
 							to: context.node.ref.sha,
 							from: `${context.node.ref.sha}^`,
-							uris: [context.node.uri],
+							uris: getFileDiffPathspecs(context.node.file),
 							title: `Changes (partial) in ${shortenRevision(context.node.ref.sha)}`,
 						};
 					}
@@ -183,7 +204,7 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 							repoPath: context.node.repoPath,
 							to: to,
 							from: context.node.is('uncommitted-file') ? 'HEAD' : undefined,
-							uris: [context.node.uri],
+							uris: getFileDiffPathspecs(context.node.file),
 							title: to === uncommittedStaged ? 'Staged Changes' : 'Uncommitted Changes',
 						};
 					} else {
@@ -191,14 +212,14 @@ abstract class CreatePatchCommandBase extends GlCommandBase {
 							repoPath: context.node.repoPath,
 							to: context.node.ref.sha,
 							from: `${context.node.ref.sha}^`,
-							uris: [context.node.uri],
+							uris: getFileDiffPathspecs(context.node.file),
 							title: `Changes (partial) in ${shortenRevision(context.node.ref.sha)}`,
 						};
 					}
 
 					for (const node of context.nodes) {
 						if (isViewRefFileNode(node) && node !== context.node && node.ref.sha === args.to) {
-							args.uris!.push(node.uri);
+							args.uris!.push(...getFileDiffPathspecs(node.file));
 						}
 					}
 				}
@@ -301,25 +322,29 @@ export class ApplyPatchFromClipboardCommand extends GlCommandBase {
 		super(['gitlens.applyPatchFromClipboard', 'gitlens.pastePatchFromClipboard']);
 	}
 
-	async execute(): Promise<void> {
+	async execute(args?: ApplyPatchFromClipboardCommandArgs): Promise<void> {
 		const patch = await env.clipboard.readText();
-		let repo = this.container.git.getBestRepositoryOrFirst();
+		// Resolve by path rather than looking up a repository — a worktree is often not an opened one
+		let svc =
+			args?.repoPath != null
+				? this.container.git.getRepositoryService(args.repoPath)
+				: this.container.git.getBestRepositoryOrFirst()?.git;
 
 		// Make sure it looks like a valid patch
-		const valid = patch.length ? await repo?.git.patch?.validatePatch(patch) : false;
+		const valid = patch.length ? await svc?.patch?.validatePatch(patch) : false;
 		if (!valid) {
 			void window.showWarningMessage('No valid patch found in the clipboard');
 			return;
 		}
 
-		repo ??= await getRepositoryOrShowPicker(this.container, 'Apply Copied Patch');
-		if (repo == null) return;
+		svc ??= (await getRepositoryOrShowPicker(this.container, 'Apply Copied Patch'))?.git;
+		if (svc == null) return;
 
 		try {
-			const commit = await repo.git.patch?.createUnreachableCommitForPatch('HEAD', 'Pasted Patch', patch);
+			const commit = await svc.patch?.createUnreachableCommitForPatch('HEAD', 'Pasted Patch', patch);
 			if (commit == null) return;
 
-			await repo.git.patch?.applyUnreachableCommitForPatch(commit.sha, { stash: false });
+			await svc.patch?.applyUnreachableCommitForPatch(commit.sha, { stash: false });
 			void window.showInformationMessage(`Patch applied successfully`);
 		} catch (ex) {
 			if (isCancellationError(ex)) return;

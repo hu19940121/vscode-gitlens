@@ -277,9 +277,9 @@ export function run<T extends number | string>(
 					let stderrDecoded: string;
 					if (encoding === 'utf8' || encoding === 'binary' || encoding === 'buffer') {
 						// stdout & stderr can be `Buffer` or `string
-						// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-conversion
+						// oxlint-disable-next-line typescript/no-unnecessary-type-conversion
 						stdoutDecoded = stdout.toString();
-						// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-conversion
+						// oxlint-disable-next-line typescript/no-unnecessary-type-conversion
 						stderrDecoded = stderr.toString();
 					} else {
 						if (decode == null) {
@@ -332,7 +332,15 @@ export function run<T extends number | string>(
 }
 
 export interface RunExitResult {
-	exitCode: number;
+	/**
+	 * The process's exit code. ABSENT when the process never exited normally — killed by a signal, in which
+	 * case {@link signal} is set. Deliberately optional rather than defaulted to `0`: a signalled process
+	 * reported as `exitCode: 0` is indistinguishable from a clean success, so callers would read a partial
+	 * or empty stdout as a complete answer.
+	 */
+	readonly exitCode?: number;
+	/** Set when the process was terminated by a signal instead of exiting; {@link exitCode} is then absent. */
+	readonly signal?: NodeJS.Signals;
 }
 
 export interface RunResult<T extends string | Buffer> extends RunExitResult {
@@ -412,7 +420,11 @@ export function runSpawn<T extends string | Buffer>(
 
 		proc.once('close', async (code, signal) => {
 			if (options?.exitCodeOnly) {
-				resolve({ exitCode: code ?? 0 });
+				// Resolves unconditionally, so this is the one path that can hand back a signalled run. `code`
+				// is null exactly when the process was killed — report the signal rather than coercing to `0`,
+				// which would claim a clean success for a command that never finished. Note this returns BEFORE
+				// the SIGTERM-to-cancellation diversion below, so callers have to classify that themselves.
+				resolve({ exitCode: code ?? undefined, signal: signal ?? undefined });
 
 				return;
 			}
@@ -453,7 +465,10 @@ export function runSpawn<T extends string | Buffer>(
 				);
 			}
 
-			resolve({ exitCode: code ?? 0, stdout: stdout, stderr: stderr });
+			// The guard above already rejected every non-zero and every signalled close, so this is a clean
+			// zero exit — `code` cannot be null here. (The optional typing exists for the `exitCodeOnly`
+			// branch, which is where a codeless result can genuinely surface.)
+			resolve({ exitCode: code ?? undefined, signal: signal ?? undefined, stdout: stdout, stderr: stderr });
 		});
 
 		if (stdin) {

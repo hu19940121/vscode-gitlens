@@ -8,6 +8,7 @@ import type {
 	CommitErrorReason,
 	FetchErrorReason,
 	GitCommandError,
+	GitWarningKey,
 	MergeErrorReason,
 	PausedOperationAbortErrorReason,
 	PausedOperationContinueErrorReason,
@@ -24,8 +25,9 @@ import type {
 	WorktreeCreateErrorReason,
 	WorktreeDeleteErrorReason,
 } from '@gitlens/git/errors.js';
-import { WorkspaceUntrustedError } from '@gitlens/git/errors.js';
+import { GitWarnings, WorkspaceUntrustedError } from '@gitlens/git/errors.js';
 import type { SigningFormat } from '@gitlens/git/models/signature.js';
+import type { GitRunCancellation } from '@gitlens/git/run.types.js';
 import { CancellationError, getAbortSignalId, isCancellationError } from '@gitlens/utils/cancellation.js';
 import { getScopedCounter } from '@gitlens/utils/counter.js';
 import { getDurationMilliseconds, hrtime } from '@gitlens/utils/hrtime.js';
@@ -69,7 +71,6 @@ export const GitErrors = {
 	changesWouldBeOverwritten:
 		/Your local changes to the following files would be overwritten|Your local changes would be overwritten|overwritten by checkout/i,
 	cherryPickAborted: /cherry-pick.*aborted/i,
-	cherryPickEmptyPrevious: /The previous cherry-pick is now empty/i,
 	cherryPickInProgress: /cherry-pick is already in progress|You have not concluded your cherry-pick/i,
 	commitChangesFirst: /Please, commit your changes before you can/i,
 	conflict: /^CONFLICT \([^)]+\): \b/m,
@@ -98,6 +99,7 @@ export const GitErrors = {
 	noPausedOperation:
 		/no merge (?:in progress|to abort)|no cherry-pick(?: or revert)? in progress|no rebase in progress/i,
 	permissionDenied: /Permission.*denied/i,
+	previousOperationEmpty: /The previous (?:cherry-pick|revert) is now empty/i,
 	pushRejected: /^error:\s*failed to push some refs to\b/m,
 	pushRejectedRefDoesNotExists: /error:\s*unable to delete '(.*?)': remote ref does not exist/m,
 	rebaseAborted: /Nothing to do|rebase.*aborted/i,
@@ -126,26 +128,16 @@ export const GitErrors = {
 	unsafeRepository:
 		/(?:^fatal:\s*detected dubious ownership in repository at '([^']+)'|unsafe repository \('([^']+)' is owned by someone else\))[\s\S]*(git config --global --add safe\.directory [^\n•]+)/m,
 	unstagedChanges: /You have unstaged changes/i,
+	// Matches both variants: with a lock reason (`..., lock reason: <reason>`) and without (`...;`)
+	worktreeLocked: /fatal:\s*cannot remove a locked working tree/i,
+	// Only matches the variant where Git reports a lock reason; the reason is free text, so capture the whole line
+	worktreeLockedReason: /cannot remove a locked working tree,[ \t]*lock reason:[ \t]*(.*)/i,
 } as const;
 
-export const GitWarnings = {
-	notARepository: /Not a git repository/i,
-	outsideRepository: /is outside repository/i,
-	noPath: /no such path/i,
-	noCommits: /does not have any commits/i,
-	notFound: /Path '.*?' does not exist in/i,
-	foundButNotInRevision: /Path '.*?' exists on disk, but not in/i,
-	headNotABranch: /HEAD does not point to a branch/i,
-	noUpstream: /no upstream configured for branch '(.*?)'/i,
-	unknownRevision:
-		/ambiguous argument '.*?': unknown revision or path not in the working tree|not stored as a remote-tracking branch/i,
-	mustRunInWorkTree: /this operation must be run in a work tree/i,
-	patchWithConflicts: /Applied patch to '.*?' with conflicts/i,
-	noRemoteRepositorySpecified: /No remote repository specified\./i,
-	remoteConnectionError: /Could not read from remote repository/i,
-	notAGitCommand: /'.+' is not a git command/i,
-	tipBehind: /tip of your current branch is behind/i,
-} as const;
+// `GitWarnings` moved to `@gitlens/git/errors.js` so the shared run contract can name its keys; re-exported
+// here because it's long-established as part of this module's surface.
+export { GitWarnings };
+export type { GitWarningKey } from '@gitlens/git/errors.js';
 
 export class GitError extends Error {
 	readonly cmd: string | undefined;
@@ -250,7 +242,7 @@ const errorToReasonMap = new Map<GitCommand, [RegExp, GitCommandToReasonMap[GitC
 			[GitErrors.cherryPickAborted, 'aborted'],
 			[GitErrors.cherryPickInProgress, 'alreadyInProgress'],
 			[GitErrors.conflict, 'conflicts'],
-			[GitErrors.cherryPickEmptyPrevious, 'emptyCommit'],
+			[GitErrors.previousOperationEmpty, 'emptyCommit'],
 			[GitErrors.changesWouldBeOverwritten, 'wouldOverwriteChanges'],
 		],
 	],
@@ -285,13 +277,23 @@ const errorToReasonMap = new Map<GitCommand, [RegExp, GitCommandToReasonMap[GitC
 	[
 		'paused-operation-continue',
 		[
-			[GitErrors.cherryPickEmptyPrevious, 'emptyCommit'],
+			[GitErrors.previousOperationEmpty, 'emptyCommit'],
 			[GitErrors.noPausedOperation, 'nothingToContinue'],
 			[GitErrors.uncommittedChanges, 'uncommittedChanges'],
 			[GitErrors.unmergedFiles, 'unmergedFiles'],
 			[GitErrors.unresolvedConflicts, 'conflicts'],
 			[GitErrors.unstagedChanges, 'unstagedChanges'],
 			[GitErrors.changesWouldBeOverwritten, 'wouldOverwriteChanges'],
+			// A single (non-sequencer) revert resolved to a no-op never gets git's "previous revert is now
+			// empty" message — its `--continue` falls through to the commit, which reports having nothing to
+			// commit. Mid-paused-op that means the step became empty, so it earns the same choice.
+			//
+			// Kept LAST because the pattern is deliberately broad: it also matches "no changes added to
+			// commit" and "nothing added to commit", which appear alongside the more specific unmerged /
+			// conflict / unstaged messages. Matching first would shadow those. It isn't narrowed to the
+			// "working tree clean" variant because an empty step with untracked files present instead reports
+			// "nothing added to commit but untracked files present".
+			[GitErrors.nothingToCommit, 'emptyCommit'],
 		],
 	],
 	[
@@ -393,6 +395,8 @@ const errorToReasonMap = new Map<GitCommand, [RegExp, GitCommandToReasonMap[GitC
 	[
 		'worktree-delete',
 		[
+			// Must come first -- a locked worktree's lock reason is free text that can otherwise match the errors below
+			[GitErrors.worktreeLocked, 'locked'],
 			[GitErrors.mainWorkingTree, 'defaultWorkingTree'],
 			[GitErrors.uncommittedChanges, 'uncommittedChanges'],
 			[GitErrors.failedToDeleteDirectoryNotEmpty, 'directoryNotEmpty'],
@@ -653,14 +657,37 @@ export class Git {
 			return options.caching.cache.getOrCreate(
 				options.caching.commonPath ?? options.cwd!,
 				gitCommand,
-				async cacheable => {
-					const result = await this.runCore<T>({ ...options, caching: undefined }, runArgs, gitCommand);
-					if (result.exitCode !== 0) {
+				async (cacheable, signal) => {
+					// Bind the shared spawn to the aggregate `signal` (fires only when ALL current callers
+					// abort), not this-caller's `options.cancellation` — otherwise a superseded caller's
+					// abort would kill the shared command and reject concurrent riders that never cancelled.
+					const result = await this.runCore<T>(
+						{ ...options, caching: undefined, cancellation: signal ?? options.cancellation },
+						runArgs,
+						gitCommand,
+					);
+					// Never cache a result that isn't a genuine command outcome. Under `errors: 'ignore'` a
+					// cancelled/aborted run RESOLVES an empty result, which — left cached — would be served as a
+					// real empty result for the full TTL (e.g. a valid merge-base read back as "none").
+					// Invalidate on anything that isn't a clean exit, or whenever the aggregate signal aborted,
+					// so the entry self-evicts instead of poisoning later callers.
+					//
+					// `status !== 'exited'` is what catches the case a bare `exitCode` check cannot. A swallowed
+					// `GitWarnings` match used to report `exitCode: 0` UNCONDITIONALLY — the old code read it off
+					// a `result` that is only ever assigned on the non-throwing path, so it was always the `?? 0`
+					// fallback — which meant `exitCode !== 0` could never fire and every swallowed failure was
+					// cached. A `warned` result now carries git's real code, so it's the status, not the code,
+					// that has to do the work here. The `exitCode !== 0` half is kept as-is — a non-zero exit is
+					// a real answer and arguably cacheable, but it isn't cached today and this isn't the change
+					// to start.
+					if (result.completion.status !== 'exited' || result.exitCode !== 0 || signal?.aborted) {
 						cacheable.invalidate();
 					}
 					return result;
 				},
-				options.caching.options,
+				// Forward this caller's cancellation so `getOrCreate` races each caller's own wait — an
+				// aborting caller rejects only itself, leaving the shared work (and its riders) intact.
+				{ ...options.caching.options, cancellation: options.cancellation },
 			);
 		}
 
@@ -746,12 +773,42 @@ export class Git {
 		let result;
 		try {
 			result = await promise;
+			// A normal `runSpawn` only resolves on a clean exit — `code !== 0 || signal` rejects — but the
+			// `exitCodeOnly` overload resolves unconditionally, INCLUDING for a signalled run (no code, partial
+			// or absent stdout). Coercing that to `0` would report a killed command as a clean success, so
+			// classify it as the failure it is.
+			if (result.exitCode == null) {
+				// SIGTERM is how BOTH a timeout kill and a caller abort terminate, so it has to group with
+				// cancellations here exactly as it does on the reject path — `failed`/`signal` is for every
+				// OTHER signal. Only `exitCodeOnly` reaches this: a native spawn `timeout` fires
+				// `close(null, 'SIGTERM')` with no `error` event, so it resolves instead of rejecting.
+				// Throwing hands it to the catch below, which owns the timeout-vs-abort heuristic, the ABORTED
+				// log, and the `onAborted` hook — none of which a branch here would fire.
+				if (result.signal === 'SIGTERM') {
+					throw new CancelledRunError(gitCommand, true, undefined, result.signal);
+				}
+
+				return {
+					stdout: result.stdout,
+					stderr: result.stderr,
+					completion: {
+						status: 'failed',
+						reason: result.signal != null ? 'signal' : 'unstarted',
+						error: new Error(
+							`Command terminated without an exit code${result.signal != null ? ` (${result.signal})` : ''}`,
+						),
+					},
+				};
+			}
+
 			return {
 				stdout: result.stdout,
 				stderr: result.stderr,
-				exitCode: result.exitCode ?? 0,
+				exitCode: result.exitCode,
+				completion: { status: 'exited', code: result.exitCode },
 			};
 		} catch (ex) {
+			let cancellationReason: GitRunCancellation = 'unknown';
 			if (ex instanceof CancelledRunError) {
 				const duration = getDurationMilliseconds(start);
 				const timeout = runOpts.timeout ?? 0;
@@ -761,6 +818,9 @@ export class Git {
 						: cancellation?.aborted
 							? 'cancellation'
 							: 'unknown';
+				// Also surfaced on the result, but DIAGNOSTIC ONLY — a timeout kill and a caller abort are both
+				// SIGTERM, so this duration heuristic can be wrong near the boundary. Never gate behavior on it.
+				cancellationReason = reason === 'cancellation' ? 'aborted' : reason;
 				Logger.warn(
 					`${formatLoggableScopeBlock('GIT')} ${gitCommand} \u00b7 ABORTED after ${duration}ms (${reason})`,
 				);
@@ -774,19 +834,44 @@ export class Git {
 
 			if (errorHandling === 'ignore') {
 				if (ex instanceof RunError) {
+					// `code` is `string | number | undefined`: a numeric string is a real exit code, but an errno
+					// (`'ENOENT'`) means the spawn itself failed, and `undefined` means the process never exited
+					// normally. Only the numeric case is an exit; the rest previously became `0` or `NaN`.
+					const code = typeof ex.code === 'number' ? ex.code : ex.code != null ? parseInt(ex.code, 10) : NaN;
+					const exited = Number.isInteger(code);
+
 					return {
 						stdout: ex.stdout,
 						stderr: ex.stderr,
-						exitCode: ex.code != null ? (typeof ex.code === 'number' ? ex.code : parseInt(ex.code, 10)) : 0,
-						cancelled: ex instanceof CancelledRunError,
+						...(exited ? { exitCode: code } : {}),
+						completion:
+							ex instanceof CancelledRunError
+								? { status: 'cancelled', reason: cancellationReason, error: ex }
+								: exited
+									? { status: 'exited', code: code }
+									: {
+											status: 'failed',
+											// A signal means it ran and was killed (partial `stdout` may exist);
+											// no signal and no numeric code means it never got that far.
+											reason: ex.signal != null ? 'signal' : 'unstarted',
+											error: ex,
+										},
 					};
 				}
 
+				// No cancellation branch here: `CancelledRunError extends RunError`, so reaching this at all
+				// proves `ex` is neither.
 				return {
 					stdout: '',
 					stderr: undefined,
-					exitCode: 0,
-					cancelled: ex instanceof CancelledRunError,
+					completion: {
+						status: 'failed',
+						// No `RunError` means no process was ever spawned — a queue rejection or a
+						// failure before `spawn` returned. (Not an untrusted workspace: `run` refuses
+						// those up front, so they never reach this catch.)
+						reason: 'unstarted',
+						error: ex instanceof Error ? ex : new Error(String(ex)),
+					},
 				};
 			}
 
@@ -797,9 +882,31 @@ export class Git {
 			}
 			if (errorHandling === 'throw') throw exception;
 
-			defaultExceptionHandler(exception, options.cwd, start);
+			// Rethrows unless the message matches a `GitWarnings` pattern, in which case it logs and returns the
+			// key that matched. Capture the error first — `exception` is cleared to keep it out of the `finally`
+			// log, but the result still needs to carry it.
+			const swallowed = exception;
+			const warning = defaultExceptionHandler(exception, options.cwd, start);
 			exception = undefined;
-			return { stdout: '', stderr: result?.stderr, exitCode: result?.exitCode ?? 0 };
+			// The command did NOT produce this empty stdout — a warning was swallowed. Say so, or the caller
+			// can't tell a genuinely empty answer (`noCommits`) from a read that never happened
+			// (`notARepository`).
+			//
+			// The process DID exit though (a warning is only ever swallowed for a non-zero exit), so report the
+			// code. `GitError.exitCode` is `number | string | undefined` — same normalization as the
+			// `errors: 'ignore'` path above, since only the numeric case is a real exit.
+			const rawCode = swallowed instanceof GitError ? swallowed.exitCode : undefined;
+			const code = typeof rawCode === 'number' ? rawCode : rawCode != null ? parseInt(rawCode, 10) : NaN;
+
+			// No `stderr`: it belongs to the error here. The top-level field is the channel for runs that
+			// completed WITHOUT one (`exited` carries no error, so a successful command's stderr has nowhere
+			// else to go) — a swallowed warning always has a `GitError`, and it carries the stderr. Reading
+			// `result?.stderr` would be dead anyway: `result` is only assigned on the non-throwing path.
+			return {
+				stdout: '',
+				...(Number.isInteger(code) ? { exitCode: code } : {}),
+				completion: { status: 'warned', warning: warning, error: swallowed },
+			};
 		} finally {
 			this.logGitCommandComplete(gitCommand, exception, getDurationMilliseconds(start), waiting);
 		}
@@ -826,13 +933,7 @@ export class Git {
 
 		// Fixes https://github.com/gitkraken/vscode-gitlens/issues/73 & https://github.com/gitkraken/vscode-gitlens/issues/161
 		// See https://stackoverflow.com/questions/4144417/how-to-handle-asian-characters-in-file-names-in-git-on-os-x
-		runArgs.unshift(
-			'-c',
-			'core.quotepath=false',
-			'-c',
-			'color.ui=false',
-			...(configs !== undefined ? configs : emptyArray),
-		);
+		runArgs.unshift('-c', 'core.quotepath=false', '-c', 'color.ui=false', ...(configs ?? emptyArray));
 
 		if (process.platform === 'win32') {
 			runArgs.unshift('-c', 'core.longpaths=true');
@@ -962,7 +1063,7 @@ export class Git {
 		// Ensure cleanup happens immediately when the generator is explicitly closed (e.g., via break or return)
 		// This is called by JavaScript when the generator is abandoned, ensuring logGitCommand is called
 		// synchronously rather than waiting for garbage collection.
-		// eslint-disable-next-line @typescript-eslint/no-meaningless-void-operator
+		// oxlint-disable-next-line typescript/no-meaningless-void-operator
 		return void cleanup();
 	}
 
@@ -1114,12 +1215,21 @@ export class Git {
 	}
 }
 
-export function defaultExceptionHandler(ex: Error, cwd: string | undefined, start?: [number, number]): void {
+/**
+ * Swallows an error whose message matches a known-benign {@link GitWarnings} pattern, returning WHICH one
+ * matched so the caller can record it — the distinction matters, since `noCommits` is a real answer while
+ * `notARepository` is a failed read. Rethrows anything else.
+ */
+export function defaultExceptionHandler(
+	ex: Error,
+	cwd: string | undefined,
+	start?: [number, number],
+): GitWarningKey | undefined {
 	if (isCancellationError(ex)) throw ex;
 
 	const msg = ex.message || ex.toString();
 	if (msg) {
-		for (const warning of Object.values(GitWarnings)) {
+		for (const [key, warning] of Object.entries(GitWarnings) as [GitWarningKey, RegExp][]) {
 			if (warning.test(msg)) {
 				const duration = start !== undefined ? ` [${getDurationMilliseconds(start)}ms]` : '';
 				Logger.warn(
@@ -1128,7 +1238,7 @@ export function defaultExceptionHandler(ex: Error, cwd: string | undefined, star
 						.replace(/fatal:\s*/g, '')
 						.replace(/\r?\n|\r/g, ' \u00b7 ')}${duration}`,
 				);
-				return;
+				return key;
 			}
 		}
 
@@ -1137,7 +1247,9 @@ export function defaultExceptionHandler(ex: Error, cwd: string | undefined, star
 			const [, ref] = match;
 
 			// Since looking up a ref with ^3 (e.g. looking for untracked files in a stash) can error on some versions of git just ignore it
-			if (ref?.endsWith('^3')) return;
+			// Swallowed, but it matched no `GitWarnings` entry — `undefined` records "unclassified", which
+			// callers must treat as "not a real answer" exactly like any warning they don't whitelist.
+			if (ref?.endsWith('^3')) return undefined;
 		}
 	}
 

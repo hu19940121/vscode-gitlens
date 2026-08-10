@@ -7,12 +7,12 @@ import type { GitPausedOperationStatus } from '@gitlens/git/models/pausedOperati
 import type { GitBranchReference } from '@gitlens/git/models/reference.js';
 import type { RemoteProviderSupportedFeatures } from '@gitlens/git/models/remoteProvider.js';
 import type { GitBranchMergedStatus } from '@gitlens/git/providers/branches.js';
+import type { IntegrationDescriptor } from '@gitlens/integrations/constants.js';
 import type { AgentSessionState } from '../../agents/models/agentSessionState.js';
-import type { IntegrationDescriptor } from '../../constants.integrations.js';
-import type { WalkthroughContextKeys } from '../../constants.walkthroughs.js';
+import type { WalkthroughProgress } from '../../constants.walkthroughs.js';
 import type { RepositoryShape } from '../../git/models/repositoryShape.js';
 import type { Subscription } from '../../plus/gk/models/subscription.js';
-import type { LaunchpadSummaryResult } from '../../plus/launchpad/launchpadIndicator.js';
+import type { LaunchpadSummaryError, LaunchpadSummaryResult } from '../../plus/launchpad/launchpadIndicator.js';
 import type { LaunchpadItem } from '../../plus/launchpad/launchpadProvider.js';
 import type { LaunchpadGroup } from '../../plus/launchpad/models/launchpad.js';
 import type { IpcScope } from '../ipc/models/ipc.js';
@@ -45,12 +45,7 @@ export interface State extends WebviewState<'gitlens.views.home'> {
 	avatar?: string;
 	organizationsCount?: number;
 	walkthroughSupported: boolean;
-	walkthroughProgress?: {
-		doneCount: number;
-		allCount: number;
-		progress: number;
-		state: Record<WalkthroughContextKeys, boolean>;
-	};
+	walkthroughProgress?: WalkthroughProgress;
 	dateFormat: string | null;
 	previewEnabled: boolean;
 	newInstall: boolean;
@@ -88,7 +83,7 @@ export interface OverviewFilters {
 	stale: { threshold: OverviewStaleThreshold; show: boolean; limit: number };
 }
 
-export type GetLaunchpadSummaryResponse = LaunchpadSummaryResult | { error: Error } | undefined;
+export type GetLaunchpadSummaryResponse = LaunchpadSummaryResult | { error: LaunchpadSummaryError } | undefined;
 
 export interface GetOverviewBranch {
 	reference: GitBranchReference;
@@ -125,6 +120,8 @@ export interface GetOverviewBranch {
 				hasConflicts?: boolean;
 				conflictsCount?: number;
 				pausedOpStatus?: GitPausedOperationStatus;
+				/** A continue/skip is still running — see `OverviewBranchWip.pausedOpContinuing`. */
+				pausedOpContinuing?: boolean;
 		  }
 		| undefined
 	>;
@@ -191,7 +188,6 @@ export interface GetOverviewBranch {
 									approval: number;
 									changeRequest: number;
 									comment: number;
-									codeSuggest: number;
 								};
 							};
 

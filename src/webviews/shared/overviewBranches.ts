@@ -106,6 +106,28 @@ export interface OverviewBranchWip {
 	hasConflicts?: boolean;
 	conflictsCount?: number;
 	pausedOpStatus?: GitPausedOperationStatus;
+	/**
+	 * A continue/skip is still running for the repo/worktree that owns `pausedOpStatus`. `<op> --continue`
+	 * blocks for as long as git's commit-message tab stays open, so only the host knows when it ends —
+	 * without this the bar's optimistic busy state is cleared by the next overview refresh, which lands
+	 * while git is still blocked. `true`/absent, never `false`, mirroring the Graph's
+	 * `WipChange.pausedOpContinuing`.
+	 */
+	pausedOpContinuing?: boolean;
+	/**
+	 * Set when an on-demand stats fetch settled without producing a breakdown (the request failed or was
+	 * cancelled), so the hover can show a terminal "Couldn't load changes" instead of a perpetual
+	 * "Loading changes…". Only meaningful while `workingTreeState` is absent. Supplied by the Graph's WIP
+	 * bar, which fetches breakdowns lazily per worktree; the overview's own loads never set it.
+	 */
+	statsUnavailable?: boolean;
+	/**
+	 * Whether the branch has unpushed commits but NO upstream to count them against. `gl-tracking-status`
+	 * renders nothing without an upstream, so without this the hover would silently drop the fact that a
+	 * never-published branch has work to push. Supplied by the Graph's WIP bar (a `rev-list --not --remotes`
+	 * presence probe — there's no count, only the bit).
+	 */
+	hasUnpublishedCommits?: boolean;
 }
 
 /** Enrichment data keyed by branch ID. Expensive — sourced from API calls and git log. */
@@ -134,6 +156,9 @@ export interface OverviewBranchRemote {
 
 export interface OverviewBranchPullRequest {
 	id: string;
+	/** User-facing pull request number — `id` is the number only on provider-native fetch paths; the
+	 *  providers-api path puts the provider's internal id there. */
+	number: string;
 	title: string;
 	state: string;
 	url: string;
@@ -147,6 +172,9 @@ export interface OverviewBranchPullRequest {
 	/** Provider id (e.g. 'github') — lets the host resolve the PR by id without relying on the
 	 *  repo's current-branch fallback. */
 	providerId?: string;
+	/** Stack membership, when this pull request is one layer of a stack. `position` is 1-based from the
+	 *  stack's base. */
+	stack?: { number: number; position: number; size: number };
 	launchpad?: Promise<OverviewBranchLaunchpadItem | undefined>;
 }
 
@@ -169,7 +197,6 @@ export interface OverviewBranchLaunchpadItem {
 			approval: number;
 			changeRequest: number;
 			comment: number;
-			codeSuggest: number;
 		};
 	};
 

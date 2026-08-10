@@ -6,6 +6,7 @@ import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.
 import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import { formatIdentityDisplayName } from '@gitlens/git/utils/commit.utils.js';
+import { getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import type { Autolink } from '../../../../autolinks/models/autolinks.js';
 import type { IpcSerialized } from '../../../../system/ipcSerialize.js';
@@ -22,36 +23,42 @@ import type {
 	GraphItemRefContext,
 	GraphStashContextValue,
 } from '../../../plus/graph/protocol.js';
+import type { AiModelInfo } from '../../../rpc/services/types.js';
 import type { RunningOperationExecState } from '../../plus/graph/components/detailsState.js';
 import { renderLearnAboutAutolinks } from '../../shared/components/chips/learn-about-autolinks.js';
+import { renderDetailsMaximizeChip } from '../../shared/components/details-header/details-maximize-chip.js';
 import type { TreeItemAction, TreeItemBase } from '../../shared/components/tree/base.js';
 import { ModifierKeysController } from '../../shared/controllers/modifier-keys.js';
 import type { NavigationState } from '../../shared/controllers/navigationStack.js';
+import { dispatchContextMenuAt } from '../../shared/dom.js';
 import { detailsBaseStyles } from './gl-details-base.css.js';
 import type { File } from './gl-details-base.js';
 import { GlDetailsBase } from './gl-details-base.js';
 import { detailsCommitPanelStyles } from './gl-details-commit-panel.css.js';
+import '../../shared/components/ai-input.js';
+import '../../shared/components/gl-ai-model-chip.js';
+import '../../shared/components/branch-name.js';
 import '../../shared/components/button.js';
 import '../../shared/components/chips/action-chip.js';
 import '../../shared/components/chips/autolink-chip.js';
 import '../../shared/components/chips/chip-overflow.js';
-import '../../shared/components/menu/menu-divider.js';
-import '../../shared/components/menu/menu-item.js';
-import '../../shared/components/menu/menu-label.js';
-import '../../shared/components/branch-name.js';
 import '../../shared/components/code-icon.js';
 import '../../shared/components/copy-container.js';
 import '../../shared/components/commit/commit-author.js';
 import '../../shared/components/commit/commit-stats.js';
 import '../../shared/components/commit-sha.js';
+import '../../shared/components/details-header/gl-details-header.js';
 import '../../shared/components/markdown/markdown.js';
+import '../../shared/components/menu/menu-divider.js';
+import '../../shared/components/menu/menu-item.js';
+import '../../shared/components/menu/menu-label.js';
+import '../../shared/components/nav-buttons.js';
+import '../../shared/components/overlays/popover.js';
+import '../../shared/components/overlays/tooltip.js';
 import '../../shared/components/panes/pane-group.js';
+import '../../shared/components/progress.js';
 import '../../shared/components/rich/issue-pull-request.js';
 import '../../shared/components/split-panel/split-panel.js';
-import '../../shared/components/progress.js';
-import '../../shared/components/ai-input.js';
-import '../../shared/components/details-header/gl-details-header.js';
-import '../../shared/components/nav-buttons.js';
 
 type State = IpcSerialized<_State>;
 interface ExplainState {
@@ -112,6 +119,10 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 	@property({ type: Boolean })
 	aiEnabled = false;
 
+	/** Currently selected AI model — shown in the Explain input's floating footer chip. */
+	@property({ type: Object })
+	aiModel?: AiModelInfo;
+
 	/** Host advertises that it supports compare mode (graph orchestrator does, standalone doesn't). */
 	@property({ type: Boolean, attribute: 'compare-enabled' })
 	compareEnabled = false;
@@ -139,8 +150,8 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 	/** Forwarded to `gl-details-header` — when true, close becomes a back arrow. */
 	@property({ type: Boolean }) inResultsView = false;
 
-	/** Back/forward history state, forwarded to `gl-details-header`. Set by the graph host; unset
-	 *  for the inspect panel (which renders nav in `gl-inspect-nav`). */
+	/** Back/forward history state, forwarded to `gl-details-header` and rendered as nav-buttons in
+	 *  the actions cluster. Set by both the graph host and the inspect app. */
 	@property({ attribute: false }) navigation?: NavigationState;
 
 	@property({ type: Boolean })
@@ -148,6 +159,34 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 
 	@property({ type: Boolean, attribute: 'panel-actions' })
 	panelActions = true;
+
+	/** Inspect-host-only: render the pin toggle in the header actions cluster (the graph host
+	 *  doesn't pin). Folds in the old `gl-inspect-nav` pin. */
+	@property({ type: Boolean, attribute: 'show-pin' })
+	showPin = false;
+
+	/** Inspect-host-only: current pin state — drives the pin chip icon and its warning tint
+	 *  (the "automatic following is suspended" cue, previously the whole `gl-inspect-nav` band). */
+	@property({ type: Boolean, reflect: true })
+	pinned = false;
+
+	/** Inspect-host-only: render the "Open in Commit Graph" toggle in the header actions cluster.
+	 *  Folds in the old `gl-inspect-nav` graph toggle. */
+	@property({ type: Boolean, attribute: 'show-graph-action' })
+	showGraphAction = false;
+
+	/** Graph-bottom-only: render the maximize/restore chip left of Refresh (and thread it into the
+	 *  header's active-mode cluster). The Inspect host never sets this. */
+	@property({ type: Boolean, attribute: 'show-maximize' })
+	showMaximize = false;
+	/** Drives the maximize chip's icon/label when `showMaximize` is true. */
+	@property({ type: Boolean })
+	maximized = false;
+
+	/** Graph-only: the PR chip's body opens details on click instead of the card's eye (see
+	 *  `gl-autolink-chip`'s `details-on-click`). The Inspect host never sets this. */
+	@property({ type: Boolean, attribute: 'details-on-click' })
+	detailsOnClick = false;
 
 	@state()
 	private _reachabilityExpanded = false;
@@ -277,37 +316,41 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 
 		return html`
 			${hasSubPanel ? nothing : this.renderHiddenNotice()} ${this.renderEmbeddedAuthorHeader()}
-			${hasSubPanel
-				? html`${this.renderEmbeddedMetadataBar()}
-						<div class="sub-panel-enter">${this.subPanelContent}</div>`
-				: html`${this.renderEmbeddedMetadataBar()}
-					${hasMessage
-						? html`<gl-split-panel
-								orientation="vertical"
-								primary="start"
-								class="split ${this._userAdjustedSplitter ? '' : 'split--auto-size'}"
-								position="${this._messagePanelHeight ?? 25}"
-								.snap=${this._messagePanelSnap}
-								@gl-split-panel-change=${this._onMessagePanelChange}
-								@gl-split-panel-drag-end=${this._onMessagePanelDragEnd}
-								@gl-split-panel-dblclick=${this._onDividerDblClick}
-							>
-								<div slot="start" class="msg-slot">${this.renderEmbeddedMessage()}</div>
-								<div slot="divider" class="split__handle"></div>
-								<div slot="end" class="bottom-section">
-									${this.renderEmbeddedAutolinks()} ${this.renderEmbeddedExplainInput()}
-									<div class="files">
+			${
+				hasSubPanel
+					? html`${this.renderEmbeddedMetadataBar()}
+							<div class="sub-panel-enter">${this.subPanelContent}</div>`
+					: html`${this.renderEmbeddedMetadataBar()}
+						${
+							hasMessage
+								? html`<gl-split-panel
+										orientation="vertical"
+										primary="start"
+										class="split ${this._userAdjustedSplitter ? '' : 'split--auto-size'}"
+										.position=${this._messagePanelHeight ?? 25}
+										.snap=${this._messagePanelSnap}
+										@gl-split-panel-change=${this._onMessagePanelChange}
+										@gl-split-panel-drag-end=${this._onMessagePanelDragEnd}
+										@gl-split-panel-dblclick=${this._onDividerDblClick}
+									>
+										<div slot="start" class="msg-slot">${this.renderEmbeddedMessage()}</div>
+										<div slot="divider" class="split__handle"></div>
+										<div slot="end" class="bottom-section">
+											${this.renderEmbeddedAutolinks()} ${this.renderEmbeddedExplainInput()}
+											<div class="files">
+												<webview-pane-group flexible>
+													${this.renderChangedFiles(fileMode, renderOpts)}
+												</webview-pane-group>
+											</div>
+										</div>
+									</gl-split-panel>`
+								: html`<div class="files">
 										<webview-pane-group flexible>
 											${this.renderChangedFiles(fileMode, renderOpts)}
 										</webview-pane-group>
-									</div>
-								</div>
-							</gl-split-panel>`
-						: html`<div class="files">
-								<webview-pane-group flexible>
-									${this.renderChangedFiles(fileMode, renderOpts)}
-								</webview-pane-group>
-							</div>`}`}
+									</div>`
+						}`
+			}
 		`;
 	}
 
@@ -353,6 +396,7 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 			.showAvatar="${this.preferences?.avatars ?? true}"
 			.showSignature="${this.preferences?.showSignatureBadges ?? true}"
 			.signature="${this.signature}"
+			.repoPath="${commit.repoPath}"
 		></gl-commit-author>`;
 
 		if (!this.panelActions) {
@@ -377,39 +421,68 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 			.loading=${this.loading}
 			.modes=${this.computeCommitModes()}
 			.compareEnabled=${this.compareEnabled}
+			?show-maximize=${this.showMaximize}
+			?maximized=${this.maximized}
 			?in-results-view=${this.inResultsView}
 		>
 			${headerContent}
-			${this.activeMode == null && (this.navigation?.count ?? 0) > 1
-				? html`<gl-nav-buttons slot="actions" .navigation=${this.navigation}></gl-nav-buttons>`
-				: nothing}
+			${
+				this.activeMode == null &&
+				((this.navigation?.count ?? 0) > 1 || (this.showJumpToNearestWip && !isStash && !this.isUncommitted))
+					? html`<span slot="actions" class="nav-jump">
+							<gl-nav-buttons .navigation=${this.navigation}></gl-nav-buttons>
+							${
+								this.showJumpToNearestWip && !isStash && !this.isUncommitted
+									? html`<gl-action-chip
+											icon="download"
+											iconFlip="block"
+											label="Jump to Working Changes"
+											overlay="tooltip"
+											@click=${this.onJumpToNearestWipClick}
+										></gl-action-chip>`
+									: nothing
+							}
+						</span>`
+					: nothing
+			}
+			${
+				this.activeMode == null && this.showPin
+					? html`<gl-action-chip
+							slot="actions"
+							class="pin-action${this.pinned ? ' pinned' : ''}"
+							icon=${this.pinned ? 'gl-pinned-filled' : 'pin'}
+							label=${
+								this.pinned
+									? 'Unpin this Commit\nRestores Automatic Following'
+									: 'Pin this Commit\nSuspends Automatic Following'
+							}
+							overlay="tooltip"
+							@click=${this.onTogglePin}
+						></gl-action-chip>`
+					: nothing
+			}
+			${
+				this.activeMode == null && this.showGraphAction
+					? html`<gl-action-chip
+							slot="actions"
+							icon="gl-graph"
+							label="Open in Commit Graph"
+							overlay="tooltip"
+							@click=${this.onOpenInGraph}
+						></gl-action-chip>`
+					: nothing
+			}
+			${this.activeMode == null && this.showMaximize ? renderDetailsMaximizeChip(this.maximized) : nothing}
 			${when(
-				this.showJumpToNearestWip && !isStash && !this.isUncommitted && this.activeMode == null,
+				this.activeMode == null,
 				() =>
 					html`<gl-action-chip
 						slot="actions"
-						icon="arrow-up"
-						label="Jump to Working Changes"
-						overlay="tooltip"
-						@click=${this.onJumpToNearestWipClick}
-					></gl-action-chip>`,
-			)}
-			${when(
-				!isStash && !this.isUncommitted && this.hasRemotes && this.activeMode == null,
-				() =>
-					html`<gl-action-chip
-						slot="actions"
-						icon="globe"
-						label="Open Commit on Remote"
+						icon="refresh"
+						label="Refresh"
 						overlay="tooltip"
 						@click=${() =>
-							this.dispatchEvent(
-								new CustomEvent('open-on-remote', {
-									detail: { sha: commit.sha },
-									bubbles: true,
-									composed: true,
-								}),
-							)}
+							this.dispatchEvent(new CustomEvent('refresh-commit', { bubbles: true, composed: true }))}
 					></gl-action-chip>`,
 			)}
 		</gl-details-header>`;
@@ -438,27 +511,49 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 						.sha=${isStash ? `#${commit.stashNumber}` : commit.sha}
 						.icon=${isStash ? 'gl-stashes-view' : 'git-commit'}
 					></gl-commit-sha-copy>
-					${this.isUncommitted ? nothing : this.renderMoreActionsButton()}
 					${isStash ? this.renderStashApplyButton() : nothing}
-					${isStash
-						? this.branchName
-							? html`<gl-tooltip content="Stashed on ${this.branchName}">
-									<span class="metadata-bar__branch-indicator">
-										<gl-branch-name
-											class="metadata-bar__branch"
-											.name=${this.branchName}
-										></gl-branch-name>
-									</span>
-								</gl-tooltip>`
-							: nothing
-						: !this.isUncommitted
-							? this.renderBranchIndicator()
-							: nothing}
+					${when(
+						!isStash && !this.isUncommitted && this.hasRemotes && this.activeMode == null,
+						() =>
+							html`<gl-action-chip
+								class="metadata-bar__action metadata-bar__action--remote"
+								icon="globe"
+								label="Open Commit on Remote"
+								overlay="tooltip"
+								@click=${() =>
+									this.dispatchEvent(
+										new CustomEvent('open-on-remote', {
+											detail: { sha: commit.sha },
+											bubbles: true,
+											composed: true,
+										}),
+									)}
+							></gl-action-chip>`,
+					)}
+					${this.isUncommitted ? nothing : this.renderMoreActionsButton()}
+					${
+						isStash
+							? this.branchName
+								? html`<gl-tooltip content="Stashed on ${this.branchName}">
+										<span class="metadata-bar__branch-indicator">
+											<gl-branch-name
+												class="metadata-bar__branch"
+												.name=${this.branchName}
+											></gl-branch-name>
+										</span>
+									</gl-tooltip>`
+								: nothing
+							: !this.isUncommitted
+								? this.renderBranchIndicator()
+								: nothing
+					}
 				</div>
 				<div class="metadata-bar__right">
-					${this.modeStatusText
-						? html`<span class="mode-status">${this.modeStatusText}</span>`
-						: this.renderCommitStats(commit.stats)}
+					${
+						this.modeStatusText
+							? html`<span class="mode-status">${this.modeStatusText}</span>`
+							: this.renderCommitStats(commit.stats)
+					}
 				</div>
 			</div>
 			${this._reachabilityExpanded ? html`<div class="reachability">${this.renderReachability()}</div>` : nothing}`;
@@ -496,13 +591,32 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		const fromSha = this.commit?.sha;
 		if (!fromSha) return;
 
+		// The graph decides whether this moves the viewport — the WIP this resolves to usually sits on the
+		// commit the panel is describing, but can be a peer worktree's and far away. Flashes regardless: the
+		// user clicked, and without a scroll the wash is the only signal the selection went anywhere.
 		this.dispatchEvent(
 			new CustomEvent('gl-jump-to-nearest-wip', {
-				detail: { fromSha: fromSha },
+				detail: { fromSha: fromSha, flash: true },
 				bubbles: true,
 				composed: true,
 			}),
 		);
+	};
+
+	// Folded-in `gl-inspect-nav` actions (inspect host only). Composed/bubbling so they reach the
+	// app's listener on the panel element, where `onCommitActions` / `togglePin` already handle them.
+	private onOpenInGraph = (e: MouseEvent): void => {
+		this.dispatchEvent(
+			new CustomEvent('gl-commit-actions', {
+				detail: { action: 'graph', alt: e.altKey },
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	};
+
+	private onTogglePin = (): void => {
+		this.dispatchEvent(new CustomEvent('gl-pin', { bubbles: true, composed: true }));
 	};
 
 	private onMoreActionsClick = (e: MouseEvent): void => {
@@ -512,17 +626,7 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		const target = e.currentTarget as HTMLElement | null;
 		if (target == null) return;
 
-		const rect = target.getBoundingClientRect();
-		target.dispatchEvent(
-			new MouseEvent('contextmenu', {
-				bubbles: true,
-				composed: true,
-				cancelable: true,
-				clientX: rect.left,
-				clientY: rect.bottom,
-				button: 2,
-			}),
-		);
+		dispatchContextMenuAt(target);
 	};
 
 	private onStashApplyClick = (e: MouseEvent): void => {
@@ -629,9 +733,11 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		// Loaded with refs — show the primary ref name + count
 		if (primaryRef) {
 			return html`<gl-tooltip
-				content="${this._reachabilityExpanded
-					? 'Hide All Branches & Tags Containing this Commit'
-					: 'Show All Branches & Tags Containing this Commit'}"
+				content="${
+					this._reachabilityExpanded
+						? 'Hide All Branches & Tags Containing this Commit'
+						: 'Show All Branches & Tags Containing this Commit'
+				}"
 			>
 				<button
 					class="metadata-bar__branch-indicator"
@@ -674,7 +780,15 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		if (!commit) return nothing;
 
 		const message = this.formattedMessage ?? commit.message;
-		const index = message.indexOf(messageHeadlineSplitterToken);
+		// The splitter token is only injected during autolink linkification; the raw commit.message
+		// (graph commitLite / full fetch) carries a plain newline. Fall back to it so the
+		// headline/body split — and its font sizing — is stable before autolinks land.
+		let index = message.indexOf(messageHeadlineSplitterToken);
+		let bodyOffset = messageHeadlineSplitterToken.length;
+		if (index === -1) {
+			index = message.indexOf('\n');
+			bodyOffset = 1;
+		}
 
 		return html`<div class="message">
 			<div class="message-block">
@@ -707,7 +821,10 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 							<strong
 								><gl-markdown .markdown=${message.substring(0, index)} density="compact"></gl-markdown
 							></strong>
-							<gl-markdown .markdown=${message.substring(index + 3)} density="compact"></gl-markdown>
+							<gl-markdown
+								.markdown=${message.substring(index + bodyOffset)}
+								density="compact"
+							></gl-markdown>
 						</div>`,
 				)}
 			</div>
@@ -715,6 +832,11 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 	}
 
 	private renderEmbeddedAutolinks() {
+		// Drop the whole strip when autolinks are off — otherwise `computeAutolinkState` returns
+		// undefined and the chips fall through to the "Configure autolinks" promo, advertising a
+		// feature the user just disabled. Matches the compare and multi-commit panels.
+		if (!this.autolinksEnabled) return nothing;
+
 		return html`<div class="autolinks">${this.renderAutoLinksChips()}</div>`;
 	}
 
@@ -723,9 +845,12 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 
 		return html`<gl-ai-input
 			multiline
+			floating-footer
 			.busy=${this.explainBusy}
 			@gl-explain=${this.onExplainChanges}
-		></gl-ai-input>`;
+		>
+			<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
+		</gl-ai-input>`;
 	}
 
 	private onToggleReachability() {
@@ -765,17 +890,17 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 					<li>stashes in the <a href="command:gitlens.showStashesView">Stashes view</a></li>
 				</ul>
 
-				<p>Alternatively, show your work-in-progress, or search for or choose a commit</p>
+				<p>Alternatively, search for or choose a commit</p>
 
 				<p class="button-container">
 					<span class="button-group button-group--single">
-						<gl-button full data-action="wip">Overview</gl-button>
-					</span>
-				</p>
-				<p class="button-container">
-					<span class="button-group button-group--single">
-						<gl-button full data-action="pick-commit">Choose Commit...</gl-button>
-						<gl-button density="compact" data-action="search-commit" tooltip="Search for Commit"
+						<gl-button full @click=${() => this.dispatchEvent(new CustomEvent('gl-pick-commit'))}
+							>Choose Commit...</gl-button
+						>
+						<gl-button
+							density="compact"
+							tooltip="Search for Commit"
+							@click=${() => this.dispatchEvent(new CustomEvent('gl-search-commit'))}
 							><code-icon icon="search"></code-icon
 						></gl-button>
 					</span>
@@ -920,9 +1045,7 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 			${when(autolinks.length, () =>
 				autolinks.map(autolink => {
 					let name = autolink.description ?? autolink.title;
-					if (name === undefined) {
-						name = `Custom Autolink ${autolink.prefix}${autolink.id}`;
-					}
+					name ??= `Custom Autolink ${autolink.prefix}${autolink.id}`;
 					return html`<gl-autolink-chip
 						type="autolink"
 						name="${name}"
@@ -933,26 +1056,27 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 				}),
 			)}
 			${when(prs.length, () =>
-				prs.map(
-					pr =>
-						html`<gl-autolink-chip
-							type="pr"
-							name="${pr.title}"
-							url="${pr.url}"
-							identifier="#${pr.id}"
-							status="${pr.state}"
-							.date=${pr.updatedDate}
-							.dateFormat="${this.preferences?.dateFormat}"
-							.dateStyle="${this.preferences?.dateStyle}"
-							.author=${pr.author?.name}
-							?isDraft=${pr.isDraft}
-							.reviewDecision=${pr.reviewDecision}
-							.itemId=${pr.id}
-							.providerId=${pr.provider?.id}
-							details
-							openOnRemote
-						></gl-autolink-chip>`,
-				),
+				prs.map(pr => {
+					const prNumber = getPullRequestNumberFromUrl(pr.url) ?? pr.id;
+					return html`<gl-autolink-chip
+						type="pr"
+						name="${pr.title}"
+						url="${pr.url}"
+						identifier="#${prNumber}"
+						status="${pr.state}"
+						.date=${pr.updatedDate}
+						.dateFormat="${this.preferences?.dateFormat}"
+						.dateStyle="${this.preferences?.dateStyle}"
+						.author=${pr.author?.name}
+						?isDraft=${pr.isDraft}
+						.reviewDecision=${pr.reviewDecision}
+						.itemId=${prNumber}
+						.providerId=${pr.provider?.id}
+						details
+						?details-on-click=${this.detailsOnClick}
+						openOnRemote
+					></gl-autolink-chip>`;
+				}),
 			)}
 			${when(issues.length, () =>
 				issues.map(
@@ -990,40 +1114,46 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		if (autolinks.length === 0 && prs.length === 0 && issues.length === 0) return nothing;
 
 		return html`<div slot="popover">
-			${prs.length > 0
-				? html`<menu-label>Pull Requests</menu-label> ${prs.map(
-							pr =>
-								html`<menu-item href=${pr.url}>
-									<code-icon icon="git-pull-request"></code-icon> #${pr.id}${pr.title
-										? ` — ${pr.title}`
-										: ''}
-								</menu-item>`,
-						)}`
-				: nothing}
-			${issues.length > 0
-				? html`${prs.length > 0 ? html`<menu-divider></menu-divider>` : nothing}
-						<menu-label>Issues</menu-label>
-						${issues.map(
-							issue =>
-								html`<menu-item href=${issue.url}>
-									<code-icon icon="issues"></code-icon> #${issue.id}${issue.title
-										? ` — ${issue.title}`
-										: ''}
-								</menu-item>`,
-						)}`
-				: nothing}
-			${autolinks.length > 0
-				? html`${prs.length > 0 || issues.length > 0 ? html`<menu-divider></menu-divider>` : nothing}
-						<menu-label>Autolinks</menu-label>
-						${autolinks.map(
-							a =>
-								html`<menu-item href=${a.url}>
-									<code-icon icon="link"></code-icon> ${a.prefix}${a.id}${a.title
-										? ` — ${a.title}`
-										: ''}
-								</menu-item>`,
-						)}`
-				: nothing}
+			${
+				prs.length > 0
+					? html`<menu-label>Pull Requests</menu-label> ${prs.map(
+								pr =>
+									html`<menu-item href=${pr.url}>
+										<code-icon icon="git-pull-request"></code-icon> #${pr.id}${
+											pr.title ? ` — ${pr.title}` : ''
+										}
+									</menu-item>`,
+							)}`
+					: nothing
+			}
+			${
+				issues.length > 0
+					? html`${prs.length > 0 ? html`<menu-divider></menu-divider>` : nothing}
+							<menu-label>Issues</menu-label>
+							${issues.map(
+								issue =>
+									html`<menu-item href=${issue.url}>
+										<code-icon icon="issues"></code-icon> #${issue.id}${
+											issue.title ? ` — ${issue.title}` : ''
+										}
+									</menu-item>`,
+							)}`
+					: nothing
+			}
+			${
+				autolinks.length > 0
+					? html`${prs.length > 0 || issues.length > 0 ? html`<menu-divider></menu-divider>` : nothing}
+							<menu-label>Autolinks</menu-label>
+							${autolinks.map(
+								a =>
+									html`<menu-item href=${a.url}>
+										<code-icon icon="link"></code-icon> ${a.prefix}${a.id}${
+											a.title ? ` — ${a.title}` : ''
+										}
+									</menu-item>`,
+							)}`
+					: nothing
+			}
 		</div>`;
 	}
 
@@ -1037,16 +1167,18 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		return html`<div class="reachability-summary">
 				${this.renderReachabilityChip('branch', branches)} ${this.renderReachabilityChip('tag', tags)}
 			</div>
-			${this.reachability.partial
-				? html`<gl-tooltip content="Load All Branches &amp; Tags">
-						<button
-							class="reachability__load-all"
-							aria-label="Load all branches and tags"
-							@click=${() => this.dispatchEvent(new CustomEvent('load-reachability'))}
-						>
-							<code-icon icon="sync"></code-icon></button
-					></gl-tooltip>`
-				: nothing}`;
+			${
+				this.reachability.partial
+					? html`<gl-tooltip content="Load All Branches &amp; Tags">
+							<button
+								class="reachability__load-all"
+								aria-label="Load all branches and tags"
+								@click=${() => this.dispatchEvent(new CustomEvent('load-reachability'))}
+							>
+								<code-icon icon="sync"></code-icon></button
+						></gl-tooltip>`
+					: nothing
+			}`;
 	}
 
 	private renderReachabilityChip(type: 'branch' | 'tag', refs: NonNullable<typeof this.reachability>['refs']) {
@@ -1063,11 +1195,9 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 				icon="${icon}"
 				label="Commit on 1 ${refTypeLabel}: ${first.name}"
 				overlay="tooltip"
-				class="reachability-range-chip reachability-range-chip--${first.refType === 'branch'
-					? first.remote
-						? 'remote-branch'
-						: 'local-branch'
-					: 'tag'}${first.current ? ' reachability-range-chip--current' : ''}"
+				class="reachability-range-chip reachability-range-chip--${
+					first.refType === 'branch' ? (first.remote ? 'remote-branch' : 'local-branch') : 'tag'
+				}${first.current ? ' reachability-range-chip--current' : ''}"
 				><span class="reachability-range-chip__label">${first.name}</span></gl-action-chip
 			>`;
 		}
@@ -1078,10 +1208,9 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		return html`<gl-popover placement="bottom" trigger="hover focus click" class="reachability-range-chip-wrapper">
 			<gl-action-chip
 				slot="anchor"
-				class="reachability-range-chip reachability-range-chip--range reachability-range-chip--${type ===
-				'branch'
-					? 'local-branch'
-					: 'tag'}"
+				class="reachability-range-chip reachability-range-chip--range reachability-range-chip--${
+					type === 'branch' ? 'local-branch' : 'tag'
+				}"
 				><span class="reachability-range-chip__label">
 					<code-icon icon="${icon}"></code-icon>${first.name}
 					<span class="reachability-range-chip__ellipsis">...</span>
@@ -1161,6 +1290,12 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		return buildFolderContext(this.commit?.repoPath, folder);
 	}
 
+	/** Worktree reachability is fetched off the critical path, so it can land after the files do — without
+	 *  this the rows' baked contexts would keep the pre-enrichment answer and never offer "(Worktree)". */
+	protected override get fileContextRevision(): unknown {
+		return this.commit?.reachableFromOtherWorktrees === true;
+	}
+
 	override getFileContext(file: File): string | undefined {
 		if (!this.commit) return undefined;
 
@@ -1169,7 +1304,7 @@ export class GlDetailsCommitPanel extends GlDetailsBase {
 		const commit = this.commit;
 		const isStash = commit.stashNumber != null;
 		const submodule = file.submodule != null ? '+submodule' : '';
-		// Reachable from a sibling worktree → offer "Open Worktree File" (committed files only)
+		// Reachable from a sibling worktree → offer the "(Worktree)" file actions (committed files only)
 		const worktree = !isStash && commit.reachableFromOtherWorktrees ? '+worktree' : '';
 
 		// The uncommitted pseudo-commit isn't a real commit — give its files working-tree context so the

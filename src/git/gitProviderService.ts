@@ -326,6 +326,14 @@ export class GitProviderService implements UnifiedDisposable {
 		this._disposable = fromDisposables(
 			this._gitService,
 			this._cache,
+			// Drive the cache's status clock from the ONE point every watched repo's changes flow through (the watch
+			// session), so a single edit advances it exactly once regardless of how many subscribers (an open repo's
+			// own lease + a service-level `watch()`) share the ref-counted session — and, because the session fires
+			// these BEFORE notifying its subscribers, always before any consumer can read status.
+			// Forced changes (`forcedRepositoryChanges`) bypass the session, so the provider's own repo handler
+			// advances those instead — `fireChange` accepts `force` only for those, so the two sets are disjoint.
+			this._watchService.onDidChangeWorkingTree(repoPath => this._cache.onWorkingTreeChanged(repoPath)),
+			this._watchService.onDidChangeRepository(e => this._cache.onRepositoryChanged(e.repoPath, e.changes)),
 			this._repositoryInitWatcher,
 			this._repositoryInitWatcher.onDidCreate(e => {
 				const f = workspace.getWorkspaceFolder(Uri.file(e.path));
@@ -1029,7 +1037,7 @@ export class GitProviderService implements UnifiedDisposable {
 	private async clearRepoVisibilityCache(keys?: string[]): Promise<void> {
 		if (keys == null) {
 			this._repoVisibilityCache = undefined;
-			void this.container.storage.delete('repoVisibility');
+			await this.container.storage.delete('repoVisibility');
 		} else {
 			keys?.forEach(key => this._repoVisibilityCache?.delete(key));
 
@@ -1564,12 +1572,12 @@ export class GitProviderService implements UnifiedDisposable {
 		);
 	}
 
-	@debug({ args: (uri, document) => ({ uri: uri, document: document?.isDirty }) })
 	/**
 	 * Returns the blame of a file
 	 * @param uri Uri of the file to blame
 	 * @param document Optional TextDocument to blame the contents of if dirty
 	 */
+	@debug({ args: (uri, document) => ({ uri: uri, document: document?.isDirty }) })
 	async getBlame(uri: GitUri, document?: TextDocument | undefined): Promise<GitBlame | undefined> {
 		// Check for snapshot first — handles both dirty and recently-saved clean documents.
 		// After auto-save, the document is clean but the snapshot holds the correct blame,
@@ -1653,12 +1661,12 @@ export class GitProviderService implements UnifiedDisposable {
 		}
 	}
 
-	@debug({ args: uri => ({ uri: uri, contents: '<contents>' }) })
 	/**
 	 * Returns the blame of a file, using the editor contents (for dirty editors)
 	 * @param uri Uri of the file to blame
 	 * @param contents Contents from the editor to use
 	 */
+	@debug({ args: uri => ({ uri: uri, contents: '<contents>' }) })
 	async getBlameContents(uri: GitUri, contents: string): Promise<GitBlame | undefined> {
 		const { provider } = this.getProvider(uri);
 		if (!(await provider.isTracked(uri))) return undefined;
@@ -1675,7 +1683,6 @@ export class GitProviderService implements UnifiedDisposable {
 		}
 	}
 
-	@debug({ args: (uri, editorLine, document) => ({ uri: uri, editorLine: editorLine, document: document?.isDirty }) })
 	/**
 	 * Returns the blame of a single line
 	 * @param uri Uri of the file to blame
@@ -1683,6 +1690,7 @@ export class GitProviderService implements UnifiedDisposable {
 	 * @param document Optional TextDocument to blame the contents of if dirty
 	 * @param options.forceSingleLine Forces blame to be for the single line (rather than the whole file)
 	 */
+	@debug({ args: (uri, editorLine, document) => ({ uri: uri, editorLine: editorLine, document: document?.isDirty }) })
 	async getBlameForLine(
 		uri: GitUri,
 		editorLine: number,
@@ -1758,7 +1766,6 @@ export class GitProviderService implements UnifiedDisposable {
 		}
 	}
 
-	@debug({ args: (uri, editorLine) => ({ uri: uri, editorLine: editorLine, contents: '<contents>' }) })
 	/**
 	 * Returns the blame of a single line, using the editor contents (for dirty editors)
 	 * @param uri Uri of the file to blame
@@ -1766,6 +1773,7 @@ export class GitProviderService implements UnifiedDisposable {
 	 * @param contents Contents from the editor to use
 	 * @param options.forceSingleLine Forces blame to be for the single line (rather than the whole file)
 	 */
+	@debug({ args: (uri, editorLine) => ({ uri: uri, editorLine: editorLine, contents: '<contents>' }) })
 	async getBlameForLineContents(
 		uri: GitUri,
 		editorLine: number,
@@ -1966,13 +1974,13 @@ export class GitProviderService implements UnifiedDisposable {
 		return commit;
 	}
 
-	@debug()
 	/**
 	 * Returns a file diff between two commits
 	 * @param uri Uri of the file to diff
 	 * @param ref1 Commit to diff from
 	 * @param ref2 Commit to diff to
 	 */
+	@debug()
 	async getDiffForFile(
 		uri: GitUri,
 		ref1: string | undefined,
@@ -1986,13 +1994,13 @@ export class GitProviderService implements UnifiedDisposable {
 		return diff.getDiffForFile(path, ref1, ref2, { encoding: encoding });
 	}
 
-	@debug({ args: (uri, ref) => ({ uri: uri, ref: ref, contents: '<contents>' }) })
 	/**
 	 * Returns a file diff between a commit and the specified contents
 	 * @param uri Uri of the file to diff
 	 * @param ref Commit to diff from
 	 * @param contents Contents to use for the diff
 	 */
+	@debug({ args: (uri, ref) => ({ uri: uri, ref: ref, contents: '<contents>' }) })
 	async getDiffForFileContents(uri: GitUri, ref: string, contents: string): Promise<ParsedGitDiffHunks | undefined> {
 		const [path, root] = splitPath(uri.fsPath, uri.repoPath);
 		const diff = this._gitService.forRepo(root)?.diff;
@@ -2002,7 +2010,6 @@ export class GitProviderService implements UnifiedDisposable {
 		return diff.getDiffForFileContents(path, ref, contents, { encoding: encoding });
 	}
 
-	@debug()
 	/**
 	 * Returns a line diff between two commits
 	 * @param uri Uri of the file to diff
@@ -2010,6 +2017,7 @@ export class GitProviderService implements UnifiedDisposable {
 	 * @param ref1 Commit to diff from
 	 * @param ref2 Commit to diff to
 	 */
+	@debug()
 	async getDiffForLine(
 		uri: GitUri,
 		editorLine: number,
@@ -2030,9 +2038,9 @@ export class GitProviderService implements UnifiedDisposable {
 	}
 
 	getBestRepository(): GlRepository | undefined;
-	// eslint-disable-next-line @typescript-eslint/unified-signatures
+	// oxlint-disable-next-line typescript/unified-signatures
 	getBestRepository(uri?: Uri, editor?: TextEditor): GlRepository | undefined;
-	// eslint-disable-next-line @typescript-eslint/unified-signatures
+	// oxlint-disable-next-line typescript/unified-signatures
 	getBestRepository(editor?: TextEditor): GlRepository | undefined;
 	@debug({ exit: true })
 	getBestRepository(editorOrUri?: TextEditor | Uri, editor?: TextEditor): GlRepository | undefined {
@@ -2052,9 +2060,9 @@ export class GitProviderService implements UnifiedDisposable {
 	}
 
 	getBestRepositoryOrFirst(): GlRepository | undefined;
-	// eslint-disable-next-line @typescript-eslint/unified-signatures
+	// oxlint-disable-next-line typescript/unified-signatures
 	getBestRepositoryOrFirst(uri?: Uri, editor?: TextEditor): GlRepository | undefined;
-	// eslint-disable-next-line @typescript-eslint/unified-signatures
+	// oxlint-disable-next-line typescript/unified-signatures
 	getBestRepositoryOrFirst(editor?: TextEditor): GlRepository | undefined;
 	@debug({ exit: true })
 	getBestRepositoryOrFirst(editorOrUri?: TextEditor | Uri, editor?: TextEditor): GlRepository | undefined {

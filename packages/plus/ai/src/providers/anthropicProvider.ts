@@ -1,11 +1,27 @@
 import { anthropicProviderDescriptor as provider } from '../constants.js';
 import { AIError, AIErrorReason } from '../errors.js';
 import type { AIActionType, AIModel } from '../models/model.js';
+import type { AIChatMessage, AIChatMessageRole, AIResponseFormat, AIToolDefinition } from '../models/provider.js';
 import { getReducedMaxInputTokens } from '../utils/ai.utils.js';
+import type { ChatCompletionRequest } from './openAICompatibleProviderBase.js';
 import { OpenAICompatibleProviderBase } from './openAICompatibleProviderBase.js';
 
 type AnthropicModel = AIModel<typeof provider.id>;
 const models: AnthropicModel[] = [
+	{
+		id: 'claude-opus-4-8',
+		name: 'Claude Opus 4.8',
+		maxTokens: { input: 1048576, output: 128000 },
+		provider: provider,
+		temperature: null, // Sampling params removed on Opus 4.7+/Sonnet 5 (rejected with 400)
+	},
+	{
+		id: 'claude-sonnet-5',
+		name: 'Claude Sonnet 5',
+		maxTokens: { input: 1048576, output: 128000 },
+		provider: provider,
+		temperature: null, // Sampling params removed on Opus 4.7+/Sonnet 5 (rejected with 400)
+	},
 	{
 		id: 'claude-haiku-4-5',
 		name: 'Claude Haiku 4.5',
@@ -21,15 +37,22 @@ const models: AnthropicModel[] = [
 		hidden: true,
 	},
 	{
+		id: 'claude-opus-4-7',
+		name: 'Claude Opus 4.7',
+		maxTokens: { input: 1048576, output: 128000 },
+		provider: provider,
+		temperature: null, // Sampling params removed on Opus 4.7+/Sonnet 5 (rejected with 400)
+	},
+	{
 		id: 'claude-sonnet-4-6',
 		name: 'Claude Sonnet 4.6',
-		maxTokens: { input: 204800, output: 64000 },
+		maxTokens: { input: 1048576, output: 64000 },
 		provider: provider,
 	},
 	{
 		id: 'claude-opus-4-6',
 		name: 'Claude Opus 4.6',
-		maxTokens: { input: 204800, output: 128000 },
+		maxTokens: { input: 1048576, output: 128000 },
 		provider: provider,
 	},
 	{
@@ -37,6 +60,7 @@ const models: AnthropicModel[] = [
 		name: 'Claude Sonnet 4.5',
 		maxTokens: { input: 204800, output: 64000 },
 		provider: provider,
+		hidden: true,
 	},
 	{
 		id: 'claude-sonnet-4-5-20250929',
@@ -50,6 +74,7 @@ const models: AnthropicModel[] = [
 		name: 'Claude Opus 4.5',
 		maxTokens: { input: 204800, output: 32000 },
 		provider: provider,
+		hidden: true,
 	},
 	{
 		id: 'claude-opus-4-5-20251101',
@@ -64,6 +89,8 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 32000 },
 		provider: provider,
 		hidden: true,
+		// Structured outputs require the 4.5 generation or newer (this and every entry below)
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-opus-4-1-20250805',
@@ -71,6 +98,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 32000 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-opus-4-0',
@@ -78,6 +106,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 32000 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-opus-4-20250514',
@@ -85,12 +114,15 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 32000 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-sonnet-4-0',
 		name: 'Claude Sonnet 4',
 		maxTokens: { input: 204800, output: 64000 },
 		provider: provider,
+		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-sonnet-4-20250514',
@@ -98,6 +130,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 64000 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-7-sonnet-latest',
@@ -105,6 +138,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 64000 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-7-sonnet-20250219',
@@ -112,6 +146,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 64000 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-5-sonnet-latest',
@@ -119,6 +154,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-5-sonnet-20241022',
@@ -126,6 +162,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-5-sonnet-20240620',
@@ -133,6 +170,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-5-haiku-latest',
@@ -140,6 +178,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-5-haiku-20241022',
@@ -147,6 +186,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 8192 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-opus-latest',
@@ -154,6 +194,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-opus-20240229',
@@ -161,6 +202,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-sonnet-latest',
@@ -168,6 +210,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-sonnet-20240229',
@@ -175,6 +218,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-haiku-latest',
@@ -182,6 +226,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-3-haiku-20240307',
@@ -189,6 +234,7 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 	{
 		id: 'claude-2.1',
@@ -196,12 +242,14 @@ const models: AnthropicModel[] = [
 		maxTokens: { input: 204800, output: 4096 },
 		provider: provider,
 		hidden: true,
+		supportsStructuredOutputs: false,
 	},
 ];
 
 export class AnthropicProvider extends OpenAICompatibleProviderBase<typeof provider.id> {
 	readonly id = provider.id;
 	readonly name = provider.name;
+	readonly supportsTools = true;
 	protected readonly descriptor = provider;
 	protected readonly config = {
 		keyUrl: 'https://console.anthropic.com/account/keys',
@@ -214,6 +262,16 @@ export class AnthropicProvider extends OpenAICompatibleProviderBase<typeof provi
 
 	protected getUrl(_model: AIModel<typeof provider.id>): string {
 		return 'https://api.anthropic.com/v1/messages';
+	}
+
+	// Anthropic uses `output_config.format` (no name/strict — enforcement is unconditional) and
+	// rejects unknown fields, so this must fully replace the base's `response_format` translation
+	protected override applyResponseFormat(
+		request: ChatCompletionRequest,
+		_model: AIModel<typeof provider.id>,
+		responseFormat: AIResponseFormat,
+	): void {
+		request.output_config = { format: { type: 'json_schema', schema: responseFormat.schema } };
 	}
 
 	protected override getHeaders<TAction extends AIActionType>(
@@ -245,17 +303,40 @@ export class AnthropicProvider extends OpenAICompatibleProviderBase<typeof provi
 		return super.fetchCore(action, model, apiKey, request, signal);
 	}
 
+	protected override extractSystemPrompt(messages: AIChatMessage<AIChatMessageRole>[]): {
+		messages: AIChatMessage<AIChatMessageRole>[];
+		system?: string;
+	} {
+		// Anthropic's Messages API rejects `system`-role entries in `messages` and requires the initial
+		// system prompt in the top-level `system` field, so pull any such messages out.
+		const systemMessages = messages.filter(m => m.role === 'system');
+		if (!systemMessages.length) return { messages: messages };
+
+		return {
+			system: systemMessages.map(m => m.content).join('\n\n'),
+			messages: messages.filter(m => m.role !== 'system'),
+		};
+	}
+
 	protected override async handleFetchFailure<TAction extends AIActionType>(
 		rsp: Response,
 		action: TAction,
 		model: AIModel<typeof provider.id>,
 		retries: number,
 		maxInputTokens: number,
-	): Promise<{ retry: true; maxInputTokens: number }> {
+		body?: string,
+		sentTools?: boolean,
+	): Promise<{ retry: true; maxInputTokens: number; withoutTools?: boolean }> {
 		if (rsp.status !== 404 && rsp.status !== 429) {
+			// Read into `body` (not the response) so `super.handleFetchFailure` below can still
+			// use it; consuming the response here would lose Anthropic's error for the fallback.
+			body ??= await rsp
+				.clone()
+				.text()
+				.catch(() => undefined);
 			let json;
 			try {
-				json = (await rsp.json()) as AnthropicError | undefined;
+				json = (body != null ? JSON.parse(body) : undefined) as AnthropicError | undefined;
 			} catch {}
 
 			debugger;
@@ -288,8 +369,62 @@ export class AnthropicProvider extends OpenAICompatibleProviderBase<typeof provi
 			}
 		}
 
-		return super.handleFetchFailure(rsp, action, model, retries, maxInputTokens);
+		return super.handleFetchFailure(rsp, action, model, retries, maxInputTokens, body, sentTools);
 	}
+
+	protected override serializeTools(tools: readonly AIToolDefinition[]): { tools: unknown[] } {
+		// Anthropic names the schema field `input_schema` and has no `function` envelope.
+		return {
+			tools: tools.map(t => ({ name: t.name, description: t.description, input_schema: t.parameters })),
+		};
+	}
+
+	protected override serializeMessages(messages: AIChatMessage<AIChatMessageRole>[]): unknown[] {
+		const out: unknown[] = [];
+
+		for (const m of messages) {
+			// Anthropic carries tool results as `tool_result` blocks on a *user* message, not a
+			// `tool`-role message. Consecutive results are batched into one user turn, matching how the
+			// API expects a multi-tool-call round to be answered.
+			if (m.role === 'tool') {
+				// See the base provider: a result with no call id can't be addressed, so it goes as plain
+				// text instead of a `tool_use_id: undefined` block the API rejects.
+				if (m.toolCallId == null) {
+					out.push({ role: 'user', content: m.content });
+					continue;
+				}
+
+				const block = { type: 'tool_result', tool_use_id: m.toolCallId, content: m.content };
+				const last = out.at(-1) as { role?: string; content?: unknown[] } | undefined;
+				if (last?.role === 'user' && Array.isArray(last.content) && isToolResultBlocks(last.content)) {
+					last.content.push(block);
+				} else {
+					out.push({ role: 'user', content: [block] });
+				}
+				continue;
+			}
+
+			if (m.role === 'assistant' && m.toolCalls?.length) {
+				out.push({
+					role: 'assistant',
+					content: [
+						...(m.content ? [{ type: 'text', text: m.content }] : []),
+						...m.toolCalls.map(c => ({ type: 'tool_use', id: c.id, name: c.name, input: c.args })),
+					],
+				});
+				continue;
+			}
+
+			out.push({ role: m.role, content: m.content });
+		}
+
+		return out;
+	}
+}
+
+/** Whether an assembled user message's content is a batch of `tool_result` blocks we can append to. */
+function isToolResultBlocks(content: unknown[]): content is { type: string }[] {
+	return content.every(b => (b as { type?: string })?.type === 'tool_result');
 }
 
 interface AnthropicError {

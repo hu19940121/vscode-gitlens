@@ -1,6 +1,5 @@
-import type { GraphRefOptData } from '@gitkraken/gitkraken-components';
-import { consume } from '@lit/context';
 import { SignalWatcher } from '@lit-labs/signals';
+import { consume } from '@lit/context';
 import type { PropertyValues } from 'lit';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
@@ -12,7 +11,10 @@ import type { RepositoryShape } from '../../../../../git/models/repositoryShape.
 import type {
 	DidGetSidebarDataParams,
 	GraphExcludeTypes,
+	GraphRefOptData,
+	GraphScopeOrigin,
 	GraphSidebarBranch,
+	GraphSidebarPullRequest,
 	UpdateGraphConfigurationParams,
 } from '../../../../plus/graph/protocol.js';
 import {
@@ -22,9 +24,18 @@ import {
 	UpdateIncludedRefsCommand,
 } from '../../../../plus/graph/protocol.js';
 import type { GlPopover } from '../../../shared/components/overlays/popover.js';
-import type { TreeItemSelectionDetail, TreeModel } from '../../../shared/components/tree/base.js';
+import type { TreeItemDecoration, TreeItemSelectionDetail, TreeModel } from '../../../shared/components/tree/base.js';
+import type { GlTreeView } from '../../../shared/components/tree/tree-view.js';
 import { ipcContext } from '../../../shared/contexts/ipc.js';
+import type { ResourceStatus } from '../../../shared/state/resource.js';
 import { graphStateContext } from '../context.js';
+import { branchTreeIcon, remoteProviderFolderIcon, remoteProviderIconsByName } from '../sidebar/branchActions.utils.js';
+import {
+	getPullRequestNumberFromQuery,
+	parsePullRequestFilterTerms,
+	withSearchedPullRequest,
+} from '../sidebar/pullRequestFilter.utils.js';
+import { groupPullRequestsByStack } from '../sidebar/pullRequestStacks.utils.js';
 import { sidebarActionsContext } from '../sidebar/sidebarContext.js';
 import type { SidebarActions } from '../sidebar/sidebarState.js';
 import { graphScopePopoverStyles } from './gl-graph-scope-popover.css.js';
@@ -95,6 +106,31 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 	};
 	private _branchesFetchAttempts = 0;
 	@state() private _branchesFetchExhausted = false;
+	private _pendingFocusBranchFilter = false;
+
+	@state()
+	private _focusPrExpanded = false;
+
+	private _lastPullRequestsData: DidGetSidebarDataParams | undefined;
+	private _prFetchRetryTimer: ReturnType<typeof setTimeout> | undefined;
+	private _prFetchAttempts = 0;
+	@state() private _prFetchExhausted = false;
+	/** Memo for the PR list model, mirroring `_branchModelCache` — renders fire on every unrelated
+	 *  checkbox toggle, so an unchanged list must not rebuild its model. */
+	private _prModelCache?: {
+		prs: GraphSidebarPullRequest[];
+		scopedBranchName: string | undefined;
+		model: TreeModel<BranchTreeContext>[];
+	};
+
+	/** Live filter text for the PR pane, so the pane can offer to look up a PR the list doesn't hold. */
+	@state() private _prFilterQuery = '';
+	/** A PR found by the lookup fallback, merged into the list so it renders and focuses like any row. */
+	@state() private _prSearchResult: GraphSidebarPullRequest | undefined;
+	/** Repo the search result belongs to — the popover can outlive a repo switch, and a pull request
+	 *  found for one repo names a ref that may not exist in another. */
+	private _prSearchRepoId: string | undefined;
+	@state() private _prSearchState: 'idle' | 'searching' | 'notFound' = 'idle';
 
 	/** Maximum poll attempts (~750ms total at 250ms cadence) before showing the unable-to-load
 	 *  state. Bounded so a stuck sidebar service can't pin the popover on "Loading…" forever. */
@@ -108,6 +144,9 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 			const resource = this._sidebarActions?.state.panels.branches;
 			if (resource != null && resource.value.get() == null && !resource.loading.get()) {
 				this.tryFetchBranches();
+			}
+			if (this._pendingFocusBranchFilter) {
+				this.tryFocusBranchFilter();
 			}
 		}
 
@@ -157,7 +196,7 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 				}
 				break;
 			case 'current':
-				icon = 'target';
+				icon = 'git-branch';
 				label = headName ?? 'Current Branch';
 				tooltip = 'Showing Current Branch Only';
 				break;
@@ -176,11 +215,25 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 				label = 'Agents';
 				tooltip = 'Showing Agent Branches Only';
 				break;
-			case 'scoped':
-				icon = 'eye';
-				label = scopedName ?? 'Scoped';
-				tooltip = `Showing ${scopedName ?? 'Specific Branch'} Only`;
+			case 'scoped': {
+				// Every scope lands on a branch, but the branch isn't always what was picked — a focused
+				// pull request or stack names itself here instead of whichever branch it resolved to.
+				const origin = this.graphState.scope?.origin;
+				if (origin?.kind === 'pullRequest') {
+					icon = 'git-pull-request';
+					label = `#${origin.number}`;
+					tooltip = `Showing Pull Request #${origin.number} Only`;
+				} else if (origin?.kind === 'stack') {
+					icon = 'layers';
+					label = `Stack #${origin.number}`;
+					tooltip = `Showing Stack #${origin.number} of ${origin.size} Pull Requests Only`;
+				} else {
+					icon = 'target';
+					label = scopedName ?? 'Scoped';
+					tooltip = `Showing ${scopedName ?? 'Specific Branch'} Only`;
+				}
 				break;
+			}
 		}
 
 		const filtered = this.isFiltered;
@@ -192,7 +245,7 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 			placement="right-start"
 			trigger="click"
 			?arrow=${false}
-			distance=${4}
+			.distance=${4}
 			auto-size-vertical
 			resize="bottom right"
 			@gl-popover-show=${this.handleModePopoverShow}
@@ -231,7 +284,7 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 			</gl-tooltip>
 			<div slot="content" class="mode-popover__content" role="menu" @keydown=${this.handleContentKeydown}>
 				${this.renderModeMenuItem('all', 'repo', 'All Branches', undefined, mode, this.repo?.virtual ?? false)}
-				${this.renderModeMenuItem('current', 'target', 'Current Branch', 'Follows HEAD', mode, false)}
+				${this.renderModeMenuItem('current', 'git-branch', 'Current Branch', 'Follows HEAD', mode, false)}
 				${this.renderModeMenuItem(
 					'smart',
 					'wand',
@@ -256,7 +309,7 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 					mode,
 					this.repo?.virtual ?? false,
 				)}
-				${this.renderFocusBranchRow(mode)}
+				${this.renderFocusBranchRow(mode)} ${this.renderFocusPrRow()}
 				<menu-divider></menu-divider>
 				${this.renderGraphFiltersSection()}
 			</div>
@@ -370,37 +423,44 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 				<code-icon icon=${icon}></code-icon>
 			</span>
 			<span class="mode-menu-item__label">${label}</span>
-			${description != null
-				? html`<gl-tooltip placement="right" content=${description}>
-						<code-icon class="mode-menu-item__info" icon="info"></code-icon>
-					</gl-tooltip>`
-				: nothing}
+			${
+				description != null
+					? html`<gl-tooltip placement="right" content=${description}>
+							<code-icon class="mode-menu-item__info" icon="info"></code-icon>
+						</gl-tooltip>`
+					: nothing
+			}
 		</menu-item>`;
 	}
 
 	private renderFocusBranchRow(currentMode: string) {
-		const isCurrent = currentMode === 'scoped';
-		const scopedName = this.graphState.scope?.branchName;
+		// A scope reached through a pull request or a stack belongs to the row below: it still resolves to a
+		// branch, but naming that branch here would mark two rows as the live scope and leave the user to
+		// work out which one they actually picked.
+		const isCurrent = currentMode === 'scoped' && this.graphState.scope?.origin == null;
+		const scopedName = isCurrent ? this.graphState.scope?.branchName : undefined;
 		const expanded = this._focusBranchExpanded;
 
 		return html`<menu-item
-				class="mode-menu-item mode-menu-item--focus ${isCurrent ? 'mode-menu-item--current' : ''} ${expanded
-					? 'mode-menu-item--expanded'
-					: ''}"
+				class="mode-menu-item mode-menu-item--focus ${isCurrent ? 'mode-menu-item--current' : ''} ${
+					expanded ? 'mode-menu-item--expanded' : ''
+				}"
 				aria-expanded=${expanded ? 'true' : 'false'}
 				@click=${this.handleFocusBranchRowClick}
 			>
 				<span class="mode-menu-item__icon">
-					<code-icon icon="eye"></code-icon>
+					<code-icon icon="target"></code-icon>
 				</span>
 				<span class="mode-menu-item__label">Focus Branch</span>
-				${scopedName != null
-					? html`<gl-branch-name
-							class="mode-menu-item__branch"
-							.name=${scopedName}
-							.size=${11}
-						></gl-branch-name>`
-					: nothing}
+				${
+					scopedName != null
+						? html`<gl-branch-name
+								class="mode-menu-item__branch"
+								.name=${scopedName}
+								.size=${11}
+							></gl-branch-name>`
+						: nothing
+				}
 				<code-icon
 					class="mode-menu-item__chevron"
 					icon=${expanded ? 'chevron-down' : 'chevron-right'}
@@ -428,6 +488,145 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 		const layout = this._branchLayoutOverride ?? data?.layout ?? 'list';
 
 		return html`<div class="mode-popover__focus-pane">${this.renderScopeBranchList(data, status, layout)}</div>`;
+	}
+
+	private renderFocusPrRow() {
+		const expanded = this._focusPrExpanded;
+
+		// A stack is more pull requests than it is branches, so its readout belongs on this row rather than
+		// the branch one — even though the scope it produces focuses a branch like any other.
+		const origin = this.graphState.scope?.origin;
+
+		return html`<menu-item
+				class="mode-menu-item mode-menu-item--focus ${
+					origin != null ? 'mode-menu-item--current' : ''
+				} ${expanded ? 'mode-menu-item--expanded' : ''}"
+				aria-expanded=${expanded ? 'true' : 'false'}
+				@click=${this.handleFocusPrRowClick}
+			>
+				<span class="mode-menu-item__icon">
+					<code-icon icon="git-pull-request"></code-icon>
+				</span>
+				<span class="mode-menu-item__label">Focus Pull Request</span>
+				${
+					origin?.kind === 'stack'
+						? html`<span class="mode-menu-item__branch"
+								><code-icon icon="layers" size="11"></code-icon> Stack #${origin.number}</span
+							>`
+						: origin?.kind === 'pullRequest'
+							? html`<span class="mode-menu-item__branch">#${origin.number}</span>`
+							: nothing
+				}
+				<code-icon
+					class="mode-menu-item__chevron"
+					icon=${expanded ? 'chevron-down' : 'chevron-right'}
+					aria-hidden="true"
+				></code-icon>
+			</menu-item>
+			${when(expanded, () => this.renderFocusPrPane())}`;
+	}
+
+	private renderFocusPrPane() {
+		const resource = this._sidebarActions?.state.panels.pullRequests;
+		const freshData = resource?.value.get();
+		const status = resource?.status.get() ?? 'idle';
+
+		// Same invalidation-flicker guard the branches pane uses — a sidebar invalidation transiently
+		// clears the resource value, and without this the list would blank mid-interaction.
+		if (freshData != null) {
+			this._lastPullRequestsData = freshData;
+		}
+		const data = freshData ?? this._lastPullRequestsData;
+
+		return html`<div class="mode-popover__focus-pane">${this.renderScopePrList(data, status)}</div>`;
+	}
+
+	private renderScopePrList(data: DidGetSidebarDataParams | undefined, status: ResourceStatus) {
+		if (data?.panel !== 'pullRequests') {
+			if (status === 'error' || this._prFetchExhausted) {
+				return html`<div class="mode-popover__empty mode-popover__empty--retry">
+					<span>Unable to load pull requests</span>
+					<gl-button
+						appearance="toolbar"
+						density="compact"
+						tooltip="Retry"
+						@mousedown=${this.preventMouseDefault}
+						@click=${this.handleRetryPullRequests}
+					>
+						<code-icon icon="refresh"></code-icon>
+					</gl-button>
+				</div>`;
+			}
+			return html`<div class="mode-popover__empty">Loading pull requests…</div>`;
+		}
+
+		const scopedBranchName = this.graphState.scope?.branchName;
+		// A looked-up PR joins the list so it renders and focuses like any other row — the active filter
+		// terms reduce to its number, which its `filterText` carries, so it survives the filter.
+		const searched = this._prSearchRepoId === this.repo?.id ? this._prSearchResult : undefined;
+		const items = withSearchedPullRequest(data.items, searched);
+		const model = this.getPullRequestModel(items, scopedBranchName);
+		if (model.length === 0 && this._prFilterQuery === '') {
+			return html`<div class="mode-popover__empty">No pull requests available</div>`;
+		}
+
+		return html`<div class="mode-popover__branches">
+			<gl-tree-view
+				class="mode-popover__tree"
+				.model=${model}
+				.filterTermsParser=${parsePullRequestFilterTerms}
+				filterable
+				tooltip-anchor-right
+				filter-placeholder="Filter or paste a pull request URL..."
+				aria-label="Pull Requests"
+				@gl-tree-filter-changed=${this.handlePrFilterChanged}
+				@gl-tree-generated-item-selected=${this.handleModeTreeItemSelected}
+			></gl-tree-view>
+			${this.renderPrSearchFallback(items)}
+		</div>`;
+	}
+
+	/**
+	 * Offer to fetch a PR the loaded list doesn't hold. The panel lists only *open* PRs for this repo,
+	 * so a pasted URL for a merged, closed, or older one finds nothing until we go ask — mirroring how
+	 * Launchpad falls back to `getPullRequest` when its query names a PR outside the loaded set.
+	 */
+	private renderPrSearchFallback(items: GraphSidebarPullRequest[]) {
+		const number = getPullRequestNumberFromQuery(this._prFilterQuery);
+		if (number == null) return nothing;
+
+		// This list only holds pull requests that resolve to a ref the graph can scope to, so a found
+		// one from a fork never appears in it — say so rather than leaving an empty pane behind.
+		const found = items.find(pr => pr.number === number);
+		if (found != null) {
+			return found.focus != null
+				? nothing
+				: html`<div class="mode-popover__empty">
+						Pull request #${number} is from a fork — its branch isn't in this repository
+					</div>`;
+		}
+
+		if (this._prSearchState === 'searching') {
+			return html`<div class="mode-popover__empty">
+				<code-icon icon="loading" modifier="spin"></code-icon> Searching for #${number}…
+			</div>`;
+		}
+		if (this._prSearchState === 'notFound') {
+			return html`<div class="mode-popover__empty">No pull request #${number} in this repository</div>`;
+		}
+
+		return html`<div class="mode-popover__empty mode-popover__empty--retry">
+			<span>Not in open pull requests</span>
+			<gl-button
+				appearance="toolbar"
+				density="compact"
+				tooltip="Search for #${number}"
+				@mousedown=${this.preventMouseDefault}
+				@click=${this.handleSearchPullRequest}
+			>
+				<code-icon icon="search"></code-icon>
+			</gl-button>
+		</div>`;
 	}
 
 	private renderScopeBranchList(
@@ -517,19 +716,121 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 	};
 
 	private handleModeTreeItemSelected = (e: CustomEvent<TreeItemSelectionDetail>) => {
-		const context = (e.detail as { context?: [branchName: string, upstreamName: string | undefined] }).context;
+		const context = (e.detail as { context?: BranchTreeContext }).context;
 		const branchName = context?.[0];
 		// Skip folder nodes (branch name is empty) — let the tree handle expansion, don't close the popover.
 		if (branchName == null || branchName === '') return;
 
-		this.handleScopeToBranch(branchName, context?.[1]);
+		this.handleScopeToBranch(branchName, context?.[1], context?.[2], context?.[3], context?.[4]);
 	};
 
 	private handleFocusBranchRowClick = (e: Event) => {
 		e.stopPropagation();
 		e.preventDefault();
 		this._focusBranchExpanded = !this._focusBranchExpanded;
+		// Collapsing cancels any pending auto-focus so it can't fire on a later re-expand.
+		if (!this._focusBranchExpanded) {
+			this._pendingFocusBranchFilter = false;
+		}
 	};
+
+	private handleFocusPrRowClick = (e: Event) => {
+		e.stopPropagation();
+		e.preventDefault();
+		this._focusPrExpanded = !this._focusPrExpanded;
+		if (this._focusPrExpanded) {
+			this.tryFetchPullRequests();
+		}
+	};
+
+	private tryFetchPullRequests = () => {
+		const resource = this._sidebarActions?.state.panels.pullRequests;
+		// Same skip-when-loaded-or-in-flight rule as branches: re-fetching mid-flight would cancel and
+		// restart the request (createResource's cancelPrevious).
+		if (resource == null || resource.value.get() != null || resource.loading.get()) {
+			this.clearPullRequestsFetchRetry();
+			return;
+		}
+
+		this._sidebarActions?.fetchPanel('pullRequests');
+		if (resource.status.get() === 'idle') {
+			this._prFetchAttempts++;
+			if (this._prFetchAttempts >= GlGraphScopePopover.maxBranchesFetchAttempts) {
+				this.clearPullRequestsFetchRetry();
+				this._prFetchExhausted = true;
+				return;
+			}
+
+			if (this._prFetchRetryTimer != null) {
+				clearTimeout(this._prFetchRetryTimer);
+			}
+			this._prFetchRetryTimer = setTimeout(this.tryFetchPullRequests, 250);
+		}
+	};
+
+	private clearPullRequestsFetchRetry(): void {
+		if (this._prFetchRetryTimer != null) {
+			clearTimeout(this._prFetchRetryTimer);
+			this._prFetchRetryTimer = undefined;
+		}
+		this._prFetchAttempts = 0;
+		this._prFetchExhausted = false;
+	}
+
+	private handlePrFilterChanged = (e: CustomEvent<string>) => {
+		e.stopPropagation();
+		this._prFilterQuery = e.detail;
+		// A new query invalidates the previous lookup's verdict, but the found PR itself is kept — it
+		// stays a legitimate row, and dropping it would make a result vanish as soon as it was found.
+		if (this._prSearchState !== 'idle') {
+			this._prSearchState = 'idle';
+		}
+	};
+
+	private handleSearchPullRequest = async (e: Event) => {
+		e.stopPropagation();
+		e.preventDefault();
+
+		const number = getPullRequestNumberFromQuery(this._prFilterQuery);
+		if (number == null || this._sidebarActions == null) return;
+
+		this._prSearchState = 'searching';
+		try {
+			const pr = await this._sidebarActions.findPullRequest(number);
+			// The query may have moved on while the request was in flight; a stale result would
+			// silently inject a PR the user is no longer asking about.
+			if (getPullRequestNumberFromQuery(this._prFilterQuery) !== number) return;
+
+			if (pr == null) {
+				this._prSearchState = 'notFound';
+				return;
+			}
+
+			this._prSearchResult = pr;
+			this._prSearchRepoId = this.repo?.id;
+			this._prSearchState = 'idle';
+		} catch {
+			this._prSearchState = 'notFound';
+		}
+	};
+
+	private handleRetryPullRequests = () => {
+		this._prFetchAttempts = 0;
+		this._prFetchExhausted = false;
+		this.tryFetchPullRequests();
+	};
+
+	private getPullRequestModel(
+		prs: GraphSidebarPullRequest[],
+		scopedBranchName: string | undefined,
+	): TreeModel<BranchTreeContext>[] {
+		const cache = this._prModelCache;
+		if (cache?.prs === prs && cache.scopedBranchName === scopedBranchName) return cache.model;
+
+		const model = buildPullRequestListModel(prs, scopedBranchName);
+		this._prModelCache = { prs: prs, scopedBranchName: scopedBranchName, model: model };
+		return model;
+	}
 
 	private handleContentKeydown = (e: KeyboardEvent) => {
 		// When focus is inside gl-tree-view's own shadow DOM (filter input, scrollable, tree
@@ -556,6 +857,7 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 			e.preventDefault();
 			e.stopPropagation();
 			this._focusBranchExpanded = false;
+			this._pendingFocusBranchFilter = false;
 			return;
 		}
 
@@ -617,19 +919,33 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 		// Focus the first menu item once the popover body is visible (body.hidden flips after
 		// gl-popover-show fires, so defer until the next frame).
 		requestAnimationFrame(() => {
+			// An alt-click open expands the focus pane and drives its own filter focus (openToFocusBranch,
+			// with the `updated()` retry as the cold-load fallback). Don't let this fallback steal focus
+			// to the first menu item in that case.
+			if (this._focusBranchExpanded) return;
+
 			this.getFocusableMenuItems()[0]?.focus();
 		});
 	};
 
 	private handleModePopoverHide = () => {
 		this.clearBranchesFetchRetry();
+		this.clearPullRequestsFetchRetry();
 		this._focusBranchExpanded = false;
+		this._focusPrExpanded = false;
+		this._pendingFocusBranchFilter = false;
+		this._prFilterQuery = '';
+		this._prSearchResult = undefined;
+		this._prSearchRepoId = undefined;
+		this._prSearchState = 'idle';
 	};
 
 	private tryFetchBranches = () => {
 		const actions = this._sidebarActions;
 		const resource = actions?.state.panels.branches;
-		if (resource == null || resource.value.get() != null) {
+		// Skip when already loaded or a fetch is already in flight — re-fetching mid-flight would cancel
+		// and restart it (createResource's cancelPrevious), wasting the round trip and delaying results.
+		if (resource == null || resource.value.get() != null || resource.loading.get()) {
 			this.clearBranchesFetchRetry();
 			return;
 		}
@@ -697,6 +1013,41 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 		void popover.hide();
 	}
 
+	/** Opens the scope menu straight into the Focus Branch pane with the branch filter focused.
+	 *  Invoked by the header's focus-branch button on alt-click. */
+	async openToFocusBranch(): Promise<void> {
+		const popover = this.renderRoot.querySelector<GlPopover>('gl-popover.mode-popover');
+		if (popover == null) return;
+
+		this._focusBranchExpanded = true;
+		this._pendingFocusBranchFilter = true;
+		// `show()` resolves after the popover body is visible (or immediately when it was already open,
+		// e.g. keyboard re-activation), so drive the focus directly here. When branches are still
+		// loading the tree isn't mounted yet — `updated()` retries once it renders.
+		await popover.show('click');
+		this.tryFocusBranchFilter();
+	}
+
+	/** Focuses the Focus Branch filter input once the tree has mounted. No-op (leaving the pending
+	 *  flag for the `updated()` retry) while branches are still loading. Guards against the pane
+	 *  collapsing/closing or the user moving focus before the deferred focus runs, so it never steals. */
+	private tryFocusBranchFilter(): void {
+		if (!this._pendingFocusBranchFilter || !this._focusBranchExpanded) return;
+
+		const tree = this.renderRoot.querySelector<GlTreeView>('gl-tree-view');
+		if (tree == null) return;
+
+		this._pendingFocusBranchFilter = false;
+		// Wait for the tree's own first render so its `.filter-input` exists (gl-tree-view.focus()
+		// prefers it when filterable), then re-check nothing changed while awaiting: don't focus if the
+		// pane collapsed/closed, and don't steal focus the user has since moved into the menu.
+		void tree.updateComplete.then(() => {
+			if (!this._focusBranchExpanded || (this.renderRoot as ShadowRoot).activeElement != null) return;
+
+			this.focusTreeView();
+		});
+	}
+
 	private handleModeSelect(value: GraphBranchesVisibility) {
 		// Defer the scope clear so it lands in the same render as the filter visibility update —
 		// otherwise the minimap resets zoom now and the graph re-filters in a later frame.
@@ -705,10 +1056,22 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 		this.hideModePopover();
 	}
 
-	private handleScopeToBranch(branchName: string, upstreamName?: string | undefined) {
+	private handleScopeToBranch(
+		branchName: string,
+		upstreamName?: string | undefined,
+		remote?: boolean,
+		additional?: { branchName: string; remote?: boolean }[],
+		origin?: GraphScopeOrigin,
+	) {
 		this.dispatchEvent(
 			new CustomEvent('gl-graph-scope-to-branch', {
-				detail: { branchName: branchName, upstreamName: upstreamName },
+				detail: {
+					branchName: branchName,
+					upstreamName: upstreamName,
+					remote: remote,
+					additional: additional,
+					origin: origin,
+				},
 				bubbles: true,
 				composed: true,
 			}),
@@ -771,7 +1134,109 @@ export class GlGraphScopePopover extends SignalWatcher(LitElement) {
 	}
 }
 
-type BranchTreeContext = [branchName: string, upstreamName: string | undefined];
+type BranchTreeContext = [
+	branchName: string,
+	upstreamName: string | undefined,
+	remote?: boolean,
+	/** Set only by a stack row: the layers above the focal one, which the scope can't reach on its own. */
+	additional?: { branchName: string; remote?: boolean }[],
+	/** What the row represents, so the scope can name it rather than the branch it resolved to. */
+	origin?: GraphScopeOrigin,
+];
+
+function pullRequestToLeaf(
+	pr: GraphSidebarPullRequest,
+	scopedBranchName: string | undefined,
+	level: number,
+): TreeModel<BranchTreeContext> {
+	return {
+		branch: false,
+		expanded: false,
+		path: `pr:${pr.number}`,
+		level: level,
+		// Title leads, number rides as a decoration — same treatment as the sidebar panel's rows.
+		// No fork marker is needed here: rows without a focus target are filtered out by the caller, so
+		// every row in this list is focusable by construction.
+		label: pr.title,
+		decorations: [
+			{ type: 'text', label: `#${pr.number}`, position: 'before', kind: 'muted' },
+			...(pr.stack != null
+				? [
+						{
+							type: 'stack' as const,
+							label: `Layer ${pr.stack.position} of ${pr.stack.size}`,
+							position: 'before' as const,
+							layer: pr.stack.position,
+							size: pr.stack.size,
+						},
+					]
+				: []),
+		] satisfies TreeItemDecoration[],
+		// Head branch included so filtering by branch name finds the PR, matching how users think
+		// about which PR a branch belongs to.
+		filterText: `${pr.number} ${pr.title} ${pr.headBranch ?? ''}`,
+		icon: { type: 'pull-request', state: pr.state, draft: pr.isDraft },
+		checkable: false,
+		context: [
+			pr.focus!.branchName,
+			pr.focus!.upstreamName,
+			pr.focus!.remote,
+			undefined,
+			{ kind: 'pullRequest', number: pr.number },
+		] as BranchTreeContext,
+		matched: pr.focus!.branchName === scopedBranchName,
+	};
+}
+
+function buildPullRequestListModel(
+	prs: GraphSidebarPullRequest[],
+	scopedBranchName: string | undefined,
+): TreeModel<BranchTreeContext>[] {
+	// Only PRs whose head resolves against this repo are listed — a fork head has no ref this graph
+	// can scope to, so offering it would produce a row that does nothing when picked.
+	const focusable = prs.filter(pr => pr.focus != null);
+
+	return groupPullRequestsByStack(focusable).flatMap(entry => {
+		if (entry.kind === 'pullRequest') return [pullRequestToLeaf(entry.pr, scopedBranchName, 1)];
+
+		// Every row here IS its action, so an incomplete stack can't have one: with a layer missing (paged
+		// off, or a fork head that's unfocusable) the last member is NOT the base, and focusing it would
+		// re-root on a layer whose own merge target is the layer below rather than the trunk. Same gate the
+		// sidebar's Focus on Stack applies — it just drops the action and keeps the group; here the group
+		// falls back to plain rows, each of which still focuses its own layer.
+		if (entry.members.length !== entry.size) {
+			return entry.members.map(m => pullRequestToLeaf(m, scopedBranchName, 1));
+		}
+
+		// Picking the stack focuses the BASE layer with the ones above it as additional branches — the same
+		// arrangement the sidebar's Focus on Stack builds, since only the base's own line reaches the trunk.
+		// Members are ordered top-first, so the base is last.
+		const base = entry.members.at(-1)!;
+		return {
+			branch: true,
+			expanded: true,
+			path: `stack:${entry.number}`,
+			level: 1,
+			label: `Stack #${entry.number}`,
+			description: `→ ${entry.baseRef}`,
+			icon: 'layers',
+			checkable: false,
+			filterText: `stack #${entry.number} ${entry.baseRef}`,
+			decorations: [
+				{ type: 'text', label: `${entry.size} PRs`, position: 'before', kind: 'muted' },
+			] satisfies TreeItemDecoration[],
+			context: [
+				base.focus!.branchName,
+				base.focus!.upstreamName,
+				base.focus!.remote,
+				entry.members.slice(0, -1).map(m => ({ branchName: m.focus!.branchName, remote: m.focus!.remote })),
+				{ kind: 'stack', number: entry.number, size: entry.size },
+			] as BranchTreeContext,
+			matched: base.focus!.branchName === scopedBranchName,
+			children: entry.members.map(m => pullRequestToLeaf(m, scopedBranchName, 2)),
+		};
+	});
+}
 
 function branchToLeaf(
 	b: GraphSidebarBranch,
@@ -788,9 +1253,11 @@ function branchToLeaf(
 		level: level,
 		label: label,
 		filterText: filterText,
-		icon: { type: 'branch', status: b.status, worktree: b.worktree },
+		icon: branchTreeIcon(b),
 		checkable: false,
-		context: [b.name, b.upstream?.missing ? undefined : b.upstream?.name],
+		// A remote branch has no upstream of its own — the flag is what makes `getBranchId` build a
+		// `remotes/` ref downstream; without it the scope resolves against a `heads/` ref that matches nothing
+		context: [b.name, b.upstream?.missing ? undefined : b.upstream?.name, b.remote || undefined],
 		matched: b.name === scopedBranchName,
 	};
 }
@@ -813,13 +1280,14 @@ function buildBranchTreeModel(
 		true,
 		() => true,
 	);
-	return hierarchyToTreeModel(hierarchy, 1, scopedBranchName);
+	return hierarchyToTreeModel(hierarchy, 1, scopedBranchName, remoteProviderIconsByName(branches));
 }
 
 function hierarchyToTreeModel(
 	node: HierarchicalItem<GraphSidebarBranch>,
 	level: number,
 	scopedBranchName: string | undefined,
+	remoteIcons: Map<string, string>,
 ): TreeModel<BranchTreeContext>[] {
 	const models: TreeModel<BranchTreeContext>[] = [];
 	if (node.children != null) {
@@ -837,14 +1305,14 @@ function hierarchyToTreeModel(
 					),
 				);
 			} else if (child.children != null && child.children.size > 0) {
-				const childModels = hierarchyToTreeModel(child, level + 1, scopedBranchName);
+				const childModels = hierarchyToTreeModel(child, level + 1, scopedBranchName, remoteIcons);
 				models.push({
 					branch: true,
 					expanded: false,
 					path: `folder:${child.relativePath}`,
 					level: level,
+					icon: remoteProviderFolderIcon(remoteIcons, child.name) ?? 'folder',
 					label: child.name,
-					icon: 'folder',
 					checkable: false,
 					context: ['', undefined],
 					children: childModels,

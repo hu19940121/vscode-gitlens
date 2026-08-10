@@ -4,8 +4,22 @@ import type {
 	PullRequestRefs,
 	PullRequestRepositoryIdentityDescriptor,
 	PullRequestShape,
+	PullRequestStackInfo,
 } from '../models/pullRequest.js';
 import { shortenRevision } from './revision.utils.js';
+
+/** How many pull requests a merge action affects — unstacked is always 1; a stacked merge lands either
+ *  just this layer and everything below it (`position`), or the whole stack (`wholeStack`). The one
+ *  source every merge-confirmation and merge-action label counts from, so they can't drift apart.
+ *  Takes only the two fields it needs (not the full {@link PullRequestStackInfo}) since callers on the
+ *  webview side carry narrower serialized stack shapes. */
+export function getStackedMergeCount(
+	stack: Pick<PullRequestStackInfo, 'position' | 'size'> | undefined,
+	options?: { wholeStack?: boolean },
+): number {
+	if (stack == null) return 1;
+	return options?.wholeStack ? stack.size : stack.position;
+}
 
 export interface PullRequestUrlIdentity<TProvider extends string = string> {
 	provider?: TProvider;
@@ -39,6 +53,18 @@ export function getPullRequestIdentityFromMaybeUrl(search: string): PullRequestU
 	}
 
 	return prNumber == null ? undefined : { ownerAndRepo: undefined, prNumber: prNumber, provider: undefined };
+}
+
+/** A pull request's display number from its url, or `undefined` for a url naming no pull request. Anchors
+ *  on the provider's pull request path segment (GitHub `pull`, Bitbucket `pull-requests`, GitLab
+ *  `merge_requests`, Azure `pullrequest`) so a digit-leading owner (`github.com/1Password/x/pull/123`)
+ *  can't win. */
+export function getPullRequestNumberFromUrl(url: string): string | undefined {
+	// No loose fallback: `getPullRequestIdentityFromMaybeUrl` scans for any `/<digits>`, which reads a bare
+	// repository url like `github.com/1Password/sdk` as pull request #1. Callers that hold a real pull
+	// request fall back to its id instead, and the one that asks whether a pasted url names a pull request
+	// needs "no" for an answer.
+	return url.match(/(?:pull|pull-requests|merge_requests|pullrequest)\/(\d+)(?:\b|\/|$)/)?.[1];
 }
 
 export function getRepositoryIdentityForPullRequest(
@@ -101,6 +127,7 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 		author: {
 			id: value.author.id,
 			name: value.author.name,
+			username: value.author.username,
 			avatarUrl: value.author.avatarUrl,
 			url: value.author.url,
 		},
@@ -116,6 +143,9 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 						sha: value.refs.head.sha,
 						branch: value.refs.head.branch,
 						url: value.refs.head.url,
+						cloneHttps: value.refs.head.cloneHttps,
+						cloneSsh: value.refs.head.cloneSsh,
+						isFork: value.refs.head.isFork,
 					},
 					base: {
 						exists: value.refs.base.exists,
@@ -124,6 +154,9 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 						sha: value.refs.base.sha,
 						branch: value.refs.base.branch,
 						url: value.refs.base.url,
+						cloneHttps: value.refs.base.cloneHttps,
+						cloneSsh: value.refs.base.cloneSsh,
+						isFork: value.refs.base.isFork,
 					},
 					isCrossRepository: value.refs.isCrossRepository,
 				}
@@ -142,6 +175,15 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 					name: value.project.name,
 					resourceId: value.project.resourceId,
 					resourceName: value.project.resourceName,
+				}
+			: undefined,
+		stack: value.stack
+			? {
+					id: value.stack.id,
+					number: value.stack.number,
+					size: value.stack.size,
+					position: value.stack.position,
+					baseRef: value.stack.baseRef,
 				}
 			: undefined,
 	};

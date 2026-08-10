@@ -3,6 +3,34 @@ import { getRemoteNameSlashIndex, isDetachedHead, parseRefName, parseUpstream } 
 
 suite('Branch Utils Test Suite', () => {
 	suite('parseUpstream', () => {
+		// KEY ORDER IS A CONTRACT, not a style choice. These objects are handed straight to
+		// `createReference` and serialized with a bare `JSON.stringify` into the graph's ref-pill
+		// `data-vscode-context`, and the webview rebuilds the same payload from the wire
+		// (`webviews/apps/plus/graph/utils/refContext.utils.ts`). A reordering here silently changes the
+		// bytes on one side only, so a `when` clause could match on a ref pill and not in Inspect.
+		// `providers/branches.ts` re-spreads this object, which preserves whatever order it is given —
+		// meaning this function is the single place the order is actually decided.
+		test('yields name, missing, state in that order — both arms', () => {
+			assert.deepStrictEqual(Object.keys(parseUpstream('refs/remotes/origin/main', '[ahead 3]')!), [
+				'name',
+				'missing',
+				'state',
+			]);
+			// The no-match arm is a separate literal and drifts independently.
+			assert.deepStrictEqual(Object.keys(parseUpstream('refs/remotes/origin/main', '')!), [
+				'name',
+				'missing',
+				'state',
+			]);
+		});
+
+		test('state is ahead then behind', () => {
+			assert.deepStrictEqual(
+				Object.keys(parseUpstream('refs/remotes/origin/main', '[ahead 3, behind 1]')!.state),
+				['ahead', 'behind'],
+			);
+		});
+
 		test('parses ahead only', () => {
 			const result = parseUpstream('refs/remotes/origin/main', '[ahead 3]');
 			assert.deepStrictEqual(result, {
@@ -157,6 +185,30 @@ suite('Branch Utils Test Suite', () => {
 
 		test('returns true for detached-at message in parentheses', () => {
 			assert.strictEqual(isDetachedHead('(HEAD detached at abc1234)'), true);
+		});
+
+		test('returns true for the rest of git’s "no branch" states', () => {
+			assert.strictEqual(isDetachedHead('(HEAD detached from abc1234)'), true);
+			assert.strictEqual(isDetachedHead('(no branch)'), true);
+			assert.strictEqual(isDetachedHead('(no branch, rebasing feature)'), true);
+			assert.strictEqual(isDetachedHead('(no branch, bisect started on main)'), true);
+		});
+
+		test("returns true for porcelain v2's branch.head token", () => {
+			// `git status --porcelain=v2 --branch` prints `# branch.head (detached)` for ANY
+			// non-branch HEAD (plain detached, rebase, bisect) and the status parser passes the
+			// token through verbatim — `GitStatus.detached` depends on this match.
+			assert.strictEqual(isDetachedHead('(detached)'), true);
+		});
+
+		test('returns false for real branch names that happen to be parenthesized', () => {
+			// Parentheses are legal in ref names — all three are branches `git check-ref-format
+			// --branch` accepts and a user can be checked out on. Treating them as detached made
+			// `GitBranch` rewrite the name to the synthesized `(sha…)` label and re-key the id by SHA,
+			// corrupting the branch's identity everywhere downstream.
+			assert.strictEqual(isDetachedHead('(release)'), false);
+			assert.strictEqual(isDetachedHead('v1.0(rc)'), false);
+			assert.strictEqual(isDetachedHead('feat/(wip)'), false);
 		});
 	});
 });

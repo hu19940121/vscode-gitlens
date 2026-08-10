@@ -1,4 +1,4 @@
-import type { GraphRow } from '@gitkraken/gitkraken-components';
+import type { GitGraphRow } from '@gitlens/git/models/graph.js';
 import type {
 	GraphDownstreams,
 	GraphMinimapMarkerTypes,
@@ -6,7 +6,7 @@ import type {
 	GraphRowStats,
 	GraphSearchResults,
 	GraphSearchResultsError,
-	GraphWipMetadataBySha,
+	GraphWipRowsById,
 } from '../../../../plus/graph/protocol.js';
 import { getCommitDateFromRow } from '../utils/row.utils.js';
 import type {
@@ -18,13 +18,16 @@ import type {
 } from './minimap.js';
 
 export interface MinimapAggregateInput {
-	readonly rows: readonly GraphRow[];
+	readonly rows: readonly GitGraphRow[];
 	readonly rowsStats: Record<string, GraphRowStats> | undefined;
 	readonly refMetadata: GraphRefsMetadata | null | undefined;
 	readonly downstreams: GraphDownstreams | undefined;
 	readonly markerTypes: readonly GraphMinimapMarkerTypes[];
 	readonly dataType: 'commits' | 'lines';
-	readonly wipMetadataBySha: GraphWipMetadataBySha | undefined;
+	readonly wipRowsById: GraphWipRowsById | undefined;
+	/** The graph's own worktree's WIP row id, excluded from the worktree markers below — the minimap's
+	 *  `worktree` marker means "another worktree is parked here", and the graph's own is never that. */
+	readonly primaryWipRowId: string | undefined;
 }
 
 export interface MinimapAggregate {
@@ -37,7 +40,7 @@ export function getDay(date: number | Date): number {
 }
 
 export function aggregate(input: MinimapAggregateInput): MinimapAggregate {
-	const { rows, rowsStats, refMetadata, downstreams, markerTypes, dataType, wipMetadataBySha } = input;
+	const { rows, rowsStats, refMetadata, downstreams, markerTypes, dataType, wipRowsById, primaryWipRowId } = input;
 	const showLinesChanged = dataType === 'lines';
 	if (!rows.length || (showLinesChanged && rowsStats == null)) {
 		return { statsByDay: new Map(), markersByDay: new Map() };
@@ -64,15 +67,17 @@ export function aggregate(input: MinimapAggregateInput): MinimapAggregate {
 	// Group worktree HEADs by their parent commit SHA up front, so the row scan can emit a worktree
 	// marker into `markersByDay` whenever it visits one of those commits — no separate post-pass.
 	// Skipped entirely (no Map allocated) when the toggle is off or there are no non-current worktrees.
-	const wantsWorktrees = markerTypes.includes('worktree') && wipMetadataBySha != null;
+	const wantsWorktrees = markerTypes.includes('worktree') && wipRowsById != null;
 	let worktreesByParentSha: Map<string, WorktreeMarker[]> | undefined;
 	if (wantsWorktrees) {
-		for (const meta of Object.values(wipMetadataBySha)) {
-			const marker: WorktreeMarker = { type: 'worktree', name: meta.label };
+		for (const [id, row] of Object.entries(wipRowsById)) {
+			if (id === primaryWipRowId || row.parentSha == null) continue;
+
+			const marker: WorktreeMarker = { type: 'worktree', name: row.label };
 			worktreesByParentSha ??= new Map();
-			const existing = worktreesByParentSha.get(meta.parentSha);
+			const existing = worktreesByParentSha.get(row.parentSha);
 			if (existing == null) {
-				worktreesByParentSha.set(meta.parentSha, [marker]);
+				worktreesByParentSha.set(row.parentSha, [marker]);
 			} else {
 				existing.push(marker);
 			}
@@ -89,8 +94,8 @@ export function aggregate(input: MinimapAggregateInput): MinimapAggregate {
 		const row = rows[i];
 		// WIP rows represent the working tree, not commits. Their `date` is `Date.now()` (set in
 		// `graph-wrapper.ts`), so bucketing them would bump today's commit count and let `stat.sha`
-		// resolve to a non-commit SHA (`'work-dir-changes'` / `'worktree-wip::…'`) on click.
-		if (row.type === 'work-dir-changes') continue;
+		// resolve to a non-commit SHA (a synthetic `wip::<worktreePath>` row id) on click.
+		if (row.kind === 'workdir') continue;
 
 		// Always use committer date for the minimap (the GitGraphRow source populates `commitDate`
 		// even when `row.date` follows author-date ordering). A rebased commit's author date can be
@@ -180,7 +185,7 @@ export function aggregate(input: MinimapAggregateInput): MinimapAggregate {
 			}
 		}
 
-		if (wantsStashes && row.type === 'stash-node') {
+		if (wantsStashes && row.kind === 'stash') {
 			const stashMarker: StashMarker = { type: 'stash', name: row.message };
 			appendMarkers(markersByDay, day, [stashMarker]);
 		}

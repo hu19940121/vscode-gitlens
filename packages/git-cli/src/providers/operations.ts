@@ -52,20 +52,28 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 	async checkout(
 		repoPath: string,
 		ref: string,
-		options?: { createBranch?: string },
+		options?: { createBranch?: string; noTracking?: boolean },
 		runOptions?: GitOperationRunOptions,
 	): Promise<void> {
 		const scope = getScopedLogger();
 
 		const params = ['checkout'];
 		if (options?.createBranch) {
-			params.push('-b', options.createBranch, ref, '--');
+			params.push('-b', options.createBranch);
+			if (options.noTracking) {
+				params.push('--no-track');
+			}
+			params.push(ref, '--');
 		} else {
 			params.push(ref, '--');
 		}
 
 		try {
-			await this.git.run({ cwd: repoPath, ...runOptions }, ...params);
+			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
+			if (options?.createBranch) {
+				// Evict the cached base only — see `createBranch` on why the persisted keys stay.
+				this.cache.deleteBaseBranchName(repoPath, options.createBranch);
+			}
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
 		} catch (ex) {
@@ -183,6 +191,13 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		if (options?.date) {
 			params.push(`--date=${options.date}`);
 		}
+		// Host-level override (e.g. VS Code's `git.enableCommitSigning`) — request signing explicitly
+		// via `-S`. Implicit repo-config signing (`commit.gpgsign=true`) needs no flag, and `-S`
+		// alongside it is harmless, so the override can only enable signing, never force it off.
+		const sign = this.context.config?.signing?.enabled === true;
+		if (sign) {
+			params.push('-S');
+		}
 		// Read commit message from stdin via -F - to avoid shell escaping issues
 		params.push('-F', '-');
 
@@ -193,6 +208,15 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			);
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			if (sign) {
+				// `-S` was passed and the commit succeeded, so signing is confirmed — fire the
+				// explicit-sign hook (same contract as the patch provider's `commit-tree -S` path).
+				let format: SigningFormat | undefined;
+				try {
+					format = (await this.provider.config.getSigningConfig?.(repoPath))?.format;
+				} catch {}
+				this.context.hooks?.commits?.onSigned?.(format ?? 'gpg', options?.source);
+			}
 		} catch (ex) {
 			scope?.error(ex);
 			await this.throwIfSigningError(repoPath, params, ex, options?.source);
@@ -278,7 +302,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		}
 
 		try {
-			await this.git.run({ cwd: repoPath, ...runOptions }, ...params);
+			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
 			throw getGitCommandError(
 				'fetch',
@@ -373,15 +397,23 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				);
 				if (worktree != null) {
 					// Branch is checked out in a worktree — run git pull in that worktree's directory
-					await this.pullCore(
-						normalizePath(worktree.uri.fsPath),
-						{
-							rebase: options?.rebase,
-							tags: options?.tags,
-							source: options?.source,
-						},
-						runOptions,
-					);
+					// Any rebase state (e.g. from `pull.rebase=true`) appears under the worktree path
+					const worktreePath = normalizePath(worktree.uri.fsPath);
+					this.context.hooks?.operations?.onRebaseCapableOperation?.(worktreePath, 'pull', 'started');
+					try {
+						await this.pullCore(
+							worktreePath,
+							{
+								rebase: options?.rebase,
+								tags: options?.tags,
+								source: options?.source,
+							},
+							runOptions,
+						);
+					} finally {
+						this.context.hooks?.operations?.onRebaseCapableOperation?.(worktreePath, 'pull', 'ended');
+					}
+
 					this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status', 'tags');
 					this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'remotes', 'index']);
 				} else {
@@ -391,15 +423,20 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				return;
 			}
 
-			await this.pullCore(
-				repoPath,
-				{
-					rebase: options?.rebase,
-					tags: options?.tags,
-					source: options?.source,
-				},
-				runOptions,
-			);
+			this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'pull', 'started');
+			try {
+				await this.pullCore(
+					repoPath,
+					{
+						rebase: options?.rebase,
+						tags: options?.tags,
+						source: options?.source,
+					},
+					runOptions,
+				);
+			} finally {
+				this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'pull', 'ended');
+			}
 
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status', 'tags');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'remotes', 'index']);
@@ -425,7 +462,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		}
 
 		try {
-			await this.git.run({ cwd: repoPath, configs: gitConfigsPull, ...runOptions }, ...params);
+			await this.git.run({ cwd: repoPath, configs: gitConfigsPull, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
 			await this.throwIfSigningError(repoPath, params, ex, options.source);
 			throw getGitCommandError(
@@ -499,10 +536,12 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 
 		let forceOpts: PushForceOptions | undefined;
 		if (options?.force) {
-			forceOpts = {
-				withLease: true,
-				ifIncludes: true,
-			};
+			// Honor the host's force-push preferences (e.g. VS Code's `git.useForcePushWithLease` /
+			// `git.useForcePushIfIncludes`); fall back to the safer `--force-with-lease` behavior.
+			const useForceWithLease = this.context.config?.push?.useForceWithLease ?? true;
+			forceOpts = useForceWithLease
+				? { withLease: true, ifIncludes: this.context.config?.push?.useForceIfIncludes ?? true }
+				: { withLease: false };
 		}
 
 		try {
@@ -588,7 +627,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		}
 
 		try {
-			await this.git.run({ cwd: repoPath, ...runOptions }, ...params);
+			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
 			const error = getGitCommandError(
 				'push',
@@ -658,6 +697,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			branch?: string;
 			editor?: string;
 			interactive?: boolean;
+			programmaticEditor?: boolean;
 			messageEditor?: string;
 			onto?: string;
 			updateRefs?: boolean;
@@ -679,6 +719,13 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 
 			if (options.editor) {
 				configs.push('-c', `sequence.editor=${options.editor}`);
+			}
+
+			// A script-based sequence editor rewrites the todo by command word + SHA, so git must emit a
+			// plain, natural-order todo regardless of the user's rebase config: `rebase.autosquash` would
+			// reorder commits and rewrite `pick`→`fixup`, and `rebase.abbreviateCommands` would emit `p`.
+			if (options.programmaticEditor) {
+				configs.push('-c', 'rebase.autosquash=false', '-c', 'rebase.abbreviateCommands=false');
 			}
 		}
 
@@ -705,6 +752,9 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			args.push(options.branch);
 		}
 
+		// Fired before the process runs — `git rebase` exits 0 when stopping at `edit`/`break`,
+		// so the result can't be used to detect that a rebase started
+		this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'rebase', 'started');
 		try {
 			await this.git.run(
 				// Avoid a timeout since rebases can take a long time (set to 0 to disable)
@@ -731,9 +781,12 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					),
 			);
 			if (RebaseError.is(mapped, 'conflicts')) {
-				return this.createConflictResult(repoPath, 'rebase');
+				return await this.createConflictResult(repoPath, 'rebase');
 			}
 			throw mapped;
+		} finally {
+			// The command exited (success, pause, or failure) — any rebase it left behind is on disk now
+			this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'rebase', 'ended');
 		}
 	}
 
@@ -769,7 +822,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		params.push(rev, '--');
 
 		try {
-			await this.git.run({ cwd: repoPath, ...runOptions }, ...params);
+			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
 			throw getGitCommandError(
 				'reset',
@@ -813,7 +866,10 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					args.push(selector);
 				}
 				args.push('--pathspec-from-file=-', '--pathspec-file-nul');
-				await this.git.run({ cwd: repoPath, ...runOptions, stdin: normalized.join('\0') }, ...args);
+				await this.git.run(
+					{ cwd: repoPath, errors: 'throw', ...runOptions, stdin: normalized.join('\0') },
+					...args,
+				);
 			} else {
 				// Older git: pass pathspecs as args, one git invocation per chunk (collapsing N
 				// path-mode checkouts into ⌈N / chunk⌉ spawns). Reserve the command prefix length and
@@ -822,7 +878,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				const perArgOverhead = 3;
 				const prefixLength = prefix.reduce((sum, arg) => sum + arg.length + perArgOverhead, 0);
 				for (const batch of chunkByStringLength(normalized, maxGitCliLength - prefixLength, perArgOverhead)) {
-					await this.git.run({ cwd: repoPath, ...runOptions }, ...prefix, ...batch);
+					await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...prefix, ...batch);
 				}
 			}
 			this.context.hooks?.cache?.onReset?.(repoPath, 'status');

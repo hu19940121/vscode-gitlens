@@ -7,17 +7,20 @@ import type { GitStatus } from '@gitlens/git/models/status.js';
 import { GitWorktree } from '@gitlens/git/models/worktree.js';
 import type { BranchContributionsOverview } from '@gitlens/git/providers/branches.js';
 import type { GitCommandPriority } from '@gitlens/git/run.types.js';
+import { getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
 import { createRevisionRange } from '@gitlens/git/utils/revision.utils.js';
 import { filterMap } from '@gitlens/utils/iterable.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import type { EnrichedAutolink } from '../../autolinks/models/autolinks.js';
 import type { Container } from '../../container.js';
+import { isContinuingPausedOperation } from '../../git/actions/pausedOperation.js';
 import { getAssociatedIssuesForBranch } from '../../git/utils/-webview/branch.issue.utils.js';
 import {
 	getBranchAssociatedPullRequest,
 	getBranchEnrichedAutolinks,
 	getBranchMergeTargetInfo,
 	getBranchRemote,
+	isSelfMergeTarget,
 } from '../../git/utils/-webview/branch.utils.js';
 import { getContributorAvatarUri } from '../../git/utils/-webview/contributor.utils.js';
 import type { LaunchpadCategorizedResult } from '../../plus/launchpad/launchpadProvider.js';
@@ -115,14 +118,9 @@ export async function getBranchMergeTargetStatusInfo(
 	const targetBranch = await svc.branches.getBranch(target, cancellation);
 	// The tip SHA is required — without it the graph's scope anchor can't be placed.
 	if (targetBranch?.sha == null) return undefined;
-	// Bail when the target tip is the same commit as the focal branch's tip — there's no real
-	// merge to describe (happens on the default branch, where the fallback chain has nowhere
-	// to land, and on any feature branch transiently equal to its target). Letting it through
-	// poisons `scope.mergeTargetTipSha` via `reconcileScopeMergeTarget` / `scopeToBranchById`,
-	// and the graph component's `shouldHideWipRowForScope` then hides the WIP row of every
-	// worktree on the scoped branch because the parent sha matches the (excluded) merge-target
-	// tip. Matches the early-out in `computeScopeAnchor` (graphWebview.ts).
-	if (targetBranch.sha === branch.sha) return undefined;
+	// Must match the early-out in `computeScopeAnchor` (graphWebview.ts), or the graph anchors a merge
+	// target the sidebars say doesn't exist.
+	if (targetBranch.sha === branch.sha && isSelfMergeTarget(target, branch.name)) return undefined;
 
 	const [countsResult, conflictResult, mergedStatusResult] = await Promise.allSettled([
 		svc.commits.getLeftRightCommitCount(
@@ -195,7 +193,6 @@ export async function getLaunchpadItemInfo(
 				approval: lpi.approvalReviewCount,
 				changeRequest: lpi.changeRequestReviewCount,
 				comment: lpi.commentReviewCount,
-				codeSuggest: lpi.codeSuggestionsCount,
 			},
 		},
 
@@ -217,6 +214,7 @@ export async function getPullRequestInfo(
 
 	return {
 		id: pr.id,
+		number: getPullRequestNumberFromUrl(pr.url) ?? pr.id,
 		url: pr.url,
 		state: pr.state,
 		title: pr.title,
@@ -225,6 +223,10 @@ export async function getPullRequestInfo(
 		updatedDate: pr.updatedDate?.getTime(),
 		reviewDecision: pr.reviewDecision,
 		providerId: pr.provider.id,
+		stack:
+			pr.stack != null
+				? { number: pr.stack.number, position: pr.stack.position, size: pr.stack.size }
+				: undefined,
 		launchpad: getLaunchpadItemInfo(container, pr, launchpadPromise),
 	};
 }
@@ -349,6 +351,10 @@ export async function getOverviewWip(
 					hasConflicts: status?.hasConflicts,
 					conflictsCount: status?.conflicts.length,
 					pausedOpStatus: pausedOpStatus,
+					// Keyed by the same worktree-aware path as the status above — the in-flight set holds the
+					// path of the repo that OWNS the paused op.
+					pausedOpContinuing:
+						pausedOpStatus != null && isContinuingPausedOperation(repoPath) ? true : undefined,
 				};
 			}
 		}),

@@ -11,6 +11,7 @@
 import * as process from 'node:process';
 import type { FrameLocator } from '@playwright/test';
 import { test as base, createTmpDir, expect, GitFixture, MaxTimeout } from '../baseTest.js';
+import { waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
 
 const test = base.extend({
 	vscodeOptions: [
@@ -84,9 +85,15 @@ test.describe('Review & Compose Sub-Panels', () => {
 			return;
 		}
 
-		const wipRow = graphWebview.getByText(/Working (Changes|Tree)/).first();
+		// New Lit engine: the WIP row is a role="treeitem" whose accessible name starts "Working Changes".
+		const wipRow = graphWebview
+			.getByRole('treeitem', { name: /Working Changes/ })
+			.filter({ visible: true })
+			.first();
 		await expect(wipRow).toBeVisible({ timeout: MaxTimeout });
-		await wipRow.click();
+		// Force the click: the virtualized WIP row can report "not stable" within the actionability
+		// window, and the following gl-details-wip-header assertion guards against a missed click.
+		await wipRow.click({ force: true });
 		await ensureDetailsPanelOpen();
 		await expect(graphWebview.locator('gl-details-wip-header')).toBeVisible({ timeout: MaxTimeout });
 	}
@@ -102,14 +109,18 @@ test.describe('Review & Compose Sub-Panels', () => {
 		};
 
 		await vscode.gitlens.showCommitGraphView();
-		await vscode.gitlens.panel.open();
+		// Widen the side bar so the graph has room to paint its rows;
+		// in a cramped host the tree lays out but reports `hidden`, and the readiness gate below times out
+		await widenSideBarForGraph(vscode);
 
 		const wv = await vscode.gitlens.getGitLensWebview('Graph', 'webviewView', 60000);
 		expect(wv).not.toBeNull();
 		graphWebview = wv!;
 
-		await expect(graphWebview.getByText('COMMIT MESSAGE').first()).toBeVisible({ timeout: 30000 });
-		await expect(graphWebview.locator('.details-content').first()).toBeVisible({ timeout: 30000 });
+		// New Lit engine: the graph is a role="tree" ("Commit graph") of role="treeitem" rows. Gate on
+		// the tree and on rows actually painting; selectWip (beforeEach) opens the WIP details panel.
+		await expect(graphWebview.getByRole('tree', { name: 'Commit graph' })).toBeVisible({ timeout: 30000 });
+		await waitForGraphRowsRendered(graphWebview);
 	});
 
 	test.afterAll(async ({ vscode }) => {
@@ -121,11 +132,16 @@ test.describe('Review & Compose Sub-Panels', () => {
 		await selectWip();
 	});
 
-	// Exit any active mode after each test
+	// Exit any active mode after each test. While a mode is active the mode-toggle chips are
+	// removed from the header, so the only way out is the close chip in the mode header.
 	test.afterEach(async () => {
-		const activeChip = graphWebview.locator('gl-action-chip.mode-toggle--active');
-		if (await activeChip.isVisible().catch(() => false)) {
-			await activeChip.click();
+		const closeChip = graphWebview.locator('gl-action-chip.mode-close');
+		if (await closeChip.isVisible().catch(() => false)) {
+			await closeChip.click();
+			// Wait for the mode to actually exit before the next test starts, to avoid races.
+			await expect(
+				graphWebview.locator('gl-details-wip-header gl-details-header .mode-header--active'),
+			).not.toBeVisible({ timeout: MaxTimeout });
 		}
 	});
 
@@ -151,9 +167,11 @@ test.describe('Review & Compose Sub-Panels', () => {
 		const header = graphWebview.locator('gl-details-wip-header gl-details-header .mode-header--active');
 		await expect(header).toBeVisible();
 
-		// Review chip should be active
-		const activeChip = graphWebview.locator('gl-action-chip.mode-toggle--active[icon="checklist"]');
-		await expect(activeChip).toBeVisible();
+		// While a mode is active the mode-toggle chips are removed from the header (the mode
+		// identity is carried by the header title instead), so the review chip is no longer shown.
+		await expect(
+			graphWebview.locator('gl-details-wip-header gl-details-header gl-action-chip[icon="checklist"]'),
+		).not.toBeVisible();
 
 		// WIP details and commit bottom should be hidden
 		const wipDetails = graphWebview.locator('gl-details-wip-panel');
@@ -171,13 +189,13 @@ test.describe('Review & Compose Sub-Panels', () => {
 		await expect(explainInput).toBeVisible({ timeout: MaxTimeout });
 	});
 
-	test('clicking review chip again exits review mode', async () => {
+	test('exiting review mode via the close chip restores WIP details', async () => {
 		const reviewChip = graphWebview.locator('gl-action-chip[icon="checklist"]');
 		await reviewChip.click();
 		await expect(graphWebview.locator('.review-panel')).toBeVisible({ timeout: MaxTimeout });
 
-		// Click again to toggle off
-		await reviewChip.click();
+		// The mode-toggle chips are gone while in a mode; exit via the close chip in the header
+		await graphWebview.locator('gl-action-chip.mode-close').first().click();
 
 		// Review panel should be gone
 		await expect(graphWebview.locator('.review-panel')).not.toBeVisible({ timeout: MaxTimeout });
@@ -199,9 +217,10 @@ test.describe('Review & Compose Sub-Panels', () => {
 		const composePanel = graphWebview.locator('.compose-panel');
 		await expect(composePanel).toBeVisible({ timeout: MaxTimeout });
 
-		// Compose chip should be active
-		const activeChip = graphWebview.locator('gl-action-chip.mode-toggle--active[icon="wand"]');
-		await expect(activeChip).toBeVisible();
+		// While a mode is active the mode-toggle chips are removed, so the compose chip is gone.
+		await expect(
+			graphWebview.locator('gl-details-wip-header gl-details-header gl-action-chip[icon="wand"]'),
+		).not.toBeVisible();
 
 		// Header should have purple tint
 		await expect(
@@ -223,26 +242,25 @@ test.describe('Review & Compose Sub-Panels', () => {
 		await reviewChip.click();
 		await expect(graphWebview.locator('.review-panel')).toBeVisible({ timeout: MaxTimeout });
 
-		// Switch to compose
+		// The mode-toggle chips are hidden while a mode is active, so switching means exiting the
+		// current mode (close chip) first, then entering the other one.
+		await graphWebview.locator('gl-action-chip.mode-close').first().click();
+		await expect(graphWebview.locator('.review-panel')).not.toBeVisible({ timeout: MaxTimeout });
+
 		const composeChip = graphWebview.locator('gl-action-chip[icon="wand"]');
 		await composeChip.click();
 
 		// Compose should be visible, review should be gone
 		await expect(graphWebview.locator('.compose-panel')).toBeVisible({ timeout: MaxTimeout });
 		await expect(graphWebview.locator('.review-panel')).not.toBeVisible();
-
-		// Compose chip active, review chip not
-		await expect(graphWebview.locator('gl-action-chip.mode-toggle--active[icon="wand"]')).toBeVisible();
-		await expect(graphWebview.locator('gl-action-chip.mode-toggle--active[icon="checklist"]')).not.toBeVisible();
 	});
 
 	test('can enter and exit modes 3 times consecutively', async () => {
 		for (let i = 0; i < 3; i++) {
-			const reviewChip = graphWebview.locator('gl-action-chip[icon="checklist"]');
-			await reviewChip.click();
+			await graphWebview.locator('gl-action-chip[icon="checklist"]').click();
 			await expect(graphWebview.locator('.review-panel')).toBeVisible({ timeout: MaxTimeout });
 
-			await reviewChip.click();
+			await graphWebview.locator('gl-action-chip.mode-close').first().click();
 			await expect(graphWebview.locator('.review-panel')).not.toBeVisible({ timeout: MaxTimeout });
 		}
 	});
@@ -264,9 +282,12 @@ test.describe('Review & Compose Sub-Panels', () => {
 		const branchRow = graphWebview.locator('.graph-details-header__branch-row');
 		await expect(branchRow).toBeVisible({ timeout: 30000 });
 
-		// Create branch icon should be in branch row
-		const createBranchChip = branchRow.locator('gl-action-chip[icon="custom-start-work"]');
-		await expect(createBranchChip).toBeVisible();
+		// Branch actions kebab (hosts the Create Branch... context menu, replacing the old
+		// standalone create-branch chip) should be in branch row
+		const branchActionsChip = branchRow.locator(
+			'gl-action-chip[icon="kebab-vertical"][label="Show Branch Actions"]',
+		);
+		await expect(branchActionsChip).toBeVisible();
 
 		// Review/compose chips should NOT be in branch row
 		const reviewInBranch = branchRow.locator('gl-action-chip[icon="checklist"]');

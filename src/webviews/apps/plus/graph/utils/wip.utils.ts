@@ -1,9 +1,28 @@
 import { hasKeys } from '@gitlens/utils/object.js';
 import type { GraphBranchesVisibility } from '../../../../../config.js';
-import type { GraphIncludeOnlyRefs, GraphScope, GraphWipMetadataBySha } from '../../../../plus/graph/protocol.js';
+import type {
+	GraphIncludeOnlyRefs,
+	GraphScope,
+	GraphWipRowsById,
+	WorkDirStats,
+} from '../../../../plus/graph/protocol.js';
+
+/** Whether `stats` describes a working tree with anything in it. Shared so the WIP bar's pill, the node
+ *  glyph, and the merge's probe/counts contradiction check can never disagree about what "dirty" means —
+ *  `renamed` is optional and was the field the three used to differ on. */
+export function hasDirtyCounts(stats: Partial<WorkDirStats> | undefined): boolean {
+	if (stats == null) return false;
+
+	return (stats.added ?? 0) + (stats.modified ?? 0) + (stats.deleted ?? 0) + (stats.renamed ?? 0) > 0;
+}
 
 /**
- * Filters secondary worktree WIP metadata for the active scope: keeps only entries whose
+ * NOTE: callers pass the NON-PRIMARY partition of `wipRowsById`. The graph's own worktree's row has
+ * its own visibility rule ({@link shouldShowPrimaryWipRow}) — it is anchored to HEAD rather than to a
+ * branch it can be attributed to, so running it through the branch-ref match below would answer the
+ * wrong question.
+ *
+ * Filters PEER (non-primary) worktree WIP rows for the active scope: keeps only entries whose
  * worktree branch is one of the scoped local refs (`branchRef` / `additionalBranchRefs`).
  *
  * `scope.upstreamRef` is deliberately not part of the match set — it's a `remotes/*` id, while
@@ -27,10 +46,10 @@ import type { GraphIncludeOnlyRefs, GraphScope, GraphWipMetadataBySha } from '..
  * When no scope is active, this is identity (returns the same reference).
  */
 export function filterSecondariesForScope(
-	wipMetadataBySha: GraphWipMetadataBySha | undefined,
+	wipRows: GraphWipRowsById | undefined,
 	scope: GraphScope | undefined,
-): GraphWipMetadataBySha | undefined {
-	if (wipMetadataBySha == null || scope == null) return wipMetadataBySha;
+): GraphWipRowsById | undefined {
+	if (wipRows == null || scope == null) return wipRows;
 
 	const scopeRefs = new Set<string>();
 	scopeRefs.add(scope.branchRef);
@@ -40,9 +59,9 @@ export function filterSecondariesForScope(
 		}
 	}
 
-	const result: GraphWipMetadataBySha = {};
+	const result: GraphWipRowsById = {};
 	let dropped = false;
-	for (const [sha, meta] of Object.entries(wipMetadataBySha)) {
+	for (const [sha, meta] of Object.entries(wipRows)) {
 		if (meta.branchRef == null || !scopeRefs.has(meta.branchRef)) {
 			dropped = true;
 			continue;
@@ -50,7 +69,44 @@ export function filterSecondariesForScope(
 
 		result[sha] = meta;
 	}
-	return dropped ? result : wipMetadataBySha;
+	return dropped ? result : wipRows;
+}
+
+/**
+ * Answers, from the rows alone, whether the scope's focal branch tip is the row HEAD points at —
+ * the question `scope.branchRef === branch.id` is only ever a proxy for. `isCurrentHead` comes from
+ * the rows' `%D` decoration, which travels on a different channel from `state.branch`, so this still
+ * resolves while the branch payload is missing (see {@link shouldShowPrimaryWipRow}).
+ *
+ * Reads the FOCAL head's own `isCurrentHead`, not the row's — branches sharing a tip put several
+ * heads on one row, so "some head here is current" would let a scope on `feature` inherit `main`'s
+ * answer (and with it `main`'s working changes) whenever the two point at the same commit.
+ *
+ * Returns `undefined` only when genuinely undecidable: no scope, or the focal tip row isn't loaded
+ * AND no loaded row claims HEAD. If the focal tip is missing but some other row IS HEAD, that's
+ * proof enough the focal branch isn't it, so the answer is `false` rather than a shrug — otherwise
+ * the caller defaults to showing and leaks the current branch's WIP under the unloaded scope.
+ */
+export function isScopeFocalHead(
+	rows: readonly { heads?: { name: string; isCurrentHead?: boolean }[] }[] | undefined,
+	scope: GraphScope | undefined,
+): boolean | undefined {
+	if (rows == null || scope?.branchName == null) return undefined;
+
+	let sawCurrentHead = false;
+	for (const row of rows) {
+		const heads = row.heads;
+		if (heads == null || heads.length === 0) continue;
+
+		const focalHead = heads.find(h => h.name === scope.branchName);
+		if (focalHead != null) return focalHead.isCurrentHead === true;
+
+		if (!sawCurrentHead && heads.some(h => h.isCurrentHead)) {
+			sawCurrentHead = true;
+		}
+	}
+
+	return sawCurrentHead ? false : undefined;
 }
 
 /**
@@ -62,10 +118,22 @@ export function filterSecondariesForScope(
  * anchored to HEAD, so it only "belongs" to the scoped branch when the scoped branch is the
  * one HEAD points at — see `getOverviewBranchSelectionSha` for the matching selection-side
  * convention. `additionalBranchRefs` deliberately does NOT count: the primary WIP only
- * attributes to the focal branch. In a detached-HEAD-plus-scope state this returns false —
- * with no current branch there's nothing to attribute the WIP to.
+ * attributes to the focal branch. A detached HEAD hides it too — no branch to attribute to.
  *
- * `branchesVisibility` check (runs after scope):
+ * The scope check needs a KNOWN current branch: `state.branch` ships only on full-state pushes and
+ * writes through unguarded (an errored `getBranch()` sends `branch: undefined`) while `scope` is a
+ * webview-local signal, so the two can disagree for a push. Treating unknown as a mismatch deleted the
+ * row until the next full state, and only while scoped — so instead the caller answers the same
+ * question straight from the rows via `scopeFocalIsHead`: is the scope's focal branch tip the row HEAD
+ * points at? That's what `branch.id` was ever a proxy for, and the rows carry it independently of the
+ * branch payload. Only when the rows can't answer either do we fall through to the visibility checks
+ * (which already default to showing).
+ *
+ * An established focal === current SHORT-CIRCUITS to visible: focusing a branch is explicit intent
+ * and outranks the implicit `branchesVisibility` filter, matching what
+ * `filterSecondariesForScopeAndVisibility` already does for worktree WIP rows.
+ *
+ * `branchesVisibility` check (runs after scope, and only when focus didn't already decide):
  * - `'all'` (and absent): always show.
  * - `'current'`, `'smart'`, `'favorited'`: these modes always include the current branch by
  *   construction, so this returns true in normal cases.
@@ -73,28 +141,52 @@ export function filterSecondariesForScope(
  *   (i.e. an active agent is running on the current branch's worktree).
  *
  * Empty `{}` is treated as "no filter" — same convention as `filterSecondariesForIncludeOnlyRefs`.
- * If the current branch id is unknown (detached HEAD under a non-`'all'` `branchesVisibility`
- * filter with no `scope` active), defaults to showing the primary — the user's local WIP
+ * If the current branch id is unknown, defaults to showing the primary — the user's local WIP
  * still matters even when there's no branch to match against.
  */
 export function shouldShowPrimaryWipRow(
 	branchesVisibility: GraphBranchesVisibility | undefined,
 	includeOnlyRefs: GraphIncludeOnlyRefs | undefined,
-	currentBranchId: string | undefined,
+	currentBranch: { id?: string; name: string; detached?: boolean } | undefined,
 	scope: GraphScope | undefined,
+	scopeFocalIsHead?: boolean,
 ): boolean {
+	const currentBranchId = currentBranch?.id;
+
 	// Scope guard runs first — the Working Changes row is anchored to HEAD, so it only
 	// "belongs" to the scoped branch when the scoped branch is the one HEAD points at.
 	// Without this gate, the GK component keeps the primary WIP in any descendant-branch
 	// scope (HEAD's sha is in the visible ancestor set) and surfaces the current branch's
 	// WIP under a branch it doesn't belong to. `additionalBranchRefs` deliberately does
 	// NOT count — convention is "focal branch only" (matches `getOverviewBranchSelectionSha`).
-	// Detached HEAD under an active scope returns false too — no branch to attribute WIP to.
-	if (scope != null && scope.branchRef !== currentBranchId) return false;
+	if (scope != null) {
+		let focalIsCurrent: boolean;
+		if (currentBranch != null) {
+			// Detached HEAD points at no branch, so nothing for the scoped branch to claim. The host's
+			// resolved flag, never a name test — a detached name is the synthesized `(sha…)` label, but
+			// `(release)` is a legal branch name that the same test would wrongly condemn.
+			if (currentBranch.detached) return false;
+			if (scope.branchRef !== currentBranchId) return false;
+
+			focalIsCurrent = true;
+		} else {
+			// Branch unknown, but the rows answer the same question directly.
+			if (scopeFocalIsHead === false) return false;
+
+			focalIsCurrent = scopeFocalIsHead === true;
+		}
+
+		// Focusing a branch is explicit user intent and outranks the implicit `branchesVisibility`
+		// filter — the same rule `filterSecondariesForScopeAndVisibility` already applies to worktree
+		// WIP rows. Without it, focusing your own branch under `agents` mode still hid your working
+		// changes whenever no agent happened to be running on it. Only once focal === current is
+		// actually established; "can't tell" falls through to the visibility checks below.
+		if (focalIsCurrent) return true;
+	}
 
 	if (branchesVisibility == null || branchesVisibility === 'all') return true;
 	if (includeOnlyRefs == null) return true;
-	if (currentBranchId == null) return true; // detached HEAD fallback — keep primary visible
+	if (currentBranchId == null) return true; // unknown current branch — keep primary visible
 	if (!hasKeys(includeOnlyRefs)) return true; // empty `{}` = "no filter"
 	return includeOnlyRefs[currentBranchId] != null;
 }
@@ -111,18 +203,18 @@ export function shouldShowPrimaryWipRow(
  * When no scope is active, both filters apply as usual.
  */
 export function filterSecondariesForScopeAndVisibility(
-	wipMetadataBySha: GraphWipMetadataBySha | undefined,
+	wipRows: GraphWipRowsById | undefined,
 	scope: GraphScope | undefined,
 	branchesVisibility: GraphBranchesVisibility | undefined,
 	includeOnlyRefs: GraphIncludeOnlyRefs | undefined,
-): GraphWipMetadataBySha | undefined {
-	const scoped = filterSecondariesForScope(wipMetadataBySha, scope);
+): GraphWipRowsById | undefined {
+	const scoped = filterSecondariesForScope(wipRows, scope);
 	if (scope != null) return scoped;
 	return filterSecondariesForIncludeOnlyRefs(scoped, branchesVisibility, includeOnlyRefs);
 }
 
 /**
- * Filters secondary worktree WIP metadata for the active `branchesVisibility` mode: drops any
+ * Filters PEER (non-primary) worktree WIP rows for the active `branchesVisibility` mode: drops any
  * entry whose worktree branch isn't part of the host-computed `includeOnlyRefs` set. Mirrors
  * `filterSecondariesForScope`'s detached-worktree fall-through — entries with `branchRef`
  * undefined pass through and defer to the graph component's SHA filter.
@@ -135,23 +227,23 @@ export function filterSecondariesForScopeAndVisibility(
  * branch ref, so every entry with a real `branchRef` gets dropped.
  */
 export function filterSecondariesForIncludeOnlyRefs(
-	wipMetadataBySha: GraphWipMetadataBySha | undefined,
+	wipRows: GraphWipRowsById | undefined,
 	branchesVisibility: GraphBranchesVisibility | undefined,
 	includeOnlyRefs: GraphIncludeOnlyRefs | undefined,
-): GraphWipMetadataBySha | undefined {
-	if (wipMetadataBySha == null) return wipMetadataBySha;
-	if (branchesVisibility == null || branchesVisibility === 'all') return wipMetadataBySha;
-	if (includeOnlyRefs == null) return wipMetadataBySha;
+): GraphWipRowsById | undefined {
+	if (wipRows == null) return wipRows;
+	if (branchesVisibility == null || branchesVisibility === 'all') return wipRows;
+	if (includeOnlyRefs == null) return wipRows;
 
 	const refIds = new Set(Object.keys(includeOnlyRefs));
 	// Empty `{}` means "no filter" (graph shows all) — match that semantics here so we don't
 	// silently drop every WIP row in detached-HEAD smart/current modes where the host returns
 	// `{ refs: {} }` because there's no current branch to anchor on.
-	if (!refIds.size) return wipMetadataBySha;
+	if (!refIds.size) return wipRows;
 
-	const result: GraphWipMetadataBySha = {};
+	const result: GraphWipRowsById = {};
 	let dropped = false;
-	for (const [sha, meta] of Object.entries(wipMetadataBySha)) {
+	for (const [sha, meta] of Object.entries(wipRows)) {
 		if (meta.branchRef != null && !refIds.has(meta.branchRef)) {
 			dropped = true;
 			continue;
@@ -159,5 +251,5 @@ export function filterSecondariesForIncludeOnlyRefs(
 
 		result[sha] = meta;
 	}
-	return dropped ? result : wipMetadataBySha;
+	return dropped ? result : wipRows;
 }

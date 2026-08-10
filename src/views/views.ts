@@ -120,7 +120,7 @@ export class Views implements Disposable {
 		let newInstall = false;
 		let showGitLensView = false;
 		if (!configuration.get('advanced.skipOnboarding')) {
-			// If this is a new install, expand the GitLens view and show the home view by default, unless we are skipping onboarding
+			// If this is a new install, expand the GitLens view and land on the Graph — its main view — unless we are skipping onboarding
 			newInstall = getContext('gitlens:install:new', false);
 			showGitLensView = newInstall;
 			if (!showGitLensView) {
@@ -151,7 +151,7 @@ export class Views implements Disposable {
 				setTimeout(() => {
 					executeCoreCommand(getViewFocusCommand('gitlens.views.scm.grouped'), { preserveFocus: true });
 					if (newInstall) {
-						executeCoreCommand(getViewFocusCommand('gitlens.views.home'), { preserveFocus: true });
+						executeCoreCommand(getViewFocusCommand('gitlens.views.graph'), { preserveFocus: true });
 					}
 				}, 0);
 			});
@@ -447,7 +447,7 @@ export class Views implements Disposable {
 		let proxy = this._scmGroupedViewProxyCache.get(type) as TreeViewByType[T] | undefined;
 		if (proxy != null) return proxy;
 
-		// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
+		// oxlint-disable-next-line typescript/no-unsafe-function-type
 		const methodCache = new Map<string | symbol, Function | undefined>();
 
 		// Use a proxy to lazily initialize the view (guard against the view not existing or having been disposed) and cache method bindings for performance

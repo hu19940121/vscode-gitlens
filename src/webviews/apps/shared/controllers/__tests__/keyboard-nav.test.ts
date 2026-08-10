@@ -15,12 +15,16 @@ function fakeHost(): ReactiveControllerHost {
 	};
 }
 
-function key(k: string, mods?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean }): KeyboardEvent {
+function key(
+	k: string,
+	mods?: { shiftKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; altKey?: boolean },
+): KeyboardEvent {
 	const event = {
 		key: k,
 		shiftKey: mods?.shiftKey ?? false,
 		ctrlKey: mods?.ctrlKey ?? false,
 		metaKey: mods?.metaKey ?? false,
+		altKey: mods?.altKey ?? false,
 	};
 	return event as unknown as KeyboardEvent;
 }
@@ -101,6 +105,14 @@ suite('KeyboardNavController', () => {
 		assert.deepStrictEqual(selectedIds(), []);
 	});
 
+	test('Alt+Space is consumed without toggling — checkable rows own it', () => {
+		const { focus, keyboard, selectedIds } = setup('multi');
+		focus.focusIndex(2); // 'c'
+		const handled = keyboard.handleKeydown(key(' ', { altKey: true }));
+		assert.strictEqual(handled, true);
+		assert.deepStrictEqual(selectedIds(), []);
+	});
+
 	test('Space activates in single mode', () => {
 		const { focus, keyboard, activated } = setup('single');
 		focus.focusIndex(1); // 'b'
@@ -158,13 +170,15 @@ suite('KeyboardNavController', () => {
 		return { focus: focus, selection: selection, keyboard: keyboard };
 	}
 
-	test('multi-mode plain arrow onto a non-selectable row keeps the selection (folder guard)', () => {
+	test('multi-mode plain arrow onto a non-selectable row clears the selection (follows focus)', () => {
 		const { focus, selection, keyboard } = setupWithUnselectable('multi');
 		selection.setSingle('b');
 		focus.focusIndex(1); // 'b'
 		keyboard.handleKeydown(key('ArrowDown')); // -> 'folder' (non-selectable)
 		assert.strictEqual(focus.focusedId, 'folder'); // cursor still moves
-		assert.deepStrictEqual([...selection.selectedIds], ['b']); // selection NOT collapsed onto the folder
+		// Plain arrow is selection-follows-focus: the folder can't be a member, so the set collapses to
+		// empty rather than leaving 'b' highlighted behind the folder cursor.
+		assert.deepStrictEqual([...selection.selectedIds], []);
 	});
 
 	test('single-mode arrow onto a non-selectable row still highlights it (no guard in single)', () => {

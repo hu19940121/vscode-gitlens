@@ -1,17 +1,17 @@
 import type { ConfigurationChangeEvent, StatusBarItem } from 'vscode';
 import { Disposable, MarkdownString, StatusBarAlignment, ThemeColor, window } from 'vscode';
+import type { GitCloudHostIntegrationId } from '@gitlens/integrations/constants.js';
+import type { ConnectionStateChangeEvent } from '@gitlens/integrations/integrationService.js';
 import { once } from '@gitlens/utils/event.js';
 import { groupByMap } from '@gitlens/utils/iterable.js';
 import { wait } from '@gitlens/utils/promise.js';
 import { pluralize } from '@gitlens/utils/string.js';
 import type { OpenWalkthroughCommandArgs } from '../../commands/walkthroughs.js';
 import type { Colors } from '../../constants.colors.js';
-import type { GitCloudHostIntegrationId } from '../../constants.integrations.js';
 import { proBadge } from '../../constants.js';
 import type { Container } from '../../container.js';
 import { createCommand, executeCommand, registerCommand } from '../../system/-webview/command.js';
 import { configuration } from '../../system/-webview/configuration.js';
-import type { ConnectionStateChangeEvent } from '../integrations/integrationService.js';
 import type { LaunchpadCommandArgs } from './launchpad.js';
 import type { LaunchpadItem, LaunchpadProvider, LaunchpadRefreshEvent } from './launchpadProvider.js';
 import { groupAndSortLaunchpadItems, supportedLaunchpadIntegrations } from './launchpadProvider.js';
@@ -230,7 +230,9 @@ export class LaunchpadIndicator implements Disposable {
 						// If something else has already caused a refresh, don't do another one
 						if (this._hasRefreshed) return;
 
-						void this.provider.getCategorizedItems({ force: true });
+						// Don't force at startup -- nothing is cached yet, so this still fetches, but it shares the
+						// gate with any load already in flight instead of duplicating the whole pipeline
+						void this.provider.getCategorizedItems();
 					});
 				} else {
 					void this.provider.getCategorizedItems({ force: true });
@@ -615,11 +617,17 @@ export class LaunchpadIndicator implements Disposable {
 	}
 }
 
+/** Serializable stand-in for `Error` — the summary crosses the webview RPC, which uses `JSON.stringify` */
+export interface LaunchpadSummaryError {
+	name: string;
+	message: string;
+}
+
 export interface LaunchpadSummaryResult {
 	total: number;
 	groups: LaunchpadGroup[];
 	hasGroupedItems: boolean;
-	error?: Error;
+	error?: LaunchpadSummaryError;
 
 	mergeable?: {
 		total: number;

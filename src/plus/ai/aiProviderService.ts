@@ -8,7 +8,6 @@ import {
 	azureProviderDescriptor,
 	deepSeekProviderDescriptor,
 	geminiProviderDescriptor,
-	githubProviderDescriptor,
 	gitKrakenProviderDescriptor,
 	huggingFaceProviderDescriptor,
 	mistralProviderDescriptor,
@@ -24,6 +23,7 @@ import type {
 	AIActionType,
 	AIModel,
 	AIModelDescriptor,
+	AIProviderDescriptor,
 	AIProviderDescriptorWithConfiguration,
 } from '@gitlens/ai/models/model.js';
 import type {
@@ -33,8 +33,17 @@ import type {
 	PromptTemplateType,
 	TruncationHandler,
 } from '@gitlens/ai/models/promptTemplates.js';
-import type { AIChatMessage, AIProvider, AIProviderResponse, AIProviderResult } from '@gitlens/ai/models/provider.js';
+import type {
+	AIChatMessage,
+	AIChatMessageRole,
+	AIProvider,
+	AIProviderResponse,
+	AIProviderResult,
+	AIResponseFormat,
+	AIToolDefinition,
+} from '@gitlens/ai/models/provider.js';
 import type { AIProviderContext } from '@gitlens/ai/providers/context.js';
+import { clearResponseFormatRejections } from '@gitlens/ai/providers/responseFormatCache.js';
 import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
 import { filterDiffFiles } from '@gitlens/git/parsers/diffParser.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
@@ -66,7 +75,7 @@ import { Directive, isDirective } from '../../quickpicks/items/directive.js';
 import { configuration } from '../../system/-webview/configuration.js';
 import { getContext } from '../../system/-webview/context.js';
 import { loadChunk } from '../../system/-webview/loadChunk.js';
-import type { Storage } from '../../system/-webview/storage.js';
+import { openUrl } from '../../system/-webview/vscode/uris.js';
 import type { Serialized } from '../../system/serialize.js';
 import type { ServerConnection } from '../gk/serverConnection.js';
 import { ensureFeatureAccess } from '../gk/utils/-webview/acount.utils.js';
@@ -90,6 +99,8 @@ import {
 } from './utils/-webview/ai.utils.js';
 import type { ResolvePromptOptions } from './utils/-webview/prompt.utils.js';
 import { getLocalPromptTemplate, resolvePrompt } from './utils/-webview/prompt.utils.js';
+import type { BYOKUsage } from './utils/byokUsage.utils.js';
+import { aggregateBYOKUsage } from './utils/byokUsage.utils.js';
 
 export interface AIResponse<T = void> extends AIProviderResponse<T> {
 	readonly type: AIActionType;
@@ -109,16 +120,30 @@ export type AISourceContext<T> = Source & { context: T };
 /**
  * Identifies an operation that maintains its own remembered AI model, independent of the
  * global default. Picking a model from a scoped surface (the composer chip, the graph
- * compose/review mode chip) writes only to that scope's storage — the global `ai.model`
+ * compose/review/resolve mode chip) writes only to that scope's storage — the global `ai.model`
  * config and other features (commit messages, explain, etc.) are untouched.
+ *
+ * Declared as a value so consumers that must enumerate the scopes at runtime have a
+ * compiler-checked source of truth instead of their own literal array; order is display order.
  */
-export type AIModelScope = 'compose' | 'review';
+export const aiModelScopes = ['compose', 'review', 'resolve'] as const;
+export type AIModelScope = (typeof aiModelScopes)[number];
 
 export interface AIModelChangeEvent {
 	readonly model: AIModel | undefined;
 	/** Scope whose model changed, or `undefined` when the global default changed. */
 	readonly scope?: AIModelScope;
 }
+
+type AIModelUpdateOptions = {
+	/** Scope the resolve belongs to — keys the resolved-model cache and, when persisting, the write target. */
+	scope?: AIModelScope;
+	/**
+	 * Whether to write the model to settings/storage. Only an explicit user pick earns a write —
+	 * a passively-resolved fallback must never pin the user to a provider they never chose.
+	 */
+	persist?: boolean;
+};
 
 /** Maps an `AIActionType` to its remembered scope, or `undefined` for unscoped actions. */
 export function scopeForAction(action: AIActionType): AIModelScope | undefined {
@@ -127,6 +152,8 @@ export function scopeForAction(action: AIActionType): AIModelScope | undefined {
 			return 'compose';
 		case 'review-changes':
 			return 'review';
+		case 'conflict-resolution':
+			return 'resolve';
 		default:
 			return undefined;
 	}
@@ -289,20 +316,6 @@ const supportedAIProviders = new Map<AIProviders, AIProviderDescriptorWithType>(
 		},
 	],
 	[
-		'github',
-		{
-			...githubProviderDescriptor,
-			type: lazy(
-				async () =>
-					(
-						await loadChunk(
-							() => import(/* webpackChunkName: "ai" */ '@gitlens/ai/providers/githubModelsProvider.js'),
-						)
-					).GitHubModelsProvider,
-			),
-		},
-	],
-	[
 		'deepseek',
 		{
 			...deepSeekProviderDescriptor,
@@ -339,6 +352,15 @@ if (DEBUG) {
 	});
 }
 
+function getOrgEnabledProviderDescriptors(): AIProviderDescriptorWithType[] {
+	const orgAIConfig = getOrgAIConfig();
+	return [...supportedAIProviders.values()].filter(p => isProviderEnabledByOrg(p.id, orgAIConfig));
+}
+
+function getOrgEnabledProviders(): AIProviderDescriptor[] {
+	return getOrgEnabledProviderDescriptors().map(p => ({ ...p, type: undefined }));
+}
+
 export interface AIRequestProvider {
 	/**
 	 * Get the messages for the current conversation state.
@@ -351,7 +373,7 @@ export interface AIRequestProvider {
 		cancellation: CancellationToken,
 		maxInputTokens: number,
 		retries: number,
-	) => Promise<AIChatMessage[]>;
+	) => Promise<AIChatMessage<AIChatMessageRole>[]>;
 
 	/**
 	 * Get the progress title for each attempt.
@@ -402,7 +424,8 @@ export class AIProviderService implements AIService, Disposable {
 	private _providerDisposable: Disposable | undefined;
 
 	// Resolved AIModel per scope ('global' for the global default). Populated lazily by `getModel`
-	// and proactively by `getOrUpdateModel` after every persist. Invalidated on config changes,
+	// and proactively by `getOrUpdateModel` on every successful resolve — including the passive
+	// fallbacks it deliberately doesn't persist, which live only here. Invalidated on config changes,
 	// subscription changes, provider state changes, and `force` reads. Lets repeated silent reads
 	// (graph details, composer event handler, etc.) skip the full resolve pipeline and the network
 	// `provider.getModels()` call inside it.
@@ -412,18 +435,30 @@ export class AIProviderService implements AIService, Disposable {
 	// subscription change, and force.
 	private readonly _providerModelsCache = new Map<AIProviders, Promise<readonly AIModel[]>>();
 
+	// BYOK token usage accumulated per conversation (keyed by conversationId, then provider/model),
+	// reported as ONE usage report — and so one backend feature fee — when `flushBYOKUsage` is
+	// called at session end.
+	private readonly _pendingBYOKUsage = new Map<string, Map<string, BYOKUsage>>();
+
 	private _actions: AIActions | undefined;
 	get actions(): AIActions {
 		this._actions ??= new AIActions(this);
 		return this._actions;
 	}
 
+	/** Whether AI is usable: enabled by the user AND allowed by the org. */
 	get allowed(): boolean {
-		return getContext('gitlens:gk:organization:ai:enabled', true);
+		return this.enabled && this.orgEnabled;
 	}
 
+	/** Whether the user has enabled AI features (`gitlens.ai.enabled` setting). */
 	get enabled(): boolean {
 		return configuration.get('ai.enabled', undefined, true);
+	}
+
+	/** Whether the org permits AI (GitKraken admin setting). Fail-open: defaults true until org settings load. */
+	get orgEnabled(): boolean {
+		return getContext('gitlens:gk:organization:ai:enabled', true);
 	}
 
 	constructor(
@@ -442,10 +477,39 @@ export class AIProviderService implements AIService, Disposable {
 				if (accountChanged || planChanged) {
 					this._modelCache.clear();
 					this._providerModelsCache.clear();
+					clearResponseFormatRejections();
+
+					// Re-resolve now rather than waiting for a consumer to ask — signing in is what makes
+					// GitKraken AI resolvable, and this resolve is what fires `onDidChangeModel` so the AI
+					// chips update without a reload.
+					if (this.allowed) {
+						void this.getModel({ silent: true });
+					}
 				}
 			}),
 			configuration.onDidChange(e => {
-				if (!configuration.changed(e, 'ai')) return;
+				// Only the keys that define the global model matter here — other `ai.*` edits (temperature,
+				// custom instructions, exclusions) must not invalidate the resolved-model cache and force a
+				// fresh `provider.getModels()` round trip.
+				// A provider's server URL isn't part of a model id, so it can never produce the drift the
+				// compare below looks for and has to invalidate on its own. Ollama only: it's the one provider
+				// whose model list comes FROM that server, so a new URL can disagree about which models exist.
+				// The rest ship a static list, where re-resolving provably yields the same model.
+				if (configuration.changed(e, 'ai.ollama.url')) {
+					if (
+						this._model?.provider.id === 'ollama' ||
+						this._modelCache.get('global')?.provider.id === 'ollama'
+					) {
+						this._modelCache.clear();
+						this._providerModelsCache.delete('ollama');
+						// A different server can disagree about schema support for the same model id
+						clearResponseFormatRejections();
+						this._model = undefined;
+					}
+					return;
+				}
+
+				if (!configuration.changed(e, ['ai.model', 'ai.gitkraken.model', 'ai.vscode.model'])) return;
 
 				// Only invalidate when the configured global model actually drifted from what's
 				// cached. Our own `updateEffective` writes inside `getOrUpdateModel` also trigger
@@ -455,13 +519,13 @@ export class AIProviderService implements AIService, Disposable {
 				if (!this._modelCache.has('global')) return;
 
 				const cached = this._modelCache.get('global');
-				const cfg = this.getConfiguredModel()?.descriptor;
+				const cfg = this.getConfiguredModel();
 				const matches =
 					cfg == null ? cached == null : cfg.provider === cached?.provider.id && cfg.model === cached.id;
 				if (matches) return;
 
-				// Drift detected — any scope whose `fromScope: false` resolution used the global
-				// fallback could now be stale, so clear everything.
+				// Drift detected — any scope that fell back to the global default could now be stale,
+				// so clear everything.
 				this._modelCache.clear();
 			}),
 		);
@@ -474,6 +538,12 @@ export class AIProviderService implements AIService, Disposable {
 	}
 
 	dispose(): void {
+		// Best-effort: report any BYOK usage still pending for unflushed conversations so it isn't
+		// silently dropped on shutdown/reload.
+		for (const conversationId of [...this._pendingBYOKUsage.keys()]) {
+			void this.flushBYOKUsage(conversationId);
+		}
+
 		this._disposable.dispose();
 		this._onDidChangeModel.dispose();
 		this._providerDisposable?.dispose();
@@ -670,19 +740,60 @@ export class AIProviderService implements AIService, Disposable {
 	}
 
 	/**
-	 * Resolves the configured model for the given scope. Returns `fromScope: true` when the
-	 * value was read from the scope's Memento storage; `false` when it fell back to the
-	 * global `ai.model` config (or scope was undefined). Callers use this to decide whether
-	 * a subsequent persist should write to scope storage — silent reads that fell back to
-	 * global must NOT auto-populate scope storage, otherwise the scope would "snapshot" the
-	 * global default at first read and stop tracking later changes.
+	 * The qualified `provider:model` explicitly remembered for `scope`, or `undefined` when the scope
+	 * inherits the global default. Unlike `getModel({ scope })`, this never falls back.
 	 */
-	private getConfiguredModel(
-		scope?: AIModelScope,
-	): { descriptor: AIModelDescriptor; fromScope: boolean } | undefined {
+	private getScopedModelId(scope: AIModelScope): AIProviderAndModel | undefined {
+		return this.container.storage.get(`ai:scope:${scope}:model`);
+	}
+
+	/**
+	 * Resolves `scope`'s model together with whether that model came from the scope's own stored
+	 * selection rather than the inherited default.
+	 *
+	 * `isOverride` requires the stored selection to also be what resolved. A stored selection whose
+	 * provider has since been org-disabled or removed resolves past it to the fallback, and reporting
+	 * that as an override would label a model the user isn't actually getting as their choice. The
+	 * qualified-id comparison lives here because this class owns that storage encoding.
+	 */
+	async getScopedModel(
+		scope: AIModelScope,
+		options?: { silent?: boolean },
+	): Promise<{ model: AIModel | undefined; isOverride: boolean }> {
+		const stored = this.getScopedModelId(scope);
+		const model = await this.getModel({ silent: options?.silent, scope: scope });
+
+		return {
+			model: model,
+			isOverride: stored != null && model != null && `${model.provider.id}:${model.id}` === stored,
+		};
+	}
+
+	/**
+	 * Clears `scope`'s remembered model so it inherits the global default again.
+	 */
+	async clearScopedModel(scope: AIModelScope): Promise<void> {
+		if (this.getScopedModelId(scope) == null) return;
+
+		await this.container.storage.delete(`ai:scope:${scope}:model`);
+
+		// Only this scope's resolved value is stale. Unlike `resetModels`, `_model` and
+		// `_providerModelsCache` are deliberately left alone: `resetModels` clears `_model` because every
+		// selection disappears at once, whereas here `getOrUpdateModel`'s reuse of `_model` is gated on a
+		// model-id match, so the stale singleton can't leak into this scope's re-resolve.
+		this._modelCache.delete(scope);
+
+		this._onDidChangeModel.fire({ model: undefined, scope: scope });
+	}
+
+	/**
+	 * Resolves the configured model for the given scope — the scope's Memento storage when it holds a
+	 * value, otherwise the global `ai.model` config. A configured value is by definition already
+	 * persisted, so callers never need to write one back.
+	 */
+	private getConfiguredModel(scope?: AIModelScope): AIModelDescriptor | undefined {
 		const scopedQualifiedModelId =
 			scope != null ? this.container.storage.get(`ai:scope:${scope}:model`) : undefined;
-		const fromScope = scopedQualifiedModelId != null;
 		const qualifiedModelId = scopedQualifiedModelId ?? configuration.get('ai.model') ?? undefined;
 		if (qualifiedModelId == null) return undefined;
 
@@ -692,16 +803,16 @@ export class AIProviderService implements AIService, Disposable {
 
 		if (providerId != null && this.supports(providerId)) {
 			if (modelId != null) {
-				return { descriptor: { provider: providerId, model: modelId }, fromScope: fromScope };
+				return { provider: providerId, model: modelId };
 			} else if (isPrimaryAIProvider(providerId)) {
 				// Primary providers may store just the providerId in `ai.model` and the model id
 				// in `ai.${providerId}.model`. Scoped storage always carries the qualified form,
-				// so this path only matters for the global fallback (always `fromScope: false`).
+				// so this path only matters for the global fallback.
 				modelId = configuration.get(`ai.${providerId}.model`) ?? undefined;
 				if (modelId != null) {
 					// Model ids are in the form of `provider:model`
 					if (/^(.+):(.+)$/.test(modelId)) {
-						return { descriptor: { provider: providerId, model: modelId }, fromScope: false };
+						return { provider: providerId, model: modelId };
 					}
 				}
 			}
@@ -748,7 +859,14 @@ export class AIProviderService implements AIService, Disposable {
 		if (pending == null) {
 			pending = (async () => {
 				try {
-					return await provider.getModels();
+					const models = await provider.getModels();
+					// For a provider whose list comes from a server, an empty result is a failure in disguise
+					// — Ollama swallows fetch errors and returns `[]` — so don't let one stick for the session
+					// and strand the user on "no models" until a reload.
+					if (!models.length) {
+						this._providerModelsCache.delete(providerId);
+					}
+					return models;
 				} catch (ex) {
 					// Don't cache a failure — let the next call retry.
 					this._providerModelsCache.delete(providerId);
@@ -760,40 +878,27 @@ export class AIProviderService implements AIService, Disposable {
 		return pending;
 	}
 
+	/**
+	 * The model to use when nothing is configured. GitKraken AI is the only provider we ever select
+	 * automatically — every other provider (Copilot, BYOK) is an explicit user choice. Every AI feature
+	 * requires a verified account and a paid plan, so with no account there is no usable model at all
+	 * and falling back to another provider would only offer something the user can't run.
+	 */
 	private async getBestFallbackModel(scope?: AIModelScope): Promise<AIModel | undefined> {
-		let model: AIModel | undefined;
-		let models: readonly AIModel[];
+		if (!isProviderEnabledByOrg('gitkraken')) return undefined;
 
-		const orgAIConfig = getOrgAIConfig();
-		const isComposeOrReviewScope = scope === 'compose' || scope === 'review';
+		const subscription = await this.container.subscription.getSubscription();
+		if (!subscription.account?.verified) return undefined;
 
-		// First, use the GitKraken AI scope-preferred (compose/review), default, or first model
-		if (isProviderEnabledByOrg('gitkraken', orgAIConfig)) {
-			try {
-				const subscription = await this.container.subscription.getSubscription();
-				if (subscription.account?.verified) {
-					models = await this.getModels('gitkraken');
-					const scopedDefault = isComposeOrReviewScope
-						? models.find(m => m.id === 'gemini:gemini-3-flash-preview')
-						: undefined;
-					model = scopedDefault ?? models.find(m => m.default) ?? models[0];
-					if (model != null) return model;
-				}
-			} catch {}
-		}
+		try {
+			const models = await this.getModels('gitkraken');
+			// Scoped operations (compose/review/resolve) prefer a faster model over the overall default
+			const scopedDefault =
+				scope != null ? models.find(m => m.id === 'gemini:gemini-3-flash-preview') : undefined;
+			return scopedDefault ?? models.find(m => m.default) ?? models[0];
+		} catch {}
 
-		// Second, use Copilot GPT 4.1 or first model
-		if (isProviderEnabledByOrg('vscode', orgAIConfig)) {
-			try {
-				models = await this.getModels('vscode');
-				if (models.length) {
-					model = models.find(m => m.id === 'copilot:gpt-4.1') ?? models[0];
-					if (model != null) return model;
-				}
-			} catch {}
-		}
-
-		return model;
+		return undefined;
 	}
 
 	async getModel(
@@ -809,6 +914,7 @@ export class AIProviderService implements AIService, Disposable {
 			// `provider.getModels()` list.
 			this._modelCache.delete(cacheKey);
 			this._providerModelsCache.clear();
+			clearResponseFormatRejections();
 		} else if (options?.silent) {
 			// Silent reads are the hot path (graph details, composer event handler, RPC chip reads).
 			// Cache hits skip the storage/config reads + `getOrUpdateModel` + `provider.getModels()`
@@ -836,30 +942,35 @@ export class AIProviderService implements AIService, Disposable {
 		source?: Source,
 	): Promise<AIModel | undefined> {
 		const scope = options?.scope;
-		const cfgResult = this.getConfiguredModel(scope);
-		const cfg = cfgResult?.descriptor;
-		// Persist to scope storage only when (a) the value already exists in scope storage —
-		// a write-through update — or (b) the user explicitly picks via a scoped picker (set
-		// inside the loop below). Silent reads that fell back to the global default must NOT
-		// auto-populate scope storage, otherwise the scope would "snapshot" the global default
-		// at first read and stop tracking later global changes.
-		const cfgFromScope = cfgResult?.fromScope ?? false;
-		let scopeForPersist: AIModelScope | undefined = cfgFromScope ? scope : undefined;
+		const cfg = this.getConfiguredModel(scope);
 
 		if (!options?.force && cfg?.provider != null && cfg?.model != null) {
-			const model = await this.getOrUpdateModel(cfg.provider, cfg.model, scopeForPersist);
+			// Reading back an already-stored selection — there is nothing to write
+			const model = await this.getOrUpdateModel(cfg.provider, cfg.model, { scope: scope });
 			if (model != null) return model;
 		}
 
 		let chosenModel: AIModel | undefined;
 		let chosenProviderId: AIProviders | undefined;
+		// Only a model the user picked out of the picker below earns a write. A passively-resolved
+		// fallback must never land in settings: it would pin the user to a provider they never chose (and
+		// a scoped resolve's preferred model to the global default), and once written it resolves
+		// successfully forever, so later changes — signing in, a new GitKraken default — never re-evaluate.
+		let picked = false;
 		const currentModel =
 			cfg?.provider != null && cfg?.model != null
-				? lazy(() => this.getOrUpdateModel(cfg.provider, cfg.model, scopeForPersist))
+				? lazy(() => this.getOrUpdateModel(cfg.provider, cfg.model, { scope: scope }))
 				: undefined;
 		const fallbackModel = lazy(() => this.getBestFallbackModel(scope));
 
-		if (!options?.silent) {
+		// Gate the account once, up front. Every step below would otherwise prompt for one on its own —
+		// a primary provider's `configured()` check and both pickers — so a signed-out user got a
+		// sign-in prompt per step instead of a single one.
+		// `undefined` when silent — the gate never runs and nothing was asked of the user.
+		const allowed = options?.silent ? undefined : await ensureAccess(this.container, { showPicker: true }, source);
+		// Tracks a pick the user backed out of, so it isn't later reported as a switch (see the send below).
+		let cancelled = allowed === false;
+		if (allowed) {
 			if (!options?.force) {
 				chosenModel = currentModel != null ? await currentModel.value : await fallbackModel.value;
 				chosenProviderId = chosenModel?.provider.id;
@@ -867,11 +978,29 @@ export class AIProviderService implements AIService, Disposable {
 
 			const titles = getPickerTitlesForScope(scope);
 
+			// If a provider is already selected, skip the provider step and go straight to the
+			// model picker — it leads with a "Change AI Provider" entry (see `showAIModelPicker`)
+			// so switching providers stays one pick away.
+			let skippedProviderPicker = false;
+			if (
+				chosenProviderId == null &&
+				cfg?.provider != null &&
+				supportedAIProviders.has(cfg.provider) &&
+				isProviderEnabledByOrg(cfg.provider)
+			) {
+				chosenProviderId = cfg.provider;
+				skippedProviderPicker = true;
+			}
+
 			while (true) {
-				chosenProviderId ??= (await showAIProviderPicker(this.container, cfg, source, titles.provider))
-					?.provider;
+				if (chosenProviderId == null) {
+					skippedProviderPicker = false;
+					chosenProviderId = (await showAIProviderPicker(this.container, cfg, source, titles.provider))
+						?.provider;
+				}
 				if (chosenProviderId == null) {
 					chosenModel = undefined;
+					cancelled = true;
 					break;
 				}
 
@@ -893,9 +1022,11 @@ export class AIProviderService implements AIService, Disposable {
 						source,
 						titles.model,
 						scope,
+						skippedProviderPicker ? { availableProviders: getOrgEnabledProviders() } : undefined,
 					);
 					if (result == null || (isDirective(result) && result !== Directive.Back)) {
 						chosenModel = undefined;
+						cancelled = true;
 						break;
 					}
 					if (result === Directive.Back) {
@@ -904,8 +1035,7 @@ export class AIProviderService implements AIService, Disposable {
 					}
 
 					chosenModel = result.model;
-					// User explicitly picked from a scoped picker — persist to scope going forward.
-					scopeForPersist = scope;
+					picked = true;
 				}
 
 				break;
@@ -913,8 +1043,16 @@ export class AIProviderService implements AIService, Disposable {
 		}
 
 		chosenModel ??= currentModel != null ? await currentModel.value : await fallbackModel.value;
-		const model = chosenModel == null ? undefined : await this.getOrUpdateModel(chosenModel, scopeForPersist);
+		const model =
+			chosenModel == null
+				? undefined
+				: await this.getOrUpdateModel(chosenModel, { scope: scope, persist: picked });
 		if (options?.silent) return model;
+		// A pick the user backed out of is not a switch. The `??=` above deliberately falls back to the
+		// configured model so the cache still warms and an opportunistic picker's caller keeps working — but
+		// reporting that fallback as `ai/switchModel` counted a switch that never happened, on EVERY cancelled
+		// pick (either picker, or the account gate), not just the declined gate.
+		if (cancelled) return model;
 
 		this.container.telemetry.sendEvent(
 			'ai/switchModel',
@@ -928,17 +1066,13 @@ export class AIProviderService implements AIService, Disposable {
 			source,
 		);
 
-		if (model != null) {
-			void (await showConfirmAIProviderToS(this.container.storage));
-		}
 		return model;
 	}
 
 	async getProvidersConfiguration(): Promise<Map<AIProviders, AIProviderDescriptorWithConfiguration>> {
-		const orgAiConfig = getOrgAIConfig();
 		const promises = await Promise.allSettled(
 			map(
-				[...supportedAIProviders.values()].filter(p => isProviderEnabledByOrg(p.id, orgAiConfig)),
+				getOrgEnabledProviderDescriptors(),
 				async p =>
 					[
 						p.id,
@@ -963,31 +1097,32 @@ export class AIProviderService implements AIService, Disposable {
 		}
 	}
 
-	private getOrUpdateModel(model: AIModel, scope?: AIModelScope): Promise<AIModel | undefined>;
+	private getOrUpdateModel(model: AIModel, options?: AIModelUpdateOptions): Promise<AIModel | undefined>;
 	private getOrUpdateModel<T extends AIProviders>(
 		providerId: T,
 		modelId: string,
-		scope?: AIModelScope,
+		options?: AIModelUpdateOptions,
 	): Promise<AIModel | undefined>;
 	private async getOrUpdateModel(
 		modelOrProviderId: AIModel | AIProviders,
-		modelIdOrScope?: string | AIModelScope,
-		maybeScope?: AIModelScope,
+		modelIdOrOptions?: string | AIModelUpdateOptions,
+		maybeOptions?: AIModelUpdateOptions,
 	): Promise<AIModel | undefined> {
 		let providerId: AIProviders;
 		let model: AIModel | undefined;
 		let modelId: string | undefined;
-		let scope: AIModelScope | undefined;
+		let options: AIModelUpdateOptions | undefined;
 		if (typeof modelOrProviderId === 'string') {
 			providerId = modelOrProviderId;
-			modelId =
-				typeof modelIdOrScope === 'string' && !isAIModelScope(modelIdOrScope) ? modelIdOrScope : undefined;
-			scope = maybeScope ?? (isAIModelScope(modelIdOrScope) ? modelIdOrScope : undefined);
+			modelId = typeof modelIdOrOptions === 'string' ? modelIdOrOptions : undefined;
+			options = maybeOptions ?? (typeof modelIdOrOptions === 'object' ? modelIdOrOptions : undefined);
 		} else {
 			model = modelOrProviderId;
 			providerId = model.provider.id;
-			scope = isAIModelScope(modelIdOrScope) ? modelIdOrScope : undefined;
+			options = typeof modelIdOrOptions === 'object' ? modelIdOrOptions : undefined;
 		}
+
+		const scope = options?.scope;
 
 		if (providerId && !isProviderEnabledByOrg(providerId)) {
 			// Only clear the singleton cache when working on the global default — the cache
@@ -1077,22 +1212,24 @@ export class AIProviderService implements AIService, Disposable {
 		this._modelCache.set(scope ?? 'global', model);
 
 		if (changed) {
-			if (scope != null) {
-				// Scoped persistence: only the scope's Memento key is updated. The global default
-				// `ai.model` config is intentionally NOT touched so other features keep their model.
-				// Scoped storage uses the fully qualified `provider:model` form for ALL providers
-				// (including primaries) so a single read resolves the model without consulting any
-				// global `ai.${providerId}.model` config — keeping scope isolation airtight.
-				const qualified: AIProviderAndModel = `${model.provider.id}:${model.id}`;
-				await this.container.storage.store(`ai:scope:${scope}:model`, qualified);
-			} else if (isPrimaryAIProviderModel(model)) {
-				await configuration.updateEffective(`ai.model`, model.provider.id);
-				await configuration.updateEffective(`ai.${model.provider.id}.model`, model.id);
-			} else {
-				await configuration.updateEffective(
-					`ai.model`,
-					`${model.provider.id}:${model.id}` as SupportedAIModels,
-				);
+			if (options?.persist) {
+				if (scope != null) {
+					// Scoped persistence: only the scope's Memento key is updated. The global default
+					// `ai.model` config is intentionally NOT touched so other features keep their model.
+					// Scoped storage uses the fully qualified `provider:model` form for ALL providers
+					// (including primaries) so a single read resolves the model without consulting any
+					// global `ai.${providerId}.model` config — keeping scope isolation airtight.
+					const qualified: AIProviderAndModel = `${model.provider.id}:${model.id}`;
+					await this.container.storage.store(`ai:scope:${scope}:model`, qualified);
+				} else if (isPrimaryAIProviderModel(model)) {
+					await configuration.updateEffective(`ai.model`, model.provider.id);
+					await configuration.updateEffective(`ai.${model.provider.id}.model`, model.id);
+				} else {
+					await configuration.updateEffective(
+						`ai.model`,
+						`${model.provider.id}:${model.id}` as SupportedAIModels,
+					);
+				}
 			}
 			this._onDidChangeModel.fire({ model: model, scope: scope });
 		}
@@ -1126,7 +1263,7 @@ export class AIProviderService implements AIService, Disposable {
 		let label;
 		switch (feature) {
 			case 'generate-searchQuery':
-				label = `AI-powered search (preview) ${suffix}`;
+				label = `AI-powered search ${suffix}`;
 				break;
 
 			default:
@@ -1154,10 +1291,26 @@ export class AIProviderService implements AIService, Disposable {
 		source: Source,
 		options?: {
 			cancellation?: CancellationToken;
+			/** Session-scoped ID sent to the GitKraken backend (as `GK-Conversation-ID`) so its flat
+			 *  per-feature fee is charged once per session instead of once per request. Multi-call
+			 *  features should pass the same ID for every request in a user-facing session. Also defers
+			 *  BYOK usage reporting — the caller MUST call {@link flushBYOKUsage} when the session ends. */
+			conversationId?: string;
 			generating?: Deferred<AIModel>;
 			modelOptions?: { outputTokens?: number; temperature?: number };
 			progress?: ProgressOptions;
+			/** Schema for native structured output on capable provider+model combos; ignored elsewhere */
+			responseFormat?: AIResponseFormat;
+			/** Suppresses the interactive error notifications (retry / switch-model / upgrade prompts) this
+			 *  service otherwise shows and *awaits*. Required for any driven multi-step run: a notification
+			 *  carrying buttons doesn't auto-dismiss, so an un-actioned one parks the request and freezes
+			 *  whatever is driving it. Pair with {@link throwAIErrors} so the caller still receives the
+			 *  reason and can report it in its own UI. */
+			silent?: boolean;
 			throwAIErrors?: boolean;
+			/** Tools to advertise to the model. Silently dropped for providers that don't support them,
+			 *  so callers don't need to know which provider resolved. */
+			tools?: readonly AIToolDefinition[];
 		},
 	): Promise<AIProviderResult<void> | 'cancelled' | undefined> {
 		const scope = getScopedLogger();
@@ -1209,18 +1362,11 @@ export class AIProviderService implements AIService, Disposable {
 			await this.showAiAllAccessNotificationIfNeeded(true);
 		}
 
-		const confirmed = await showConfirmAIProviderToS(this.container.storage);
-		if (!confirmed || cancellation.isCancellationRequested) {
-			scope?.setFailed(
-				cancellation.isCancellationRequested ? 'cancelled: user cancelled' : 'cancelled: user declined ToS',
-			);
+		if (cancellation.isCancellationRequested) {
+			scope?.setFailed('cancelled: user cancelled');
 			this.container.telemetry.sendEvent(
 				telementry.key,
-				{
-					...telementry.data,
-					failed: true,
-					'failed.reason': cancellation.isCancellationRequested ? 'user-cancelled' : 'user-declined',
-				},
+				{ ...telementry.data, failed: true, 'failed.reason': 'user-cancelled' },
 				source,
 			);
 
@@ -1293,7 +1439,15 @@ export class AIProviderService implements AIService, Disposable {
 							model,
 							apiKey,
 							provider.getMessages.bind(this, model, telementry.data, cancellation),
-							{ signal: controller.signal, modelOptions: options?.modelOptions },
+							{
+								signal: controller.signal,
+								modelOptions: options?.modelOptions,
+								conversationId: options?.conversationId,
+								responseFormat: options?.responseFormat,
+								// Drop tools for providers whose wire format can't carry them — the caller
+								// sees no `toolCalls` back and falls through to its text-only path.
+								tools: requestProviderRef.provider.supportsTools ? options?.tools : undefined,
+							},
 						);
 						if (!fulfilled) {
 							options?.generating?.fulfill(model);
@@ -1330,7 +1484,14 @@ export class AIProviderService implements AIService, Disposable {
 						);
 
 						if (result != null && supportedAIProviders.get(model.provider.id)?.requiresUserKey) {
-							void this.reportBYOKUsage(action, result);
+							// Within a conversation, defer reporting — each report is charged the flat
+							// per-feature fee, so the session's many calls are aggregated into ONE report
+							// sent by `flushBYOKUsage` when the session ends.
+							if (options?.conversationId != null) {
+								this.accumulateBYOKUsage(options.conversationId, action, result);
+							} else {
+								void this.reportBYOKUsage(action, result);
+							}
 						}
 
 						if (!isGkModel) {
@@ -1380,6 +1541,22 @@ export class AIProviderService implements AIService, Disposable {
 								},
 								source,
 							);
+
+							// Every arm below `await`s a notification, and a VS Code notification carrying
+							// buttons doesn't auto-dismiss — so an un-actioned one parks this request, and with
+							// it anything driving it. A multi-step run (automatic rebase) would sit mid-step
+							// behind a toast, reporting the last thing it did, with even its own Cancel inert
+							// until someone clicks. Driven callers therefore opt out of the whole interactive
+							// tier and surface the failure in their own UI; they pass `throwAIErrors` so the
+							// reason survives for them to classify.
+							if (options?.silent) {
+								if (!fulfilled) {
+									options?.generating?.cancel();
+								}
+								if (options?.throwAIErrors) throw error;
+
+								return undefined;
+							}
 
 							switch (error.reason) {
 								case AIErrorReason.NoNetwork:
@@ -1461,14 +1638,56 @@ export class AIProviderService implements AIService, Disposable {
 									return undefined;
 								}
 								case AIErrorReason.UserQuotaExceeded: {
-									const increaseLimit: MessageItem = { title: 'Increase Limit' };
-									const result = await window.showErrorMessage(
-										"Your request could not be completed because you've reached the weekly AI usage limit for your current plan. Upgrade to unlock more AI-powered actions.",
-										increaseLimit,
-									);
+									const sub = await this.container.subscription.getSubscription();
+									const role = sub.activeOrganization?.role;
+									const canPurchase =
+										role == null || role === 'owner' || role === 'admin' || role === 'billing';
 
-									if (result === increaseLimit) {
-										void this.container.subscription.manageSubscription(source);
+									if (canPurchase) {
+										const getMoreCredits: MessageItem = {
+											title: 'Get More Credits',
+										};
+										const dismiss: MessageItem = {
+											title: 'Dismiss',
+											isCloseAffordance: true,
+										};
+										const result = await window.showErrorMessage(
+											"Your request could not be completed because you've reached the weekly usage included in your plan. Purchase additional AI credits to keep using GitKraken AI.",
+											getMoreCredits,
+											dismiss,
+										);
+
+										if (result === getMoreCredits) {
+											this.container.telemetry.sendEvent(
+												'ai/credits/addOnClicked',
+												{ 'organization.role': role },
+												source,
+											);
+											void openUrl(
+												await this.container.urls.getGkDevUrl('subscription/credit-add-on'),
+											);
+										} else {
+											this.container.telemetry.sendEvent(
+												'ai/credits/addOnDismissed',
+												{ 'organization.role': role },
+												source,
+											);
+										}
+									} else {
+										const ok: MessageItem = {
+											title: 'OK',
+											isCloseAffordance: true,
+										};
+										await window.showErrorMessage(
+											"Your request could not be completed because you've reached the weekly usage included in your plan. Contact your organization admin or owner to request more AI credits.",
+											ok,
+										);
+
+										this.container.telemetry.sendEvent(
+											'ai/credits/addOnDismissed',
+											{ 'organization.role': role },
+											source,
+										);
 									}
 
 									if (options?.throwAIErrors) throw error;
@@ -1591,16 +1810,86 @@ export class AIProviderService implements AIService, Disposable {
 		// API requires total_tokens >= 1
 		if (totalTokens < 1) return;
 
+		await this.postBYOKUsageReport(model.provider.id, model.id, action, totalTokens, promptTokens);
+	}
+
+	/**
+	 * Accumulates a BYOK response's token usage under its conversation instead of reporting it
+	 * immediately — the backend charges a flat per-feature fee per report, so a multi-call session
+	 * reports once, via {@link flushBYOKUsage}, when it ends.
+	 */
+	private accumulateBYOKUsage(
+		conversationId: string,
+		action: AIActionType,
+		response: AIProviderResponse<void>,
+	): void {
+		const model = response.model;
+		const promptTokens = response.usage?.promptTokens;
+		const completionTokens = response.usage?.completionTokens;
+		const totalTokens = response.usage?.totalTokens ?? (promptTokens ?? 0) + (completionTokens ?? 0);
+		if (totalTokens < 1) return;
+
+		let buckets = this._pendingBYOKUsage.get(conversationId);
+		if (buckets == null) {
+			buckets = new Map();
+			this._pendingBYOKUsage.set(conversationId, buckets);
+		}
+
+		const key = `${model.provider.id}/${model.id}`;
+		const bucket = buckets.get(key);
+		if (bucket == null) {
+			buckets.set(key, {
+				provider: model.provider.id,
+				model: model.id,
+				action: action,
+				totalTokens: totalTokens,
+				inputTokens: promptTokens ?? 0,
+			});
+		} else {
+			bucket.totalTokens += totalTokens;
+			bucket.inputTokens += promptTokens ?? 0;
+		}
+	}
+
+	/**
+	 * Sends the single aggregated BYOK usage report for a conversation started via `sendRequest`'s
+	 * `conversationId` option. Call when the user-facing session ends (applied/discarded/disposed).
+	 * No-op when nothing was accumulated, so it's safe to call repeatedly (e.g. discard then dispose).
+	 */
+	async flushBYOKUsage(conversationId: string): Promise<void> {
+		const buckets = this._pendingBYOKUsage.get(conversationId);
+		this._pendingBYOKUsage.delete(conversationId);
+		if (buckets == null) return;
+
+		const usage = aggregateBYOKUsage(buckets.values());
+		if (usage == null) return;
+
+		await this.postBYOKUsageReport(
+			usage.provider,
+			usage.model,
+			usage.action,
+			usage.totalTokens,
+			usage.inputTokens > 0 ? usage.inputTokens : undefined,
+		);
+	}
+
+	private async postBYOKUsageReport(
+		provider: AIProviders,
+		model: string,
+		action: AIActionType,
+		totalTokens: number,
+		inputTokens?: number,
+	): Promise<void> {
 		try {
 			await this.connection.fetchGkApi('v1/ai-tasks/usage/reports', {
 				method: 'POST',
 				body: JSON.stringify({
-					provider: model.provider.id,
-					model: model.id,
+					provider: provider,
+					model: model,
 					task_type: 'message-prompt',
 					action: action,
 					total_tokens: totalTokens,
-					...(promptTokens != null && { input_tokens: promptTokens }),
+					...(inputTokens != null && { input_tokens: inputTokens }),
 				}),
 			});
 		} catch {}
@@ -1635,6 +1924,8 @@ export class AIProviderService implements AIService, Disposable {
 			progress?: ProgressOptions;
 			modelOptions?: { outputTokens?: number; temperature?: number };
 			maxAttempts?: number;
+			/** Schema for native structured output on capable provider+model combos; ignored elsewhere */
+			responseFormat?: AIResponseFormat;
 		},
 	): Promise<{ response: AIProviderResponse<void>; result: TResult } | 'cancelled' | undefined> {
 		const maxAttempts = options?.maxAttempts ?? 4;
@@ -1765,7 +2056,12 @@ export class AIProviderService implements AIService, Disposable {
 		}
 
 		if ('instructions' in context && context.instructions) {
-			context.instructions = `Carefully follow these additional instructions (provided directly by the user), but do not deviate from the output structure:\n${context.instructions}`;
+			// Wrap a copy — getMessages callbacks re-invoke this on provider retries, so mutating the
+			// caller's context would stack the preamble
+			context = {
+				...context,
+				instructions: `Carefully follow these additional instructions (provided directly by the user), but do not deviate from the output structure:\n${context.instructions}`,
+			};
 		}
 
 		// Handle the two overload cases
@@ -1851,7 +2147,7 @@ export class AIProviderService implements AIService, Disposable {
 		});
 	}
 
-	async reset(all?: boolean): Promise<void> {
+	async reset(options?: { all?: boolean; silent?: boolean }): Promise<void> {
 		let { _provider: provider } = this;
 		if (provider == null) {
 			// If we have no provider, try to get the current model (which will load the provider)
@@ -1864,7 +2160,7 @@ export class AIProviderService implements AIService, Disposable {
 		const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
 
 		let result;
-		if (all) {
+		if (options?.all) {
 			result = resetAll;
 		} else if (provider == null) {
 			result = await window.showInformationMessage(
@@ -1884,43 +2180,72 @@ export class AIProviderService implements AIService, Disposable {
 		}
 
 		if (provider != null && result === resetCurrent) {
-			this.resetProviderKey(provider.id);
-			this.resetConfirmations();
+			await this.resetProviderKey(provider.id);
 		} else if (result === resetAll) {
 			const keys = [];
 			for (const providerId of supportedAIProviders.keys()) {
-				keys.push(await this.container.storage.getSecret(`gitlens.${providerId}.key`));
+				const key = await this.container.storage.getSecret(`gitlens.${providerId}.key`);
+				if (key != null) {
+					keys.push(key);
+				}
 
-				this.resetProviderKey(providerId, true);
+				await this.resetProviderKey(providerId, true);
 			}
 
-			this.resetConfirmations();
-
-			void env.clipboard.writeText(keys.join('\n'));
-			void window.showInformationMessage(
-				`All stored AI keys have been reset. The configured keys were copied to your clipboard.`,
-			);
+			// A blanket wipe (e.g. `Reset Stored Data > Everything`) must not put every key it just
+			// deleted onto the clipboard — that's only a convenience for an explicit key reset.
+			if (!options?.silent && keys.length) {
+				void env.clipboard.writeText(keys.join('\n'));
+				void window.showInformationMessage(
+					`All stored AI keys have been reset. The configured keys were copied to your clipboard.`,
+				);
+			}
+		} else {
+			return;
 		}
+
+		// Keys just changed, so drop everything derived from them; all three repopulate lazily.
+		// `_pendingBYOKUsage` is deliberately NOT cleared — it holds unreported usage, not cache.
+		this._promptTemplates.clear();
+		this._modelCache.clear();
+		this._providerModelsCache.clear();
+		clearResponseFormatRejections();
 	}
 
-	resetConfirmations(): void {
-		void this.container.storage.deleteWithPrefix(`confirm:ai:tos`);
-		void this.container.storage.deleteWorkspaceWithPrefix(`confirm:ai:tos`);
-		void this.container.storage.deleteWithPrefix(`confirm:ai:generateCommits`);
+	/**
+	 * Restores every AI model selection to its default: the per-feature choices for composing, reviewing,
+	 * and resolving conflicts (stored), plus the global default and each primary provider's model
+	 * (settings). Leaves stored keys alone.
+	 */
+	async resetModels(): Promise<void> {
+		// The scoped keys are the only place per-feature models live, and nothing else stores under `ai:`
+		await this.container.storage.deleteWithPrefix('ai:scope');
+
+		// The global default, plus the model each primary provider (`gitkraken`, `vscode`) stores separately
+		await configuration.clear('ai.model');
+		await configuration.clear('ai.gitkraken.model');
+		await configuration.clear('ai.vscode.model');
+
+		this._model = undefined;
+		this._modelCache.clear();
+		this._providerModelsCache.clear();
+		clearResponseFormatRejections();
+
+		// Scoped consumers treat any fire as a refresh trigger, so one global-scope fire covers them all
+		this._onDidChangeModel.fire({ model: undefined, scope: undefined });
 	}
 
-	resetProviderKey(provider: AIProviders, silent?: boolean): void {
+	async resetProviderKey(provider: AIProviders, silent?: boolean): Promise<void> {
 		if (!silent) {
-			void this.container.storage.getSecret(`gitlens.${provider}.key`).then(key => {
-				if (key) {
-					void env.clipboard.writeText(key);
-					void window.showInformationMessage(
-						`The stored AI key has been reset. The configured key was copied to your clipboard.`,
-					);
-				}
-			});
+			const key = await this.container.storage.getSecret(`gitlens.${provider}.key`);
+			if (key) {
+				void env.clipboard.writeText(key);
+				void window.showInformationMessage(
+					`The stored AI key has been reset. The configured key was copied to your clipboard.`,
+				);
+			}
 		}
-		void this.container.storage.deleteSecret(`gitlens.${provider}.key`);
+		await this.container.storage.deleteSecret(`gitlens.${provider}.key`);
 	}
 
 	supports(provider: AIProviders | string): boolean {
@@ -2006,45 +2331,12 @@ export class AIProviderService implements AIService, Disposable {
 	}
 }
 
-async function showConfirmAIProviderToS(storage: Storage): Promise<boolean> {
-	const confirmed = storage.get(`confirm:ai:tos`, false) || storage.getWorkspace(`confirm:ai:tos`, false);
-	if (confirmed) return true;
-
-	const acceptAlways: MessageItem = { title: 'Accept' };
-	const acceptWorkspace: MessageItem = { title: 'Accept Only for this Workspace' };
-	const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
-
-	const result = await window.showInformationMessage(
-		'GitLens AI features can send code snippets, diffs, and other context to your selected AI provider for analysis.',
-		{ modal: true },
-		acceptAlways,
-		acceptWorkspace,
-		cancel,
-	);
-
-	if (result === acceptWorkspace) {
-		void storage.storeWorkspace(`confirm:ai:tos`, true).catch();
-		return true;
-	}
-
-	if (result === acceptAlways) {
-		void storage.store(`confirm:ai:tos`, true).catch();
-		return true;
-	}
-
-	return false;
-}
-
 function isPrimaryAIProvider(provider: AIProviders): provider is AIPrimaryProviders {
 	return supportedAIProviders.get(provider)?.primary === true;
 }
 
 function isPrimaryAIProviderModel(model: AIModel): model is AIModel<AIPrimaryProviders, AIProviderAndModel> {
 	return isPrimaryAIProvider(model.provider.id);
-}
-
-function isAIModelScope(value: unknown): value is AIModelScope {
-	return value === 'compose' || value === 'review';
 }
 
 function getPickerTitlesForScope(scope: AIModelScope | undefined): {
@@ -2075,6 +2367,20 @@ function getPickerTitlesForScope(scope: AIModelScope | undefined): {
 			model: {
 				title: 'Select AI Model for Reviewing',
 				placeholder: 'Choose an AI model for reviewing',
+				scope: scope,
+			},
+		};
+	}
+	if (scope === 'resolve') {
+		return {
+			provider: {
+				title: 'Select AI Provider for Resolving Conflicts',
+				placeholder: 'Choose an AI provider for resolving conflicts',
+				scope: scope,
+			},
+			model: {
+				title: 'Select AI Model for Resolving Conflicts',
+				placeholder: 'Choose an AI model for resolving conflicts',
 				scope: scope,
 			},
 		};

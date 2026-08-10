@@ -1,5 +1,6 @@
 import './commands/addAuthors.js';
 import './commands/ai.js';
+import './commands/autoRebase.js';
 import './commands/browseRepoAtRevision.js';
 import './commands/closeUnchangedFiles.js';
 import './commands/cloudIntegrations.js';
@@ -62,6 +63,7 @@ import './commands/regenerateMarkdownDocument.js';
 import './commands/remoteProviders.js';
 import './commands/repositories.js';
 import './commands/resets.js';
+import './commands/resolveConflicts.js';
 import './commands/resetViewsLayout.js';
 import './commands/runPromptInAgent.js';
 import './commands/searchCommits.js';

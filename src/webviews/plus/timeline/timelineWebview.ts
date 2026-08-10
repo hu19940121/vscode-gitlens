@@ -41,7 +41,8 @@ import { openTextEditor } from '../../../system/-webview/vscode/editors.js';
 import { getTabUri, tabContainsPath } from '../../../system/-webview/vscode/tabs.js';
 import type { EventVisibilityBuffer, SubscriptionTracker } from '../../rpc/eventVisibilityBuffer.js';
 import { createRpcEventSubscription } from '../../rpc/eventVisibilityBuffer.js';
-import { createSharedServices, proxyServices } from '../../rpc/services/common.js';
+import { createSharedServices } from '../../rpc/services/common.js';
+import { proxyServices } from '../../rpc/services/proxy.js';
 import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from '../../webviewProvider.js';
 import type { WebviewShowOptions } from '../../webviewsController.js';
 import { isSerializedState } from '../../webviewsController.js';
@@ -402,11 +403,19 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 			this.updateViewTitle(scope, repo);
 		}
 
+		// `mixed` means the workspace has both public and private repos — so a gated (private) scope can
+		// offer switching to a public one. Only computed when access is denied (the only time the gate, and
+		// thus the switch affordance, is shown) to avoid an aggregate visibility() scan on every (allowed)
+		// dataset fetch, including each load-more. The result is cached on the provider.
+		const allowRepoSwitch =
+			result.access.allowed === false ? (await this.container.git.visibility()) === 'mixed' : false;
+
 		return {
 			dataset: result.dataset,
 			scope: result.scope,
 			repository: result.repository,
 			access: result.access,
+			allowRepoSwitch: allowRepoSwitch,
 		};
 	}
 

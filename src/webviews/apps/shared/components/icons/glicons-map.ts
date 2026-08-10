@@ -83,4 +83,11 @@ export const iconMap = Object.freeze({
 	'pause': '\\f14b',
 	'kanban-view': '\\f14c',
 	'filter-mixed': '\\f14d',
+	'start-new': '\\f14e',
+	'merge': '\\f14f',
+	'remote': '\\f150',
+	'remote-filled': '\\f151',
+	'continue-sparkle': '\\f152',
+	'checkbox-unchecked': '\\f153',
+	'checkbox-checked': '\\f154',
 });

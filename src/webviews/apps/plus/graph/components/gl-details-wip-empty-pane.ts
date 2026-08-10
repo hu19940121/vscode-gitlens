@@ -1,13 +1,11 @@
 import { consume } from '@lit/context';
-import type { TemplateResult } from 'lit';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { ifDefined } from 'lit/directives/if-defined.js';
 import { pluralize } from '@gitlens/utils/string.js';
-import type { ConnectCloudIntegrationsCommandArgs } from '../../../../../commands/cloudIntegrations.js';
-import type { LaunchpadCommandArgs } from '../../../../../plus/launchpad/launchpad.js';
-import type { LaunchpadSummaryResult } from '../../../../../plus/launchpad/launchpadIndicator.js';
-import { createCommandLink } from '../../../../../system/commands.js';
+import type {
+	LaunchpadSummaryError,
+	LaunchpadSummaryResult,
+} from '../../../../../plus/launchpad/launchpadIndicator.js';
 import type { GitBranchShape, Wip } from '../../../../plus/graph/detailsProtocol.js';
 import type { BranchMergeTargetStatus } from '../../../../rpc/services/branches.js';
 import type { BranchRef } from '../../../../shared/branchRefs.js';
@@ -15,29 +13,12 @@ import { elementBase } from '../../../shared/components/styles/lit/base.css.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { detailsWipEmptyPaneStyles } from './gl-details-wip-empty-pane.css.js';
+import type { NextStep } from './nextStep.js';
+import { nextStepStyles, renderNextStep } from './nextStep.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/button-container.js';
 import '../../../shared/components/code-icon.js';
-import '../../../shared/components/skeleton-loader.js';
-
-type NextStepAction = {
-	actionLabel: string;
-	tooltip?: string;
-	icon?: string;
-	/** When true, renderNextStep ignores `event`/`href` and renders a disabled button with a
-	 *  spinning icon in place of the normal action button. Used for in-flight states that
-	 *  should anchor layout (the row stays put) while a real action isn't yet available. */
-	loading?: boolean;
-} & ({ event: string; href?: never } | { href: string; event?: never });
-
-type NextStep = {
-	icon: string;
-	iconFlip?: 'inline' | 'block';
-	label: string;
-	actionPrefixIcon?: string;
-	/** Optional alt action — rendered as the small side of a split-button. */
-	alt?: NextStepAction;
-} & NextStepAction;
+import './gl-launchpad-summary.js';
 
 function getRemoteNameFromUpstream(upstreamName: string | undefined): string {
 	if (!upstreamName) return 'origin';
@@ -48,7 +29,7 @@ function getRemoteNameFromUpstream(upstreamName: string | undefined): string {
 
 @customElement('gl-details-wip-empty-pane')
 export class GlDetailsWipEmptyPane extends LitElement {
-	static override styles = [elementBase, detailsWipEmptyPaneStyles];
+	static override styles = [elementBase, nextStepStyles, detailsWipEmptyPaneStyles];
 
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
@@ -63,7 +44,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 	 *  stable "Checking for pull request…" row that anchors the layout until enrichment lands. */
 	@property({ type: Boolean }) pullRequestLoading = false;
 	@property({ type: Boolean }) hasIntegrationsConnected = false;
-	@property({ type: Object }) launchpadSummary?: LaunchpadSummaryResult | { error: Error };
+	@property({ type: Object }) launchpadSummary?: LaunchpadSummaryResult | { error: LaunchpadSummaryError };
 	@property({ type: Boolean }) launchpadSummaryLoading = false;
 	/** When true, render the Launchpad section between Next steps and Start New. Off by default
 	 *  so consumers that don't wire Launchpad props (e.g., the commit-details `gl-details-wip-panel`)
@@ -100,17 +81,19 @@ export class GlDetailsWipEmptyPane extends LitElement {
 
 		// Launchpad renders from initial mount (when `showLaunchpad`) — the summary content is
 		// branch-agnostic (PRs across the user's connected integrations) and the inner
-		// `renderLaunchpadSummary` handles its own loading/empty/unconnected states with a
+		// `gl-launchpad-summary` handles its own loading/empty/unconnected states with a
 		// stable footprint. Gating on `branch != null` here would cause the section to pop into
 		// existence the moment WIP arrived, shifting `Start New` down — the very layout flip
 		// this scaffold was reshaped to avoid.
 		return html`<div class="hub">
-			${hasSteps
-				? html`<section class="section">
-						<h3 class="section__heading">Next steps</h3>
-						${allSteps.map(step => this.renderNextStep(step))}
-					</section>`
-				: nothing}
+			${
+				hasSteps
+					? html`<section class="section">
+							<h3 class="section__heading">Next steps</h3>
+							${allSteps.map(step => renderNextStep(step))}
+						</section>`
+					: nothing
+			}
 			${branch != null && this.aiEnabled && hasDiverged ? this.renderAiWorkflows(ahead) : nothing}
 			${this.showLaunchpad ? this.renderLaunchpadSection() : nothing} ${this.renderStartNewSection()}
 		</div>`;
@@ -131,7 +114,11 @@ export class GlDetailsWipEmptyPane extends LitElement {
 					<code-icon icon="refresh"></code-icon>
 				</gl-button>
 			</header>
-			${this.renderLaunchpadSummary()}
+			<gl-launchpad-summary
+				.summary=${this.launchpadSummary}
+				?has-integrations-connected=${this.hasIntegrationsConnected}
+				source="graph-details"
+			></gl-launchpad-summary>
 		</section>`;
 	}
 
@@ -180,10 +167,9 @@ export class GlDetailsWipEmptyPane extends LitElement {
 	}
 
 	protected override updated(): void {
-		// Mirror what `render()` actually puts in the Next-steps section: cached next steps PLUS
-		// uniqueWorkSteps. Pre-rename this guard only checked `_cachedNextSteps`, so a render
-		// that showed Review/Recompose alone (uniqueWorkSteps populated, no cached steps) never
-		// fired the event — breaking telemetry (`TrackGraphDetailsWipShownCommand`) and the
+		// Counts BOTH sources the Next-steps section renders. A section showing only
+		// Review/Recompose (uniqueWorkSteps populated, no cached steps) still has to fire
+		// `next-steps-shown` — it drives `TrackGraphDetailsWipShownCommand` and the
 		// deferred-walkthrough trigger.
 		const hasNextSteps = this._cachedNextSteps.length + this._cachedUniqueWorkSteps.length > 0;
 		if (hasNextSteps && !this._hadNextSteps) {
@@ -192,268 +178,32 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		this._hadNextSteps = hasNextSteps;
 	}
 
-	private renderNextStep(step: NextStep) {
-		const primaryInner = html`${step.actionPrefixIcon
-			? html`<code-icon icon=${step.actionPrefixIcon} slot="prefix"></code-icon>`
-			: nothing}${step.actionLabel}`;
-		const primary = step.loading
-			? html`<gl-button
-					class="next-step__action"
-					appearance="secondary"
-					disabled
-					aria-label=${step.actionLabel}
-					tooltip=${ifDefined(step.tooltip)}
-					><code-icon icon="loading" modifier="spin"></code-icon
-				></gl-button>`
-			: step.href != null
-				? html`<gl-button class="next-step__action" appearance="secondary" href=${step.href}
-						>${primaryInner}</gl-button
-					>`
-				: html`<gl-button class="next-step__action" appearance="secondary" @click=${() => this.emit(step.event)}
-						>${primaryInner}</gl-button
-					>`;
-
-		const alt = step.alt;
-		const altInner = alt?.icon ? html`<code-icon icon=${alt.icon}></code-icon>` : alt?.actionLabel;
-		const altButton =
-			alt == null
-				? nothing
-				: alt.href != null
-					? html`<gl-button appearance="secondary" tooltip=${alt.tooltip ?? alt.actionLabel} href=${alt.href}
-							>${altInner}</gl-button
-						>`
-					: html`<gl-button
-							appearance="secondary"
-							tooltip=${alt.tooltip ?? alt.actionLabel}
-							@click=${() => this.emit(alt.event)}
-							>${altInner}</gl-button
-						>`;
-
-		const action =
-			alt != null
-				? html`<button-container class="next-step__action">${primary}${altButton}</button-container>`
-				: primary;
-
-		return html`<div class="next-step">
-			<code-icon class="next-step__icon" icon=${step.icon} flip=${ifDefined(step.iconFlip)}></code-icon>
-			<span class="next-step__label">${step.label}</span>
-			${action}
-		</div>`;
-	}
-
 	private renderAiWorkflows(ahead: number) {
 		return html`<section class="section">
 			<h3 class="section__heading">AI workflows</h3>
 			<div class="ai-grid">
 				<gl-button class="ai-button" appearance="secondary" @click=${() => this.emit('ai-draft-pr')}>
-					<code-icon icon="sparkle"></code-icon>Draft PR description
+					<code-icon icon="sparkle"></code-icon>Draft PR Description
 				</gl-button>
 				<gl-button class="ai-button" appearance="secondary" @click=${() => this.emit('ai-summarize-branch')}>
-					<code-icon icon="sparkle"></code-icon>Summarize branch
+					<code-icon icon="sparkle"></code-icon>Summarize Branch
 				</gl-button>
-				${ahead > 0
-					? html`<gl-button
-							class="ai-button"
-							appearance="secondary"
-							@click=${() => this.emit('ai-review-unpushed')}
-						>
-							<code-icon icon="sparkle"></code-icon>Review ${pluralize('unpushed commit', ahead)}
-						</gl-button>`
-					: nothing}
+				${
+					ahead > 0
+						? html`<gl-button
+								class="ai-button"
+								appearance="secondary"
+								@click=${() => this.emit('ai-review-unpushed')}
+							>
+								<code-icon icon="sparkle"></code-icon>Review ${pluralize('Unpushed Commit', ahead)}
+							</gl-button>`
+						: nothing
+				}
 				<gl-button class="ai-button" appearance="secondary" @click=${() => this.emit('ai-changelog')}>
-					<code-icon icon="sparkle"></code-icon>Generate changelog entry
+					<code-icon icon="sparkle"></code-icon>Generate Changelog Entry
 				</gl-button>
 			</div>
 		</section>`;
-	}
-
-	private renderLaunchpadSummary(): TemplateResult {
-		if (!this.hasIntegrationsConnected) {
-			return html`<ul class="launchpad-items">
-				<li>
-					<a
-						class="launchpad-item launchpad-item--link"
-						href=${createCommandLink<ConnectCloudIntegrationsCommandArgs>(
-							'gitlens.plus.cloudIntegrations.connect',
-							{ source: { source: 'graph' } },
-						)}
-					>
-						<code-icon class="launchpad-item__icon" icon="plug"></code-icon>
-						<span>Connect to see PRs here</span>
-					</a>
-				</li>
-			</ul>`;
-		}
-
-		const summary = this.launchpadSummary;
-		if (summary == null) {
-			// Single skeleton line matches the most common landed content — "You are all caught
-			// up!" or a single group summary. Two lines was nearly always over-tall, causing a
-			// downward shift when content landed.
-			return html`<div class="launchpad-items launchpad-items--loading">
-				<skeleton-loader lines="1"></skeleton-loader>
-			</div>`;
-		}
-
-		if (!('total' in summary)) {
-			return html`<ul class="launchpad-items">
-				<li class="launchpad-item launchpad-item--muted">Unable to load items</li>
-			</ul>`;
-		}
-
-		const items: TemplateResult[] = [];
-
-		if (summary.error != null) {
-			items.push(
-				html`<li>
-					<span class="launchpad-item launchpad-item--muted">
-						<code-icon class="launchpad-item__icon" icon="warning"></code-icon>
-						<span>Some integrations failed to load</span>
-					</span>
-				</li>`,
-			);
-		}
-
-		if (summary.total === 0) {
-			items.push(html`<li class="launchpad-item launchpad-item--muted">You are all caught up!</li>`);
-			return html`<ul class="launchpad-items">
-				${items}
-			</ul>`;
-		}
-
-		if (!summary.hasGroupedItems) {
-			items.push(
-				html`<li class="launchpad-item launchpad-item--muted">No pull requests need your attention</li>
-					<li class="launchpad-item launchpad-item--muted">(${summary.total} other pull requests)</li>`,
-			);
-			return html`<ul class="launchpad-items">
-				${items}
-			</ul>`;
-		}
-
-		for (const group of summary.groups) {
-			switch (group) {
-				case 'mergeable': {
-					const total = summary.mergeable?.total ?? 0;
-					if (total === 0) continue;
-
-					items.push(
-						html`<li>
-							<a
-								class="launchpad-item launchpad-item--link launchpad-item--mergeable"
-								href=${this.createShowLaunchpadLink('mergeable')}
-							>
-								<code-icon class="launchpad-item__icon" icon="rocket"></code-icon>
-								<span>${pluralize('pull request', total)} can be merged</span>
-							</a>
-						</li>`,
-					);
-					break;
-				}
-				case 'blocked': {
-					const total = summary.blocked?.total ?? 0;
-					if (total === 0) continue;
-
-					const messages: { count: number; message: string }[] = [];
-					if (summary.blocked!.unassignedReviewers) {
-						messages.push({
-							count: summary.blocked!.unassignedReviewers,
-							message: `${summary.blocked!.unassignedReviewers > 1 ? 'need' : 'needs'} reviewers`,
-						});
-					}
-					if (summary.blocked!.failedChecks) {
-						messages.push({
-							count: summary.blocked!.failedChecks,
-							message: `${summary.blocked!.failedChecks > 1 ? 'have' : 'has'} failed CI checks`,
-						});
-					}
-					if (summary.blocked!.conflicts) {
-						messages.push({
-							count: summary.blocked!.conflicts,
-							message: `${summary.blocked!.conflicts > 1 ? 'have' : 'has'} conflicts`,
-						});
-					}
-
-					const href = this.createShowLaunchpadLink('blocked');
-					if (messages.length === 1) {
-						items.push(
-							html`<li>
-								<a class="launchpad-item launchpad-item--link launchpad-item--blocked" href=${href}>
-									<code-icon class="launchpad-item__icon" icon="error"></code-icon>
-									<span>${pluralize('pull request', total)} ${messages[0].message}</span>
-								</a>
-							</li>`,
-						);
-					} else {
-						items.push(
-							html`<li>
-								<a class="launchpad-item launchpad-item--link launchpad-item--blocked" href=${href}>
-									<code-icon class="launchpad-item__icon" icon="error"></code-icon>
-									<span
-										>${pluralize('pull request', total)} ${total > 1 ? 'are' : 'is'} blocked
-										(${messages.map(m => `${m.count} ${m.message}`).join(', ')})</span
-									>
-								</a>
-							</li>`,
-						);
-					}
-					break;
-				}
-				case 'follow-up': {
-					const total = summary.followUp?.total ?? 0;
-					if (total === 0) continue;
-
-					items.push(
-						html`<li>
-							<a
-								class="launchpad-item launchpad-item--link launchpad-item--attention"
-								href=${this.createShowLaunchpadLink('follow-up')}
-							>
-								<code-icon class="launchpad-item__icon" icon="report"></code-icon>
-								<span
-									>${pluralize('pull request', total)} ${total > 1 ? 'require' : 'requires'}
-									follow-up</span
-								>
-							</a>
-						</li>`,
-					);
-					break;
-				}
-				case 'needs-review': {
-					const total = summary.needsReview?.total ?? 0;
-					if (total === 0) continue;
-
-					items.push(
-						html`<li>
-							<a
-								class="launchpad-item launchpad-item--link launchpad-item--attention"
-								href=${this.createShowLaunchpadLink('needs-review')}
-							>
-								<code-icon class="launchpad-item__icon" icon="comment-unresolved"></code-icon>
-								<span
-									>${pluralize('pull request', total)} ${total > 1 ? 'need' : 'needs'} your
-									review</span
-								>
-							</a>
-						</li>`,
-					);
-					break;
-				}
-			}
-		}
-
-		return html`<ul class="launchpad-items">
-			${items}
-		</ul>`;
-	}
-
-	private createShowLaunchpadLink(group: NonNullable<LaunchpadCommandArgs['state']>['initialGroup']): string {
-		return `command:gitlens.showLaunchpad?${encodeURIComponent(
-			JSON.stringify({
-				source: 'graph-details',
-				state: { initialGroup: group },
-			} satisfies Omit<LaunchpadCommandArgs, 'command'>),
-		)}`;
 	}
 
 	private computeNextSteps(branch: GitBranchShape): NextStep[] {
@@ -469,7 +219,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 				icon: 'cloud-upload',
 				label: `Publish ${branch.name} to ${remoteName}`,
 				actionLabel: 'Publish',
-				event: 'publish-branch',
+				onClick: () => this.emit('publish-branch'),
 			});
 		} else {
 			if (behind > 0) {
@@ -477,14 +227,14 @@ export class GlDetailsWipEmptyPane extends LitElement {
 					icon: 'repo-pull',
 					label: `Pull ${pluralize('commit', behind)} from ${remoteName}`,
 					actionLabel: 'Pull',
-					event: 'pull',
+					onClick: () => this.emit('pull'),
 				});
 			} else if (ahead > 0) {
 				steps.push({
 					icon: 'repo-push',
 					label: `Push ${pluralize('commit', ahead)} to ${remoteName}`,
 					actionLabel: 'Push',
-					event: 'push',
+					onClick: () => this.emit('push'),
 				});
 			}
 
@@ -507,7 +257,6 @@ export class GlDetailsWipEmptyPane extends LitElement {
 					label: 'Checking for pull request…',
 					actionLabel: 'Checking',
 					loading: true,
-					event: '',
 				});
 			} else {
 				const useAI = this.aiCreatePrEnabled;
@@ -516,7 +265,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 					label: 'Create a Pull Request',
 					actionLabel: 'Create PR',
 					actionPrefixIcon: useAI ? 'sparkle' : undefined,
-					event: useAI ? 'create-pr-ai' : 'create-pr',
+					onClick: () => this.emit(useAI ? 'create-pr-ai' : 'create-pr'),
 				});
 			}
 		}
@@ -550,13 +299,13 @@ export class GlDetailsWipEmptyPane extends LitElement {
 			icon: 'checklist',
 			label: 'Review Changes',
 			actionLabel: 'Review',
-			event: 'review-branch-changes',
+			onClick: () => this.emit('review-branch-changes'),
 		};
 		const recompose: NextStep = {
 			icon: 'wand',
 			label: 'Recompose Branch',
 			actionLabel: 'Recompose',
-			event: 'recompose-branch-changes',
+			onClick: () => this.emit('recompose-branch-changes'),
 		};
 
 		return recomposeFirst ? [recompose, review] : [review, recompose];
@@ -644,11 +393,11 @@ export class GlDetailsWipEmptyPane extends LitElement {
 				iconFlip: 'block',
 				label: `Potential Conflicts with ${mergeTarget.name}`,
 				actionLabel: 'Rebase',
-				event: 'rebase-onto-merge-target',
+				onClick: () => this.emit('rebase-onto-merge-target'),
 				alt: {
 					actionLabel: 'Merge',
 					tooltip: `Merge ${mergeTarget.name} into ${branch.name} instead`,
-					event: 'merge-merge-target-into-current',
+					onClick: () => this.emit('merge-merge-target-into-current'),
 				},
 			};
 		}
@@ -661,11 +410,11 @@ export class GlDetailsWipEmptyPane extends LitElement {
 			iconFlip: 'block',
 			label: `${pluralize('Commit', behind)} Behind ${mergeTarget.name}`,
 			actionLabel: 'Rebase',
-			event: 'rebase-onto-merge-target',
+			onClick: () => this.emit('rebase-onto-merge-target'),
 			alt: {
 				actionLabel: 'Merge',
 				tooltip: `Merge ${mergeTarget.name} into ${branch.name} instead`,
-				event: 'merge-merge-target-into-current',
+				onClick: () => this.emit('merge-merge-target-into-current'),
 			},
 		};
 	}

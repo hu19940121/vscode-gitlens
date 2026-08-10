@@ -1,5 +1,5 @@
-import { CancellationTokenSource } from 'vscode';
-import type { AIChatMessage, AIProviderResponse } from '@gitlens/ai/models/provider.js';
+import { CancellationTokenSource, window } from 'vscode';
+import type { AIChatMessage, AIProviderResponse, AIResponseFormat } from '@gitlens/ai/models/provider.js';
 import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
 import type { GitRepositoryService } from '../../../git/gitRepositoryService.js';
@@ -14,16 +14,19 @@ import type {
 	ComposeGitPort,
 	ComposeHunk,
 	ComposePlan,
+	ComposeSession,
 	ComposeSource,
 	GitExecOptions,
+	InteriorRefViolation,
 	OnBeforePrompt,
 	UndoForceOptions,
 } from './types.js';
-import { undoCompose, validateUndoCompose } from './utils.js';
+import { detectInteriorRefs, undoCompose, validateUndoCompose } from './utils.js';
 
 /**
  * Shape cached between generate + apply phases. UX-specific subclasses may carry
- * additional opaque fields (e.g. graph's `excludedFiles` filter snapshot).
+ * additional opaque fields (e.g. graph's `excludedFiles` filter snapshot, or resolved
+ * scope metadata for the refine path's result shape).
  */
 export interface CachedPlan {
 	plan: ComposePlan;
@@ -35,6 +38,19 @@ export interface CachedPlan {
 	 *  cached snapshot's diff hash won't match the freshly collected diff. */
 	excludedFiles?: readonly string[];
 	aiExcludedFiles?: readonly string[];
+	/**
+	 * Conversation + completed-steps cache returned by `composePlan`. Passed unmodified to
+	 * `refinePlan` when the caller wants to refine the cached plan. The library treats this
+	 * as opaque carry-forward state — we do not strip messages, clear completedSteps, or
+	 * otherwise mutate it on the way to refine.
+	 */
+	session?: ComposeSession;
+	/**
+	 * UX-specific extras stamped onto the cache entry by the integration subclass. Opaque to
+	 * the base. The graph integration stores the resolved scope (head sha, kind, etc.) so
+	 * refine can produce a downstream-equivalent result shape without re-running any git ops.
+	 */
+	extras?: unknown;
 }
 
 /**
@@ -103,6 +119,23 @@ export class ComposeToolsIntegration {
 		return buildLargePromptGate(initiallySuppressed);
 	}
 
+	/**
+	 * Pre-flight gate for history-rewriting composes: warn when branches, tags, or a detached HEAD
+	 * point at commits inside the range this compose would rewrite (the refs the `interiorRefs`
+	 * override leaves in place), and let the user confirm. No-op for sources that don't rewrite
+	 * history (e.g. workdir) or when nothing points into the range.
+	 */
+	protected async confirmInteriorRefsOrThrow(git: ComposeGitPort, source: ComposeSource): Promise<void> {
+		const violations = await detectInteriorRefs(git, source);
+		if (violations.length === 0) return;
+
+		// Declining is a user choice, not a failure — throw an AbortError so callers treat it as a
+		// cancellation (`isCancellationError`), matching the large-prompt gate's decline path.
+		if (!(await showInteriorRefsWarning(violations))) {
+			throw new DOMException('Compose cancelled — interior-ref warning declined', 'AbortError');
+		}
+	}
+
 	protected createCacheKey(repoPath: string): string {
 		return `${repoPath}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`;
 	}
@@ -135,8 +168,8 @@ function createComposeGitPort(svc: GitRepositoryService): ComposeGitPort {
  *   3. Maps the provider response back to `AiGenerateResult`.
  *   4. Translates AbortSignal <-> CancellationToken at the boundary.
  *
- * ToS confirmation, API key gathering, and feature gating are handled inside
- * `sendRequest` itself — this adapter inherits them for free.
+ * API key gathering and feature gating are handled inside `sendRequest` itself —
+ * this adapter inherits them for free.
  *
  * Large-prompt gating is handled via the library's `onBeforePrompt` hook
  * (supplied by the integration layer), not here.
@@ -145,7 +178,7 @@ function createComposeGitPort(svc: GitRepositoryService): ComposeGitPort {
  * `ComposeWorkflowError('CANCELLED')` from the library, because the library catches
  * adapter errors and wraps cancellation.
  */
-function createAiModelPort(container: Container, source: Source): AiModelPort {
+export function createAiModelPort(container: Container, source: Source): AiModelPort {
 	return {
 		generate: async (params: AiGenerateParams): Promise<AiGenerateResult> => {
 			const cancellationSource = new CancellationTokenSource();
@@ -200,6 +233,9 @@ function createAiModelPort(container: Container, source: Source): AiModelPort {
 							outputTokens: params.maxTokens,
 							temperature: params.temperature,
 						},
+						// Cast until the published shared-tools port carries responseFormat (shape-compatible)
+						responseFormat: (params as AiGenerateParams & { responseFormat?: AIResponseFormat })
+							.responseFormat,
 						throwAIErrors: true,
 					},
 				);
@@ -222,6 +258,7 @@ function createAiModelPort(container: Container, source: Source): AiModelPort {
 				return {
 					text: response.content,
 					usage: mapUsage(response),
+					...(response.finishReason ? { finishReason: response.finishReason } : {}),
 				};
 			} finally {
 				params.signal?.removeEventListener('abort', abortHandler);
@@ -263,4 +300,32 @@ function buildLargePromptGate(initiallySuppressed: boolean): OnBeforePrompt {
 		hasConfirmed = true;
 		return true;
 	};
+}
+
+async function showInteriorRefsWarning(violations: InteriorRefViolation[]): Promise<boolean> {
+	const confirm = { title: 'Continue' };
+	const cancel = { title: 'Cancel', isCloseAffordance: true };
+	const result = await window.showWarningMessage(
+		`Some commits being recomposed are also pointed to by other branches or tags:\n\n${formatInteriorRefList(
+			violations,
+		)}\n\nThese references won't be updated — they'll keep pointing at their current commits (which remain in the repository), so the recomposed history will diverge from them rather than being followed by them.\n\nDo you want to continue?`,
+		{ modal: true },
+		confirm,
+		cancel,
+	);
+	return result === confirm;
+}
+
+function formatInteriorRefList(violations: InteriorRefViolation[]): string {
+	const max = 10;
+	const labels = violations.map(v => {
+		if (v.refname.startsWith('refs/tags/')) return `tag ${v.refname.slice('refs/tags/'.length)}`;
+		if (v.refname.startsWith('refs/heads/')) return v.refname.slice('refs/heads/'.length);
+		return v.refname;
+	});
+	const shown = labels.slice(0, max).map(l => `  • ${l}`);
+	if (labels.length > max) {
+		shown.push(`  • …and ${labels.length - max} more`);
+	}
+	return shown.join('\n');
 }

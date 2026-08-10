@@ -43,9 +43,12 @@ export type AgentSessionStatus =
 	| 'waiting'
 	| 'idle'
 	| 'compacting'
-	| 'permission_requested';
+	| 'permission_requested'
+	// Terminal state: the session has ended (SessionEnd fired, or the CLI's durable store reports it
+	// `ended`). Kept in the list as a de-emphasized "completed" row until archived or 30-day-purged.
+	| 'completed';
 
-export type AgentSessionPhase = 'idle' | 'working' | 'waiting';
+export type AgentSessionPhase = 'idle' | 'working' | 'waiting' | 'completed';
 
 export function getPhaseForStatus(status: AgentSessionStatus): AgentSessionPhase {
 	switch (status) {
@@ -59,6 +62,8 @@ export function getPhaseForStatus(status: AgentSessionStatus): AgentSessionPhase
 			return 'waiting';
 		case 'idle':
 			return 'idle';
+		case 'completed':
+			return 'completed';
 	}
 }
 
@@ -233,6 +238,59 @@ export interface AgentSessionProvider extends UnifiedDisposable {
 	 *  `vscode.openFolder` and relies on VS Code's window-folder matching to focus the owning
 	 *  window (which works whether or not the peer runs GitLens). */
 	notifyPeerOpenSession?(workspacePath: string, sessionId: string): Promise<boolean>;
+
+	/** Lists past sessions that can be resumed from `cwd`, most-recently-active first. Omitted by
+	 *  providers with no durable per-directory session store to read. Live sessions are excluded by
+	 *  the caller, not here — this reports what the store holds. The caller may also pass its live
+	 *  set via {@link ResumableSessionsOptions.excludeSessionIds} so exclusion happens before `limit`
+	 *  applies rather than after. */
+	listResumableSessions?(cwd: string, options?: ResumableSessionsOptions): Promise<ResumableSessionsResult>;
+
+	/** Archives a completed (non-live) session via the CLI, dismissing it from the list. Ends an
+	 *  active session first (the CLI broadcasts a synthetic SessionEnd) — but callers should only
+	 *  offer this on `completed` sessions, and a provider refuses (returns `false`) any non-completed
+	 *  row that resumed since the click, so the CLI never terminates live work. Resolves to `true` when
+	 *  the session was archived (removed locally; the next reconciliation poll confirms it). */
+	archiveSession?(sessionId: string): Promise<boolean>;
+
+	/** Resolves git identity + the transcript title and first/last prompt for a completed session
+	 *  lazily — called by the host when the user *opens* a completed row (the `Open Session` action),
+	 *  not on mere display. Completed sessions skip eager resolution during the poll so a 30-day
+	 *  cold-start doesn't fan out hundreds of git probes + transcript reads; the row shows its
+	 *  durable-store label until opened. No-op if the session isn't a tracked completed one. */
+	resolveCompletedSessionDetails?(sessionId: string): void;
+
+	/** Lists the ids of sessions that have been archived. Used to exclude them from the "Past"
+	 *  transcript-store listing — the tracked row is gone once archived, but the transcript on disk
+	 *  survives and would otherwise resurface there. Resolves to `[]` on any error. */
+	getArchivedSessionIds?(): Promise<string[]>;
+}
+
+export interface ResumableSessionsOptions {
+	/** How many sessions to detail. Discovery covers the whole store; only this many are read. */
+	readonly limit?: number;
+	/** Session ids to skip before `limit` applies — typically the caller's live sessions.
+	 *  Excluded entries still count toward `total`. */
+	readonly excludeSessionIds?: ReadonlySet<string>;
+}
+
+/** A session that is no longer running but whose transcript survives, so it can be resumed. */
+export interface ResumableAgentSession {
+	readonly id: string;
+	readonly providerId: string;
+	/** The directory the session must be resumed from — resolving it is the store's whole job. */
+	readonly cwd: string;
+	readonly lastActivity: Date;
+	/** Mirrors {@link AgentSession.transcriptTitles} — kept unresolved so naming stays the display
+	 *  cascade's job rather than being decided here. */
+	readonly titles?: { readonly custom?: string; readonly ai?: string; readonly agent?: string };
+	readonly lastPrompt?: string;
+}
+
+export interface ResumableSessionsResult {
+	readonly sessions: ResumableAgentSession[];
+	/** Everything the store holds for `cwd`, not just the detailed slice — drives "Showing N of M". */
+	readonly total: number;
 }
 
 /**

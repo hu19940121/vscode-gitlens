@@ -13,6 +13,30 @@ declare global {
 	}
 }
 
+/**
+ * A button that renders as a `<button>`, or as an `<a>` when `href` is set.
+ *
+ * @tag gl-button
+ *
+ * @slot - The button label.
+ * @slot prefix - Content before the label, typically a `code-icon`.
+ * @slot suffix - Content after the label, typically a `code-icon`.
+ * @slot tooltip - Rich tooltip content. Use instead of the `tooltip` property when the tooltip needs markup.
+ *
+ * @cssproperty --button-foreground - Text color. Default `var(--vscode-button-foreground)`.
+ * @cssproperty --button-background - Background color. Default `var(--vscode-button-background)`.
+ * @cssproperty --button-hover-background - Background color on hover. Default `var(--vscode-button-hoverBackground)`.
+ * @cssproperty --button-border - Border color. Default `var(--vscode-button-border, transparent)`.
+ * @cssproperty --button-width - Host and control width. Default `max-content`. Ignored when `full` is set.
+ * @cssproperty --button-padding - Control padding. Default `0.4rem`.
+ * @cssproperty --button-padding-inline - Horizontal padding for the default and `secondary` appearances only. Default `0.8rem`.
+ * @cssproperty --button-gap - Gap between the prefix, label, and suffix slots. Default `0.6rem`.
+ * @cssproperty --button-line-height - Line height of the host and control. Default `1.35`.
+ * @cssproperty --button-compact-padding - Control padding when `density="compact"`. Default `0.4rem`.
+ * @cssproperty --button-tight-padding - Control padding when `density="tight"`. Default `0.4rem 0.8rem`.
+ * @cssproperty --button-input-padding - Control padding when `appearance="input"`. Default `0.1rem`.
+ * @cssproperty --button-input-height - Control height when `appearance="input"`. Default `1.8rem`.
+ */
 @customElement('gl-button')
 export class GlButton extends LitElement {
 	static override shadowRootOptions: ShadowRootInit = {
@@ -41,18 +65,18 @@ export class GlButton extends LitElement {
 
 				display: inline-block;
 				width: var(--button-width);
-				border: none;
 				font-family: inherit;
 				font-size: inherit;
 				line-height: var(--button-line-height);
+				color: var(--button-foreground);
 				text-align: center;
 				text-decoration: none;
+				cursor: pointer;
 				user-select: none;
 				background: var(--button-background);
-				color: var(--button-foreground);
-				cursor: pointer;
-				border: 1px solid var(--button-border);
-				border-radius: var(--gk-action-radius, 0.3rem);
+				border: none;
+				border: var(--gl-border-width) solid var(--button-border);
+				border-radius: var(--gl-radius-sm);
 				-webkit-font-smoothing: auto;
 			}
 
@@ -60,20 +84,18 @@ export class GlButton extends LitElement {
 				box-sizing: border-box;
 				display: inline-flex;
 				flex-direction: row;
-				justify-content: center;
-				align-items: center;
 				gap: var(--button-gap);
-				padding: var(--button-padding);
-				line-height: var(--button-line-height);
-				font-family: inherit;
-				font-size: inherit;
-
-				color: inherit;
-				text-decoration: none;
-
+				align-items: center;
+				justify-content: center;
 				width: var(--button-width);
 				max-width: 100%;
 				height: 100%;
+				padding: var(--button-padding);
+				font-family: inherit;
+				font-size: inherit;
+				line-height: var(--button-line-height);
+				color: inherit;
+				text-decoration: none;
 				cursor: pointer;
 			}
 
@@ -100,10 +122,10 @@ export class GlButton extends LitElement {
 
 			/* Text truncation option - enabled via truncate attribute */
 			:host([truncate]) .label {
+				display: block; /* Change from flex to block for ellipsis to work */
 				overflow: hidden;
 				text-overflow: ellipsis;
 				white-space: nowrap;
-				display: block; /* Change from flex to block for ellipsis to work */
 			}
 
 			:host(:hover) {
@@ -145,11 +167,33 @@ export class GlButton extends LitElement {
 				--button-foreground: var(--color-alert-infoForeground);
 				--button-hover-background: var(--color-alert-infoBorder);
 				--button-line-height: 1.64;
+
 				width: max-content;
 			}
 
 			:host([appearance='alert']:hover) {
 				--button-foreground: var(--vscode-button-foreground);
+			}
+
+			/* Text-link appearance — renders like an inline hyperlink rather than a button */
+			:host([appearance='link']) {
+				--button-background: transparent;
+				--button-foreground: var(--vscode-textLink-foreground);
+				--button-hover-background: transparent;
+				--button-border: transparent;
+				--button-padding: 0;
+
+				width: max-content;
+				border-radius: 0;
+			}
+
+			:host([appearance='link']:hover) {
+				--button-foreground: var(--vscode-textLink-activeForeground);
+			}
+
+			/* Underline only the text label on hover — leave prefix/suffix icon slots undecorated */
+			:host([appearance='link']:hover) .label {
+				text-decoration: underline;
 			}
 
 			/* Variant property for semantic states - appearance controls structure, variant controls color */
@@ -167,7 +211,7 @@ export class GlButton extends LitElement {
 			}
 
 			:host([variant='warning']) {
-				--button-foreground: var(--vscode-inputValidation-warningForeground, #ffcc66);
+				--button-foreground: var(--vscode-inputValidation-warningForeground, #fc6);
 				--button-background: var(--vscode-inputValidation-warningBackground, #352a05);
 				--button-hover-background: color-mix(
 					in srgb,
@@ -185,6 +229,7 @@ export class GlButton extends LitElement {
 			}
 
 			/* Transparent appearances (toolbar, input, alert) with variants only change foreground color */
+
 			/* These come after the main variant rules to override background/border back to transparent */
 			:host([appearance='toolbar'][variant='danger']),
 			:host([appearance='input'][variant='danger']),
@@ -211,10 +256,10 @@ export class GlButton extends LitElement {
 			}
 
 			:host([appearance='input']) .control {
+				gap: var(--gl-space-2);
+				height: var(--button-input-height, 1.8rem);
 				padding: var(--button-input-padding);
 				--button-line-height: 1.1;
-				height: var(--button-input-height, 1.8rem);
-				gap: 0.2rem;
 			}
 
 			:host([appearance='input'][href]) > a,
@@ -229,8 +274,8 @@ export class GlButton extends LitElement {
 			}
 
 			/* Give solid-filled buttons a bit more horizontal breathing room. Exposed via a
-			   CSS var so consumers (e.g. compose-mode commit checkbox) can collapse to a
-			   square icon button. */
+	   CSS var so consumers (e.g. compose-mode commit checkbox) can collapse to a
+	   square icon button. */
 			:host(:not([appearance])) .control,
 			:host([appearance='secondary']) .control {
 				padding-inline: var(--button-padding-inline, 0.8rem);
@@ -249,14 +294,14 @@ export class GlButton extends LitElement {
 				--code-icon-v-align: unset;
 			}
 
-			:host([aria-checked]:hover:not([disabled]):not([aria-checked='true'])) {
+			:host([aria-checked]:hover:not([disabled], [aria-checked='true'])) {
 				background-color: var(--vscode-inputOption-hoverBackground);
 			}
 
 			:host([disabled]) {
-				opacity: 0.4;
-				cursor: not-allowed;
 				pointer-events: none;
+				cursor: not-allowed;
+				opacity: 0.4;
 			}
 
 			:host([disabled][aria-checked='true']) {
@@ -264,17 +309,17 @@ export class GlButton extends LitElement {
 			}
 
 			:host([aria-checked='true']) {
-				background-color: var(--vscode-inputOption-activeBackground);
 				color: var(--vscode-inputOption-activeForeground);
+				background-color: var(--vscode-inputOption-activeBackground);
 				border-color: var(--vscode-inputOption-activeBorder);
 			}
 
 			gl-tooltip {
-				height: 100%;
-				width: 100%;
 				display: inline-flex;
 				align-items: center;
 				justify-content: center;
+				width: 100%;
+				height: 100%;
 			}
 		`,
 	];
@@ -282,8 +327,37 @@ export class GlButton extends LitElement {
 	@query('.control')
 	protected control!: HTMLElement;
 
+	/**
+	 * Visual treatment. Controls chrome and structure; use `variant` for semantic state color and
+	 * `density` for size. On the transparent appearances (`toolbar`, `input`, `alert`) a `variant`
+	 * only recolors the text — the background and border stay transparent.
+	 *
+	 * Unset (default) — solid, filled with VS Code's primary button color. The main action on a
+	 * surface; there should generally be only one.
+	 *
+	 * `secondary` — solid, in VS Code's muted button color. The lesser action sitting next to a
+	 * default button (Cancel, Dismiss, a second choice in the same row).
+	 *
+	 * `toolbar` — no chrome until hover. Icon actions in view headers, row hover actions, and
+	 * action bars, where a filled button would be visual noise.
+	 *
+	 * `input` — `toolbar`, but sized to sit inside a text field's chrome: fixed height, tighter
+	 * padding and gap, and an inset focus ring so it doesn't collide with the field's border. For
+	 * affordances rendered within a field — clear buttons, mode toggles, token pickers. Often
+	 * paired with `role="checkbox"` + `aria-checked` for the toggles.
+	 *
+	 * `alert` — outlined in the info-alert color, filling on hover. For the call to action inside
+	 * an alert or feature-gate banner, where a solid button would fight the banner's background.
+	 *
+	 * `link` — renders as an inline hyperlink: text-link colors, no padding or radius, and the
+	 * label (not the prefix/suffix icons) underlines on hover. For an action inside prose that
+	 * should read as a link. Combine with `href` for real navigation; use it without `href` when
+	 * the action runs a command but belongs visually in the sentence.
+	 *
+	 * @summary Visual treatment. Unset is the primary filled button.
+	 */
 	@property({ reflect: true })
-	appearance?: 'alert' | 'secondary' | 'toolbar' | 'input';
+	appearance?: 'alert' | 'secondary' | 'toolbar' | 'input' | 'link';
 
 	@property({ reflect: true })
 	variant?: 'danger' | 'warning' | 'success';
@@ -297,6 +371,11 @@ export class GlButton extends LitElement {
 	@property({ type: Boolean, reflect: true })
 	full = false;
 
+	/**
+	 * Setting `href` switches the host `role` to `link` and renders an anchor; otherwise the
+	 * host is a `button`. Setting `aria-checked` turns it into a toggle, picking up VS Code's
+	 * input-option colors.
+	 */
 	@property()
 	href?: string;
 
@@ -327,9 +406,10 @@ export class GlButton extends LitElement {
 		}
 
 		if (changedProperties.has('disabled')) {
-			const disabled = changedProperties.get('disabled');
-			if (disabled) {
-				this.setAttribute('aria-disabled', disabled.toString());
+			// Reflect the NEW disabled state — `changedProperties.get('disabled')` is the PREVIOUS value,
+			// which set `aria-disabled` inverted on every toggle (announced enabled buttons as disabled).
+			if (this.disabled) {
+				this.setAttribute('aria-disabled', 'true');
 			} else {
 				this.removeAttribute('aria-disabled');
 			}

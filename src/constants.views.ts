@@ -46,7 +46,43 @@ export type GroupableTreeViewIds<T extends GroupableTreeViewTypes = GroupableTre
 /** Grouped views that require a local repository and are unavailable for virtual repositories */
 export const localOnlyGroupedViews: ReadonlySet<GroupableTreeViewTypes> = new Set(['worktrees', 'stashes']);
 
-export type WebviewPanelTypes = 'composer' | 'graph' | 'patchDetails' | 'settings' | 'timeline';
+/**
+ * Authoritative, ordered list of the groupable views — each entry is
+ * compiler-checked against `GroupableTreeViewTypes` (a typo'd entry fails to
+ * compile), though unlike the `Extract`-derived union above, this array isn't
+ * verified to be exhaustive; a future addition to the union must be added
+ * here too. Drives the Settings "GitLens SCM" editor's row order.
+ */
+export const groupableViewTypes: readonly GroupableTreeViewTypes[] = [
+	'commits',
+	'branches',
+	'remotes',
+	'stashes',
+	'tags',
+	'worktrees',
+	'contributors',
+	'repositories',
+	'searchAndCompare',
+	'launchpad',
+	'fileHistory',
+];
+
+/** Display labels for the groupable views, keyed the same as {@link groupableViewTypes}. */
+export const groupableViewTypeLabels: Readonly<Record<GroupableTreeViewTypes, string>> = {
+	commits: 'Commits',
+	branches: 'Branches',
+	remotes: 'Remotes',
+	stashes: 'Stashes',
+	tags: 'Tags',
+	worktrees: 'Worktrees',
+	contributors: 'Contributors',
+	repositories: 'Repositories',
+	searchAndCompare: 'Search & Compare',
+	launchpad: 'Launchpad',
+	fileHistory: 'File History',
+};
+
+export type WebviewPanelTypes = 'allowedSigners' | 'graph' | 'patchDetails' | 'settings' | 'timeline';
 export type WebviewPanelIds = `gitlens.${WebviewPanelTypes}`;
 
 export type WebviewViewTypes = 'commitDetails' | 'graph' | 'home' | 'patchDetails' | 'timeline' | 'welcome';
@@ -108,12 +144,12 @@ export const viewIdsByDefaultContainerId = new Map<ViewContainerIds | CoreViewCo
 		'workbench.view.scm',
 		['branches', 'commits', 'remotes', 'repositories', 'stashes', 'tags', 'worktrees', 'contributors'],
 	],
-	['workbench.view.extension.gitlensPanel', ['graph']],
+	['workbench.view.extension.gitlensPanel', []],
 	[
 		'workbench.view.extension.gitlensInspect',
 		['commitDetails', 'fileHistory', 'lineHistory', 'timeline', 'searchAndCompare'],
 	],
-	['workbench.view.extension.gitlens', ['welcome', 'home', 'workspaces']],
+	['workbench.view.extension.gitlens', ['welcome', 'graph', 'home', 'launchpad', 'drafts', 'workspaces']],
 ]);
 
 export type TreeViewRefNodeTypes = 'branch' | 'commit' | 'stash' | 'tag';

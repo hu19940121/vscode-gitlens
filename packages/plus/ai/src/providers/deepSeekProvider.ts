@@ -5,11 +5,26 @@ import { OpenAICompatibleProviderBase } from './openAICompatibleProviderBase.js'
 type DeepSeekModel = AIModel<typeof provider.id>;
 const models: DeepSeekModel[] = [
 	{
+		id: 'deepseek-v4-flash',
+		name: 'DeepSeek V4 Flash',
+		maxTokens: { input: 1000000, output: 65536 },
+		provider: provider,
+		default: true,
+		temperature: 0.0, // Recommended for Coding/Math
+	},
+	{
+		id: 'deepseek-v4-pro',
+		name: 'DeepSeek V4 Pro',
+		maxTokens: { input: 1000000, output: 65536 },
+		provider: provider,
+		temperature: 0.0, // Recommended for Coding/Math
+	},
+	{
 		id: 'deepseek-chat',
 		name: 'DeepSeek-V3',
 		maxTokens: { input: 65536, output: 8192 },
 		provider: provider,
-		default: true,
+		hidden: true,
 		temperature: 0.0, // Recommended for Coding/Math
 	},
 	{
@@ -17,6 +32,7 @@ const models: DeepSeekModel[] = [
 		name: 'DeepSeek-R1',
 		maxTokens: { input: 65536, output: 8192 },
 		provider: provider,
+		hidden: true,
 		temperature: 0.0, // Recommended for Coding/Math
 	},
 ];
@@ -24,6 +40,7 @@ const models: DeepSeekModel[] = [
 export class DeepSeekProvider extends OpenAICompatibleProviderBase<typeof provider.id> {
 	readonly id = provider.id;
 	readonly name = provider.name;
+	readonly supportsTools = true;
 	protected readonly descriptor = provider;
 	protected readonly config = {
 		keyUrl: 'https://platform.deepseek.com/api_keys',
@@ -36,5 +53,10 @@ export class DeepSeekProvider extends OpenAICompatibleProviderBase<typeof provid
 
 	protected getUrl(_model: AIModel<typeof provider.id>): string {
 		return 'https://api.deepseek.com/v1/chat/completions';
+	}
+
+	// DeepSeek's response_format only accepts text|json_object — json_schema is rejected outright
+	protected override supportsResponseFormat(_model: AIModel<typeof provider.id>): boolean {
+		return false;
 	}
 }

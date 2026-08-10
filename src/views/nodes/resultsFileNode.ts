@@ -10,7 +10,6 @@ import { StatusFileFormatter } from '../../git/formatters/statusFormatter.js';
 import { GitUri } from '../../git/gitUri.js';
 import { createCommand } from '../../system/-webview/command.js';
 import { relativeDir } from '../../system/-webview/path.js';
-import { editorLineToDiffRange } from '../../system/-webview/vscode/range.js';
 import type { View } from '../viewBase.js';
 import { getFileTooltipMarkdown } from './abstract/viewFileNode.js';
 import type { ViewNode } from './abstract/viewNode.js';
@@ -81,33 +80,23 @@ export class ResultsFileNode extends ViewRefFileNode<'results-file', View, State
 
 	private _description: string | undefined;
 	get description(): string {
-		if (this._description === undefined) {
-			this._description = StatusFileFormatter.fromTemplate(
-				this.view.config.formats.files.description,
-				this.file,
-				{
-					relativePath: this.relativePath,
-				},
-			);
-		}
+		this._description ??= StatusFileFormatter.fromTemplate(this.view.config.formats.files.description, this.file, {
+			relativePath: this.relativePath,
+		});
 		return this._description;
 	}
 
 	private _folderName: string | undefined;
 	get folderName(): string {
-		if (this._folderName === undefined) {
-			this._folderName = relativeDir(this.uri.relativePath);
-		}
+		this._folderName ??= relativeDir(this.uri.relativePath);
 		return this._folderName;
 	}
 
 	private _label: string | undefined;
 	get label(): string {
-		if (this._label === undefined) {
-			this._label = StatusFileFormatter.fromTemplate(this.view.config.formats.files.label, this.file, {
-				relativePath: this.relativePath,
-			});
-		}
+		this._label ??= StatusFileFormatter.fromTemplate(this.view.config.formats.files.label, this.file, {
+			relativePath: this.relativePath,
+		});
 		return this._label;
 	}
 
@@ -150,7 +139,7 @@ export class ResultsFileNode extends ViewRefFileNode<'results-file', View, State
 			repoPath: this.uri.repoPath!,
 
 			fromComparison: true,
-			range: editorLineToDiffRange(0),
+			range: null,
 			showOptions: { preserveFocus: true, preview: true },
 		});
 	}

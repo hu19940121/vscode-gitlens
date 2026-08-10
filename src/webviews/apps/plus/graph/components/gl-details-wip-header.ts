@@ -7,10 +7,12 @@ import { createCommandLink } from '../../../../../system/commands.js';
 import type { Wip } from '../../../../plus/graph/detailsProtocol.js';
 import type { BranchMergeTargetStatus } from '../../../../rpc/services/branches.js';
 import type { OverviewBranchIssue, OverviewBranchPullRequest } from '../../../../shared/overviewBranches.js';
+import { renderDetailsMaximizeChip } from '../../../shared/components/details-header/details-maximize-chip.js';
 import { elementBase, metadataBarVarsBase } from '../../../shared/components/styles/lit/base.css.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import type { NavigationState } from '../../../shared/controllers/navigationStack.js';
+import { dispatchContextMenuAt } from '../../../shared/dom.js';
 import type { RunningOperationExecState } from './detailsState.js';
 import { detailsWipHeaderStyles } from './gl-details-wip-header.css.js';
 import '../../shared/components/merge-rebase-status.js';
@@ -26,6 +28,7 @@ import '../../../shared/components/code-icon.js';
 import '../../../shared/components/details-header/gl-details-header.js';
 import '../../../shared/components/nav-buttons.js';
 import '../../../shared/components/overlays/tooltip.js';
+import './gl-graph-coachmark.js';
 
 @customElement('gl-details-wip-header')
 export class GlDetailsWipHeader extends LitElement {
@@ -39,7 +42,7 @@ export class GlDetailsWipHeader extends LitElement {
 	 *  is for a secondary worktree (`wip.repo.path !== currentRepoPath`) so we can surface the
 	 *  Open Worktree action. */
 	@property() currentRepoPath?: string;
-	@property() activeMode?: 'review' | 'compose' | null;
+	@property() activeMode?: 'review' | 'compose' | 'resolve' | null;
 	/** Pre-computed snippet shown on the right of the identity row while in mode (e.g. "7 files",
 	 *  "Generating…", "3 commits · 7 files", "Error"). Computed by the host panel from scope +
 	 *  resource + registry state. Hidden when `activeMode` is null. */
@@ -52,7 +55,7 @@ export class GlDetailsWipHeader extends LitElement {
 	 *  separates a `'backed'` entry with a viewable result from a `'backed'`-no-result placeholder
 	 *  (cancelled / first-error Go Back) so the chip doesn't falsely advertise a completed run. */
 	@property({ attribute: false }) modeStatus?: Partial<
-		Record<'review' | 'compose', { execState: RunningOperationExecState; hasResult: boolean }>
+		Record<'review' | 'compose' | 'resolve', { execState: RunningOperationExecState; hasResult: boolean }>
 	>;
 	@property({ type: Boolean }) aiEnabled = false;
 	@property({ type: Boolean }) loading = false;
@@ -66,6 +69,13 @@ export class GlDetailsWipHeader extends LitElement {
 	@property() dateStyle?: string;
 	/** Back/forward history state from the graph host, rendered to the left of the jump button. */
 	@property({ attribute: false }) navigation?: NavigationState;
+	/** True while a sheet covers the panel — the header is `inert` then, so marks must not open behind it. */
+	@property({ type: Boolean, attribute: 'sheets-open' }) sheetsOpen = false;
+	/** Graph-bottom-only: render the maximize/restore chip left of Refresh (and thread it into the
+	 *  header's active-mode cluster). */
+	@property({ type: Boolean, attribute: 'show-maximize' }) showMaximize = false;
+	/** Drives the maximize chip's icon/label when `showMaximize` is true. */
+	@property({ type: Boolean }) maximized = false;
 
 	override render() {
 		const wip = this.wip;
@@ -78,7 +88,7 @@ export class GlDetailsWipHeader extends LitElement {
 		const behind = wip.branch?.tracking?.behind ?? 0;
 
 		// Prefer the git-authoritative counts embedded in the wip (`wip.stats`, same object the
-		// header/row badges derive `workingTreeStats` from) so the panel header and the graph
+		// header/row badges derive their WIP status from) so the panel header and the graph
 		// header/row can never disagree. Fall back to iterating the file list only when stats are
 		// absent (e.g. a wip produced by the standalone commitDetails webview, which doesn't
 		// compute diffStatus). Note: the file list double-counts mixed staged+unstaged entries,
@@ -115,94 +125,119 @@ export class GlDetailsWipHeader extends LitElement {
 			.loading=${this.loading}
 			.modes=${this.computeWipModes()}
 			.compareEnabled=${true}
+			?show-maximize=${this.showMaximize}
+			?maximized=${this.maximized}
 			?in-results-view=${this.inResultsView}
 		>
 			<div class="graph-details-header__title-group">
 				<span class="graph-details-header__wip-title">
-					${this.activeMode === 'compose'
-						? html`<code-icon class="graph-details-header__mode-icon" icon="wand"></code-icon>Composing
-								Changes`
-						: this.activeMode === 'review'
-							? html`<code-icon class="graph-details-header__mode-icon" icon="checklist"></code-icon
-									>Reviewing Changes`
-							: html`Working Changes`}
+					${
+						this.activeMode === 'compose'
+							? html`<code-icon class="graph-details-header__mode-icon" icon="wand"></code-icon
+									><span class="graph-details-header__wip-title-text">Composing Changes</span>`
+							: this.activeMode === 'review'
+								? html`<code-icon class="graph-details-header__mode-icon" icon="checklist"></code-icon
+										><span class="graph-details-header__wip-title-text">Reviewing Changes</span>`
+								: this.activeMode === 'resolve'
+									? html`<code-icon
+												class="graph-details-header__mode-icon"
+												icon="gl-merge"
+											></code-icon
+											><span class="graph-details-header__wip-title-text"
+												>Resolving Conflicts</span
+											>`
+									: html`<span class="graph-details-header__wip-title-text">Working Changes</span>`
+					}
 				</span>
-				${!isModeActive
-					? html`<gl-wip-stats
-							.added=${addedCount}
-							.modified=${modifiedCount}
-							.removed=${removedCount}
-							show-clean
-						></gl-wip-stats>`
-					: nothing}
-			</div>
-			${!isModeActive
-				? html`<gl-action-chip
-							slot="actions"
-							icon="terminal"
-							label="Open in Integrated Terminal"
-							overlay="tooltip"
-							href=${this._webview.createCommandLink('gitlens.openInIntegratedTerminal:', {
-								worktreeUri: wip.repo.uri,
-							})}
-						></gl-action-chip>
-						${isSecondaryWorktree
-							? html`<gl-action-chip
-									slot="actions"
-									icon="empty-window"
-									label="Open Worktree in New Window"
-									alt-icon="window"
-									alt-label="Open Worktree"
-									overlay="tooltip"
-									href=${this._webview.createCommandLink('gitlens.openWorktreeInNewWindow:', {
-										worktreeUri: wip.repo.uri,
-									})}
-									alt-href=${this._webview.createCommandLink('gitlens.openWorktree:', {
-										worktreeUri: wip.repo.uri,
-									})}
-								></gl-action-chip>`
-							: nothing}
-						<gl-nav-buttons slot="actions" .navigation=${this.navigation}></gl-nav-buttons>
-						${wip.branch?.reference?.sha != null
-							? html`<gl-action-chip
-									slot="actions"
-									icon="arrow-down"
-									label="Jump to Branch Tip"
-									overlay="tooltip"
-									@click=${this.onJumpToTipClick}
-								></gl-action-chip>`
-							: nothing}
-						<gl-action-chip
-							slot="actions"
-							icon="refresh"
-							label="Refresh"
-							overlay="tooltip"
-							@click=${() => this.emit('refresh-wip')}
-						></gl-action-chip>`
-				: nothing}
-			<div slot="secondary" class="graph-details-header__branch-row">
-				<div class="branch-identity">
-					${branchName
-						? html`<gl-tooltip placement="bottom">
-								<gl-branch-name
-									appearance="button"
-									class="graph-details-header__branch"
-									chevron
-									.name=${branchName}
-									@click=${() => this.emit('switch-branch')}
-								></gl-branch-name>
-								<span slot="content">Switch Branch...</span>
-							</gl-tooltip>`
-						: nothing}
-					${!isModeActive ? this.renderWipActionsButton() : nothing}
-					${isModeActive
+				${
+					!isModeActive
 						? html`<gl-wip-stats
 								.added=${addedCount}
 								.modified=${modifiedCount}
 								.removed=${removedCount}
 								show-clean
 							></gl-wip-stats>`
-						: nothing}
+						: nothing
+				}
+				${this.renderCoachMarks(wip)}
+			</div>
+			${
+				!isModeActive
+					? html`${
+								(this.navigation?.count ?? 0) > 1 || wip.branch?.reference?.sha != null
+									? html`<span slot="actions" class="nav-jump">
+											<gl-nav-buttons .navigation=${this.navigation}></gl-nav-buttons>
+											${
+												wip.branch?.reference?.sha != null
+													? html`<gl-action-chip
+															icon="download"
+															label="Jump to Branch Tip"
+															overlay="tooltip"
+															@click=${this.onJumpToTipClick}
+														></gl-action-chip>`
+													: nothing
+											}
+										</span>`
+									: nothing
+							}
+							${this.showMaximize ? renderDetailsMaximizeChip(this.maximized) : nothing}
+							<gl-action-chip
+								slot="actions"
+								icon="refresh"
+								label="Refresh"
+								overlay="tooltip"
+								@click=${() => this.emit('refresh-wip')}
+							></gl-action-chip>`
+					: nothing
+			}
+			${this.renderPausedOpStatus()}
+			<div slot="secondary" class="graph-details-header__branch-row">
+				<div class="branch-identity">
+					${
+						branchName
+							? isModeActive
+								? html`<gl-tooltip placement="bottom"
+										><gl-branch-name
+											class="graph-details-header__branch graph-details-header__branch--static"
+											.name=${branchName}
+										></gl-branch-name
+										><span slot="content"
+											><gl-branch-name .name=${branchName}></gl-branch-name></span
+									></gl-tooltip>`
+								: html`<gl-tooltip placement="bottom">
+										<gl-branch-name
+											appearance="button"
+											class="graph-details-header__branch"
+											chevron
+											.name=${branchName}
+											@click=${() => this.emit('switch-branch')}
+										></gl-branch-name>
+										<span slot="content"
+											>Switch Branch...
+											<hr />
+											<gl-branch-name .name=${branchName}></gl-branch-name
+										></span>
+									</gl-tooltip>`
+							: nothing
+					}
+					${
+						!isModeActive
+							? html`<div class="branch-actions">
+									${this.renderBranchStateAction()}${this.renderFetchAction()}
+								</div>`
+							: nothing
+					}
+					${!isModeActive ? this.renderBranchActionsButton() : nothing}
+					${
+						isModeActive
+							? html`<gl-wip-stats
+									.added=${addedCount}
+									.modified=${modifiedCount}
+									.removed=${removedCount}
+									show-clean
+								></gl-wip-stats>`
+							: nothing
+					}
 					<gl-tracking-status
 						.branchName=${branchName}
 						.upstreamName=${upstream?.name}
@@ -214,30 +249,127 @@ export class GlDetailsWipHeader extends LitElement {
 					></gl-tracking-status>
 					${this.renderMergeTargetStatus()}${this.renderAssociatedPullRequest()}
 				</div>
-				${!isModeActive
-					? html`<div class="branch-ops">
-							${this.renderBranchStateAction()}${this.renderFetchAction()}
-							<gl-action-chip
-								icon="custom-start-work"
-								label="Create Branch..."
-								overlay="tooltip"
-								@click=${() => this.emit('create-branch')}
-							></gl-action-chip>
-							${files.length > 0
-								? html`<gl-action-chip
-										icon="gl-cloud-patch-share"
-										label="Share as Cloud Patch"
-										overlay="tooltip"
-										@click=${() => this.emit('share-as-cloud-patch')}
-									></gl-action-chip>`
-								: nothing}
-						</div>`
-					: this.modeStatusText
-						? html`<div class="mode-status">${this.modeStatusText}</div>`
-						: nothing}
+				${
+					!isModeActive
+						? html`<div class="branch-ops">
+								${
+									files.length > 0
+										? html`<gl-action-chip
+												icon="gl-cloud-patch-share"
+												label="Share as Cloud Patch"
+												overlay="tooltip"
+												@click=${() => this.emit('share-as-cloud-patch')}
+											></gl-action-chip>`
+										: nothing
+								}
+								<gl-action-chip
+									icon="terminal"
+									label="Open in Integrated Terminal"
+									overlay="tooltip"
+									href=${this._webview.createCommandLink('gitlens.openInIntegratedTerminal:', {
+										worktreeUri: wip.repo.uri,
+									})}
+								></gl-action-chip>
+								${
+									isSecondaryWorktree
+										? html`<gl-action-chip
+												icon="empty-window"
+												label="Open Worktree in New Window"
+												alt-icon="window"
+												alt-label="Open Worktree"
+												overlay="tooltip"
+												href=${this._webview.createCommandLink(
+													'gitlens.openWorktreeInNewWindow:',
+													{
+														worktreeUri: wip.repo.uri,
+													},
+												)}
+												alt-href=${this._webview.createCommandLink('gitlens.openWorktree:', {
+													worktreeUri: wip.repo.uri,
+												})}
+											></gl-action-chip>`
+										: nothing
+								}
+								${this.renderWipActionsButton()}
+							</div>`
+						: this.modeStatusText
+							? html`<div class="mode-status">${this.modeStatusText}</div>`
+							: nothing
+				}
 			</div>
-			${!isModeActive ? this.renderIssuesRow() : nothing}${this.renderPausedOpStatus()}
+			${!isModeActive ? this.renderIssuesRow() : nothing}
 		</gl-details-header>`;
+	}
+
+	/** In the title group so the lightbulb lands inline with the header. `details` lives here rather
+	 *  than the Next-steps pane because this header is the only part of the WIP view present in every
+	 *  sub-state, and its trigger is "first open of Graph" regardless of selection. */
+	private renderCoachMarks(wip: Wip) {
+		const eligible = this.graphReady && !this.sheetsOpen;
+		const pausedWithConflicts = wip.changes?.pausedOpStatus != null && (wip.changes?.hasConflicts ?? false);
+
+		// One current context means one tip, and so one lightbulb. Without this the commit-details tip
+		// (whose trigger holds in every sub-state) would park its bulb next to the active mode's.
+		const context = this.activeMode ?? (pausedWithConflicts ? 'conflicts' : 'details');
+
+		return html`<gl-graph-coachmark
+				mark="details"
+				placement="bottom"
+				.anchor=${this.queryHeaderTitle}
+				?auto-show=${eligible && context === 'details'}
+			></gl-graph-coachmark>
+			<gl-graph-coachmark
+				mark="compose"
+				placement="bottom"
+				.anchor=${this.queryHeaderTitle}
+				?auto-show=${eligible && context === 'compose'}
+			></gl-graph-coachmark>
+			<gl-graph-coachmark
+				mark="review"
+				placement="bottom"
+				.anchor=${this.queryHeaderTitle}
+				?auto-show=${eligible && context === 'review'}
+			></gl-graph-coachmark>
+			<gl-graph-coachmark
+				mark="conflicts"
+				placement="bottom"
+				.anchor=${this.queryPausedOp}
+				?auto-show=${eligible && context === 'conflicts'}
+			></gl-graph-coachmark>
+			<gl-graph-coachmark
+				mark="resolve"
+				placement="bottom"
+				.anchor=${this.queryHeaderTitle}
+				?auto-show=${eligible && context === 'resolve'}
+			></gl-graph-coachmark>`;
+	}
+
+	/** True once the Graph itself is open and interactive (set by the details panel from graph state). */
+	@property({ type: Boolean, attribute: 'graph-ready' }) graphReady = false;
+
+	/** NOT the `gl-details-header` host: it's `display: contents`, so it has no box and
+	 *  `checkVisibility()` is always false, defeating the visibility guard and popover positioning.
+	 *  The title span is a real box, present both idle and in-mode. */
+	private readonly queryHeaderTitle = (): HTMLElement | undefined =>
+		this.renderRoot.querySelector<HTMLElement>('.graph-details-header__wip-title') ?? undefined;
+
+	/** The paused-op banner renders exactly when the `conflicts` trigger holds — a self-gating anchor. */
+	private readonly queryPausedOp = (): HTMLElement | undefined =>
+		this.renderRoot.querySelector<HTMLElement>('.graph-details-header__paused-op') ?? this.queryHeaderTitle();
+
+	private renderBranchActionsButton() {
+		// `wip.stats.branchContext` is the serialized `gitlens:branch` context built host-side, so this
+		// kebab opens the same branch actions menu as a graph branch row. Undefined on detached HEAD.
+		const context = this.wip?.stats?.branchContext;
+		if (context == null) return nothing;
+
+		return html`<gl-action-chip
+			icon="kebab-vertical"
+			label="Show Branch Actions"
+			overlay="tooltip"
+			data-vscode-context=${context}
+			@click=${this.onMoreActionsClick}
+		></gl-action-chip>`;
 	}
 
 	private renderWipActionsButton() {
@@ -263,22 +395,15 @@ export class GlDetailsWipHeader extends LitElement {
 		const target = e.currentTarget as HTMLElement | null;
 		if (target == null) return;
 
-		const rect = target.getBoundingClientRect();
-		target.dispatchEvent(
-			new MouseEvent('contextmenu', {
-				bubbles: true,
-				composed: true,
-				cancelable: true,
-				clientX: rect.left,
-				clientY: rect.bottom,
-				button: 2,
-			}),
-		);
+		dispatchContextMenuAt(target);
 	};
 
-	private computeWipModes(): ('review' | 'compose')[] {
+	private computeWipModes(): ('review' | 'compose' | 'resolve')[] {
 		if (!this.aiEnabled) return [];
-		return ['compose', 'review'];
+		// Surface the Resolve toggle only when the WIP has conflicts (a paused merge/rebase) —
+		// resolve operates on the conflicted-file set, so it's meaningless otherwise. It leads
+		// the cluster when present: resolving is the primary action for a conflicted WIP.
+		return this.wip?.changes?.hasConflicts ? ['resolve', 'compose', 'review'] : ['compose', 'review'];
 	}
 
 	private renderBranchStateAction() {
@@ -351,26 +476,37 @@ export class GlDetailsWipHeader extends LitElement {
 		return html`<div slot="secondary" class="graph-details-header__paused-op">
 			<gl-merge-rebase-status
 				?conflicts=${this.wip?.changes?.hasConflicts ?? false}
+				.conflictsCount=${this.wip?.stats?.conflictsCount}
+				?has-staged-changes=${this.wip?.changes?.files?.some(f => f.staged) ?? false}
+				?ai-resolve=${this.aiEnabled}
+				?ai-resume=${this.aiEnabled}
+				?ai-active=${this.wip?.changes?.aiRebaseActive ?? false}
+				?continuing=${this.wip?.changes?.pausedOpContinuing ?? false}
+				?readonly=${this.activeMode != null}
 				.pausedOpStatus=${pausedOpStatus}
 			></gl-merge-rebase-status>
 		</div>`;
 	}
 
 	private renderMergeTargetStatus() {
+		// Hidden while any mode (compose/review/resolve) is active — the mode takes over the row.
+		if (this.activeMode != null) return nothing;
 		if (this.wip?.branch == null) return nothing;
 
 		const status = this.mergeTargetStatus;
 		const loading = this.mergeTargetStatusLoading;
 		const showComponent = status != null || loading;
 		return html`<span class="graph-details-header__merge-target-slot">
-			${showComponent
-				? html`<gl-merge-target-status
-						class="graph-details-header__merge-target"
-						.branch=${status?.branch}
-						.targetPromise=${status != null ? Promise.resolve(status.mergeTarget) : undefined}
-						?loading=${status == null && loading}
-					></gl-merge-target-status>`
-				: nothing}
+			${
+				showComponent
+					? html`<gl-merge-target-status
+							class="graph-details-header__merge-target"
+							.branch=${status?.branch}
+							.targetPromise=${status != null ? Promise.resolve(status.mergeTarget) : undefined}
+							?loading=${status == null && loading}
+						></gl-merge-target-status>`
+					: nothing
+			}
 		</span>`;
 	}
 
@@ -397,17 +533,20 @@ export class GlDetailsWipHeader extends LitElement {
 			type="pr"
 			name=${pr.title}
 			url=${pr.url}
-			identifier="#${pr.id}"
+			identifier="#${pr.number}"
 			status=${status}
+			date-label="updated"
 			.date=${pr.updatedDate}
 			.dateFormat=${this.dateFormat}
 			.dateStyle=${this.dateStyle}
 			.author=${pr.authorName}
 			?isDraft=${pr.draft ?? false}
 			.reviewDecision=${pr.reviewDecision}
-			.itemId=${pr.id}
+			.itemId=${pr.number}
 			.providerId=${pr.providerId}
+			.stack=${pr.stack}
 			details
+			details-on-click
 			openOnRemote
 		></gl-autolink-chip>`;
 	}
@@ -421,12 +560,14 @@ export class GlDetailsWipHeader extends LitElement {
 		const hasAny = associated.length > 0 || patternAutolinks.length > 0;
 
 		return html`<div slot="secondary" class="graph-details-header__issues">
-			${hasAny
-				? html`<gl-chip-overflow max-rows="1" class="graph-details-header__issues-chips">
-						${associated.map(i => this.renderIssueChip(i, true))}
-						${patternAutolinks.map(i => this.renderIssueChip(i, false))}
-					</gl-chip-overflow>`
-				: nothing}
+			${
+				hasAny
+					? html`<gl-chip-overflow max-rows="1" class="graph-details-header__issues-chips">
+							${associated.map(i => this.renderIssueChip(i, true))}
+							${patternAutolinks.map(i => this.renderIssueChip(i, false))}
+						</gl-chip-overflow>`
+					: nothing
+			}
 			${this.renderAssociateIssueAction(branchReference, hasAny)}
 		</div>`;
 	}
@@ -509,9 +650,12 @@ export class GlDetailsWipHeader extends LitElement {
 		const sha = this.wip?.branch?.reference?.sha;
 		if (!sha) return;
 
+		// The graph decides whether this moves the viewport — the tip can be the next row down or far away,
+		// depending on how many other branches' commits sort between it and the WIP row. Flashes regardless:
+		// the user clicked, and without a scroll the wash is the only signal the selection went anywhere.
 		this.dispatchEvent(
 			new CustomEvent('gl-jump-to-commit', {
-				detail: { sha: sha },
+				detail: { sha: sha, flash: true },
 				bubbles: true,
 				composed: true,
 			}),

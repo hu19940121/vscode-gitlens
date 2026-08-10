@@ -1,4 +1,4 @@
-import type { AgentSession } from '@gitlens/agents/types.js';
+import type { AgentSession, ResumableAgentSession } from '@gitlens/agents/types.js';
 import { basename, normalizePath } from '@gitlens/utils/path.js';
 import type { Shape } from '@gitlens/utils/types.js';
 import { deriveNameFromPrompt } from '../utils/deriveNameFromPrompt.js';
@@ -53,23 +53,92 @@ export type AgentSessionState = Omit<Shape<AgentSession>, 'subagents'> & {
 };
 
 /**
- * Resolves the user-facing name for a session. Prefers the harness-supplied `name`, then
- * transcript-discovered titles (user-set `customTitle`, then AI-generated `aiTitle`), then a
- * heuristic derived from `firstPrompt`, then the same heuristic on `lastPrompt` (so resumed/
- * headless sessions with no first prompt still get a content-derived label), then the
- * transcript-discovered `agentName` slug as a low-priority content name (it's a slug-twin of
- * `customTitle`, often auto-derived and less readable than a prompt-derived label). If no content
- * name resolves, falls back to a location anchor (`On <X>`) built from worktree/cwd basename.
- * Always returns a non-empty string so consumers don't need to repeat fallback logic.
+ * A past session, recovered from a provider's transcript store, that can be resumed. Deliberately
+ * not an {@link AgentSessionState}: there's no process, so status, phase, pid and permissions are all
+ * meaningless — modelling it as a live session with those fields faked would let it reach code that
+ * assumes a running agent.
  */
-export function getSessionDisplayName(session: AgentSession, worktreeName: string | undefined): string {
+export interface PastAgentSessionState {
+	readonly id: string;
+	/** The directory it must be resumed from. */
+	readonly cwd: string;
+	readonly worktreePath: string;
+	readonly displayName: string;
+	/** Epoch ms — matches the RPC convention for dates crossing to a webview. */
+	readonly lastActivity: number;
+	readonly lastPrompt?: string;
+}
+
+export interface PastAgentSessionsResult {
+	readonly sessions: PastAgentSessionState[];
+	/** Every past session found for the worktree, not just the returned slice — drives "Showing N of M". */
+	readonly total: number;
+}
+
+export function serializePastAgentSession(
+	session: ResumableAgentSession,
+	worktreePath: string,
+	worktreeName: string | undefined,
+): PastAgentSessionState {
+	return {
+		id: session.id,
+		cwd: session.cwd,
+		worktreePath: worktreePath,
+		displayName: getSessionDisplayName(
+			{
+				providerName: session.providerId,
+				transcriptTitles: session.titles,
+				lastPrompt: session.lastPrompt,
+				worktreePath: worktreePath,
+				cwd: session.cwd,
+			},
+			worktreeName,
+		),
+		lastActivity: session.lastActivity.getTime(),
+		lastPrompt: session.lastPrompt,
+	};
+}
+
+/** The fields {@link getSessionDisplayName} reads — the intersection of a live {@link AgentSession}
+ *  and a past session recovered from a transcript store. */
+export interface AgentSessionNameSource {
+	readonly name?: string;
+	readonly providerName: string;
+	readonly transcriptTitles?: { readonly custom?: string; readonly ai?: string; readonly agent?: string };
+	readonly firstPrompt?: string;
+	readonly lastPrompt?: string;
+	readonly worktreePath?: string;
+	readonly cwd?: string;
+}
+
+/**
+ * Resolves the user-facing name for a session. Prefers transcript-discovered titles (user-set
+ * `customTitle`, then AI-generated `aiTitle`), then a heuristic derived from `firstPrompt`, then the
+ * same heuristic on `lastPrompt` (so resumed/headless sessions with no first prompt still get a
+ * content-derived label), then the harness-supplied `name`, then the transcript-discovered
+ * `agentName` slug. If no content name resolves, falls back to a location anchor (`On <X>`) built
+ * from worktree/cwd basename. Always returns a non-empty string so consumers don't need to repeat
+ * fallback logic.
+ *
+ * `session.name` sits *below* the transcript titles + prompt-derived names because for Claude Code
+ * it's an auto-generated repo slug (`vscode-gitlens-9f`) — a low-quality label that a real title or
+ * prompt should always beat. (The newer CLI always stamps it, so ranking it first would mask every
+ * good title.) It stays *above* the location anchor because for a subagent `name` is the meaningful
+ * `agentType` (`Explore`, `reviewer-agent`), which a subagent — having no titles or prompts — would
+ * otherwise lose to `On <cwd>`.
+ *
+ * Takes a structural shape rather than an `AgentSession` so past sessions read out of a transcript
+ * store — which have no process, status, or phase — resolve through this same cascade instead of a
+ * parallel one. `AgentSession` satisfies it as-is.
+ */
+export function getSessionDisplayName(session: AgentSessionNameSource, worktreeName: string | undefined): string {
 	const titles = session.transcriptTitles;
 	const name =
-		session.name ||
 		titles?.custom ||
 		titles?.ai ||
 		deriveNameFromPrompt(session.firstPrompt) ||
 		deriveNameFromPrompt(session.lastPrompt) ||
+		session.name ||
 		titles?.agent;
 	if (name) return name;
 
@@ -92,6 +161,9 @@ export interface AgentSessionWorktreeMetadata {
 	readonly name: string;
 	readonly type: 'bare' | 'detached' | 'branch';
 	readonly isDefault: boolean;
+	/** The owning repo (`GitWorktree.repoPath`) — i.e. this worktree's `commonPath`. Backfills
+	 *  {@link AgentSessionState.commonPath} for sessions the provider never git-probed. */
+	readonly repoPath?: string;
 	readonly branch?: { readonly name: string; readonly upstreamName?: string };
 }
 
@@ -102,6 +174,13 @@ export function serializeAgentSession(
 	const { subagents, ...rest } = session;
 	return {
 		...rest,
+		// Backfill repo identity from the host's worktree lookup when the provider never resolved it.
+		// Completed sessions read from the CLI's durable store carry a `worktreePath` but no
+		// `commonPath` (no git probe, by design — a 30-day history must not fan out). Consumers gate
+		// on `commonPath` to decide whether a session belongs to the repo they're showing, so without
+		// this those sessions' cards would stay permanently inert rather than briefly (see
+		// `AgentSessionWorktreeMetadata.repoPath`).
+		commonPath: session.commonPath ?? worktree?.repoPath,
 		displayName: getSessionDisplayName(session, worktree?.name),
 		subagentCount: subagents?.length ?? 0,
 		worktree:

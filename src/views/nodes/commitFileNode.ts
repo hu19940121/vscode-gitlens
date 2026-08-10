@@ -136,19 +136,15 @@ export abstract class CommitFileNodeBase<
 
 	private _folderName: string | undefined;
 	get folderName(): string {
-		if (this._folderName === undefined) {
-			this._folderName = relativeDir(this.uri.relativePath);
-		}
+		this._folderName ??= relativeDir(this.uri.relativePath);
 		return this._folderName;
 	}
 
 	private _label: string | undefined;
 	get label(): string {
-		if (this._label === undefined) {
-			this._label = StatusFileFormatter.fromTemplate(this.view.config.formats.files.label, this.file, {
-				relativePath: this.relativePath,
-			});
-		}
+		this._label ??= StatusFileFormatter.fromTemplate(this.view.config.formats.files.label, this.file, {
+			relativePath: this.relativePath,
+		});
 		return this._label;
 	}
 
@@ -162,7 +158,7 @@ export abstract class CommitFileNodeBase<
 	}
 
 	override getCommand(): Command | undefined {
-		let range: DiffRange;
+		let range: DiffRange | null;
 		if (this.commit.lines.length) {
 			// TODO@eamodio should the endLine be the last line of the commit?
 			range = {
@@ -172,7 +168,8 @@ export abstract class CommitFileNodeBase<
 				endCharacter: 1,
 			};
 		} else {
-			range = this.commit.file?.range ?? selectionToDiffRange(this.options?.selection);
+			const selection = this.options?.selection;
+			range = this.commit.file?.range ?? (selection != null ? selectionToDiffRange(selection) : null);
 		}
 
 		return createCommand<[undefined, DiffWithPreviousCommandArgs]>(

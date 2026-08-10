@@ -2,6 +2,7 @@ import * as assert from 'assert';
 import { RunError } from '../exec.errors.js';
 import {
 	classifySigningError,
+	defaultExceptionHandler,
 	getGitCommandError,
 	GitError,
 	GitErrors,
@@ -221,6 +222,40 @@ suite('GitErrors Regex Test Suite', () => {
 			assert.ok(GitErrors.uncommittedChanges.test(stderr));
 		});
 
+		test('worktreeLocked matches a locked worktree, with and without a lock reason', () => {
+			assert.ok(
+				GitErrors.worktreeLocked.test(
+					"fatal: cannot remove a locked working tree, lock reason: kepler:task:cb600cca\nuse 'remove -f -f' to override or unlock first",
+				),
+			);
+			assert.ok(
+				GitErrors.worktreeLocked.test(
+					"fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first",
+				),
+			);
+		});
+
+		test('worktreeLocked does not match a locked worktree that could not be moved', () => {
+			assert.ok(!GitErrors.worktreeLocked.test('fatal: cannot move a locked working tree, lock reason: kepler'));
+		});
+
+		test('worktreeLocked does not match when the phrase only appears within a worktree path', () => {
+			const stderr = "error: '/repo/cannot remove a locked working tree' contains modified or untracked files";
+			assert.ok(!GitErrors.worktreeLocked.test(stderr));
+		});
+
+		test('worktreeLockedReason captures the whole lock reason, including spaces and semicolons', () => {
+			const stderr =
+				"fatal: cannot remove a locked working tree, lock reason: CI running; do not touch\nuse 'remove -f -f' to override or unlock first";
+			assert.strictEqual(GitErrors.worktreeLockedReason.exec(stderr)?.[1].trim(), 'CI running; do not touch');
+		});
+
+		test('worktreeLockedReason does not match when there is no lock reason', () => {
+			const stderr =
+				"fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first";
+			assert.strictEqual(GitErrors.worktreeLockedReason.exec(stderr), null);
+		});
+
 		test('alreadyExists matches "already exists"', () => {
 			const stderr = "fatal: '/path/to/worktree' already exists";
 			assert.ok(GitErrors.alreadyExists.test(stderr));
@@ -267,9 +302,19 @@ suite('GitErrors Regex Test Suite', () => {
 			assert.ok(GitErrors.cherryPickInProgress.test(stderr));
 		});
 
-		test('cherryPickEmptyPrevious matches "The previous cherry-pick is now empty"', () => {
+		test('previousOperationEmpty matches "The previous cherry-pick is now empty"', () => {
 			const stderr = 'The previous cherry-pick is now empty, possibly due to conflict resolution.';
-			assert.ok(GitErrors.cherryPickEmptyPrevious.test(stderr));
+			assert.ok(GitErrors.previousOperationEmpty.test(stderr));
+		});
+
+		test('previousOperationEmpty matches "The previous revert is now empty"', () => {
+			const stderr = 'The previous revert is now empty, possibly due to conflict resolution.';
+			assert.ok(GitErrors.previousOperationEmpty.test(stderr));
+		});
+
+		test('previousOperationEmpty does not match an unrelated empty-commit message', () => {
+			const stderr = 'nothing to commit, working tree clean';
+			assert.ok(!GitErrors.previousOperationEmpty.test(stderr));
 		});
 
 		test('revertInProgress matches "revert is already in progress"', () => {
@@ -424,6 +469,75 @@ suite('getGitCommandError() Test Suite', () => {
 		assert.strictEqual(captureReason('worktree-delete', ex), 'defaultWorkingTree');
 	});
 
+	// Both routes to `emptyCommit` gate the same UI choice (record the empty commit, or skip it), so
+	// both have to land on that reason rather than falling through to a raw git error.
+	test('maps paused-operation-continue stderr to "emptyCommit" reason (sequencer message)', () => {
+		const ex = makeGitError('The previous cherry-pick is now empty, possibly due to conflict resolution.');
+		assert.strictEqual(captureReason('paused-operation-continue', ex), 'emptyCommit');
+	});
+
+	test('maps paused-operation-continue stderr to "emptyCommit" reason (single revert)', () => {
+		const ex = makeGitError('You are currently reverting commit 5235973.\n\nnothing to commit, working tree clean');
+		assert.strictEqual(captureReason('paused-operation-continue', ex), 'emptyCommit');
+	});
+
+	// The "nothing to commit" route to `emptyCommit` is matched by a broad pattern that also fires on
+	// "no changes added to commit"/"nothing added to commit", which git prints alongside the specific
+	// unmerged/conflict/unstaged messages — so it is mapped LAST. A refusal has to keep reporting the
+	// refusal, or the user gets offered an empty commit for a step that isn't empty.
+	test('a paused-operation-continue refusal still reports conflicts, not "emptyCommit"', () => {
+		const ex = makeGitError(
+			'a.txt: needs merge\nYou must edit all merge conflicts and then\nmark them as resolved using git add',
+		);
+		assert.strictEqual(captureReason('paused-operation-continue', ex), 'conflicts');
+	});
+
+	// Synthetic overlap — not output git was observed to produce, but the invariant the LAST position
+	// buys: whenever a specific reason and the broad "nothing to commit" pattern both match, the
+	// specific one has to win. Fails if the mapping is moved back ahead of the specific reasons.
+	test('a paused-operation-continue error matching both reports the specific one, not "emptyCommit"', () => {
+		const ex = makeGitError(
+			'error: You have unstaged changes.\nno changes added to commit (use "git add" and/or "git commit -a")',
+		);
+		assert.strictEqual(captureReason('paused-operation-continue', ex), 'unstagedChanges');
+	});
+
+	// Guards against narrowing that pattern to the "working tree clean" variant: an empty step with
+	// untracked files present reports this instead, and it must still reach the record-or-skip choice.
+	test('maps paused-operation-continue stderr to "emptyCommit" reason (empty step, untracked files)', () => {
+		const ex = makeGitError(
+			'You are currently reverting commit 5235973.\n\nUntracked files:\n\tnoise.txt\n\nnothing added to commit but untracked files present (use "git add" to track)',
+		);
+		assert.strictEqual(captureReason('paused-operation-continue', ex), 'emptyCommit');
+	});
+
+	test('maps paused-operation-continue stderr to "nothingToContinue" reason', () => {
+		const ex = makeGitError('error: no cherry-pick or revert in progress');
+		assert.strictEqual(captureReason('paused-operation-continue', ex), 'nothingToContinue');
+	});
+
+	test('maps worktree-delete stderr to "locked" reason', () => {
+		const ex = makeGitError(
+			"fatal: cannot remove a locked working tree, lock reason: kepler:task:cb600cca\nuse 'remove -f -f' to override or unlock first",
+		);
+		assert.strictEqual(captureReason('worktree-delete', ex), 'locked');
+	});
+
+	test('maps worktree-delete stderr to "locked" reason when there is no lock reason', () => {
+		const ex = makeGitError(
+			"fatal: cannot remove a locked working tree;\nuse 'remove -f -f' to override or unlock first",
+		);
+		assert.strictEqual(captureReason('worktree-delete', ex), 'locked');
+	});
+
+	test('maps worktree-delete stderr to "locked" reason even when the lock reason looks like another error', () => {
+		// The lock reason is free text, so it must not be mistaken for the error it quotes
+		const ex = makeGitError(
+			"fatal: cannot remove a locked working tree, lock reason: contains modified or untracked files\nuse 'remove -f -f' to override or unlock first",
+		);
+		assert.strictEqual(captureReason('worktree-delete', ex), 'locked');
+	});
+
 	test('matches on stderr property when toString does not match', () => {
 		// Create a GitError where the message is generic but stderr has the real error
 		const runError = new RunError(
@@ -443,6 +557,31 @@ suite('getGitCommandError() Test Suite', () => {
 	test('maps fetch stderr to "remoteConnectionFailed" reason', () => {
 		const ex = makeGitError('fatal: Could not read from remote repository.');
 		assert.strictEqual(captureReason('fetch', ex), 'remoteConnectionFailed');
+	});
+});
+
+suite('defaultExceptionHandler() Test Suite', () => {
+	// Documents the mechanism behind the requirement that mutating operations (push, etc.) pass
+	// `errors: 'throw'`: any rejection whose message matches a `GitWarnings` regex is treated as
+	// non-fatal and swallowed here, so it never reaches the operation's catch block. A push left to
+	// the default handler would resolve as if it succeeded on a non-fast-forward (`tipBehind`) rejection.
+	test('swallows tipBehind (non-fast-forward) rejections as non-fatal', () => {
+		const ex = makeGitError(
+			'hint: Updates were rejected because the tip of your current branch is behind\nhint: its remote counterpart.',
+		);
+		assert.doesNotThrow(() => defaultExceptionHandler(ex, '/repo'));
+	});
+
+	test('rethrows remoteAhead rejections (not a GitWarning)', () => {
+		const ex = makeGitError(
+			"error: failed to push some refs to 'origin'\nhint: Updates were rejected because the remote contains work that you do not have locally.",
+		);
+		assert.throws(() => defaultExceptionHandler(ex, '/repo'));
+	});
+
+	test('rethrows unrecognized errors', () => {
+		const ex = makeGitError('some unknown error happened');
+		assert.throws(() => defaultExceptionHandler(ex, '/repo'));
 	});
 });
 
