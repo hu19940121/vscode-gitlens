@@ -28,7 +28,6 @@ import type {
 } from '../../../plus/graph/protocol.js';
 import {
 	ChooseRepositoryCommand,
-	CloseGraphWalkthroughBannerCommand,
 	createWipRowId,
 	SearchCancelCommand,
 	SearchOpenInViewCommand,
@@ -46,6 +45,7 @@ import { telemetryContext } from '../../shared/contexts/telemetry.js';
 import type { WebviewContext } from '../../shared/contexts/webview.js';
 import { webviewContext } from '../../shared/contexts/webview.js';
 import { ModifierKeysController } from '../../shared/controllers/modifier-keys.js';
+import { providerIconName } from '../../shared/git-utils.js';
 import { emitTelemetrySentEvent } from '../../shared/telemetry.js';
 import { ruleStyles } from '../shared/components/vscode.css.js';
 import { getDisplayedMode, isGraphFiltered } from './components/gl-graph-scope-popover.js';
@@ -60,7 +60,6 @@ import { isGraphSearchResultsError, shouldRestoreSearchQuery } from './stateProv
 import { actionButton, linkBase } from './styles/graph.css.js';
 import { graphHeaderControlStyles, titlebarStyles } from './styles/header.css.js';
 import { getSelectedRepoPath } from './utils/repository.utils.js';
-import { isGraphWalkthroughBannerHighlighted } from './walkthroughBanner.js';
 import '../shared/components/account-chip.js';
 import '../shared/components/integrations-chip.js';
 import '../../shared/components/branch-name.js';
@@ -150,57 +149,6 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 			.inline-chip {
 				flex: none;
 				align-self: center;
-			}
-
-			.mcp-tooltip::part(body),
-			.hooks-tooltip::part(body) {
-				--max-width: 320px;
-			}
-
-			.graph-walkthrough-tooltip::part(body) {
-				--max-width: 400px;
-			}
-
-			.mcp-tooltip__content a,
-			.hooks-tooltip__content a,
-			.graph-walkthrough-tooltip__content a {
-				color: var(--vscode-textLink-foreground);
-			}
-
-			.action-button--mcp,
-			.action-button--hooks {
-				background: var(--gl-gradient-brand-subtle);
-				border: var(--gl-border-width) solid var(--vscode-panel-border);
-			}
-
-			.action-button--graph-walkthrough {
-				color: var(--vscode-button-foreground);
-				background: var(--vscode-button-background);
-				border: var(--gl-border-width) solid var(--vscode-button-background);
-			}
-
-			.action-button--graph-walkthrough:hover {
-				background: var(--vscode-button-hoverBackground);
-			}
-
-			.preview-badge {
-				font-size: 0.8em;
-				color: var(--color-foreground--65);
-			}
-
-			.graph-walkthrough-tooltip__title {
-				display: flex;
-				gap: 1ch;
-				align-items: center;
-				justify-content: space-between;
-				margin-block-end: var(--gl-space-4);
-			}
-
-			.graph-walkthrough-tooltip__actions {
-				display: flex;
-				gap: var(--gl-space-8);
-				align-items: center;
-				margin-block-start: var(--gl-space-8);
 			}
 
 			/* Search is meaningless in Timeline mode — visually dim it and let inert block focus
@@ -441,16 +389,6 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 			}),
 		);
 		return true;
-	}
-
-	private onGraphWalkthroughBannerDismiss(e: Event): void {
-		e.preventDefault();
-		this._ipc.sendCommand(CloseGraphWalkthroughBannerCommand, {});
-	}
-
-	private onGraphWalkthroughBannerButtonClick(e: Event): void {
-		e.preventDefault();
-		this._ipc.sendCommand(CloseGraphWalkthroughBannerCommand, { openWelcome: true });
 	}
 
 	private onOpenPullRequest(pr: NonNullable<NonNullable<State['branchState']>['pr']>): void {
@@ -793,6 +731,9 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				// A landing: stepping results is driven from the search box in the header, so each hit needs
 				// to announce where it put you rather than rely on you having watched the rows.
 				flash: true,
+				// This call already has its own hidden-result affordance — a generic toast on top would
+				// double-report the same miss.
+				feedback: false,
 			});
 		} finally {
 			if (this._activeNavigationAbort === abort) {
@@ -1037,7 +978,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	private renderTitlebarHeaderRow(repo: RepositoryShape | undefined) {
 		const hasMultipleRepositories = (this.graphState.repositories?.length ?? 0) > 1;
 
-		const { allowed, branch, branchState, config, lastFetched, loading, state } = this.graphState;
+		const { allowed, branch, branchState, config, lastFetched, loading } = this.graphState;
 		// Names what a plain jump-to-ref click will do, so the label can't drift from the behavior.
 		const focusLabel = this.isScopedToCurrentBranch ? 'Unfocus Current Branch' : 'Focus on Current Branch';
 
@@ -1142,105 +1083,11 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				)}
 			</div>
 			<div class="titlebar__group">
-				${when(
-					// `mcpBannerCollapsed` is dismissal-only; this button also stays hidden when MCP
-					// auto-registers (the modal shows the "bundled" banner variant instead)
-					!(state.mcpBannerCollapsed ?? true) && !(state.mcpCanAutoRegister ?? false),
-					() => html`
-						<gl-popover class="mcp-tooltip" placement="bottom" trigger="click focus hover">
-							<a
-								class="action-button action-button--mcp"
-								href=${createCommandLink('gitlens.ai.mcp.install', { source: 'graph' })}
-								slot="anchor"
-							>
-								<code-icon class="action-button__icon" icon="mcp"></code-icon>
-							</a>
-							<div class="mcp-tooltip__content" slot="content">
-								<strong>Install GitKraken MCP for GitLens</strong> <br />
-								Leverage Git and Integration information from GitLens in AI chat.
-								<a href="https://help.gitkraken.com/mcp/mcp-getting-started">Learn more</a>
-								${when(
-									state.canInstallClaudeHook,
-									() => html`
-										<br /><br />
-										<a href=${createCommandLink('gitlens.agents.installClaudeHook')}
-											>Install Claude Code Hooks</a
-										>
-										to see and manage your parallel agent work from GitLens.
-									`,
-								)}
-							</div>
-						</gl-popover>
-					`,
-				)}
-				${when(
-					((state.mcpBannerCollapsed ?? true) || (state.mcpCanAutoRegister ?? false)) &&
-						(state.canInstallClaudeHook ?? false) &&
-						!(state.hooksBannerCollapsed ?? true),
-					() => html`
-						<gl-popover class="hooks-tooltip" placement="bottom" trigger="click focus hover">
-							<button type="button" class="action-button action-button--hooks" slot="anchor">
-								<code-icon class="action-button__icon" icon="robot"></code-icon>
-							</button>
-							<div class="hooks-tooltip__content" slot="content">
-								<strong>Install Claude Code Hooks</strong><br />
-								Configure Claude to send status updates to GitLens so you can see and manage your
-								parallel agent work.
-								<br /><br />
-								<a href=${createCommandLink('gitlens.agents.installClaudeHook')}>Install</a>
-								&middot;
-								<a href=${createCommandLink('gitlens.agents.uninstallClaudeHook')}>Uninstall</a>
-								&middot;
-								<a
-									href=${createCommandLink('gitlens.onboarding.dismiss', {
-										id: 'hooks:banner',
-									})}
-									>Dismiss</a
-								>
-							</div>
-						</gl-popover>
-					`,
-				)}
-				${this.renderGraphWalkthroughBanner(state)} ${this.renderStartMenu()}
+				${this.renderStartMenu()}
 				<gl-graph-launchpad-indicator></gl-graph-launchpad-indicator>
 				<gl-graph-account-indicator></gl-graph-account-indicator>
 			</div>
 		</div>`;
-	}
-
-	private renderGraphWalkthroughBanner(state: State) {
-		const dismissed = (state.graphWalkthroughBannerCollapsed ?? true) || (state.graphWalkthroughComplete ?? false);
-
-		if (dismissed) {
-			return nothing;
-		}
-
-		const highlighted = isGraphWalkthroughBannerHighlighted(state);
-
-		return html`
-			<gl-popover class="graph-walkthrough-tooltip" placement="bottom" trigger="hover focus" ?open=${highlighted}>
-				<button
-					type="button"
-					class="action-button ${highlighted ? 'action-button--graph-walkthrough' : ''}"
-					slot="anchor"
-					@click=${this.onGraphWalkthroughBannerButtonClick}
-				>
-					<code-icon class="action-button__icon" icon="megaphone"></code-icon>
-				</button>
-				<div class="graph-walkthrough-tooltip__content" slot="content">
-					<span class="graph-walkthrough-tooltip__title">
-						<strong>Try the All-New Commit Graph</strong>
-						<span class="preview-badge">PREVIEW</span>
-					</span>
-					Where your development and agentic workflows come together. Go beyond history visualization to
-					manage, execute, and parallelize your entire Git workflow.
-					<div class="graph-walkthrough-tooltip__actions">
-						<gl-button @click=${this.onGraphWalkthroughBannerButtonClick}>See what's new</gl-button>
-						<a href="#" @click=${this.onGraphWalkthroughBannerDismiss}>Dismiss</a>
-					</div>
-				</div>
-			</gl-popover>
-		`;
 	}
 
 	private renderStartMenu() {
@@ -1346,7 +1193,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				this.handleOnToggleRefsVisibilityClick(event, [ref], true);
 			}}
 		>
-			${this.renderRemoteAvatarOrIcon(ref)}
+			${this.renderHiddenRefIcon(ref)}
 			<span class="hidden-ref__label"
 				>${owner ? html`<span class="hidden-ref__owner">${owner}</span>` : nothing}${name}${
 					suffix ? html` <span class="hidden-ref__suffix">· ${suffix}</span>` : nothing
@@ -1505,11 +1352,12 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	}
 
 	/** The leading glyph on a hidden-ref row. Decorative: the row's own text names the ref, so an alt/label
-	 *  here would only announce it twice (and a remote-wide hide's raw name is a bare `*`). */
-	private renderRemoteAvatarOrIcon(refOptData: GraphRefOptData) {
-		if (refOptData.avatarUrl) {
-			return html`<img class="hidden-ref__avatar" alt="" src=${refOptData.avatarUrl} />`;
-		}
-		return html`<code-icon class="hidden-ref__icon" icon=${getRemoteIcon(refOptData.type)}></code-icon>`;
+	 *  here would only announce it twice (and a remote-wide hide's raw name is a bare `*`). A remote entry
+	 *  takes its provider's font glyph — same rendering as the side bar's remotes panel, never an avatar
+	 *  image (a fixed-color raster neither matches the theme nor scales at glyph size). */
+	private renderHiddenRefIcon(refOptData: GraphRefOptData) {
+		const icon =
+			refOptData.type === 'remote' ? providerIconName(refOptData.providerIcon) : getRemoteIcon(refOptData.type);
+		return html`<code-icon class="hidden-ref__icon" icon=${icon}></code-icon>`;
 	}
 }

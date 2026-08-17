@@ -1,11 +1,13 @@
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
+import { pluralize } from '@gitlens/utils/string.js';
 import { createCommandLink } from '../../../../../system/commands.js';
 import type { AgentSessionState } from '../../../../home/protocol.js';
 import type { AgentSessionCategory, StickyDetailResolver } from '../../agentUtils.js';
 import {
 	agentPhaseToCategory,
+	canResolvePermission,
 	createAgentSessionOpenHref,
 	createStickyDetailResolver,
 	describeAgentSession,
@@ -29,6 +31,12 @@ interface AgentPillSummary {
 	category: AgentSessionCategory;
 	sessions: readonly AgentSessionState[];
 }
+
+/** Summary popovers cap at the most recent rows — the input arrays arrive most-recent-first
+ *  (sorted upstream by `sortAgentSessions`), so a slice keeps the freshest sessions. A hover is a
+ *  glance surface, not a browser: the footer hands off to the resume picker for the rest, which
+ *  matters most for completed sessions since those accumulate into the hundreds. */
+const maxSummaryRows = 3;
 
 function formatElapsed(value: Date | number | undefined): string | undefined {
 	if (value == null) return undefined;
@@ -376,6 +384,12 @@ export class GlAgentStatusPill extends LitElement {
 				flex: 0 0 auto;
 			}
 
+			.hover-actions__hint {
+				font-size: 0.8em;
+				color: var(--vscode-descriptionForeground);
+				text-align: center;
+			}
+
 			/* "…" overflow menu — anchored off the third action button. */
 			.more-menu {
 				display: flex;
@@ -431,6 +445,16 @@ export class GlAgentStatusPill extends LitElement {
 				padding-top: var(--gl-space-6);
 				border-top: var(--gl-border-width) solid
 					var(--vscode-widget-border, color-mix(in srgb, var(--vscode-foreground) 15%, transparent));
+			}
+
+			/* Completed rows add a 4th track for Resume/Archive actions — rows without actions keep
+	   the base 3-track layout. */
+			.hover-summary-row--actions {
+				grid-template-columns: auto minmax(0, 1fr) auto auto;
+			}
+
+			.hover-summary-row__actions {
+				justify-self: end;
 			}
 
 			.hover-summary-row__dot {
@@ -491,6 +515,20 @@ export class GlAgentStatusPill extends LitElement {
 	   second grid cell — visual styling lives in the shared agentToolStyles. */
 			.hover-summary-row__tool {
 				grid-column: 2 / -1;
+			}
+
+			.hover-summary__footer {
+				font-size: 0.9em;
+				color: var(--vscode-descriptionForeground);
+			}
+
+			a.hover-summary__more {
+				color: var(--vscode-textLink-foreground);
+				text-decoration: none;
+			}
+
+			a.hover-summary__more:hover {
+				text-decoration: underline;
 			}
 		`,
 	];
@@ -565,7 +603,7 @@ export class GlAgentStatusPill extends LitElement {
 		const category = agentPhaseToCategory[session.phase];
 		const permission = session.pendingPermission;
 		const label = getAgentPhaseLabel(category, permission);
-		const canResolve = category === 'needs-input' && permission != null;
+		const canResolve = canResolvePermission(category, permission);
 
 		return html`
 			<gl-popover placement="bottom">
@@ -588,9 +626,14 @@ export class GlAgentStatusPill extends LitElement {
 		const baseLabel = getAgentCategoryLabel(category);
 		const count = sessions.length;
 		const label = count > 1 ? `${baseLabel} · ${count}` : baseLabel;
+		const shown = sessions.slice(0, maxSummaryRows);
 
+		// `auto-size-vertical` caps the popover to the space the view actually has and scrolls the
+		// overflow. Home's sidebar view is often shorter than the popover, and the row cap leaves
+		// the content just under `.hover-summary`'s own max-height — so without it the footer sits
+		// past the viewport edge with no scrollbar anywhere to reach it.
 		return html`
-			<gl-popover placement="bottom">
+			<gl-popover placement="bottom" auto-size-vertical>
 				<span slot="anchor" class=${`pill pill--${category}`} tabindex="0">
 					<span class="pill__label">
 						<span class="pill__dot"></span>
@@ -598,9 +641,55 @@ export class GlAgentStatusPill extends LitElement {
 					</span>
 				</span>
 				<div slot="content" class="hover-card" tabindex="-1">
-					<div class="hover-summary">${sessions.map(s => this.renderSummaryRow(s, category))}</div>
+					<div class="hover-summary">
+						${shown.map(s => this.renderSummaryRow(s, category))}
+						${this.renderSummaryFooter(category, sessions, shown.length)}
+					</div>
 				</div>
 			</gl-popover>
+		`;
+	}
+
+	/** Beyond `maxSummaryRows`, the popover switches to a count-only footer instead of growing
+	 *  unbounded — completed sessions especially can accumulate into the hundreds. The footer links
+	 *  into the resume picker (scoped to the shared worktree) only for completed sessions that all
+	 *  share one worktree — `showResumeSessionPicker` no-ops without a `worktreePath`, and other
+	 *  categories have no equivalent picker to route to. */
+	private renderSummaryFooter(
+		category: AgentSessionCategory,
+		sessions: readonly AgentSessionState[],
+		shown: number,
+	): unknown {
+		if (sessions.length <= shown) return nothing;
+
+		const countText = pluralize(
+			`more ${getAgentCategoryLabel(category).toLowerCase()} session`,
+			sessions.length - shown,
+		);
+
+		let sharedWorktreePath: string | undefined;
+		if (category === 'completed') {
+			sharedWorktreePath = sessions[0].worktreePath ?? undefined;
+			if (sharedWorktreePath != null && !sessions.every(s => s.worktreePath === sharedWorktreePath)) {
+				sharedWorktreePath = undefined;
+			}
+		}
+
+		return html`
+			<div class="hover-summary__footer">
+				${
+					sharedWorktreePath != null
+						? html`<a
+								class="hover-summary__more"
+								href=${createCommandLink('gitlens.agents.showResumeSessionPicker', {
+									worktreePath: sharedWorktreePath,
+								})}
+								@mousedown=${this.onActionMouseDown}
+								>${countText}…</a
+							>`
+						: html`<span class="hover-summary__more">${countText}</span>`
+				}
+			</div>
 		`;
 	}
 
@@ -616,13 +705,13 @@ export class GlAgentStatusPill extends LitElement {
 		const detail =
 			stickyTool != null
 				? undefined
-				: describeAgentSession(session, category, elapsed, {
+				: describeAgentSession(session, category, {
 						awaitingPrefix: 'short',
 						idleFallback: 'lastPrompt',
 					});
 
 		return html`
-			<div class="hover-summary-row">
+			<div class=${`hover-summary-row${category === 'completed' ? ' hover-summary-row--actions' : ''}`}>
 				<span class=${`hover-summary-row__dot hover-summary-row__dot--${category}`}></span>
 				<gl-tooltip content=${session.displayName} placement="bottom">
 					<span class="hover-summary-row__name">${session.displayName}</span>
@@ -630,9 +719,24 @@ export class GlAgentStatusPill extends LitElement {
 				<span class=${`hover-summary-row__phase hover-summary-row__phase--${category}`}>
 					${phaseLabel}${elapsed != null ? html` · <span class="agent-phase-elapsed">${elapsed}</span>` : ''}
 				</span>
-				${this.renderSummaryRowDetail(stickyTool, detail)}
+				${this.renderSummaryRowActions(session, category)} ${this.renderSummaryRowDetail(stickyTool, detail)}
 			</div>
 		`;
+	}
+
+	/** Completed rows keep their Resume / Archive affordances even after rolling up into the
+	 *  summary popover — rolling up shouldn't cost the actions a live pill would have offered. */
+	private renderSummaryRowActions(session: AgentSessionState, category: AgentSessionCategory): unknown {
+		if (category !== 'completed') return nothing;
+
+		const openAction = getAgentSessionOpenAction(session);
+		const openActionHref = createAgentSessionOpenHref(session);
+		const archiveHref = createCommandLink('gitlens.agents.archiveSession', JSON.stringify(session.id));
+
+		return html`<action-nav class="hover-summary-row__actions" @mousedown=${this.onActionMouseDown}>
+			<action-item label=${openAction.label} icon=${openAction.icon} href=${openActionHref}></action-item>
+			<action-item label="Archive Session" icon="archive" href=${archiveHref}></action-item>
+		</action-nav>`;
 	}
 
 	private renderSummaryRowDetail(stickyTool: string | undefined, detail: string | undefined): unknown {
@@ -791,7 +895,9 @@ export class GlAgentStatusPill extends LitElement {
 		const permission = session.pendingPermission;
 		const openHref = createCommandLink('gitlens.agents.openSession', JSON.stringify(session.id));
 
-		const canResolve = permission != null;
+		// This hover only renders for needs-input, so the category is implied; an unresolvable ask
+		// still shows its detail but offers Open Session instead of buttons that can't route.
+		const canResolve = canResolvePermission('needs-input', permission);
 		const allowHref = canResolve
 			? createCommandLink('gitlens.agents.resolvePermission', {
 					sessionId: session.id,
@@ -875,6 +981,13 @@ export class GlAgentStatusPill extends LitElement {
 										<code-icon icon="link-external" slot="prefix"></code-icon>
 										Open Session
 									</gl-button>
+									${
+										permission != null
+											? html`<span class="hover-actions__hint"
+													>Answer in the agent's session</span
+												>`
+											: nothing
+									}
 								</div>
 							`
 			}

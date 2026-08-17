@@ -3,7 +3,14 @@ import { css, unsafeCSS } from 'lit';
 /* The single threshold (both axes) below which the gate switches to its compact look. Shared as a
    constant because the width- and height-compact rules span this file and
    feature-gate-plus-state.ts, and @container conditions can't read custom properties. */
-export const featureGateCompactThreshold = unsafeCSS('45rem');
+export const featureGateCompactThreshold = unsafeCSS('66rem');
+
+/* The width at/above which the feature list shows two comfortable ~33rem columns of static expanded
+   rows; below it the list snaps straight to the single-column accordion. Deliberately its own value
+   (not featureGateCompactThreshold): this is a list-layout decision, not the gate's compact mode, and
+   it must line up with where two columns actually fit so there is never a single-column-expanded
+   in-between. */
+const featureGateListColumnsThreshold = unsafeCSS('72rem');
 
 export const featureGateBaseStyles = css`
 	:host {
@@ -118,13 +125,39 @@ export const featureGateBaseStyles = css`
 
 	.switch-actions {
 		position: absolute;
-		top: 0.6rem;
+		top: 0.1rem;
 		right: 0.6rem;
 		z-index: 1;
 
 		gl-button:not(:hover, :focus-within) {
 			opacity: 0.6;
 		}
+	}
+
+	:host([variant='sheet']) .sheet {
+		--section-foreground: var(--vscode-foreground);
+		--section-background: var(--vscode-editor-background);
+		--section-border-color: var(--gate-border);
+
+		--link-foreground: var(--vscode-textLink-foreground);
+		--link-foreground-active: var(--vscode-textLink-activeForeground);
+
+		position: absolute;
+		inset: 0;
+		box-sizing: border-box;
+		display: flex;
+		flex-direction: column;
+		padding: 0;
+		overflow: hidden;
+		color: var(--section-foreground);
+		background: var(--vscode-editor-background);
+	}
+
+	:host([variant='sheet']) .content {
+		inline-size: 100%;
+		max-width: 90rem;
+		padding-block: var(--gl-space-24);
+		margin-inline: auto;
 	}
 `;
 
@@ -165,22 +198,20 @@ export const featureGateContentStyles = css`
 		align-items: flex-start;
 	}
 
-	/* Vertically constrained placements (e.g. the bottom panel): title and lede share one line
-	   (wrapping when also narrow) to shorten the header. The normal-height dialog is untouched. */
-	@container (max-height: ${featureGateCompactThreshold}) {
-		.feature__header hgroup {
-			display: flex;
-			flex-wrap: wrap;
-			column-gap: var(--gl-space-8);
-			align-items: baseline;
-		}
-	}
-
 	.feature__feature-icon {
 		/* Fixed light glyph: the brand gradient is dark in every theme, so a theme-driven foreground
 		   (near-black on light themes) would fail contrast against it. */
 		--icon-color: #fff;
 		--icon-background: var(--gl-gradient-brand);
+	}
+
+	gitlens-logo-circle.feature__feature-icon {
+		flex: none;
+		width: 3.2rem;
+		height: 3.2rem;
+		/* The logo renders a fixed 46px SVG; scale it from the top-left to fill the box. */
+		transform: scale(calc(32 / 46));
+		transform-origin: top left;
 	}
 
 	.feature__title {
@@ -217,62 +248,101 @@ export const featureGateContentStyles = css`
 
 	.list {
 		display: grid;
-		/* Intrinsic column collapse: two columns when the content area is wide enough for two
-		   32rem tracks, a single column in narrow placements (side bar, panel splits). */
-		grid-template-columns: repeat(auto-fit, minmax(min(32rem, 100%), 1fr));
-		gap: var(--gl-space-16);
+		/* Single column by default; the list snaps to two columns only once it's wide enough for them
+		   (see the min-width container query below). There is deliberately no single-column-expanded
+		   state in between — narrow snaps straight to the accordion. */
+		grid-template-columns: 1fr;
+		gap: var(--gl-space-4);
 		padding-inline-start: 0;
 		margin-block: var(--gl-space-6);
 		margin-inline: 0;
 		list-style: none;
 	}
 
+	/* Default (narrow) layout: each <details> is a real collapsible accordion row with a clickable
+	   summary and a chevron. Closed rows hide their content natively via ::details-content; the wide
+	   layout below force-reveals it and neuters the summary into a static row. */
 	.list__item {
+		display: block;
+		padding-block: var(--gl-space-6);
+	}
+
+	.list__summary {
 		display: flex;
-		gap: var(--gl-space-12);
-		align-items: flex-start;
+		gap: var(--gl-space-8);
+		align-items: center;
+		cursor: pointer;
+		list-style: none;
+	}
+
+	.list__summary::-webkit-details-marker,
+	.list__summary::marker {
+		display: none;
+	}
+
+	.list__chevron {
+		display: inline-flex;
+		flex: none;
+		margin-inline-start: auto;
+		color: var(--vscode-descriptionForeground);
+		transition: transform var(--gl-duration-fast) var(--gl-ease-out);
+	}
+
+	.list__item[open] .list__chevron {
+		transform: rotate(90deg);
 	}
 
 	.list__copy {
 		display: flex;
 		flex-direction: column;
 		gap: var(--gl-space-2);
+		padding-inline: var(--gl-space-6);
+		margin-block-start: var(--gl-space-6);
 		font-size: var(--gl-font-sm);
 		text-wrap: pretty;
-
-		strong {
-			font-size: var(--gl-font-md);
-			color: var(--color-foreground);
-		}
 	}
 
-	/* Vertically constrained placements: tighten the feature list. Halve the between-column gap,
-	   and float each item's icon so its copy flows around and under it instead of sitting in a
-	   rigid second column — reclaiming the indent for text. Placed after the base .list/.list__item
-	   rules so the height-scoped overrides win the cascade (the base .list gap shorthand would
-	   otherwise reset column-gap, and the base .list__item/.list__copy flex would defeat the float). */
-	@container (max-height: ${featureGateCompactThreshold}) {
+	.list__summary strong,
+	.list__copy strong {
+		font-size: var(--gl-font-md);
+		color: var(--color-foreground);
+	}
+
+	/* Wide layout: two comfortable ~33rem columns, and each <details> reads as a static expanded row
+	   rather than an accordion — the summary is blockified and neutered (non-interactive), the chevron
+	   is hidden, and ::details-content is force-revealed (Chromium hides a closed details' content
+	   wrapper; overriding its content-visibility is the only way to reveal it from CSS). Below this
+	   threshold the list snaps back to the single-column accordion — there is no in-between. */
+	@container (min-width: ${featureGateListColumnsThreshold}) {
 		.list {
-			column-gap: var(--gl-space-8);
+			grid-template-columns: 1fr 1fr;
+			gap: var(--gl-space-16);
 		}
 
 		.list__item {
-			display: block;
+			display: flex;
+			flex-direction: column;
+			align-items: flex-start;
+			padding-block: 0;
 		}
 
-		.list__item .icon-cube {
-			float: inline-start;
-			margin-inline-end: var(--gl-space-6);
+		.list__summary {
+			pointer-events: none;
+			cursor: default;
+		}
+
+		.list__item::details-content {
+			content-visibility: visible;
+		}
+
+		.list__chevron {
+			display: none;
 		}
 
 		.list__copy {
-			display: block;
-		}
-
-		/* The title runs in on the same line as the body, so match its size to the body — the
-		   larger heading size reads as inconsistent mid-sentence. Weight/color keep it distinct. */
-		.list__copy strong {
-			font-size: var(--gl-font-sm);
+			padding-inline: 0;
+			padding-inline-start: var(--gl-space-36);
+			margin-block-start: 0;
 		}
 	}
 `;

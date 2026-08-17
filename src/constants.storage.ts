@@ -1,5 +1,6 @@
 import type { ColumnMode } from '@gitkraken/commit-graph/view.js';
 import type { AIProviderAndModel, AIProviders } from '@gitlens/ai/constants.js';
+import type { GitHealthSlowness } from '@gitlens/git/gitHealth.js';
 import type { GitRevisionRangeNotation } from '@gitlens/git/models/revision.js';
 import type {
 	IntegrationIds,
@@ -202,10 +203,15 @@ export type DeprecatedWorkspaceStorage = {
 	[key in `confirm:ai:tos:${AIProviders}`]: boolean;
 };
 
+/** Persisted passive-slowness summary for a repo (keyed by repo path in `gitHealth:slowness`). */
+export type StoredGitHealthSlowness = GitHealthSlowness;
+
 interface WorkspaceStorageCore {
 	assumeRepositoriesOnStartup?: boolean;
 	'branch:comparisons': StoredBranchComparisons;
 	'gitComandPalette:usage': StoredRecentUsage;
+	/** Passive git-slowness summary per repo path (feeds the Git Health banner). */
+	'gitHealth:slowness': Record<string, StoredGitHealthSlowness>;
 	gitPath: string;
 	'graph:columns': Record<string, StoredGraphColumn>;
 	'graph:filtersByRepo': Record<string, StoredGraphFilters>;
@@ -423,7 +429,7 @@ export interface StoredGraphColumn {
 	isHidden?: boolean;
 	mode?: StoredGraphColumnMode;
 	width?: number;
-	/** Column↔grouped placement. `graph`: `true` = grouped. `ref`: host zone id = grouped, `false` = column. */
+	/** Column↔grouped placement for both columns: `undefined`/`true` = grouped with the default host zone (host Group commands write `true`; the webview echoes back the resolved zone id), a zone-id string = grouped with that zone, `false` = standalone column. */
 	grouped?: boolean | string;
 }
 
@@ -446,6 +452,8 @@ export interface StoredGraphState {
 			activePanel?: GraphSidebarPanel;
 			/** How the sidebar's filter input presents non-matches: `true` hides them (filter), `false` dims them (highlight). */
 			searchBoxFilter?: boolean;
+			/** Whether the agents panel shows completed sessions. Defaults to false (hidden). */
+			showCompletedAgentSessions?: boolean;
 		};
 		minimap?: {
 			visible?: boolean;
@@ -508,6 +516,8 @@ export interface StoredGraphExcludedRef {
 	type: StoredGraphRefType;
 	name: string;
 	owner?: string;
+	/** For a whole-remote wildcard (`name: '*'`) only — ids of branches exempted from the hide. */
+	except?: string[];
 }
 
 export interface StoredGraphIncludeOnlyRef {

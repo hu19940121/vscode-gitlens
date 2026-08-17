@@ -76,19 +76,27 @@ function listSessionsCalls(cliCalls: string[][]): number {
 	return cliCalls.filter(args => args.includes('list-sessions')).length;
 }
 
-function sessionStart(sessionId: string, cwd: string): Record<string, unknown> {
-	return { event: 'SessionStart', sessionId: sessionId, cwd: cwd, pid: process.pid };
+/** Omit `providerId` to emulate an older CLI, which doesn't stamp it. */
+function sessionStart(sessionId: string, cwd: string, providerId?: string): Record<string, unknown> {
+	return {
+		event: 'SessionStart',
+		sessionId: sessionId,
+		cwd: cwd,
+		pid: process.pid,
+		...(providerId != null ? { providerId: providerId } : undefined),
+	};
 }
 
 /** A `list-sessions` poll entry (SessionFileData shape) for an alive session, used to exercise
  *  the reconciliation poll / discrepancy detection. `pid: process.pid` so it passes `isProcessAlive`. */
-function sessionFileData(sessionId: string, cwd: string): Record<string, unknown> {
+function sessionFileData(sessionId: string, cwd: string, providerId?: string): Record<string, unknown> {
 	return {
 		sessionId: sessionId,
 		event: 'UserPromptSubmit',
 		cwd: cwd,
 		pid: process.pid,
 		updatedAt: '2024-01-01T00:00:00.000Z',
+		...(providerId != null ? { providerId: providerId } : undefined),
 	};
 }
 
@@ -463,6 +471,119 @@ suite('ClaudeCodeProvider', () => {
 
 				assert.strictEqual(provider.sessions[0].workspacePath, undefined);
 				assert.strictEqual(provider.sessions[0].isInWorkspace, false);
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('an ordinary event carrying a new cwd re-resolves the worktree', async () => {
+			// An agent that moves into another worktree keeps sending its live cwd on every event,
+			// but the CLI does not always announce the move with `CwdChanged` — and a window that
+			// started after the move never saw one at all. Resolving git info only when it is
+			// missing pins the session to its launch repo, so its real worktree's WIP row shows no
+			// agents.
+			const repo = '/repo';
+			const worktree = '/repo.worktrees/feature';
+			const { callbacks, handlers } = createMockCallbacks({
+				resolveGitInfo: (cwd: string) =>
+					Promise.resolve(
+						cwd === worktree
+							? { repoRoot: repo, worktreePath: worktree, isWorktree: true }
+							: { repoRoot: repo, worktreePath: repo, isWorktree: false },
+					),
+			});
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([repo]);
+				const handler = handlers.get('agents/session')!;
+				await handler(sessionStart('s1', repo), new URLSearchParams());
+				await flushMicrotasks();
+				assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.worktreePath, repo);
+
+				// No CwdChanged — just a normal tool event that happens to carry the new cwd.
+				await handler(
+					{ event: 'PreToolUse', sessionId: 's1', cwd: worktree, toolName: 'Read' },
+					new URLSearchParams(),
+				);
+				await flushMicrotasks();
+				await flushMicrotasks();
+
+				const s = provider.sessions.find(x => x.id === 's1')!;
+				assert.strictEqual(s.cwd, worktree, 'the live cwd tracks the move');
+				assert.strictEqual(s.worktreePath, worktree, 'the worktree must follow the cwd, not the launch dir');
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('an event carrying a cwdTimeline entry seats worktreePath synchronously, ahead of the git probe', async () => {
+			const repo = '/repo';
+			const { callbacks, handlers } = createMockCallbacks({
+				// Never resolves — proves the assertion below doesn't depend on the probe completing.
+				resolveGitInfo: () => new Promise(() => {}),
+			});
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([repo]);
+				const handler = handlers.get('agents/session')!;
+				await handler(
+					{
+						event: 'SessionStart',
+						sessionId: 's1',
+						cwd: repo,
+						pid: process.pid,
+						cwdTimeline: [{ cwd: repo, worktree: repo }],
+					},
+					new URLSearchParams(),
+				);
+
+				const s = provider.sessions.find(x => x.id === 's1');
+				assert.strictEqual(
+					s?.worktreePath,
+					repo,
+					'worktreePath comes from the event, not the (still-pending) probe',
+				);
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('a cwd-move event carrying a timeline entry for the new cwd updates worktreePath without waiting for the probe', async () => {
+			const repo = '/repo';
+			const worktree = '/repo.worktrees/feature';
+			const { callbacks, handlers } = createMockCallbacks({
+				// Never resolves — proves the update below doesn't depend on the probe completing.
+				resolveGitInfo: () => new Promise(() => {}),
+			});
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([repo]);
+				const handler = handlers.get('agents/session')!;
+				await handler(sessionStart('s1', repo), new URLSearchParams());
+
+				// No CwdChanged — an ordinary event carries the new cwd, with the CLI's own resolution
+				// for it already attached.
+				await handler(
+					{
+						event: 'PreToolUse',
+						sessionId: 's1',
+						cwd: worktree,
+						toolName: 'Read',
+						cwdTimeline: [
+							{ cwd: repo, worktree: repo },
+							{ cwd: worktree, worktree: worktree },
+						],
+					},
+					new URLSearchParams(),
+				);
+
+				const s = provider.sessions.find(x => x.id === 's1');
+				assert.strictEqual(s?.cwd, worktree, 'the live cwd tracks the move');
+				assert.strictEqual(
+					s?.worktreePath,
+					worktree,
+					'worktreePath follows the event timeline, not a pending probe',
+				);
 			} finally {
 				provider.dispose();
 			}
@@ -1933,6 +2054,74 @@ suite('ClaudeCodeProvider completed sessions', () => {
 		}
 	});
 
+	test('a poll-revived session takes the record’s location and sheds its terminal fields', async () => {
+		// The resume can happen anywhere — another worktree, another window. A row revived in place
+		// keeps whatever directory it ended in, so it attaches to the wrong WIP row and "Open Session"
+		// resumes from a stale path; and leaving `endReason`/`endedAt` set makes a live row read as
+		// terminal to every consumer that keys off them.
+		const MOVED = '/home/user/projectA-elsewhere';
+		const options: { cliResponse?: string } = { cliResponse: JSON.stringify([endedRecord('moved')]) };
+		const { callbacks } = createMockCallbacks(options);
+		const provider = new GateTestProvider(callbacks);
+		try {
+			provider.start([MOVED]);
+			await flushMicrotasks();
+			const completed = provider.sessions.find(s => s.id === 'moved');
+			assert.strictEqual(completed?.status, 'completed');
+			assert.strictEqual(completed?.endReason, 'session-end');
+			assert.strictEqual(completed?.workspacePath, undefined, 'it ended outside this workspace');
+
+			options.cliResponse = JSON.stringify([
+				{ ...sessionFileData('moved', MOVED), updatedAt: '2026-07-10T00:05:00.000Z' },
+			]);
+			await provider.runGatedSync();
+
+			const s = provider.sessions.find(x => x.id === 'moved');
+			assert.strictEqual(s?.status, 'thinking', 'the row is live again');
+			assert.strictEqual(s?.cwd, MOVED, 'cwd follows the record');
+			assert.strictEqual(s?.workspacePath, MOVED, 'workspacePath is re-derived from the new cwd');
+			assert.strictEqual(s?.isInWorkspace, true);
+			assert.strictEqual(s?.endReason, undefined, 'a revived row is no longer terminal');
+			assert.strictEqual(s?.endedAt, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a revival at a non-repo cwd keeps the session’s worktree attribution', async () => {
+		// Design invariant: attribution persists until git affirmatively resolves a NEW worktree. A
+		// resume whose cwd is scratch space (e.g. /tmp) — or an older-CLI record with no worktree data
+		// — must not strand the session rootless; the cwd alone is never the re-rooting signal.
+		const OUTSIDE = '/tmp/scratch';
+		const options: { cliResponse?: string; resolveGitInfo?: () => Promise<undefined> } = {
+			cliResponse: JSON.stringify([
+				endedRecord('older', { cwdTimeline: [{ cwd: REPO, worktree: REPO, at: '2026-07-08T00:00:00.000Z' }] }),
+			]),
+			resolveGitInfo: () => Promise.resolve(undefined),
+		};
+		const { callbacks } = createMockCallbacks(options);
+		const provider = new GateTestProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			await flushMicrotasks();
+			const completed = provider.sessions.find(s => s.id === 'older');
+			assert.strictEqual(completed?.status, 'completed');
+			assert.strictEqual(completed?.worktreePath, REPO, 'the completed row is attributed from its record');
+
+			options.cliResponse = JSON.stringify([
+				{ ...sessionFileData('older', OUTSIDE), updatedAt: '2026-07-10T00:05:00.000Z' },
+			]);
+			await provider.runGatedSync();
+
+			const s = provider.sessions.find(x => x.id === 'older');
+			assert.notStrictEqual(s?.status, 'completed', 'the row is live again');
+			assert.strictEqual(s?.cwd, OUTSIDE, 'cwd still follows the record');
+			assert.strictEqual(s?.worktreePath, REPO, 'the worktree attribution is kept');
+		} finally {
+			provider.dispose();
+		}
+	});
+
 	test('poll does not revive a completed session off a snapshot older than the completion', async () => {
 		// `SessionEnd` fires while the process is still winding down, so a poll whose `list-sessions`
 		// call started BEFORE it comes back with a snapshot that still says "active" with a live pid.
@@ -2248,5 +2437,1302 @@ suite('ClaudeCodeProvider completed sessions', () => {
 		} finally {
 			provider.dispose();
 		}
+	});
+});
+
+suite('ClaudeCodeProvider unresolvable permission asks', () => {
+	test('Notification(permission_prompt) synthesizes an unresolvable ask', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			await handler(
+				{
+					event: 'Notification',
+					sessionId: 's1',
+					cwd: '/repo',
+					notificationType: 'permission_prompt',
+					toolName: 'Bash',
+				},
+				new URLSearchParams(),
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.strictEqual(s?.pendingPermission?.resolvable, false);
+			assert.strictEqual(s?.pendingPermission?.toolName, 'Bash');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a non-blocking PermissionRequest synthesizes an unresolvable ask shaped like the blocking payload', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			await handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: '/repo',
+					toolName: 'Bash',
+					toolInput: { command: 'ls -la' },
+				},
+				new URLSearchParams(), // no `blocking=true` — the non-blocking tail
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.strictEqual(s?.pendingPermission?.resolvable, false);
+			assert.strictEqual(s?.pendingPermission?.toolName, 'Bash');
+			// Mirrors the blocking payload's shape: `toolDescription` carries the described input.
+			assert.strictEqual(s?.pendingPermission?.toolDescription, 'Bash(ls -la)');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a non-blocking question ask carries the question text and count', async () => {
+		// Surfaces render `questionText` in place of the tool description — without it a question
+		// ask reads as a generic "awaiting" card.
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			await handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: '/repo',
+					toolName: 'AskUserQuestion',
+					toolInput: { questions: [{ question: 'Which branch?' }, { question: 'Force push?' }] },
+				},
+				new URLSearchParams(), // no `blocking=true` — the non-blocking tail
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.pendingPermission?.kind, 'question');
+			assert.strictEqual(s?.pendingPermission?.resolvable, false);
+			assert.strictEqual(s?.pendingPermission?.questionText, 'Which branch?');
+			assert.strictEqual(s?.pendingPermission?.questionCount, 2);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a routable blocking permission survives a subsequent Notification(permission_prompt)', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			// The Promise executor sets `bk.pendingPermission` synchronously, before this call
+			// returns — no need to await it (it stays pending until resolvePermission/dispose).
+			const blocking = handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: '/repo',
+					toolName: 'Bash',
+					toolInput: { command: 'ls -la' },
+				},
+				new URLSearchParams('blocking=true'),
+			);
+			blocking.catch(() => {});
+
+			await handler(
+				{
+					event: 'Notification',
+					sessionId: 's1',
+					cwd: '/repo',
+					notificationType: 'permission_prompt',
+					toolName: 'Bash',
+				},
+				new URLSearchParams(),
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.notStrictEqual(
+				s?.pendingPermission?.resolvable,
+				false,
+				'the routable ask must not be replaced by a synthesized unresolvable one',
+			);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a second non-blocking PermissionRequest replaces the published ask', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			await handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: '/repo',
+					toolName: 'Bash',
+					toolInput: { command: 'ls -la' },
+				},
+				new URLSearchParams(),
+			);
+			// Same status AND same `statusDetail` (`Bash` both times) — only the ask itself differs, so
+			// a status-only short-circuit would leave the first command on the card while the agent
+			// waits on the second.
+			await handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: '/repo',
+					toolName: 'Bash',
+					toolInput: { command: 'rm -rf build' },
+				},
+				new URLSearchParams(),
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.pendingPermission?.toolDescription, 'Bash(rm -rf build)');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('Notification(elicitation_dialog) publishes an elicitation ask, not a tool ask', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			// `toolName` names the elicitation, not a tool — classifying it as one would label the card
+			// with tool-permission wording for something only answerable in-session.
+			await handler(
+				{
+					event: 'Notification',
+					sessionId: 's1',
+					cwd: '/repo',
+					notificationType: 'elicitation_dialog',
+					toolName: 'Bash',
+				},
+				new URLSearchParams(),
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.pendingPermission?.kind, 'elicitation');
+			assert.strictEqual(s?.pendingPermission?.resolvable, false);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a non-blocking plan ask carries the session planFile', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(
+				{
+					event: 'SessionStart',
+					sessionId: 's1',
+					cwd: '/repo',
+					pid: process.pid,
+					planFile: '/repo/.claude/plan.md',
+				},
+				new URLSearchParams(),
+			);
+			await handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: '/repo',
+					toolName: 'ExitPlanMode',
+					toolInput: { plan: '# Do the thing' },
+				},
+				new URLSearchParams(),
+			);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.pendingPermission?.kind, 'plan');
+			assert.strictEqual(
+				s?.pendingPermission?.planFilePath,
+				'/repo/.claude/plan.md',
+				'an unroutable plan ask still links the plan so the card can offer View Plan',
+			);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	// Regression guard: `settleBookkeeping` (called from the `Stop`/`StopFailure` handler) already
+	// clears `bk.pendingPermission`, so an unresolved `Elicitation` doesn't latch the session at
+	// `permission_requested` forever. Passes with or without the rest of this changeset — kept to
+	// catch a future regression in that clear.
+	test('Elicitation with no ElicitationResult does not pin the session at permission_requested after Stop', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			await handler(
+				{ event: 'Elicitation', sessionId: 's1', cwd: '/repo', toolName: 'ask_permission' },
+				new URLSearchParams(),
+			);
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.status, 'permission_requested');
+
+			await handler(stop('s1'), new URLSearchParams());
+			// Stop → idle is debounced (stopToIdleDebounceMs = 750ms).
+			await wait(900);
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(
+				s?.status,
+				'idle',
+				'the session must settle to idle instead of staying latched at permission_requested',
+			);
+			assert.strictEqual(s?.pendingPermission, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+});
+
+suite('ClaudeCodeProvider permission ask identity gating', () => {
+	// Guards the deny-storm bug: a pending blocking ask must only be settled by an event that
+	// refers to the SAME ask (matching `tool_use_id`, or matching toolName + canonical `tool_input`
+	// when neither side has one) — not by any `PostToolUse`/`PermissionDenied` sharing the session
+	// id. Payload shapes below mirror the installed CLI: `PermissionRequest` hook input carries
+	// `tool_name`/`tool_input` but NEVER `tool_use_id`; `PostToolUse`/`PermissionDenied` carry both.
+	type PermissionResponseLike = { hookSpecificOutput: { decision: { behavior: string } } };
+
+	function permissionRequest(
+		sessionId: string,
+		toolName: string,
+		toolInput: Record<string, unknown>,
+	): Record<string, unknown> {
+		return {
+			event: 'PermissionRequest',
+			sessionId: sessionId,
+			cwd: '/repo',
+			toolName: toolName,
+			toolInput: toolInput,
+			hookInput: { tool_name: toolName, tool_input: toolInput },
+		};
+	}
+
+	function postToolUseWithId(
+		sessionId: string,
+		toolUseId: string,
+		toolName: string,
+		toolInput: Record<string, unknown>,
+	): Record<string, unknown> {
+		return {
+			event: 'PostToolUse',
+			sessionId: sessionId,
+			toolName: toolName,
+			toolInput: toolInput,
+			hookInput: { tool_use_id: toolUseId, tool_name: toolName, tool_input: toolInput },
+		};
+	}
+
+	function permissionDenied(
+		sessionId: string,
+		toolUseId: string,
+		toolName: string,
+		toolInput: Record<string, unknown>,
+	): Record<string, unknown> {
+		return {
+			event: 'PermissionDenied',
+			sessionId: sessionId,
+			toolName: toolName,
+			toolInput: toolInput,
+			hookInput: { tool_use_id: toolUseId, tool_name: toolName, tool_input: toolInput },
+		};
+	}
+
+	test('PostToolUse with the same toolName but different tool_input does not deny the pending ask', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			const blocking = handler(
+				permissionRequest('s1', 'Bash', { command: 'ls -la' }),
+				new URLSearchParams('blocking=true'),
+			);
+			let settled = false;
+			blocking.then(
+				() => (settled = true),
+				() => (settled = true),
+			);
+
+			// A different invocation of the same tool completing elsewhere — must not touch this ask.
+			await handler(postToolUseWithId('s1', 'tu-2', 'Bash', { command: 'git status' }), new URLSearchParams());
+			await flushMicrotasks();
+
+			assert.strictEqual(settled, false, 'the live ask must still be pending');
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.strictEqual(s?.pendingPermission?.toolName, 'Bash');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('PostToolUse with the same toolName and canonically-equal tool_input denies the pending ask', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			const blocking = handler(
+				permissionRequest('s1', 'Bash', { command: 'ls -la', description: 'list files' }),
+				new URLSearchParams('blocking=true'),
+			);
+
+			// Same input, keys reordered — canonicalization must still equate them.
+			await handler(
+				postToolUseWithId('s1', 'tu-1', 'Bash', { description: 'list files', command: 'ls -la' }),
+				new URLSearchParams(),
+			);
+
+			const response = (await blocking) as PermissionResponseLike;
+			assert.strictEqual(response.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.pendingPermission, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a stray PermissionDenied naming an evicted ask does not deny the ask that replaced it', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			// Ask N: evicted-denied below by ask N+1 — a genuinely different ask (different input),
+			// which is the only way an ask lacking `tool_use_id` ever settles via eviction.
+			const askN = handler(
+				permissionRequest('s1', 'Bash', { command: 'ls -la' }),
+				new URLSearchParams('blocking=true'),
+			);
+
+			// Ask N+1 replaces N.
+			const askNPlus1 = handler(
+				permissionRequest('s1', 'Bash', { command: 'rm -rf build' }),
+				new URLSearchParams('blocking=true'),
+			);
+
+			const evicted = (await askN) as PermissionResponseLike;
+			assert.strictEqual(evicted.hookSpecificOutput.decision.behavior, 'deny', 'ask N is evicted by ask N+1');
+
+			let settled = false;
+			askNPlus1.then(
+				() => (settled = true),
+				() => (settled = true),
+			);
+
+			// A stray PermissionDenied for ask N surfaces late, naming N's tool + input (and some
+			// tool_use_id the CLI attaches) — it must not be mistaken for settling N+1: the input
+			// mismatches N+1's, so the identity gate leaves N+1 untouched.
+			await handler(permissionDenied('s1', 'tu-stray', 'Bash', { command: 'ls -la' }), new URLSearchParams());
+			await flushMicrotasks();
+
+			assert.strictEqual(settled, false, 'ask N+1 must survive the stray PermissionDenied');
+			assert.strictEqual(
+				provider.sessions.find(x => x.id === 's1')?.pendingPermission?.toolDescription,
+				'Bash(rm -rf build)',
+			);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test("a PermissionDenied matching the pending ask's name and input settles it", async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			const toolInput = { command: 'rm -rf build' };
+
+			// Production shape: `PermissionRequest` carries no `tool_use_id`.
+			const ask = handler(permissionRequest('s1', 'Bash', toolInput), new URLSearchParams('blocking=true'));
+
+			// Auto-mode classifier denies the tool call — same tool_name, canonically-equal
+			// tool_input (keys reordered), some tool_use_id the CLI attaches.
+			await handler(
+				permissionDenied('s1', 'tu-1', 'Bash', { command: toolInput.command }),
+				new URLSearchParams(),
+			);
+
+			const response = (await ask) as PermissionResponseLike;
+			assert.strictEqual(response.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.pendingPermission, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('consecutive identical asks are each settled by their own PermissionDenied, nothing is left stuck', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+			const toolInput = { command: 'rm -rf build' };
+
+			// Ask N settles via its own genuine PermissionDenied.
+			const askN = handler(permissionRequest('s1', 'Bash', toolInput), new URLSearchParams('blocking=true'));
+			await handler(permissionDenied('s1', 'tu-1', 'Bash', toolInput), new URLSearchParams());
+			const deniedN = (await askN) as PermissionResponseLike;
+			assert.strictEqual(deniedN.hookSpecificOutput.decision.behavior, 'deny');
+
+			// Ask N+1: the agent retries with the SAME input — identical identity to N, since
+			// `PermissionRequest` carries no `tool_use_id` for either. It must settle on its own
+			// genuine PermissionDenied too, not get stuck at `permission_requested` forever.
+			const askNPlus1 = handler(permissionRequest('s1', 'Bash', toolInput), new URLSearchParams('blocking=true'));
+			await handler(permissionDenied('s1', 'tu-2', 'Bash', toolInput), new URLSearchParams());
+			const deniedNPlus1 = (await askNPlus1) as PermissionResponseLike;
+
+			assert.strictEqual(deniedNPlus1.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.pendingPermission, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a duplicate blocking delivery (same name+input, no ids) attaches instead of evicting the first', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			const first = handler(
+				permissionRequest('s1', 'Bash', { command: 'ls -la', description: 'list files' }),
+				new URLSearchParams('blocking=true'),
+			);
+			// CLI retry after its 60s response-header timeout — same ask, keys reordered.
+			const second = handler(
+				permissionRequest('s1', 'Bash', { description: 'list files', command: 'ls -la' }),
+				new URLSearchParams('blocking=true'),
+			);
+
+			let firstSettled = false;
+			first.then(
+				() => (firstSettled = true),
+				() => (firstSettled = true),
+			);
+			await flushMicrotasks();
+			assert.strictEqual(firstSettled, false, 'the duplicate delivery must attach, not evict, the first');
+
+			assert.strictEqual(provider.resolvePermission('s1', 'allow'), true);
+
+			const [firstResponse, secondResponse] = (await Promise.all([first, second])) as [
+				PermissionResponseLike,
+				PermissionResponseLike,
+			];
+			assert.strictEqual(firstResponse.hookSpecificOutput.decision.behavior, 'allow');
+			assert.strictEqual(secondResponse.hookSpecificOutput.decision.behavior, 'allow');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a second blocking request with the same name but different input evicts and denies every resolver on the first', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			const firstRequest = () =>
+				handler(permissionRequest('s1', 'Bash', { command: 'ls -la' }), new URLSearchParams('blocking=true'));
+
+			// Two attached resolvers on the same ask (duplicate delivery) — both must be denied together.
+			const firstA = firstRequest();
+			const firstB = firstRequest();
+
+			// Stays pending until dispose — hold the rejection so it doesn't go unhandled.
+			const second = handler(
+				permissionRequest('s1', 'Bash', { command: 'rm -rf build' }),
+				new URLSearchParams('blocking=true'),
+			);
+			second.catch(() => {});
+
+			const [responseA, responseB] = (await Promise.all([firstA, firstB])) as [
+				PermissionResponseLike,
+				PermissionResponseLike,
+			];
+			assert.strictEqual(responseA.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(responseB.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(
+				provider.sessions.find(x => x.id === 's1')?.pendingPermission?.toolDescription,
+				'Bash(rm -rf build)',
+			);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a PostToolUse with a real tool name clears an empty-name pending ask (legacy degraded payload)', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			// No `tool_name` anywhere in the payload — registers with an empty identity.
+			const blocking = handler(
+				{ event: 'PermissionRequest', sessionId: 's1', cwd: '/repo', toolInput: { command: 'ls -la' } },
+				new URLSearchParams('blocking=true'),
+			);
+
+			await handler(postToolUseWithId('s1', 'tu-1', 'Bash', { command: 'ls -la' }), new URLSearchParams());
+
+			const response = (await blocking) as PermissionResponseLike;
+			assert.strictEqual(response.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.pendingPermission, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	// `bk.pendingPermission` (the field `clearStalePermission`'s display-only branch gates on) is
+	// only ever populated two ways: the blocking-routable path (which also has a `_pendingPermissions`
+	// map entry, so it's settled through the FIRST branch, not this one) and `Elicitation`. A
+	// non-blocking `PermissionRequest`'s synthesized ask lives solely in the session's own
+	// `pendingPermission` field and isn't gated at all — any later non-`permission_requested` status
+	// update clears it regardless of tool name (unchanged HEAD behavior, not under test here).
+	// `Elicitation` is therefore the only live path that exercises the display-only branch.
+	test('the display-only branch (Elicitation ask) is gated by toolName alone', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			await handler(
+				{ event: 'Elicitation', sessionId: 's1', cwd: '/repo', toolName: 'ask_permission' },
+				new URLSearchParams(),
+			);
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.status, 'permission_requested');
+
+			// A different tool completing elsewhere must not touch the elicitation ask.
+			await handler(
+				postToolUseWithId('s1', 'tu-1', 'Edit', { file_path: '/repo/file.ts' }),
+				new URLSearchParams(),
+			);
+			assert.strictEqual(
+				provider.sessions.find(x => x.id === 's1')?.status,
+				'permission_requested',
+				'a different tool must not clear the elicitation ask',
+			);
+
+			// The matching tool name clears it.
+			await handler(postToolUseWithId('s1', 'tu-2', 'ask_permission', {}), new URLSearchParams());
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.status, 'thinking');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('UserPromptSubmit still clears a pending ask unconditionally', async () => {
+		const { callbacks, handlers } = createMockCallbacks();
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start(['/repo']);
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', '/repo'), new URLSearchParams());
+
+			const blocking = handler(
+				permissionRequest('s1', 'Bash', { command: 'ls -la' }),
+				new URLSearchParams('blocking=true'),
+			);
+
+			await handler(
+				{ event: 'UserPromptSubmit', sessionId: 's1', cwd: '/repo', prompt: 'continue please' },
+				new URLSearchParams(),
+			);
+
+			const response = (await blocking) as PermissionResponseLike;
+			assert.strictEqual(response.hookSpecificOutput.decision.behavior, 'deny');
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.pendingPermission, undefined);
+		} finally {
+			provider.dispose();
+		}
+	});
+});
+
+suite('ClaudeCodeProvider poll-discovered live rows', () => {
+	const REPO = '/home/user/projectB';
+
+	test('a poll-discovered live row with a pending PermissionRequest gets a synthesized unresolvable ask', async () => {
+		const { callbacks } = createMockCallbacks({
+			cliResponse: JSON.stringify([
+				{ ...sessionFileData('polled-perm', REPO), event: 'PermissionRequest', toolName: 'Bash' },
+			]),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			await flushMicrotasks();
+
+			const s = provider.sessions.find(x => x.id === 'polled-perm');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.strictEqual(s?.pendingPermission?.resolvable, false);
+			assert.strictEqual(s?.pendingPermission?.toolName, 'Bash');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a poll-discovered live row seats worktreePath from the CLI record', async () => {
+		const { callbacks } = createMockCallbacks({
+			cliResponse: JSON.stringify([
+				{
+					...sessionFileData('polled-wt', REPO),
+					cwdTimeline: [{ cwd: REPO, worktree: REPO, at: '2026-07-10T00:00:00.000Z' }],
+				},
+			]),
+			resolveGitInfo: () => Promise.resolve(undefined),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			await flushMicrotasks();
+
+			const s = provider.sessions.find(x => x.id === 'polled-wt');
+			assert.strictEqual(s?.worktreePath, REPO, 'worktreePath comes straight from the record');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('the follow-up git probe does not overwrite a record-seated worktreePath', async () => {
+		const worktree = `${REPO}.worktrees/feature`;
+		const { callbacks } = createMockCallbacks({
+			cliResponse: JSON.stringify([
+				{
+					...sessionFileData('polled-nested', worktree),
+					cwdTimeline: [{ cwd: worktree, worktree: worktree, at: '2026-07-10T00:00:00.000Z' }],
+				},
+			]),
+			// The probe answers for the parent repo, as it does for a nested worktree cwd.
+			resolveGitInfo: () => Promise.resolve({ repoRoot: REPO, worktreePath: REPO, isWorktree: false }),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			await flushMicrotasks();
+
+			const s = provider.sessions.find(x => x.id === 'polled-nested');
+			assert.strictEqual(s?.worktreePath, worktree, 'the record-seated worktree wins over the probe');
+			assert.strictEqual(s?.commonPath, REPO, 'repo identity still comes from the probe');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a later poll clears a synthesized ask the record has moved past', async () => {
+		const options: { cliResponse?: string } = {
+			cliResponse: JSON.stringify([
+				{ ...sessionFileData('polled-stale', REPO), event: 'PermissionRequest', toolName: 'Bash' },
+			]),
+		};
+		const { callbacks } = createMockCallbacks(options);
+		const provider = new GateTestProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			await flushMicrotasks();
+			assert.strictEqual(
+				provider.sessions.find(x => x.id === 'polled-stale')?.pendingPermission?.resolvable,
+				false,
+				'the first poll synthesizes the ask',
+			);
+
+			// The user answered in the agent's own session — this window never sees that, so only the
+			// record's advance can retire the card.
+			options.cliResponse = JSON.stringify([
+				{
+					...sessionFileData('polled-stale', REPO),
+					event: 'PreToolUse',
+					toolName: 'Edit',
+					updatedAt: '2024-01-01T00:05:00.000Z',
+				},
+			]);
+			await provider.runGatedSync();
+
+			const s = provider.sessions.find(x => x.id === 'polled-stale');
+			assert.strictEqual(s?.pendingPermission, undefined, 'the stale synthesized ask must be dropped');
+			assert.strictEqual(s?.status, 'tool_use', 'the row takes the record’s newer status');
+			assert.strictEqual(s?.statusDetail, 'Edit', 'the detail follows the record’s tool, not the answered ask’s');
+		} finally {
+			provider.dispose();
+		}
+	});
+});
+
+suite('ClaudeCodeProvider worktree attribution', () => {
+	const REPO = '/repo';
+	const WORKTREE = '/repo.worktrees/feature';
+
+	test('a blocking PermissionRequest as the first event seats the session location', async () => {
+		const { callbacks, handlers } = createMockCallbacks({
+			// Never resolves — the row must be attributed from the event alone, for the whole time the
+			// agent sits blocked on the ask.
+			resolveGitInfo: () => new Promise(() => {}),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			const handler = handlers.get('agents/session')!;
+			// No SessionStart — this window cold-joined while the agent was already waiting, so the ask
+			// itself creates the row.
+			const blocking = handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: WORKTREE,
+					pid: process.pid,
+					toolName: 'Bash',
+					toolInput: { command: 'ls -la' },
+					cwdTimeline: [{ cwd: WORKTREE, worktree: WORKTREE }],
+				},
+				new URLSearchParams('blocking=true'),
+			);
+			blocking.catch(() => {});
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.strictEqual(s?.cwd, WORKTREE);
+			assert.strictEqual(s?.worktreePath, WORKTREE, 'the blocked row carries the CLI-resolved worktree');
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a git probe does not overwrite a CLI-seated worktreePath', async () => {
+		// The probe answers for whichever repo the host registry matches, which for a nested or
+		// linked-worktree cwd can be the parent — filing the session under the wrong WIP row.
+		const { callbacks, handlers } = createMockCallbacks({
+			resolveGitInfo: () => Promise.resolve({ repoRoot: REPO, worktreePath: REPO, isWorktree: false }),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			const handler = handlers.get('agents/session')!;
+			await handler(
+				{
+					event: 'SessionStart',
+					sessionId: 's1',
+					cwd: WORKTREE,
+					pid: process.pid,
+					cwdTimeline: [{ cwd: WORKTREE, worktree: WORKTREE }],
+				},
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.worktreePath, WORKTREE, 'the CLI-seated worktree wins over the probe');
+			assert.strictEqual(s?.commonPath, REPO, 'repo identity still comes from the probe');
+			assert.strictEqual(s?.initialWorktreePath, WORKTREE);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('a cd inside the CLI-seated worktree fires no git probe', async () => {
+		let gitInfoCalls = 0;
+		const { callbacks, handlers } = createMockCallbacks({
+			resolveGitInfo: () => {
+				gitInfoCalls++;
+				return Promise.resolve({ repoRoot: REPO, worktreePath: WORKTREE, isWorktree: true });
+			},
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			const handler = handlers.get('agents/session')!;
+			await handler(
+				{
+					event: 'SessionStart',
+					sessionId: 's1',
+					cwd: WORKTREE,
+					pid: process.pid,
+					cwdTimeline: [{ cwd: WORKTREE, worktree: WORKTREE }],
+				},
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+			assert.strictEqual(gitInfoCalls, 1, 'the creating event resolves repo identity once');
+
+			// A cd into a subdir of the same worktree. The CLI already attributed it to the same
+			// worktree, so there is nothing left to resolve — probing here means a git call per event.
+			await handler(
+				{
+					event: 'PreToolUse',
+					sessionId: 's1',
+					cwd: `${WORKTREE}/src`,
+					toolName: 'Read',
+					cwdTimeline: [
+						{ cwd: WORKTREE, worktree: WORKTREE },
+						{ cwd: `${WORKTREE}/src`, worktree: WORKTREE },
+					],
+				},
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+			await flushMicrotasks();
+
+			assert.strictEqual(gitInfoCalls, 1, 'an intra-worktree cd must not re-probe');
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.worktreePath, WORKTREE);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('CwdChanged hands attribution back to the probe when the CLI does not explain the move', async () => {
+		// Writing `cwd` directly (the old handler) left `cliSeatedWorktree` set, so the probe's answer
+		// for the new location could never replace the stale seated worktree.
+		const ELSEWHERE = '/elsewhere/repo';
+		const { callbacks, handlers } = createMockCallbacks({
+			resolveGitInfo: (cwd: string) =>
+				Promise.resolve(
+					cwd === ELSEWHERE
+						? { repoRoot: ELSEWHERE, worktreePath: ELSEWHERE, isWorktree: false }
+						: { repoRoot: REPO, worktreePath: WORKTREE, isWorktree: true },
+				),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([REPO]);
+			const handler = handlers.get('agents/session')!;
+			await handler(
+				{
+					event: 'SessionStart',
+					sessionId: 's1',
+					cwd: WORKTREE,
+					pid: process.pid,
+					cwdTimeline: [{ cwd: WORKTREE, worktree: WORKTREE }],
+				},
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.worktreePath, WORKTREE);
+
+			await handler(
+				{ event: 'CwdChanged', sessionId: 's1', cwd: ELSEWHERE, pid: process.pid },
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+			await flushMicrotasks();
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.cwd, ELSEWHERE);
+			assert.strictEqual(s?.worktreePath, ELSEWHERE, 'the probe re-owns attribution after the move');
+			assert.strictEqual(s?.commonPath, ELSEWHERE);
+		} finally {
+			provider.dispose();
+		}
+	});
+
+	test('workspace membership follows the attribution, not the raw cwd', async () => {
+		// A scratch-dir excursion (cwd in /tmp, worktree kept) must stay in-workspace via its
+		// worktree; a genuine re-root to a repo outside the workspace drops membership.
+		const ELSEWHERE = '/elsewhere/repo';
+		const { callbacks, handlers } = createMockCallbacks({
+			resolveGitInfo: (cwd: string) =>
+				Promise.resolve(
+					cwd === ELSEWHERE
+						? { repoRoot: ELSEWHERE, worktreePath: ELSEWHERE, isWorktree: false }
+						: cwd.startsWith('/tmp')
+							? undefined
+							: { repoRoot: REPO, worktreePath: WORKTREE, isWorktree: true },
+				),
+		});
+		const provider = new ClaudeCodeProvider(callbacks);
+		try {
+			provider.start([WORKTREE]);
+			const handler = handlers.get('agents/session')!;
+			await handler(
+				{
+					event: 'SessionStart',
+					sessionId: 's1',
+					cwd: WORKTREE,
+					pid: process.pid,
+					cwdTimeline: [{ cwd: WORKTREE, worktree: WORKTREE }],
+				},
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+
+			// Excursion into scratch space: no timeline entry resolves it, the probe finds no repo.
+			await handler(
+				{ event: 'PreToolUse', sessionId: 's1', cwd: '/tmp/scratch', toolName: 'Bash' },
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+
+			let s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.worktreePath, WORKTREE, 'attribution is kept');
+			assert.strictEqual(s?.workspacePath, WORKTREE, 'membership rides on the kept worktree');
+			assert.strictEqual(s?.isInWorkspace, true);
+
+			// Genuine re-root: the probe resolves a different repo outside the workspace; the next
+			// event's recompute sees the new attribution and drops membership.
+			await handler(
+				{ event: 'CwdChanged', sessionId: 's1', cwd: ELSEWHERE, pid: process.pid },
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+			await flushMicrotasks();
+			await handler(
+				{ event: 'PreToolUse', sessionId: 's1', cwd: ELSEWHERE, toolName: 'Bash' },
+				new URLSearchParams(),
+			);
+			await flushMicrotasks();
+
+			s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.worktreePath, ELSEWHERE);
+			assert.strictEqual(s?.workspacePath, undefined, 'membership honestly drops after a real re-root');
+			assert.strictEqual(s?.isInWorkspace, false);
+		} finally {
+			provider.dispose();
+		}
+	});
+});
+
+class PeerTestProvider extends ClaudeCodeProvider {
+	runPeerQuery(): Promise<void> {
+		return this.querySiblingWindowSessions();
+	}
+}
+
+suite('ClaudeCodeProvider peer session merge', () => {
+	const REPO = '/repo';
+
+	/** Stands up a peer window: a discovery file plus an `/agents/sessions/list` route serving
+	 *  whatever `published.sessions` holds when the query runs. Starts empty so the start-time query
+	 *  imports nothing and the test can seat local state first, then drive the merge explicitly. */
+	async function withPeer(
+		run: (
+			provider: PeerTestProvider,
+			handlers: MockCallbacks['handlers'],
+			published: { sessions: Record<string, unknown>[] },
+		) => Promise<void>,
+	): Promise<void> {
+		const { default: http } = await import('node:http');
+		const { mkdtemp, rm, writeFile } = await import('node:fs/promises');
+		const { tmpdir } = await import('node:os');
+		const { join } = await import('node:path');
+
+		const published: { sessions: Record<string, unknown>[] } = { sessions: [] };
+		const dir = await mkdtemp(join(tmpdir(), 'gitlens-peer-merge-'));
+		const server = http.createServer((req, res) => {
+			const url = req.url ?? '';
+			res.writeHead(200, { 'Content-Type': 'application/json' });
+			res.end(JSON.stringify(url === '/agents/sessions/list' ? published.sessions : {}));
+		});
+		await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+		const peerPort = (server.address() as { port: number }).port;
+		try {
+			await writeFile(
+				join(dir, 'gitlens-ipc-server-peer.json'),
+				JSON.stringify({
+					token: 'peer-token',
+					address: `http://127.0.0.1:${peerPort}`,
+					port: peerPort,
+					workspacePaths: [REPO],
+				}),
+			);
+
+			const { callbacks, handlers } = createMockCallbacks({ port: peerPort + 1, agentDiscoveryDir: dir });
+			const provider = new PeerTestProvider(callbacks);
+			try {
+				provider.start([REPO]);
+				await flushMicrotasks();
+				await run(provider, handlers, published);
+			} finally {
+				provider.dispose();
+			}
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+			await rm(dir, { recursive: true, force: true });
+		}
+	}
+
+	/** A peer's published row for `sessionId`, always newer than anything the local window holds. */
+	function peerRow(sessionId: string, overrides?: Record<string, unknown>): Record<string, unknown> {
+		const at = new Date(Date.now() + 60_000).toISOString();
+		return {
+			id: sessionId,
+			providerId: 'claudeCode',
+			providerName: 'Claude Code',
+			status: 'thinking',
+			phase: 'working',
+			phaseSince: at,
+			lastActivity: at,
+			isSubagent: false,
+			isInWorkspace: true,
+			cwd: REPO,
+			...overrides,
+		};
+	}
+
+	test('a merged peer ask is marked unresolvable', async () => {
+		await withPeer(async (provider, handlers, published) => {
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', REPO), new URLSearchParams());
+
+			published.sessions = [
+				peerRow('s1', {
+					status: 'permission_requested',
+					phase: 'waiting',
+					pendingPermission: {
+						kind: 'tool',
+						toolName: 'Bash',
+						toolDescription: 'Bash(ls -la)',
+						resolvable: true,
+					},
+				}),
+			];
+			await provider.runPeerQuery();
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.strictEqual(s?.status, 'permission_requested');
+			assert.strictEqual(s?.pendingPermission?.toolDescription, 'Bash(ls -la)', 'the ask is mirrored');
+			assert.strictEqual(
+				s?.pendingPermission?.resolvable,
+				false,
+				'we hold no hook entry for the peer’s ask, so it can never be routed from here',
+			);
+		});
+	});
+
+	test('a merge clears an ask the peer no longer reports', async () => {
+		await withPeer(async (provider, handlers, published) => {
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', REPO), new URLSearchParams());
+			// Non-blocking, so the row carries a synthesized ask with no bookkeeping entry behind it.
+			await handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: REPO,
+					toolName: 'Bash',
+					toolInput: { command: 'ls -la' },
+				},
+				new URLSearchParams(),
+			);
+			assert.strictEqual(provider.sessions.find(x => x.id === 's1')?.pendingPermission?.resolvable, false);
+
+			published.sessions = [peerRow('s1')];
+			await provider.runPeerQuery();
+
+			assert.strictEqual(
+				provider.sessions.find(x => x.id === 's1')?.pendingPermission,
+				undefined,
+				'the peer answered it — the card must not keep waiting',
+			);
+		});
+	});
+
+	test('a locally-routable ask survives a peer merge', async () => {
+		await withPeer(async (provider, handlers, published) => {
+			const handler = handlers.get('agents/session')!;
+			await handler(sessionStart('s1', REPO), new URLSearchParams());
+			// A blocking ask fans out to every window, so ours can hold the entry the peer lacks.
+			const blocking = handler(
+				{
+					event: 'PermissionRequest',
+					sessionId: 's1',
+					cwd: REPO,
+					toolName: 'Bash',
+					toolInput: { command: 'ls -la' },
+				},
+				new URLSearchParams('blocking=true'),
+			);
+			blocking.catch(() => {});
+
+			published.sessions = [peerRow('s1')];
+			await provider.runPeerQuery();
+
+			const s = provider.sessions.find(x => x.id === 's1');
+			assert.notStrictEqual(
+				s?.pendingPermission,
+				undefined,
+				'a routable ask must not be dropped by the peer’s view',
+			);
+			assert.notStrictEqual(s?.pendingPermission?.resolvable, false);
+		});
+	});
+});
+
+suite('ClaudeCodeProvider host filtering (providerId)', () => {
+	const REPO = '/repo';
+
+	suite('IPC events', () => {
+		test('ignores an event from another AI host', async () => {
+			const { callbacks, handlers } = createMockCallbacks();
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([REPO]);
+				const handler = handlers.get('agents/session')!;
+				// codex event names are identical to Claude's, so this is processed in full without the filter.
+				await handler(sessionStart('codex-1', REPO, 'codex'), new URLSearchParams());
+
+				assert.strictEqual(provider.sessions.length, 0, 'a foreign host event must not create a session');
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('tracks an event explicitly stamped claude-code', async () => {
+			const { callbacks, handlers } = createMockCallbacks();
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([REPO]);
+				const handler = handlers.get('agents/session')!;
+				await handler(sessionStart('claude-1', REPO, 'claude-code'), new URLSearchParams());
+
+				assert.strictEqual(provider.sessions.length, 1);
+				assert.strictEqual(provider.sessions[0].id, 'claude-1');
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('tracks an event with no providerId (older CLI fails open)', async () => {
+			const { callbacks, handlers } = createMockCallbacks();
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([REPO]);
+				const handler = handlers.get('agents/session')!;
+				await handler(sessionStart('legacy-1', REPO), new URLSearchParams());
+
+				assert.strictEqual(
+					provider.sessions.length,
+					1,
+					'an older CLI stamps no providerId — dropping it would lose every session',
+				);
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('ignores a foreign blocking PermissionRequest without answering it', async () => {
+			const { callbacks, handlers } = createMockCallbacks();
+			const provider = new ClaudeCodeProvider(callbacks);
+			try {
+				provider.start([REPO]);
+				const handler = handlers.get('agents/session')!;
+				const response = await handler(
+					{
+						event: 'PermissionRequest',
+						sessionId: 'copilot-1',
+						providerId: 'copilot',
+						cwd: REPO,
+						toolName: 'Bash',
+						toolInput: { command: 'rm -rf /' },
+					},
+					new URLSearchParams('blocking=true'),
+				);
+
+				assert.strictEqual(response, undefined, 'no permission decision may be returned');
+				assert.strictEqual(provider.sessions.length, 0, 'no session or pending ask may be created');
+			} finally {
+				provider.dispose();
+			}
+		});
+	});
+
+	suite('reconciliation poll', () => {
+		test('imports only our own and unstamped records, and keeps them out of the drift signal', async () => {
+			const { callbacks, syncDiscrepancies } = createMockCallbacks({
+				cliResponse: JSON.stringify([
+					sessionFileData('claude-1', REPO, 'claude-code'),
+					sessionFileData('codex-1', REPO, 'codex'),
+					// opencode's event names never match the live switch — the poll is its only way in.
+					sessionFileData('opencode-1', REPO, 'opencode'),
+					sessionFileData('legacy-1', REPO),
+				]),
+			});
+			const provider = new GateTestProvider(callbacks);
+			try {
+				await provider.runGatedSync();
+
+				assert.deepStrictEqual(
+					provider.sessions.map(s => s.id).sort(),
+					['claude-1', 'legacy-1'],
+					'only claude-code and unstamped records may be tracked',
+				);
+				// Drift counts must describe our own sessions only.
+				assert.strictEqual(syncDiscrepancies.length, 1);
+				assert.deepStrictEqual(syncDiscrepancies[0], {
+					provider: 'claudeCode',
+					discovered: 2,
+					missing: 0,
+					polled: 2,
+					tracked: 0,
+				});
+			} finally {
+				provider.dispose();
+			}
+		});
+
+		test('does not create a completed row for another host’s ended record', async () => {
+			const { callbacks } = createMockCallbacks({
+				cliResponse: JSON.stringify([
+					{
+						sessionId: 'opencode-ended',
+						providerId: 'opencode',
+						event: 'Stop',
+						cwd: REPO,
+						pid: 999999,
+						status: 'ended',
+						endReason: 'session-end',
+						endedAt: '2026-07-10T00:00:00.000Z',
+						updatedAt: '2026-07-10T00:00:00.000Z',
+					},
+				]),
+			});
+			const provider = new GateTestProvider(callbacks);
+			try {
+				await provider.runGatedSync();
+
+				assert.strictEqual(provider.sessions.length, 0, 'a foreign ended record must not surface as completed');
+			} finally {
+				provider.dispose();
+			}
+		});
 	});
 });

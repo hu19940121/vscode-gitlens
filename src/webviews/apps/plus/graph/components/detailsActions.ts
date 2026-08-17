@@ -58,6 +58,7 @@ import type {
 	ReresolveFileResult,
 	ResolveResult,
 	ReviewResult,
+	ScopeFile,
 	ScopeSelection,
 	TakeConflictSideResult,
 	UndoAutoRebaseResult,
@@ -203,7 +204,7 @@ export interface DetailsResources {
 	/** AI conflict-resolution result. Keyed on `(repoPath, focusedFilePaths, instructions)` — focused
 	 *  paths scope the run to specific conflicted files; `undefined` resolves all conflicts. */
 	readonly resolve: Resource<ResolveResult, [string, readonly string[] | undefined, string | undefined]>;
-	readonly scopeFiles: Resource<GitFileChangeShape[], [string, ScopeSelection]>;
+	readonly scopeFiles: Resource<ScopeFile[], [string, ScopeSelection]>;
 }
 
 interface WipBranchEnrichmentCacheEntry {
@@ -3213,7 +3214,9 @@ export class DetailsActions {
 	}
 
 	discardFiles(files: GitFileChangeShape[]): void {
-		this.sendDiscardTelemetry('files', files.length);
+		// Count distinct paths, not rows: the host de-dupes by path, so a caller that ever hands us
+		// both row shapes of a mixed file would otherwise report one discarded file as two.
+		this.sendDiscardTelemetry('files', new Set(files.map(f => f.path)).size);
 		this._pendingStagingOp = this.runStagingOp(this.services.repository.discardFiles(files), 'discard files', {
 			operation: 'discard',
 			scope: 'files',

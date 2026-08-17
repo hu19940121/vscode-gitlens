@@ -14,6 +14,7 @@ import { areEqual } from '@gitlens/utils/object.js';
 import type { GraphBranchesVisibility } from '../../../../../config.js';
 import type { CommitDetails } from '../../../../commitDetails/protocol.js';
 import type {
+	DidLoadRowParams,
 	GraphAvatars,
 	GraphColumnName,
 	GraphMissingRefsMetadata,
@@ -83,7 +84,7 @@ import {
 	isScopeFocalHead,
 	shouldShowPrimaryWipRow,
 } from '../utils/wip.utils.js';
-import type { GraphRowPeekRequest } from './gl-lit-graph.js';
+import type { GraphRowHiddenReason, GraphRowPeekRequest } from './gl-lit-graph.js';
 import './gl-lit-graph.js';
 
 /**
@@ -110,6 +111,12 @@ export type GraphNavigationSource =
 export type GraphNavigationOptions = {
 	/** Diagnostic origin for this navigation. Never drives behavior — see {@link GraphNavigationSource}. */
 	source?: GraphNavigationSource;
+	/**
+	 * Display name for the target, when the caller jumped via a named ref rather than a bare sha.
+	 * Carried through to `gl-graph-navigation-loading`/`gl-graph-navigation-failed` so feedback UI can
+	 * show a human-readable label instead of a sha. Never drives navigation behavior.
+	 */
+	ref?: string;
 	/** Cancel this navigation when its caller no longer owns the user intent. */
 	signal?: AbortSignal;
 	/** Move the graph's keyboard/ARIA focus anchor to the selected row after it renders. */
@@ -139,11 +146,30 @@ export type GraphNavigationOptions = {
 	 * skipped instead of blocking result navigation indefinitely.
 	 */
 	deferSynthetic?: boolean;
+	/**
+	 * Report a failed navigation instead of absorbing it: a loaded-but-hidden row settles as
+	 * `'not-found'` carrying its {@link GraphRowHiddenReason}, and every reportable failure also fires
+	 * `gl-graph-navigation-failed`. Defaults to `true`.
+	 *
+	 * Callers that already read the result and answer for themselves (search stepping, the WIP jump) turn
+	 * it off so they keep their own handling rather than getting a second, generic one.
+	 */
+	feedback?: boolean;
 };
+
+/** Why a navigation never landed. Only ever set on a `'not-found'` result — a `'cancelled'` one means a
+ *  newer intent took over, which is nobody's failure and stays silent. */
+export type GraphNavigationFailureReason =
+	| { kind: 'hidden'; hidden: GraphRowHiddenReason }
+	| { kind: 'not-found' }
+	| { kind: 'first-parent' }
+	| { kind: 'invalid-ref' }
+	| { kind: 'timeout' }
+	| { kind: 'error'; message?: string };
 
 export type GraphNavigationResult =
 	| { status: 'selected'; row: ReadonlyGraphRow }
-	| { status: 'not-found' }
+	| { status: 'not-found'; reason?: GraphNavigationFailureReason }
 	| { status: 'cancelled' };
 
 /** A navigation's resolved reveal intent, carried on the pending record so a coalesced repeat ask can be
@@ -157,6 +183,8 @@ type PendingGraphNavigation = {
 	hostLoadSha?: string;
 	debugMark?: string;
 	deferSynthetic: boolean;
+	/** Whether a failure here is reportable — see {@link GraphNavigationOptions.feedback}. */
+	feedback: boolean;
 	focus: boolean;
 	generation: number;
 	repositoryId?: string;
@@ -164,6 +192,10 @@ type PendingGraphNavigation = {
 	reveal: GraphRevealIntent;
 	signal?: AbortSignal;
 	sha: string;
+	/** Carried only to stamp the failure/loading events — never consulted for behavior. */
+	source?: GraphNavigationSource;
+	/** Carried only to stamp the failure/loading events — never consulted for behavior. */
+	ref?: string;
 	timeout?: ReturnType<typeof setTimeout>;
 	promise: Promise<GraphNavigationResult>;
 	resolve: (result: GraphNavigationResult) => void;
@@ -186,6 +218,21 @@ const maxUnreachableAnchorPageAttempts = 3;
  *  worktree), and a permanently-empty row that keeps asking is just a timer that never pays off. */
 const wipStatsMaxRetries = 2;
 const wipStatsRetryDelayMs = 2000;
+
+/** How the host explained a {@link LoadRowRequest} that came back without a row — an unloadable ref, a
+ *  commit only reachable off the first-parent walk, or a plain miss. */
+function toNavigationFailureReason(result: DidLoadRowParams | undefined): GraphNavigationFailureReason {
+	if (result?.error != null) return { kind: 'error', message: result.error };
+
+	switch (result?.reason) {
+		case 'firstParent':
+			return { kind: 'first-parent' };
+		case 'invalidRef':
+			return { kind: 'invalid-ref' };
+		default:
+			return { kind: 'not-found' };
+	}
+}
 
 /**
  * Walk first-parent ancestry through a row array to produce the inclusive range from
@@ -327,6 +374,21 @@ declare global {
 		'gl-graph-enable-changes-column': CustomEvent<void>;
 		'gl-graph-filter-column': CustomEvent<{ zone: GraphZoneType }>;
 		'gl-graph-mouse-leave': CustomEvent<void>;
+		/** A jump that settled without landing on its row, and whose caller didn't opt out of feedback
+		 *  (see {@link GraphNavigationOptions.feedback}). Never fires for a superseded navigation. */
+		'gl-graph-navigation-failed': CustomEvent<{
+			sha: string;
+			source?: GraphNavigationSource;
+			ref?: string;
+			reason?: GraphNavigationFailureReason;
+		}>;
+		/** A navigation started a host row load for `sha` — fired once, when the walk begins. Consumers
+		 *  can drive an interim "looking for…" affordance while `graphState.ensureLoading` is true; the
+		 *  navigation settling with a hit fires no event of its own, so absence of a later
+		 *  `gl-graph-navigation-failed` for the same sha (plus `ensureLoading` going back false) is what
+		 *  says it landed. `feedback: false` mirrors the navigation's opt-out — the load still holds
+		 *  `ensureLoading`, so consumers must clear any affordance keyed to an earlier load. */
+		'gl-graph-navigation-loading': CustomEvent<{ sha: string; ref?: string; feedback: boolean }>;
 		'gl-graph-row-context-menu': CustomEvent<{ graphZoneType: GraphZoneType; graphRow: GitGraphRow }>;
 		'gl-graph-row-double-click': CustomEvent<{ graphRow: GitGraphRow; preserveFocus?: boolean }>;
 		'gl-graph-row-hover': CustomEvent<{
@@ -395,11 +457,11 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		this.querySelector('gl-lit-graph')?.openRefFind(returnFocus);
 	}
 
-	/** Holds off the graph's Ctrl-hold lane dim until Ctrl is released — for graph-app's Ctrl-carrying
-	 *  non-lane shortcuts (search focus, the shortcut sheet), whose Ctrl press would otherwise dim the
-	 *  graph on the way to the action. */
-	suppressModifierChainUntilCtrlRelease(): void {
-		this.querySelector('gl-lit-graph')?.suppressModifierChainUntilCtrlRelease();
+	/** Holds off the graph's Ctrl/Alt-hold lane dim until both are released — for graph-app's Ctrl- or
+	 *  Alt-carrying non-lane shortcuts (search focus, the shortcut sheet, the chrome toggles), whose press
+	 *  would otherwise dim the graph on the way to the action. */
+	suppressModifierChainUntilRelease(): void {
+		this.querySelector('gl-lit-graph')?.suppressModifierChainUntilRelease();
 	}
 
 	/** The GRAPH-ROW sha(s) of graph-app's inspection anchor (the single source of truth for what the
@@ -579,6 +641,8 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			focus: options.focus,
 			reveal: options.reveal,
 			flash: options.flash,
+			// This jump reads its own result and answers below; generic feedback on top would double it.
+			feedback: false,
 		});
 		if (result.status === 'not-found') {
 			this.querySelector('gl-lit-graph')?.announce('No working changes row to jump to.');
@@ -1414,10 +1478,21 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 					status: result.status,
 					sha: pending.sha,
 					hidden: result.status === 'selected' ? result.row.hidden === true : undefined,
+					reason: result.status === 'not-found' ? result.reason?.kind : undefined,
 				});
 			}
 		}
 		pending.resolve(result);
+		// The one choke point every failure passes through (hidden row, host miss, timeout, abort-free
+		// error), so the announcement is armed once no matter which path got here. `cancelled` is silent:
+		// a newer intent took over, and nothing failed.
+		if (result.status === 'not-found' && pending.feedback) {
+			this.dispatchEvent(
+				new CustomEvent('gl-graph-navigation-failed', {
+					detail: { sha: pending.sha, source: pending.source, ref: pending.ref, reason: result.reason },
+				}),
+			);
+		}
 		// `_pendingNavigation` is half of `rowLoadInFlight` but a plain field, so clearing it schedules no
 		// render — and a navigation that resolves before the delayed `ensureLoading` affordance ever engages
 		// writes no signal either. Replay here or a page parked behind this load waits for an unrelated render.
@@ -1425,30 +1500,26 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 	}
 
 	private createPendingNavigation(
-		generation: number,
-		sha: string,
-		deferSynthetic: boolean,
-		focus: boolean,
-		signal: AbortSignal | undefined,
-		reveal: GraphRevealIntent,
-		debugMark?: string,
+		init: Omit<
+			PendingGraphNavigation,
+			'abortCleanup' | 'hostLoadSha' | 'promise' | 'repoPath' | 'repositoryId' | 'resolve' | 'timeout'
+		>,
 	): Promise<GraphNavigationResult> {
 		let resolve!: (result: GraphNavigationResult) => void;
 		const promise = new Promise<GraphNavigationResult>(r => (resolve = r));
 		const pending: PendingGraphNavigation = {
-			debugMark: debugMark,
-			deferSynthetic: deferSynthetic,
-			focus: focus,
-			generation: generation,
+			...init,
 			repositoryId: this._selectIntentRepositoryId,
 			repoPath: this._selectIntentRepoPath,
-			reveal: reveal,
-			signal: signal,
-			sha: sha,
 			promise: promise,
 			resolve: resolve,
 		};
-		pending.timeout = setTimeout(() => this.rejectPendingNavigation(generation), navigationTimeoutMs);
+		const generation = init.generation;
+		pending.timeout = setTimeout(
+			() => this.rejectPendingNavigation(generation, { kind: 'timeout' }),
+			navigationTimeoutMs,
+		);
+		const signal = init.signal;
 		if (signal != null) {
 			const onAbort = (): void => this.cancelPendingNavigation(generation);
 			signal.addEventListener('abort', onAbort, { once: true });
@@ -1469,14 +1540,14 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		}
 	}
 
-	private rejectPendingNavigation(generation: number): void {
+	private rejectPendingNavigation(generation: number, reason?: GraphNavigationFailureReason): void {
 		if (!this._selectIntent.reject(generation)) return;
 
 		this._selectIntentRepositoryId = undefined;
 		this._selectIntentRepoPath = undefined;
 		this.querySelector('gl-lit-graph')?.cancelPendingReveal();
 		if (this._pendingNavigation?.generation === generation) {
-			this.settlePendingNavigation({ status: 'not-found' });
+			this.settlePendingNavigation({ status: 'not-found', reason: reason });
 		}
 	}
 
@@ -1519,7 +1590,60 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		}
 		this._selectIntentRepositoryId = undefined;
 		this._selectIntentRepoPath = undefined;
-		this.settlePendingNavigation({ status: 'selected', row: this.withVisibility(row) });
+		this.settleNavigationOnRow(row, pending.feedback);
+	}
+
+	/**
+	 * Settle a navigation that reached its row.
+	 *
+	 * A row can be loaded and still not on screen — hidden by a ref filter, dropped by the scope, folded
+	 * into a collapsed lane — and the reveal armed for it then never fires, which is what made a jump look
+	 * like it did nothing at all. That settles as a REPORTED failure carrying why.
+	 *
+	 * Selection still moved either way: the details panel should follow a target the user asked for even
+	 * when the graph can't show it. The reveal also stays ARMED, so unhiding the row still lands it —
+	 * {@link cancelNavigationFeedback} is what disarms it, once the failure has been acknowledged.
+	 */
+	private settleNavigationOnRow(row: GitGraphRow, feedback: boolean): void {
+		const selected = this.withVisibility(row);
+		if (selected.hidden === true && feedback) {
+			const lit = this.querySelector('gl-lit-graph');
+			const hidden = lit?.getRowHiddenReason(row.sha);
+			// A collapsed lane isn't a failure — expand it (same as a pill jump would have up front) and
+			// let the armed reveal land once the expanded row renders.
+			if (hidden === 'collapsed' && lit?.expandLaneFor(row.sha) === true) {
+				this.settlePendingNavigation({ status: 'selected', row: selected });
+				return;
+			}
+
+			this.settlePendingNavigation({
+				status: 'not-found',
+				reason: { kind: 'hidden', hidden: hidden ?? 'unknown' },
+			});
+			return;
+		}
+
+		this.settlePendingNavigation({ status: 'selected', row: selected });
+	}
+
+	/** Drop the reveal still armed for a reported failure's row, once that report has been dismissed.
+	 *  Keyed to the sha so it can't cancel a reveal a newer navigation armed in the meantime. */
+	cancelNavigationFeedback(sha: string): void {
+		this.querySelector('gl-lit-graph')?.cancelPendingRevealFor(sha);
+	}
+
+	/** Cancel the pending navigation targeting `sha`, exactly as a superseding {@link navigateToCommit}
+	 *  call would (a silent `'cancelled'` settlement that withdraws any still-travelling host walk).
+	 *  No-op when the pending navigation targets a different sha or none is pending — a caller (e.g. the
+	 *  jump-feedback toast's Cancel action) can't accidentally cancel a newer, unrelated navigation. */
+	cancelNavigation(sha: string): void {
+		if (this._pendingNavigation?.sha !== sha) return;
+
+		this._selectIntent.cancel();
+		this._selectIntentRepositoryId = undefined;
+		this._selectIntentRepoPath = undefined;
+		this.settlePendingNavigation({ status: 'cancelled' });
+		this.querySelector('gl-lit-graph')?.cancelPendingReveal();
 	}
 
 	/**
@@ -1559,7 +1683,9 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		const repoPath = this.getRepoPath();
 		const repositoryId = this.graphState.selectedRepository;
 		const deferSynthetic = options?.deferSynthetic !== false;
+		const feedback = options?.feedback !== false;
 		const focus = options?.focus === true;
+		const ref = options?.ref;
 		const signal = options?.signal;
 		// Resolved once and shared by all three reveal sites below (loaded, deferred synthetic WIP, and
 		// host-loaded), so a row that has to be paged in lands the same way one already in hand does.
@@ -1592,9 +1718,14 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			return pending.promise;
 		}
 
-		// Newest ask wins: supersede any different intent still waiting for its row.
+		// Newest ask wins: supersede any different intent still waiting for its row. SAME-target reveals
+		// survive: a selection-sync navigation trails the host reveal it mirrors by a render cycle, and
+		// cancelling that reveal's still-travelling animation would strand the viewport mid-scroll — the
+		// trailing `'if-changed'` repeat can never re-issue it (`_lastRevealedSha` banks at evaluation).
 		this.settlePendingNavigation({ status: 'cancelled' });
-		litGraph?.cancelPendingReveal();
+		if (litGraph?.activeRevealSha !== sha) {
+			litGraph?.cancelPendingReveal();
+		}
 		const generation = this._selectIntent.begin();
 		this._selectIntentRepositoryId = repositoryId;
 		this._selectIntentRepoPath = repoPath;
@@ -1610,15 +1741,18 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 				loaded: row != null,
 			});
 		}
-		const navigation = this.createPendingNavigation(
-			generation,
-			sha,
-			deferSynthetic,
-			focus,
-			signal,
-			reveal,
-			debugMark,
-		);
+		const navigation = this.createPendingNavigation({
+			debugMark: debugMark,
+			deferSynthetic: deferSynthetic,
+			feedback: feedback,
+			focus: focus,
+			generation: generation,
+			ref: ref,
+			reveal: reveal,
+			sha: sha,
+			signal: signal,
+			source: options?.source,
+		});
 
 		if (row != null) {
 			this.selectCommitsCore([sha], rowBySha);
@@ -1641,7 +1775,7 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 			}
 			this._selectIntentRepositoryId = undefined;
 			this._selectIntentRepoPath = undefined;
-			this.settlePendingNavigation({ status: 'selected', row: this.withVisibility(row) });
+			this.settleNavigationOnRow(row, feedback);
 			return navigation;
 		}
 
@@ -1666,17 +1800,25 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 				if (this._pendingNavigation?.generation === generation) {
 					this._pendingNavigation.hostLoadSha = anchorSha;
 				}
+				this.dispatchEvent(
+					new CustomEvent('gl-graph-navigation-loading', {
+						detail: { sha: sha, ref: ref, feedback: feedback },
+					}),
+				);
 				void this._ipc
 					.sendRequest(LoadRowRequest, { id: anchorSha })
 					.then(result => {
 						// The anchor never arrives ⇒ the WIP row cannot be synthesized; fail now rather
 						// than let the deferred intent sit until it times out.
 						if (result?.id !== anchorSha) {
-							this.rejectPendingNavigation(generation);
+							this.rejectPendingNavigation(generation, toNavigationFailureReason(result));
 						}
 					})
-					.catch(() => {
-						this.rejectPendingNavigation(generation);
+					.catch((ex: unknown) => {
+						this.rejectPendingNavigation(generation, {
+							kind: 'error',
+							message: ex instanceof Error ? ex.message : undefined,
+						});
 					});
 			}
 			return navigation;
@@ -1686,15 +1828,21 @@ export class GlGraphWrapper extends SignalWatcher(LitElement) {
 		if (this._pendingNavigation?.generation === generation) {
 			this._pendingNavigation.hostLoadSha = sha;
 		}
+		this.dispatchEvent(
+			new CustomEvent('gl-graph-navigation-loading', { detail: { sha: sha, ref: ref, feedback: feedback } }),
+		);
 		void this._ipc
 			.sendRequest(LoadRowRequest, { id: sha })
 			.then(result => {
 				if (result?.id !== sha) {
-					this.rejectPendingNavigation(generation);
+					this.rejectPendingNavigation(generation, toNavigationFailureReason(result));
 				}
 			})
-			.catch(() => {
-				this.rejectPendingNavigation(generation);
+			.catch((ex: unknown) => {
+				this.rejectPendingNavigation(generation, {
+					kind: 'error',
+					message: ex instanceof Error ? ex.message : undefined,
+				});
 			});
 		// Selection is client-owned: hold the latest intent until the rows push makes it renderable.
 		this._selectIntent.defer(sha, generation);

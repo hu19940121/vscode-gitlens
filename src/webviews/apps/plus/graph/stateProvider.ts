@@ -28,17 +28,16 @@ import type {
 } from '../../../plus/graph/protocol.js';
 import {
 	createWipRowId,
+	DidChangeAgentsBanner,
 	DidChangeAgentSessionsNotification,
 	DidChangeBranchStateNotification,
-	DidChangeCanInstallClaudeHook,
+	DidChangeCanInstallHooks,
 	DidChangeColumnsNotification,
 	DidChangeGraphConfigurationNotification,
 	DidChangeGraphWalkthroughBanner,
 	DidChangeGraphWalkthroughComplete,
 	DidChangeGraphWalkthroughStarted,
-	DidChangeHooksBanner,
 	DidChangeLayoutPromptNotification,
-	DidChangeMcpBanner,
 	DidChangeNotification,
 	DidChangeOrgSettings,
 	DidChangeOverviewNotification,
@@ -52,6 +51,7 @@ import {
 	DidChangeWipDraftsNotification,
 	DidChangeWorkingTreeNotification,
 	DidCloseWipWatchesNotification,
+	DidFailRevealNotification,
 	DidFetchNotification,
 	DidInvalidateScopeAnchorsNotification,
 	DidRequestActiveSidebarPanelNotification,
@@ -59,6 +59,7 @@ import {
 	DidRequestOpenCompareModeNotification,
 	DidRequestOpenTimelineScopeNotification,
 	DidRequestSearchNotification,
+	DidRequestVisualizationNotification,
 	DidRequestWipRefetchNotification,
 	DidSearchNotification,
 	DidStartFeaturePreviewNotification,
@@ -215,7 +216,7 @@ export type ResolvedScopeAnchor = {
  * stale target tip many years back in history that means paging deep into unrelated history for an anchor
  * that will never be used, so the scope stays bare instead.
  *
- * Note this fires only when the host resolved NO base at all (default branch, no merge target, failed
+ * Note this fires only when the host resolved NO base at all (no merge target, failed
  * resolve). A resolved-but-not-yet-loaded base is published as-is — see `publishResolvedScope`.
  */
 function stripUnpairedMergeTarget(scope: GraphScope): GraphScope {
@@ -330,7 +331,7 @@ export function reconcileScopeMergeTarget(
 }
 
 /** The row marker's merge target as carried by a resolved anchor — undefined when the anchor named no
- *  target tip (detached, the default branch, or a resolve that bailed). */
+ *  target tip (detached, or a resolve that bailed). */
 function rowMarkerTargetFromAnchor(anchor: ResolvedScopeAnchor | undefined): AppState['rowMarkerMergeTarget'] {
 	return anchor?.mergeTargetTipSha != null
 		? { sha: anchor.mergeTargetTipSha, name: anchor.mergeTargetName }
@@ -676,6 +677,9 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 	@signalState<AppState['agentSessions']>([])
 	accessor agentSessions: AppState['agentSessions'] = [];
 
+	/** Set once a host push has written `agentSessions` — the seed request must never overwrite a push. */
+	private _agentSessionsPushed = false;
+
 	@signalState()
 	accessor overviewWip: AppState['overviewWip'];
 
@@ -705,10 +709,10 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 	/** In-flight additive fetches, so re-hovering a pill doesn't re-issue the request. */
 	private readonly _extraEnrichmentInFlight = new Set<string>();
 
-	mcpBannerCollapsed?: boolean | undefined;
+	agentsBannerCollapsed?: boolean | undefined;
 	mcpCanAutoRegister?: boolean | undefined;
-	hooksBannerCollapsed?: boolean | undefined;
-	canInstallClaudeHook?: boolean | undefined;
+	canInstallHooks?: boolean | undefined;
+	hooksAgents?: readonly { id: string; displayName: string; installed: boolean }[] | undefined;
 	graphWalkthroughBannerCollapsed?: boolean | undefined;
 	graphWalkthroughComplete?: boolean | undefined;
 	graphWalkthroughStarted?: boolean | undefined;
@@ -773,9 +777,18 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 		// the scope popover opening) rather than eagerly at bootstrap, where it competes with the
 		// graph render itself.
 
-		void this.ipc.sendRequest(GetAgentSessionsRequest, undefined).then(sessions => {
-			this.agentSessions = sortAgentSessions(sessions);
-		});
+		// Fallback seed only — the host pushes a snapshot on ready (see `GraphWebviewProvider.onReady`),
+		// and a push always wins: this response can race the host's cold-start session import, and a
+		// stale (possibly empty) response landing after a push must not clobber it. Best-effort — on
+		// failure the ready push (and every subsequent change push) still populates the state.
+		void this.ipc.sendRequest(GetAgentSessionsRequest, undefined).then(
+			sessions => {
+				if (this._agentSessionsPushed) return;
+
+				this.agentSessions = sortAgentSessions(sessions);
+			},
+			() => {},
+		);
 	}
 
 	/** Announce the held rows-plane baseline to the host on (re)connect. Best-effort — deliberately
@@ -968,6 +981,13 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 	private _pendingScope: GraphScope | undefined;
 
 	/**
+	 * `scopeToBranch` parked until a state push carries an attached branch. Any scope set or
+	 * clear — even automatic — cancels it, so it can't override a scope change made in the meantime.
+	 */
+	@signalState(false)
+	accessor pendingScopeToBranch: AppState['pendingScopeToBranch'] = false;
+
+	/**
 	 * Set by callers (e.g. the scope popover) right before sending a filter-changing IPC, so the
 	 * scope clear coalesces with the resulting `DidChangeRefsVisibilityNotification` rather than
 	 * causing an immediate minimap reset followed by a separate filter-update repaint.
@@ -975,6 +995,8 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 	private _scopeClearDeferred = false;
 
 	deferScopeClear(): void {
+		// Also retire a parked walkthrough focus — with no scope published, `clearScope` below never fires
+		this.pendingScopeToBranch = false;
 		// Cancel any in-flight `setScope` publish so a cache-miss resolve can't sneak a new
 		// scope in after the imminent visibility change clears `this.scope`.
 		this._pendingScope = undefined;
@@ -990,6 +1012,7 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 	}
 
 	clearScope(): void {
+		this.pendingScopeToBranch = false;
 		if (this.scope == null) return;
 
 		this.cancelPendingScope();
@@ -1035,6 +1058,7 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 	 * enrichment) — see `stripUnpairedMergeTarget`.
 	 */
 	async setScope(scope: GraphScope): Promise<void> {
+		this.pendingScopeToBranch = false;
 		this._pendingScope = scope;
 		// A pending `deferScopeClear` was armed to retire the scope this call REPLACES; leaving it set
 		// means the next `DidChangeRefsVisibilityNotification` clears the scope we're installing right
@@ -1836,6 +1860,17 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 					}
 				}
 				break;
+			case DidFailRevealNotification.is(msg):
+				// A host-initiated reveal that gave up before ever pushing a selection (an unresolved ref) —
+				// nothing else tells the webview the jump was a no-op, so surface it explicitly the same way
+				// `gl-graph-request-ensure-row-visible` surfaces a successful one, above.
+				this.host.dispatchEvent(
+					new CustomEvent('gl-graph-request-reveal-failed', {
+						detail: msg.params,
+						bubbles: true,
+					}),
+				);
+				break;
 
 			case DidRequestOpenCompareModeNotification.is(msg):
 				this.host.dispatchEvent(
@@ -1870,6 +1905,14 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 				});
 				break;
 
+			case DidRequestVisualizationNotification.is(msg):
+				// Both axes are needed: `visualizationMode` picks WHICH visualization, while `displayMode`
+				// is what makes the visualizations pane render at all — setting only the former leaves the
+				// graph on screen. (`openTimelineScope` sets the pair for the same reason.)
+				this.displayMode = 'visualizations';
+				this.visualizationMode = msg.params.visualization;
+				break;
+
 			case DidRequestGraphActionNotification.is(msg):
 				// Pre-populate the WIP draft for the target worktree FIRST so `loadWipDraft` (which
 				// fires when the panel anchors on the new WIP row in this same render cycle) finds
@@ -1890,8 +1933,14 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 						scopeOrigin: msg.params.scopeOrigin,
 						composeInstructions: msg.params.composeInstructions,
 						composeScope: msg.params.composeScope,
+						agentSessionId: msg.params.agentSessionId,
+						revealOnly: msg.params.revealOnly,
+						followed: msg.params.followed,
+						onlyIfWipSelected: msg.params.onlyIfWipSelected,
 					},
-					...(msg.params.action !== 'scope-to-branch' ? { details: { ...this.details, visible: true } } : {}),
+					...(msg.params.action !== 'scope-to-branch' && !msg.params.revealOnly
+						? { details: { ...this.details, visible: true } }
+						: {}),
 				});
 				break;
 
@@ -1915,19 +1964,16 @@ export class GraphStateProvider extends StateProviderBase<State['webviewId'], Ap
 				break;
 
 			case DidChangeAgentSessionsNotification.is(msg):
+				this._agentSessionsPushed = true;
 				this.agentSessions = sortAgentSessions(msg.params.sessions);
 				break;
 
-			case DidChangeMcpBanner.is(msg):
-				this.updateState({ mcpBannerCollapsed: msg.params });
+			case DidChangeAgentsBanner.is(msg):
+				this.updateState({ agentsBannerCollapsed: msg.params });
 				break;
 
-			case DidChangeHooksBanner.is(msg):
-				this.updateState({ hooksBannerCollapsed: msg.params });
-				break;
-
-			case DidChangeCanInstallClaudeHook.is(msg):
-				this.updateState({ canInstallClaudeHook: msg.params });
+			case DidChangeCanInstallHooks.is(msg):
+				this.updateState({ canInstallHooks: msg.params.canInstallHooks, hooksAgents: msg.params.agents });
 				break;
 
 			case DidChangeGraphWalkthroughBanner.is(msg):

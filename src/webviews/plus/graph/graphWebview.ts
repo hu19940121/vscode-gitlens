@@ -53,8 +53,11 @@ import {
 	pauseOnCancelOrTimeout,
 	pauseOnCancelOrTimeoutMapTuplePromise,
 } from '@gitlens/utils/promise.js';
+import { getRepositoryKey } from '@gitlens/utils/uri.js';
+import { satisfies } from '@gitlens/utils/version.js';
 import type { AgentSessionState } from '../../../agents/models/agentSessionState.js';
 import { isActiveAgentPhase } from '../../../agents/provider.js';
+import { areHooksAllowedForAgent } from '../../../agents/utils/agentHooks.js';
 import { fetchAvatarImageAsDataUri, getAvatarUri } from '../../../avatars.js';
 import { parseCommandContext } from '../../../commands/commandContext.utils.js';
 import type { OpenIssueOnRemoteCommandArgs } from '../../../commands/openIssueOnRemote.js';
@@ -77,7 +80,6 @@ import type {
 	Source,
 	WebviewTelemetryEvents,
 } from '../../../constants.telemetry.js';
-import { viewIdsByDefaultContainerId } from '../../../constants.views.js';
 import type { Container } from '../../../container.js';
 import type { FeaturePreview } from '../../../features.js';
 import { getFeaturePreviewStatus } from '../../../features.js';
@@ -93,7 +95,6 @@ import {
 	getBranchAssociatedPullRequest,
 	getBranchMergeTargetInfo,
 	getBranchRemote,
-	isSelfMergeTarget,
 } from '../../../git/utils/-webview/branch.utils.js';
 import {
 	getCommitAssociatedPullRequest,
@@ -101,7 +102,6 @@ import {
 	isCommitSigned,
 } from '../../../git/utils/-webview/commit.utils.js';
 import { stageConflictResolution } from '../../../git/utils/-webview/conflictResolution.utils.js';
-import { getRemoteIconUri } from '../../../git/utils/-webview/icons.js';
 import {
 	getBestRemoteWithIntegration,
 	getRemoteIntegration,
@@ -112,7 +112,7 @@ import { getSiblingWorktreeBranches, getWorktreesByBranch } from '../../../git/u
 import type { OnboardingChangeEvent } from '../../../onboarding/onboardingService.js';
 import type { UsageChangeEvent } from '../../../onboarding/usageTracker.js';
 import type { FeaturePreviewChangeEvent, SubscriptionChangeEvent } from '../../../plus/gk/subscriptionService.js';
-import { isHooksBannerEnabled, isMcpBannerEnabled } from '../../../plus/gk/utils/-webview/mcp.utils.js';
+import { isAgentsBannerEnabled } from '../../../plus/gk/utils/-webview/mcp.utils.js';
 import {
 	isAccountAccessRequired,
 	isSubscriptionTrialOrPaidFromState,
@@ -196,8 +196,6 @@ import type { GraphWipServiceContext } from './graphWipService.js';
 import { GraphWipService } from './graphWipService.js';
 import type {
 	BranchState,
-	ChooseGraphLayoutParams,
-	CloseGraphWalkthroughBannerParams,
 	DidGetSidebarDataParams,
 	DidRequestOpenCompareModeParams,
 	DidRequestOpenTimelineScopeParams,
@@ -229,6 +227,8 @@ import type {
 	GraphRefOptData,
 	GraphRefType,
 	GraphRepository,
+	GraphScopeBranch,
+	GraphScopeOrigin,
 	GraphScrollMarkerTypes,
 	GraphSelectedRows,
 	GraphSelection,
@@ -238,6 +238,7 @@ import type {
 	MergePullRequestParams,
 	SidebarWorktreeChange,
 	State,
+	VisualizationMode,
 } from './protocol.js';
 import {
 	CancelLoadRowCommand,
@@ -245,22 +246,19 @@ import {
 	ChooseAuthorRequest,
 	ChooseComparisonRequest,
 	ChooseFileRequest,
-	ChooseGraphLayoutCommand,
 	ChooseRefRequest,
 	ChooseRepositoryCommand,
-	CloseGraphWalkthroughBannerCommand,
 	createWipRowId,
+	DidChangeAgentsBanner,
 	DidChangeAgentSessionsNotification,
 	DidChangeBranchStateNotification,
-	DidChangeCanInstallClaudeHook,
+	DidChangeCanInstallHooks,
 	DidChangeColumnsNotification,
 	DidChangeGraphConfigurationNotification,
 	DidChangeGraphWalkthroughBanner,
 	DidChangeGraphWalkthroughComplete,
 	DidChangeGraphWalkthroughStarted,
-	DidChangeHooksBanner,
 	DidChangeLayoutPromptNotification,
-	DidChangeMcpBanner,
 	DidChangeNotification,
 	DidChangeOrgSettings,
 	DidChangeOverviewNotification,
@@ -273,6 +271,7 @@ import {
 	DidChangeSubscriptionNotification,
 	DidChangeWipDraftsNotification,
 	DidChangeWorkingTreeNotification,
+	DidFailRevealNotification,
 	DidFetchNotification,
 	DidInvalidateGraphTreemapNotification,
 	DidInvalidateScopeAnchorsNotification,
@@ -281,6 +280,7 @@ import {
 	DidRequestOpenCompareModeNotification,
 	DidRequestOpenTimelineScopeNotification,
 	DidRequestSearchNotification,
+	DidRequestVisualizationNotification,
 	DidRequestWipRefetchNotification,
 	DidStartFeaturePreviewNotification,
 	DoubleClickedCommand,
@@ -343,7 +343,8 @@ export interface SelectedRowState {
 
 /** Host-side shape returned by the scope-anchor resolver. `focalBranchTipSha` is set whenever
  *  the focal branch has a resolvable tip (almost always); `mergeBase` / `mergeTargetTipSha` are
- *  only set when there's a real merge target distinct from the focal branch. */
+ *  only set when a merge target resolves to a tip (its own upstream counts — see
+ *  `computeScopeAnchor`). */
 interface ResolvedScopeAnchor {
 	focalBranchTipSha?: string;
 	mergeBase?: { sha: string; date: number };
@@ -369,12 +370,23 @@ function hasSidebarPanel(arg: any): arg is { sidebarPanel: GraphSidebarPanel } {
 	return typeof arg?.sidebarPanel === 'string';
 }
 
+function hasVisualization(
+	arg: any,
+): arg is { visualization: VisualizationMode; repository?: GlRepository; source?: Source } {
+	return typeof arg?.visualization === 'string';
+}
+
 function hasAction(arg: any): arg is {
 	action: GraphShowAction;
 	target?: GraphActionTarget;
 	source?: Source;
 	composeInstructions?: string;
 	composeScope?: GraphComposeScopeSeed;
+	agentSessionId?: string;
+	revealOnly?: boolean;
+	followed?: boolean;
+	scopeBranch?: GraphScopeBranch;
+	scopeOrigin?: GraphScopeOrigin;
 } {
 	return typeof arg?.action === 'string';
 }
@@ -587,6 +599,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this.container.onboarding.onDidChange(this.onOnboardingChanged, this),
 			this.container.walkthrough.onDidChangeProgress(this.onGraphWalkthroughProgressChanged, this),
 			this.container.usage.onDidChange(this.onUsageChanged, this),
+			// Bridge the host-side health signal onto the RPC event, carrying the repo path so the
+			// view can filter to the one it's showing instead of re-fetching on every repo's change.
+			this.container.gitHealth.onDidChange(repoPath => this._gitHealthChangedEvent.fire({ repoPath: repoPath })),
 			onDidChangeContext(this.onContextChanged, this),
 			this.container.subscription.onDidChangeFeaturePreview(this.onFeaturePreviewChanged, this),
 			// The bar's primary continue swaps between automatic/manual with the session
@@ -598,7 +613,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// A continue can block indefinitely on git's commit-message tab, so the bar's busy state comes
 			// from here rather than a timer that could only guess when the command ended
 			onDidChangeContinuingPausedOperation(repoPath => {
-				if (repoPath === this.repository?.path) {
+				// The event carries the repo path in `getRepositoryKey` form, so key ours too rather
+				// than relying on `repository.path` already being in that form
+				if (this.repository != null && repoPath === getRepositoryKey(this.repository.path)) {
 					void this._wip.notifyDidChangeWorkingTree();
 				}
 			}),
@@ -678,7 +695,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				dispose: () => {},
 			},
 			this.container.agentStatus?.onDidChangeHooksInstallState(
-				() => void this.notifyDidChangeCanInstallClaudeHook(),
+				() => void this.notifyDidChangeCanInstallHooks(),
 				this,
 			) ?? { dispose: () => {} },
 		);
@@ -724,6 +741,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			getSession: () => this._data.session,
 			getActiveSelection: () => this.activeSelection,
 			toggleColumn: (name, visible) => this.toggleColumn(name, visible),
+			toggleColumnGrouping: (name, grouped) => this.toggleColumnGrouping(name, grouped),
 			toggleScrollMarker: (type, enabled) => this.toggleScrollMarker(type, enabled),
 			setColumnMode: (name, mode) => this.setColumnMode(name, mode),
 			updateColumns: columnsCfg => this.updateColumns(columnsCfg),
@@ -734,6 +752,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			getOpenEditorShowOptions: () => this.getOpenEditorShowOptions(),
 			runStageConflictResolution: (item, resolution) => this.runStageConflictResolution(item, resolution),
 			updateExcludedRefs: (repoPath, refs, visible) => this.updateExcludedRefs(repoPath, refs, visible),
+			showRemoteRefs: (repoPath, remoteName) => this.showRemoteRefs(repoPath, remoteName),
 			updatePinnedRef: (repoPath, ref) => this.updatePinnedRef(repoPath, ref),
 			_undoCommit: (ref, worktreePath) => this._undoCommit(ref, worktreePath),
 		};
@@ -799,7 +818,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			searchGraphOrContinue: (e, progressive) => this._searchService.searchGraphOrContinue(e, progressive),
 			notifyDidChangeOverview: () => void this._panels.notifyDidChangeOverview(),
 			notifySidebarInvalidated: () => this._panels.notifySidebarInvalidated(),
-			notifyDidChangeCanInstallClaudeHook: () => void this.notifyDidChangeCanInstallClaudeHook(),
+			notifyDidChangeCanInstallHooks: () => void this.notifyDidChangeCanInstallHooks(),
 			resetWipSendState: () => this._wip.resetSendState(),
 			clearWipStatusCache: () => this._wip.clearStatusCache(),
 			addPendingNotification: notification =>
@@ -808,15 +827,16 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	/** Collaborator surface {@link GraphPanelsService} reaches for. `getRepository`/`getSession`/
-	 *  `getLoading` read live provider state; `getPinnedRefId`/`fetchWipStatus`/`computeWorktreeChanges`
-	 *  forward into the WIP service's caches; `fireSidebarInvalidated` fires the provider's RPC event
-	 *  (subscribed in `getRpcServices`); the pending-notification queue routes through the provider's
-	 *  shared `_ipcNotificationMap`, which stays here. */
+	 *  `getLoading` read live provider state; `getPinnedRefId`/`getExcludedRefsByRepo`/`fetchWipStatus`/
+	 *  `computeWorktreeChanges` forward into the provider's stored filters and the WIP service's caches;
+	 *  `fireSidebarInvalidated` fires the provider's RPC event (subscribed in `getRpcServices`); the
+	 *  pending-notification queue routes through the provider's shared `_ipcNotificationMap`, which stays here. */
 	private createGraphPanelsContext(): GraphPanelsServiceContext {
 		return {
 			...this.createBaseServiceContext(),
 			getLoading: () => this._data.loading,
 			getPinnedRefId: repoPath => this.getFiltersByRepo(repoPath)?.pinnedRef?.id,
+			getExcludedRefsByRepo: repoPath => this.getFiltersByRepo(repoPath)?.excludeRefs,
 			fetchWipStatus: (path, signal) => this._wip.getStatusFromCache(path, signal),
 			computeWorktreeChanges: worktrees => this._wip.computeWorktreeChanges(worktrees),
 			fireSidebarInvalidated: () => this._sidebarInvalidatedEvent.fire(undefined),
@@ -944,6 +964,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// Ready is the other edge a secondary-WIP tick can defer on (`runWipRefetch`), and unlike hidden
 		// it resolves without any visibility or focus transition — so nothing else would ever flush it.
 		this._wip.recoverDeferredSecondaryWip();
+		// Bootstrap State doesn't carry agent sessions — the app seeds them with a request that can
+		// race the provider's cold-start import, and a pre-ready change sits in the pending map,
+		// which a reconnect clears. Push the current snapshot on every (re)connect so a booted
+		// iframe can never wedge empty.
+		void this.notifyDidChangeAgentSessions();
 	}
 
 	/** A soft-reconnected iframe re-boots from the ORIGINAL bootstrap plus the replay buffer — anything
@@ -967,6 +992,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void this._graphSync.flush();
 		// See onReady — a reconnect crosses the same not-ready window.
 		this._wip.recoverDeferredSecondaryWip();
+		// See onReady — the reconnect also cleared any pending agent-sessions notification.
+		void this.notifyDidChangeAgentSessions();
 	}
 
 	private _disposed = false;
@@ -1008,6 +1035,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	private readonly _sidebarInvalidatedEvent = createRpcEvent<undefined>('sidebarInvalidated', 'signal');
+	// `signal` (not `save-last`): the view re-fetches on receipt, so coalescing a burst of
+	// probe/apply/revert changes for the same repo into one wake-up is exactly the desired behavior.
+	private readonly _gitHealthChangedEvent = createRpcEvent<{ repoPath: string }>('gitHealthChanged', 'signal');
+	/** Visualization requested by a command during a cold show, replayed once the app is ready. */
+	private _pendingVisualization: VisualizationMode | undefined;
 	private readonly _sidebarWorktreeEvent = createRpcEvent<{
 		changes: Record<string, SidebarWorktreeChange | undefined>;
 	}>('sidebarWorktreeState', 'save-last');
@@ -1037,6 +1069,20 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					this.onSidebarAction({ command: command, context: context, args: args }),
 				onSidebarInvalidated: this._sidebarInvalidatedEvent.subscribe(buffer, tracker),
 				onWorktreeStateChanged: this._sidebarWorktreeEvent.subscribe(buffer, tracker),
+			},
+			welcome: { continueToGraph: options => this.onWelcomeContinueToGraph(options) },
+			graphHealth: {
+				getReport: repoPath => this.container.gitHealth.getReport(repoPath),
+				getLevers: repoPath => this.container.gitHealth.getLevers(repoPath),
+				getDetails: (repoPath, signal) => this.container.gitHealth.getDetails(repoPath, signal),
+				// Ask-tier: failures propagate to the view rather than being swallowed, so a person who
+				// clicked Enable sees the actual git error instead of a silent no-op.
+				applyFix: (repoPath, id, signal) => this.container.gitHealth.applyFix(repoPath, id, signal),
+				revertFix: (repoPath, id, signal) => this.container.gitHealth.revertFix(repoPath, id, signal),
+				runMaintenance: (repoPath, signal) => this.container.gitHealth.runMaintenanceNow(repoPath, signal),
+				setCommitGraphEnabled: (repoPath, enabled, signal) =>
+					this.container.gitHealth.setCommitGraphEnabled(repoPath, enabled, signal),
+				onHealthChanged: this._gitHealthChangedEvent.subscribe(buffer, tracker),
 			},
 			launchpad: new LaunchpadService(this.container, buffer, tracker),
 			walkthrough: new WalkthroughService(this.container, buffer, tracker),
@@ -1113,15 +1159,24 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				target?: GraphActionTarget;
 				composeInstructions?: string;
 				composeScope?: GraphComposeScopeSeed;
+				agentSessionId?: string;
+				revealOnly?: boolean;
+				followed?: boolean;
+				onlyIfWipSelected?: boolean;
+				scopeBranch?: GraphScopeBranch;
+				scopeOrigin?: GraphScopeOrigin;
 		  }
 		| undefined;
 	private _pendingCompare: DidRequestOpenCompareModeParams | undefined;
 
 	async onShowing(
 		loading: boolean,
-		_options?: WebviewShowOptions,
+		options?: WebviewShowOptions,
 		...args: WebviewShowingArgs<GraphWebviewShowingArgs, State>
 	): Promise<[boolean, GraphShownTelemetryContext]> {
+		// Passive deliveries (e.g. a background follower) must never open/raise a hidden instance.
+		if (options?.preserveVisibility && !this.host.visible) return [false, this.getShownTelemetryContext()];
+
 		this._etag = this.container.git.etag;
 		if (this.container.git.isDiscoveringRepositories) {
 			this._discovering = this.container.git.isDiscoveringRepositories.then(r => {
@@ -1139,6 +1194,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 			let id = arg.ref.ref;
 			let isWipRow = false;
+			let unresolved = false;
 			if (isUncommitted(id)) {
 				// The uncommitted revision isn't a real commit — it maps to the synthetic WIP row of the
 				// worktree it belongs to (the graph surfaces one WIP row per worktree, all keyed by path).
@@ -1146,19 +1202,51 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				id = createWipRowId(arg.ref.repoPath);
 				isWipRow = true;
 			} else if (!isSha(id)) {
-				id = (await this.container.git.getRepositoryService(arg.ref.repoPath).revision.resolveRevision(id)).sha;
+				// A sha is trusted as-is (left to the uncapped walk below); a non-sha ref is resolved
+				// first — `resolveRevision` echoes `id` back unchanged when it couldn't find a matching
+				// commit, so don't launch a doomed history walk for a ref that can never be found.
+				const resolved = await this.container.git
+					.getRepositoryService(arg.ref.repoPath)
+					.revision.resolveRevision(id);
+				if (resolved.sha === id) {
+					unresolved = true;
+				} else {
+					id = resolved.sha;
+				}
 			}
 
-			this.setSelectedRows(id);
+			if (unresolved) {
+				void this.host.notify(DidFailRevealNotification, { id: id, reason: 'invalidRef' });
+			} else {
+				this.setSelectedRows(id);
 
-			if (this._data.session != null) {
-				// Synthetic WIP rows can't be paged in via `onGetMoreRows`; selecting + notifying is enough.
-				if (isWipRow || this._data.session.current.ids.has(id)) {
-					void this.notifyDidChangeSelection();
-					return [true, this.getShownTelemetryContext()];
+				if (this._data.session != null) {
+					// Synthetic WIP rows can't be paged in via `onGetMoreRows`; selecting + notifying is enough.
+					if (isWipRow || this._data.session.current.ids.has(id)) {
+						void this.notifyDidChangeSelection();
+						return [true, this.getShownTelemetryContext()];
+					}
+
+					void this.revealRow(id);
 				}
+			}
+		} else if (hasVisualization(arg)) {
+			// Checked ahead of `hasCompare`/`hasRepository` — both duck-type on `arg.repository` alone,
+			// which a visualization request now carries too, and would otherwise steal this branch.
+			//
+			// Mirrors the compare-mode path below when a repository rides along: a repo switch must not
+			// notify immediately (the webview would apply the visualization against the outgoing repo's
+			// context) — deferring lets the switch's own state rebuild carry it, same as a cold show's
+			// bootstrap.
+			const repoChanged = arg.repository != null && this._repository !== arg.repository;
+			if (arg.repository != null) {
+				this.repository = arg.repository;
+			}
 
-				void this.revealRow(id);
+			if (loading || repoChanged || !this.host.ready) {
+				this._pendingVisualization = arg.visualization;
+			} else {
+				void this.host.notify(DidRequestVisualizationNotification, { visualization: arg.visualization });
 			}
 		} else if (hasCompare(arg)) {
 			const repoChanged = this._repository !== arg.repository;
@@ -1222,6 +1310,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				void this.host.notify(DidRequestActiveSidebarPanelNotification, { panel: arg.sidebarPanel });
 			}
 		} else if (hasAction(arg)) {
+			if (arg.action === 'scope-to-branch' && arg.target == null) {
+				void this.warnIfScopeToCurrentBranchDetached();
+			}
+
 			const { target } = arg;
 			// Switch to the target's repository only when it belongs to a DIFFERENT repo family, so a
 			// cold show lands on the right repo (and the primary-vs-secondary WIP comparison below
@@ -1230,18 +1322,35 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// `repository` setter) for a row that's already on screen. Reveals that would land on a
 			// scoped-out row unscope client-side instead.
 			let deferredForRepoSwitch = false;
+			let gateOnWipSelected = false;
 			if (target != null) {
 				const repo = await this.container.git.getOrAddRepository(Uri.file(target.worktreePath), {
 					opened: false,
 					detectNested: true,
 				});
 				const current = this.repository;
+
+				// A passive follow targeting the graph's OWN WIP row (target resolves to the shown
+				// repository itself) is gated: the webview consumes it only while a WIP row is already
+				// selected. `repo === current` also excludes every repo-switching delivery — a switch
+				// rebuilds the graph, so its reveal is the only orientation the user gets.
+				gateOnWipSelected = arg.followed === true && repo != null && repo === current;
 				// `commonPath ?? path` is the repo family key — see `RepositoryShape.commonPath`.
 				if (
 					repo != null &&
 					repo !== current &&
 					(current == null || (repo.commonPath ?? repo.path) !== (current.commonPath ?? current.path))
 				) {
+					// Passive follow deliveries never yank the graph off the repository it's showing —
+					// cross-family retargeting is opt-in; without it the delivery is ignored.
+					if (
+						options?.preserveVisibility &&
+						current != null &&
+						!configuration.get('graph.followTerminal.allowRepositorySwitching')
+					) {
+						return [false, this.getShownTelemetryContext()];
+					}
+
 					// A warm show that switches repositories must not notify immediately — the webview
 					// would consume the action against the outgoing repo's context and the mode entry
 					// no-ops. Stash the action BEFORE the switch so the setter's state rebuild delivers
@@ -1252,6 +1361,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 							target: arg.target,
 							composeInstructions: arg.composeInstructions,
 							composeScope: arg.composeScope,
+							agentSessionId: arg.agentSessionId,
+							revealOnly: arg.revealOnly,
+							followed: arg.followed,
+							onlyIfWipSelected: gateOnWipSelected ? true : undefined,
+							scopeBranch: arg.scopeBranch,
+							scopeOrigin: arg.scopeOrigin,
 						};
 						deferredForRepoSwitch = true;
 					}
@@ -1271,7 +1386,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					const graphRepoPath = this.repository?.path ?? this._data.session?.repoPath;
 					rowId = graphRepoPath != null ? createWipRowId(graphRepoPath) : undefined;
 				}
-				this.setSelectedRows(rowId);
+
+				// No same-row short-circuit here: `_selectedId` is only a paging hint that deliberately
+				// goes stale (empty selection echoes, scope filter-outs keep the old value), so gating a
+				// passive delivery on it can wrongly swallow the reveal. The webview owns selection truth
+				// and `navigateToCommit` already coalesces true no-ops.
+				if (!gateOnWipSelected) {
+					this.setSelectedRows(rowId);
+				}
 			}
 			if (loading) {
 				this._pendingAction = {
@@ -1279,6 +1401,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					target: arg.target,
 					composeInstructions: arg.composeInstructions,
 					composeScope: arg.composeScope,
+					agentSessionId: arg.agentSessionId,
+					revealOnly: arg.revealOnly,
+					followed: arg.followed,
+					onlyIfWipSelected: gateOnWipSelected ? true : undefined,
+					scopeBranch: arg.scopeBranch,
+					scopeOrigin: arg.scopeOrigin,
 				};
 			} else if (!deferredForRepoSwitch) {
 				// Select the targeted row in the graph too (mirrors the ref path). The action
@@ -1286,7 +1414,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				// graph row is never actually selected on a warm show. WIP rows + already-loaded
 				// commits select via the lightweight selection notification; an unloaded commit pages
 				// in (which carries the selection along).
-				if (rowId != null && this._data.session != null) {
+				if (!gateOnWipSelected && rowId != null && this._data.session != null) {
 					if (isWipRowId(rowId) || this._data.session.current.ids.has(rowId)) {
 						void this.notifyDidChangeSelection();
 					} else {
@@ -1302,6 +1430,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 						target: arg.target,
 						composeInstructions: arg.composeInstructions,
 						composeScope: arg.composeScope,
+						agentSessionId: arg.agentSessionId,
+						revealOnly: arg.revealOnly,
+						followed: arg.followed,
+						onlyIfWipSelected: gateOnWipSelected ? true : undefined,
+						scopeBranch: arg.scopeBranch,
+						scopeOrigin: arg.scopeOrigin,
 					};
 				}
 				void this.host.notify(DidRequestGraphActionNotification, {
@@ -1309,6 +1443,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					target: arg.target,
 					composeInstructions: arg.composeInstructions,
 					composeScope: arg.composeScope,
+					agentSessionId: arg.agentSessionId,
+					revealOnly: arg.revealOnly,
+					followed: arg.followed,
+					onlyIfWipSelected: gateOnWipSelected ? true : undefined,
+					scopeBranch: arg.scopeBranch,
+					scopeOrigin: arg.scopeOrigin,
 				});
 			}
 		} else {
@@ -1340,6 +1480,49 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 
 		return [true, this.getShownTelemetryContext()];
+	}
+
+	private _detachedWarningInFlight = false;
+
+	private async warnIfScopeToCurrentBranchDetached(options?: { skipAccessCheck?: boolean }): Promise<void> {
+		const useLatch = options?.skipAccessCheck !== true;
+		if (useLatch) {
+			if (this._detachedWarningInFlight) return;
+
+			this._detachedWarningInFlight = true;
+		}
+
+		try {
+			const repo = this.repository ?? this.container.git.getBestRepositoryOrFirst();
+			if (repo == null) return;
+
+			const branch = await repo.git.branches.getBranch();
+			if (!branch?.detached) return;
+
+			if (
+				options?.skipAccessCheck !== true &&
+				isAccountAccessRequired(await this.container.subscription.getSubscription())
+			) {
+				return;
+			}
+
+			const switchToBranch = 'Switch to Branch...';
+			const pick = await window.showWarningMessage(
+				'Unable to focus the Commit Graph on the current branch because HEAD is detached. Switch to a branch and the graph will focus on it.',
+				switchToBranch,
+			);
+			if (pick === switchToBranch) {
+				await RepoActions.switchTo(repo);
+			}
+		} catch (ex) {
+			if (!isCancellationError(ex)) {
+				Logger.error(ex, 'GraphWebviewProvider', 'warnIfScopeToCurrentBranchDetached');
+			}
+		} finally {
+			if (useLatch) {
+				this._detachedWarningInFlight = false;
+			}
+		}
 	}
 
 	onRefresh(force?: boolean): void {
@@ -1464,7 +1647,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 							this.container,
 							item.webviewItemValue,
 						);
-						if (commit == null) return;
+						if (commit == null) {
+							Logger.warn(
+								`${cmd}: unable to resolve commit for "${item.webviewItemValue.path}" — command aborted`,
+							);
+							return;
+						}
 
 						return void handler.call(fileCommands, commit, file, undefined, comparison);
 					},
@@ -1481,9 +1669,21 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					getWebviewCommand(cmd, 'graphDetails'),
 					async (item?: DetailsItemContext) => {
 						const resolved = await resolveMultiFileContext(this.container, item);
-						if (resolved.length) {
-							await handler.call(fileCommands, resolved);
+						// Mirror resolveMultiFileContext's own count: webviewItemsValues length, falling
+						// back to the single anchor row when the multi-selection field is absent.
+						const offered = item?.webviewItemsValues?.length ?? (item?.webviewItemValue != null ? 1 : 0);
+						if (!resolved.length) {
+							Logger.warn(`${cmd}: unable to resolve any files from the selection — command aborted`);
+							return;
 						}
+
+						if (resolved.length < offered) {
+							Logger.warn(
+								`${cmd}: resolved ${resolved.length} of ${offered} selected files — running on the resolved subset`,
+							);
+						}
+
+						await handler.call(fileCommands, resolved);
 					},
 				),
 			);
@@ -2038,6 +2238,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			configuration.changed(e, 'defaultCurrentUserNameStyle') ||
 			configuration.changed(e, 'defaultDateFormat') ||
 			configuration.changed(e, 'defaultDateStyle') ||
+			// Feeds the component config's `gitHealthAvailable`. Without a re-push, enabling it with a graph
+			// already open (exactly what `gitlens.showGitHealth`'s prompt does) leaves the Health tab hidden
+			// and routes the requested visualization to the timeline until the webview reloads.
+			configuration.changed(e, 'gitOptimizations.enabled') ||
 			configuration.changed(e, 'graph')
 		) {
 			void this.notifyDidChangeConfiguration();
@@ -2077,7 +2281,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this.notifyDidChangeOrgSettings();
 		}
 		if (key === 'gitlens:agents:enabled') {
-			void this.notifyDidChangeCanInstallClaudeHook();
+			void this.notifyDidChangeCanInstallHooks();
 		}
 	}
 
@@ -2263,6 +2467,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		//  - on entering the access screen, cancels any in-flight full-path `getState` (whose stale
 		//    signed-in state would otherwise overwrite the signed-out one) and clears a stale badge.
 		if (wasAccountAccessRequired !== this._accountAccessRequired && this.host.ready) {
+			if (
+				!this._accountAccessRequired &&
+				this._pendingAction?.action === 'scope-to-branch' &&
+				this._pendingAction.target == null
+			) {
+				void this.warnIfScopeToCurrentBranchDetached({ skipAccessCheck: true });
+			}
+
 			this._data.updateState(true);
 			return;
 		}
@@ -2285,12 +2497,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	private onOnboardingChanged(e: OnboardingChangeEvent) {
-		if (e.key === 'mcp:banner') {
-			this.onMcpBannerChanged();
-			// Dismissing the MCP banner can newly enable the hooks banner — refresh both.
-			this.onHooksBannerChanged();
-		} else if (e.key === 'hooks:banner') {
-			this.onHooksBannerChanged();
+		if (e.key === 'agents:banner') {
+			this.onAgentsBannerChanged();
 		} else if (e.key === 'graph-walkthrough:banner') {
 			this.onGraphWalkthroughBannerChanged();
 		} else if (e.key === 'graph:layoutPrompt') {
@@ -2298,36 +2506,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 	}
 
-	private onMcpBannerChanged() {
+	private onAgentsBannerChanged() {
 		if (!this.host.visible) return;
 
-		void this.host.notify(DidChangeMcpBanner, this.getMcpBannerCollapsed());
+		void this.host.notify(DidChangeAgentsBanner, this.getAgentsBannerCollapsed());
 	}
 
-	private onHooksBannerChanged() {
-		if (!this.host.visible) return;
-
-		void this.host.notify(DidChangeHooksBanner, this.getHooksBannerCollapsed());
-	}
-
-	private getMcpBannerCollapsed() {
-		// `showAutoRegistration: true` keeps this a pure dismissal signal — auto-registration is
-		// surfaced separately as `mcpCanAutoRegister` so the webview can render the "bundled" variant.
-		return !isMcpBannerEnabled(this.container, true);
-	}
-
-	private getHooksBannerCollapsed() {
-		return !isHooksBannerEnabled(this.container);
-	}
-
-	@ipcCommand(CloseGraphWalkthroughBannerCommand)
-	private onCloseGraphWalkthroughBanner(params: CloseGraphWalkthroughBannerParams) {
-		if (params.openWelcome) {
-			void this.container.usage.track('action:gitlens.graph.walkthrough.started:happened');
-			void commands.executeCommand('gitlens.showWelcomeView', { mode: 'graph' });
-		} else {
-			void this.container.onboarding.dismiss('graph-walkthrough:banner');
-		}
+	private getAgentsBannerCollapsed() {
+		return !isAgentsBannerEnabled(this.container);
 	}
 
 	@ipcCommand(TrackGraphOverviewShownCommand)
@@ -2371,16 +2557,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void this.host.notify(DidChangeGraphWalkthroughBanner, this.getGraphWalkthroughBannerState());
 	}
 
-	/** The prompt only applies to the Graph *view* (side bar/panel host) — the editor tab has no
-	 *  side-vs-bottom placement to choose. It arms while the Graph's DEFAULT container is the GitLens
-	 *  side bar — true since #5545 made the Graph the side bar's main view; devs/pre-release can flip
-	 *  back to the pre-move world via `gitlens.graph.simulate.mainView`, which mutates the same
-	 *  mapping. */
+	/** One-time nudge for the #5545 move of the Graph into the side bar — assumes the side bar stays
+	 *  the Graph's default container (constants.views.ts). It only applies to the Graph *view* (side
+	 *  bar/panel host) — the editor tab has no side-vs-bottom placement to choose. */
 	private getLayoutPromptNeeded(): boolean {
-		const graphIsMainView =
-			viewIdsByDefaultContainerId.get('workbench.view.extension.gitlens')?.includes('graph') ?? false;
-
-		return graphIsMainView && this.host.is('view') && !this.container.onboarding.isDismissed('graph:layoutPrompt');
+		return this.host.is('view') && !this.container.onboarding.isDismissed('graph:layoutPrompt');
 	}
 
 	private onLayoutPromptChanged() {
@@ -2389,14 +2570,37 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void this.host.notify(DidChangeLayoutPromptNotification, this.getLayoutPromptNeeded());
 	}
 
-	@ipcCommand(ChooseGraphLayoutCommand)
-	private async onChooseGraphLayout(params: ChooseGraphLayoutParams) {
-		// One-shot prompt: any answer — including closing without choosing — dismisses it for good
-		void this.container.onboarding.dismiss('graph:layoutPrompt').catch(() => {});
+	/** RPC handler for the whole welcome-continue interaction — see docs/webview-architecture.md
+	 *  ("cross-transport ordering") for why this rides one supertalk message instead of the two
+	 *  legacy IPC commands it replaces. */
+	private async onWelcomeContinueToGraph(options: { layoutChoice: 'sidebar' | 'panel' | 'dismissed' }) {
+		// Persist BOTH welcome dismissals FIRST — opening the welcome view or moving the graph churns
+		// the workbench, which can revert an in-flight global-memento write. Settled independently so
+		// one failing write can't skip the other; a failed write is logged but doesn't block the user's
+		// explicit layout choice. One-shot prompt: any answer, including closing without choosing,
+		// dismisses it for good.
+		const results = await Promise.allSettled([
+			this.container.onboarding.dismiss('graph:intro'),
+			this.container.onboarding.dismiss('graph:layoutPrompt'),
+		]);
+		for (const result of results) {
+			if (result.status === 'rejected') {
+				Logger.error(result.reason, 'GraphWebviewProvider', 'Failed to persist a welcome dismissal');
+			}
+		}
 
-		if (params.choice === 'dismissed') return;
+		void this.container.usage.track('action:gitlens.graph.walkthrough.started:happened');
+		void commands.executeCommand('gitlens.showWelcomeView', { mode: 'graph' });
 
-		if (params.choice === 'sidebar') {
+		// Resolve before the moves — the ack means "dismissals persisted", and a response still
+		// pending when the move destroys the calling webview is dropped with a logged error.
+		void this.applyWelcomeLayoutChoice(options.layoutChoice);
+	}
+
+	private async applyWelcomeLayoutChoice(choice: 'sidebar' | 'panel' | 'dismissed'): Promise<void> {
+		if (choice === 'dismissed') return;
+
+		if (choice === 'sidebar') {
 			// An explicit move, not `resetViewLocation`: "reset to default" resolves the default from the
 			// window's live view registry, which still holds the OLD (bottom panel) default when the
 			// upgrade landed via an extension-host-only restart — the button would silently no-op until
@@ -2814,9 +3018,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 	@ipcRequest(LoadRowRequest)
 	@trace()
-	private onLoadRowRequest(
-		params: IpcParams<typeof LoadRowRequest>,
-	): Promise<{ id: string | undefined; error?: string }> {
+	private onLoadRowRequest(params: IpcParams<typeof LoadRowRequest>): Promise<IpcResponse<typeof LoadRowRequest>> {
 		return this._data.onLoadRowRequest(params);
 	}
 
@@ -3260,8 +3462,8 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	 * concurrent scope-resolves dedupe naturally.
 	 *
 	 * `focalBranchTipSha` is always set when the focal branch resolves; `mergeBase` /
-	 * `mergeTargetTipSha` may be undefined when there's no real merge target (default branch,
-	 * or focal branch transiently equal to its target — see `computeScopeAnchor`).
+	 * `mergeTargetTipSha` may be undefined when no merge target resolves to a tip — see
+	 * `computeScopeAnchor`.
 	 */
 	private readonly _scopeAnchorCache = new Map<string, Promise<ResolvedScopeAnchor | undefined>>();
 
@@ -3321,17 +3523,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this._data.session?.current.branches.get(targetName) ?? (await svc.branches.getBranch(targetName));
 		const mergeTargetTipSha = targetBranch?.sha;
 
-		// Both tests are load-bearing. Same branch but tips apart is the default branch ahead of its own
-		// remote — anchoring re-roots onto the unpushed commits. Different branches on one commit is a
-		// branch level with a real target — anchoring gives a one-commit spine plus the older-history fold,
-		// where bailing leaves the scope bare and a bare scope dims everything off the focal first-parent
-		// line.
-		if (
-			mergeTargetTipSha == null ||
-			(mergeTargetTipSha === focalBranchTipSha && isSelfMergeTarget(targetName, branch.name))
-		) {
-			return { focalBranchTipSha: focalBranchTipSha };
-		}
+		// A resolvable target ALWAYS anchors — even the branch's own upstream with equal tips (the default
+		// branch up to date with its remote), where base == tip re-roots to a one-commit spine plus the
+		// older-history fold. Bailing there would leave the scope bare, and a bare scope dims everything off
+		// the focal first-parent line instead of scoping — for the default branch that line is the whole
+		// trunk, so almost nothing dims. Note `getBranchMergeTargetStatusInfo` (overviewEnrichment.utils.ts)
+		// still skips self-target status for the sidebars; that's safe because `reconcileScopeMergeTarget`
+		// only backfills anchors from enrichment, never strips them.
+		if (mergeTargetTipSha == null) return { focalBranchTipSha: focalBranchTipSha };
 
 		const mergeBaseSha = await svc.refs.getMergeBase(branch.ref, targetName);
 		if (mergeBaseSha == null) return { focalBranchTipSha: focalBranchTipSha };
@@ -3595,22 +3794,35 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		void this.host.notify(DidChangeOrgSettings, { orgSettings: this.getOrgSettings() });
 	}
 
-	/** Last value sent to the webview — seeds bulk state pushes without awaiting `gk`, and
-	 *  doubles as a dedup sentinel for `notifyDidChangeCanInstallClaudeHook`. */
-	private _lastCanInstallClaudeHook: boolean | undefined;
+	/** Last values sent to the webview — seed bulk state pushes without awaiting `gk`, and
+	 *  double as dedup sentinels for `notifyDidChangeCanInstallHooks`. */
+	private _lastCanInstallHooks: boolean | undefined;
+	private _lastHooksAgents: readonly { id: string; displayName: string; installed: boolean }[] | undefined;
 
 	@trace()
-	private async notifyDidChangeCanInstallClaudeHook() {
+	private async notifyDidChangeCanInstallHooks() {
 		if (!this.host.visible) return;
 
-		const claude = getContext('gitlens:agents:enabled', false)
-			? await this.container.agents.getClaude()
-			: undefined;
-		const canInstall = claude?.detected === true && claude.hooksSupported && !claude.hooksInstalled;
-		if (canInstall === this._lastCanInstallClaudeHook) return;
+		const all = getContext('gitlens:agents:enabled', false) ? await this.container.agents.getAll() : [];
+		const hooksAgents = all
+			.filter(a => a.detected && a.hooksSupported && areHooksAllowedForAgent(a.name))
+			.map(a => ({ id: a.name, displayName: a.displayName, installed: a.hooksInstalled }));
+		const canInstall = hooksAgents.some(a => !a.installed);
 
-		this._lastCanInstallClaudeHook = canInstall;
-		void this.host.notify(DidChangeCanInstallClaudeHook, canInstall);
+		if (
+			canInstall === this._lastCanInstallHooks &&
+			this._lastHooksAgents != null &&
+			hooksAgents.length === this._lastHooksAgents.length &&
+			hooksAgents.every(
+				(a, i) => a.id === this._lastHooksAgents![i].id && a.installed === this._lastHooksAgents![i].installed,
+			)
+		) {
+			return;
+		}
+
+		this._lastCanInstallHooks = canInstall;
+		this._lastHooksAgents = hooksAgents;
+		void this.host.notify(DidChangeCanInstallHooks, { canInstallHooks: canInstall, agents: hooksAgents });
 	}
 
 	private ensureRepositorySubscriptions(force?: boolean) {
@@ -3837,9 +4049,6 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		const storedExcludeRefs = filters?.excludeRefs;
 		if (!hasKeys(storedExcludeRefs)) return undefined;
 
-		const asWebviewUri = (uri: Uri) => this.host.asWebviewUri(uri);
-		const useAvatars = configuration.get('graph.avatars', undefined, true);
-
 		// Refs that no longer exist would otherwise stay hidden — and keep inflating the chip's count —
 		// forever. `refTips` is the complete `for-each-ref` listing the walk already captured off its
 		// critical path, so validating against it costs no extra git call (the reason the original v13
@@ -3856,13 +4065,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 			const ref: GraphExcludedRef = { ...stored };
 			if (ref.type === 'remote' && ref.owner) {
-				const remote = graph.remotes.get(ref.owner);
-				if (remote != null) {
-					ref.avatarUrl = (
-						(useAvatars ? remote.provider?.avatarUri : undefined) ??
-						getRemoteIconUri(this.container, remote, asWebviewUri)
-					)?.toString(true);
-				}
+				// The provider's glyph name, not an avatar image — the hidden-refs list renders the same
+				// font glyph the side bar's remotes panel uses, so the two stay visually consistent.
+				ref.providerIcon = graph.remotes.get(ref.owner)?.provider?.icon;
 			}
 
 			excludeRefs[id] = ref;
@@ -4101,6 +4306,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			contextItems.push('columns:canHide');
 		}
 
+		// Surface the graph/ref columns' grouped placement so the Group/Ungroup menu items can toggle
+		for (const name of ['graph', 'ref'] as const) {
+			const settings = columnSettings[name];
+			if (settings?.isHidden) continue;
+
+			contextItems.push(`grouping:${name}:${settings.grouped !== false ? 'grouped' : 'ungrouped'}`);
+		}
+
 		// Surface the current lane-spacing density so the context-menu `when` clauses can toggle it
 		contextItems.push(`lanes:density:${configuration.get('graph.lanes.density') ?? 'compact'}`);
 
@@ -4179,6 +4392,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			dimMergeCommits: configuration.get('graph.dimMergeCommits'),
 			experimentalKanbanEnabled: configuration.get('graph.experimental.kanban.enabled') ?? false,
 			experimentalVisualizationsEnabled: configuration.get('graph.experimental.visualizations.enabled') ?? false,
+			// Per-repo capability AND the master switch. The sub-provider is absent on web builds, virtual
+			// repos, and Live Share; and with `gitOptimizations.enabled` off every probe short-circuits, so
+			// the view would render an all-clear for a repository it never actually examined.
+			gitHealthAvailable:
+				this.repository?.git.maintenance != null && configuration.get('gitOptimizations.enabled') === true,
 			activityDecay: configuration.get('graph.experimental.visualizations.activityDecay') ?? '5m',
 			activityDecayMs: activityDecayToMs(
 				configuration.get('graph.experimental.visualizations.activityDecay') ?? '5m',
@@ -4189,6 +4407,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			lanesDensity: configuration.get('graph.lanes.density'),
 			lanesGroupedMin: configuration.get('graph.lanes.grouped.min'),
 			lanesGroupedMax: configuration.get('graph.lanes.grouped.max'),
+			maxInlineRefs: configuration.get('graph.refs.maxInline'),
+			maxStackedRefs: configuration.get('graph.refs.maxStacked'),
+			refsLayout: configuration.get('graph.refs.layout'),
 			minimap: configuration.get('graph.minimap.enabled'),
 			minimapDefaultVisibility: configuration.get('graph.minimap.defaultVisibility'),
 			minimapDataType: configuration.get('graph.minimap.dataType'),
@@ -4843,14 +5064,15 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			featurePreview: featurePreview,
 			orgSettings: this.getOrgSettings(),
 			overview: this._panels.getOverviewData(),
-			mcpBannerCollapsed: this.getMcpBannerCollapsed(),
+			agentsBannerCollapsed: this.getAgentsBannerCollapsed(),
 			mcpCanAutoRegister: this.container.gkMcp?.isRegistrationAllowed ?? false,
-			hooksBannerCollapsed: this.getHooksBannerCollapsed(),
-			canInstallClaudeHook: this._lastCanInstallClaudeHook ?? false,
+			canInstallHooks: this._lastCanInstallHooks ?? false,
+			hooksAgents: this._lastHooksAgents ?? [],
 			graphWalkthroughBannerCollapsed: graphWalkthroughBanner.dismissed,
 			graphWalkthroughComplete: this.getGraphWalkthroughComplete(),
 			graphWalkthroughStarted: this.getGraphWalkthroughStarted(),
 			layoutPromptNeeded: this.getLayoutPromptNeeded(),
+			upgradedFromPreV19: satisfies(this.container.previousVersion, '< 19'),
 			searchRequest: searchRequest,
 			details: {
 				...storedDetails,
@@ -4898,7 +5120,15 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				showAllBranches: storedGraphState?.timeline?.showAllBranches,
 			},
 			overviewRecentThreshold: this._panels.overviewRecentThreshold,
-			visualizationMode: storedGraphState?.visualizationMode,
+			// A command that asked for a specific visualization seeds the cold show. This DOES become the
+			// user's persisted choice on the next `persistState` — same as clicking the tab — because
+			// running "Show Repository Health" is itself a choice of visualization.
+			//
+			// `displayMode` must be seeded alongside it: picking a visualization is meaningless while the
+			// pane showing visualizations isn't the one rendered. Left undefined otherwise so a normal show
+			// keeps whatever the app decides.
+			displayMode: this._pendingVisualization != null ? 'visualizations' : undefined,
+			visualizationMode: this._pendingVisualization ?? storedGraphState?.visualizationMode,
 			treemapMode: storedGraphState?.treemap?.mode,
 		};
 		// Only the bootstrap build emits the side bar slice, so only it may consume the pending panel —
@@ -4907,6 +5137,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		if (bootstrap) {
 			this._pendingSidebarPanel = undefined;
 		}
+		// `displayMode`/`visualizationMode` above are unconditional fields on every build, bootstrap or
+		// not — a repo-switch-triggered rebuild (see `hasVisualization`'s `onShowing` branch) delivers
+		// this outside bootstrap too, so it must clear alike or the next unrelated rebuild would re-force
+		// visualizations mode. Mirrors `_pendingAction`/`_pendingCompare` below.
+		this._pendingVisualization = undefined;
 		this._pendingAction = undefined;
 		this._pendingCompare = undefined;
 		return result;
@@ -4931,22 +5166,118 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._wip.writeWipDraftToStorage(params.worktreePath, params.draft);
 	}
 
+	/** The id of the whole-remote "Hide Remote" wildcard entry (`type: 'remote'`, `name: '*'`) covering
+	 *  `owner`, if one is currently stored. */
+	private findWildcardExcludeId(
+		storedExcludeRefs: StoredGraphFilters['excludeRefs'],
+		owner: string,
+	): string | undefined {
+		for (const id in storedExcludeRefs) {
+			const stored = storedExcludeRefs[id];
+			if (stored.type === 'remote' && stored.name === '*' && stored.owner === owner) return id;
+		}
+		return undefined;
+	}
+
 	private updateExcludedRefs(repoPath: string | undefined, refs: GraphExcludedRef[], visible: boolean) {
 		if (repoPath == null || !refs?.length) return;
 
 		let storedExcludeRefs: StoredGraphFilters['excludeRefs'] = this.getFiltersByRepo(repoPath)?.excludeRefs ?? {};
 		for (const ref of refs) {
-			storedExcludeRefs = updateRecordValue(
-				storedExcludeRefs,
-				ref.id,
-				visible
-					? undefined
-					: { id: ref.id, type: ref.type as StoredGraphRefType, name: ref.name, owner: ref.owner },
-			);
+			if (!visible) {
+				if (ref.name === '*') {
+					// A remote can be hidden from more than one row (each branch leaf, or the remote row itself),
+					// each keyed by a different id — drop any existing wildcard for the same owner first, or every
+					// hide leaves behind a stale duplicate entry. The fresh wildcard carries no `except` — re-hiding
+					// a remote clears any exceptions it previously had.
+					for (const id in storedExcludeRefs) {
+						const stored = storedExcludeRefs[id];
+						if (stored.type === 'remote' && stored.name === '*' && stored.owner === ref.owner) {
+							storedExcludeRefs = updateRecordValue(storedExcludeRefs, id, undefined);
+						}
+					}
+
+					storedExcludeRefs = updateRecordValue(storedExcludeRefs, ref.id, {
+						id: ref.id,
+						type: ref.type as StoredGraphRefType,
+						name: ref.name,
+						owner: ref.owner,
+					});
+					continue;
+				}
+
+				// A remote branch already exempted from an active whole-remote wildcard is "hidden" by
+				// clearing the exception rather than adding a redundant direct entry — the wildcard already
+				// covers it.
+				if (ref.type === 'remote' && ref.owner != null) {
+					const wildcardId = this.findWildcardExcludeId(storedExcludeRefs, ref.owner);
+					if (wildcardId != null) {
+						const wildcard: StoredGraphExcludedRef = storedExcludeRefs[wildcardId];
+						if (wildcard.except?.includes(ref.id)) {
+							const except: string[] = wildcard.except.filter((id: string) => id !== ref.id);
+							const { except: _except, ...rest } = wildcard;
+							storedExcludeRefs = updateRecordValue(
+								storedExcludeRefs,
+								wildcardId,
+								except.length ? { ...wildcard, except: except } : rest,
+							);
+							continue;
+						}
+					}
+				}
+
+				storedExcludeRefs = updateRecordValue(storedExcludeRefs, ref.id, {
+					id: ref.id,
+					type: ref.type as StoredGraphRefType,
+					name: ref.name,
+					owner: ref.owner,
+				});
+				continue;
+			}
+
+			// visible === true — un-hide. A wildcard ref removes itself here (its exceptions die with it);
+			// anything else just drops its own direct entry.
+			storedExcludeRefs = updateRecordValue(storedExcludeRefs, ref.id, undefined);
+
+			// Un-hiding a single remote branch that's still covered by an active whole-remote wildcard
+			// excepts it from that wildcard instead of leaving it unreachable.
+			if (ref.name !== '*' && ref.type === 'remote' && ref.owner != null) {
+				const wildcardId = this.findWildcardExcludeId(storedExcludeRefs, ref.owner);
+				if (wildcardId != null) {
+					const wildcard: StoredGraphExcludedRef = storedExcludeRefs[wildcardId];
+					if (!wildcard.except?.includes(ref.id)) {
+						storedExcludeRefs = updateRecordValue(storedExcludeRefs, wildcardId, {
+							...wildcard,
+							except: [...(wildcard.except ?? []), ref.id],
+						});
+					}
+				}
+			}
 		}
 
 		void this.updateFiltersByRepo(repoPath, { excludeRefs: storedExcludeRefs });
 		void this.notifyDidChangeRefsVisibility();
+		// Hidden state is baked into the side bar's row contexts (`+hidden`/`+hiddenbyremote`), so a visibility
+		// change has to rebuild them the same way a pin change does (`updatePinnedRef` below).
+		this._panels.notifySidebarInvalidated();
+	}
+
+	/** Clears every stored exclusion owned by a remote — the wildcard entry hiding the whole remote plus any
+	 *  individually hidden branches under it — in one write. Reuses {@link updateExcludedRefs}'s removal path
+	 *  (visible=true removes by entry id) rather than duplicating the storage/notify/invalidate flow. */
+	private showRemoteRefs(repoPath: string | undefined, remoteName: string) {
+		const storedExcludeRefs = this.getFiltersByRepo(repoPath)?.excludeRefs;
+		if (!hasKeys(storedExcludeRefs)) return;
+
+		const refs: GraphExcludedRef[] = [];
+		for (const id in storedExcludeRefs) {
+			const stored = storedExcludeRefs[id];
+			if (stored.owner === remoteName) {
+				refs.push({ id: stored.id, type: stored.type, name: stored.name, owner: stored.owner });
+			}
+		}
+
+		this.updateExcludedRefs(repoPath, refs, true);
 	}
 
 	private updatePinnedRef(repoPath: string | undefined, ref: GraphPinnedRef | null) {
@@ -5420,6 +5751,17 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			void this._graphSync.flush();
 			this._data.updateState();
 		}
+	}
+
+	@debug()
+	private async toggleColumnGrouping(name: 'graph' | 'ref', grouped: boolean) {
+		let columns = this.container.storage.getWorkspace('graph:columns');
+		const column = { ...columns?.[name], grouped: grouped };
+
+		columns = updateRecordValue(columns, name, column);
+		await this.container.storage.storeWorkspace('graph:columns', columns);
+
+		void this.notifyDidChangeColumns();
 	}
 
 	@debug()

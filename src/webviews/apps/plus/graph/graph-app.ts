@@ -1,6 +1,7 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume, ContextProvider, provide } from '@lit/context';
 import { html, LitElement, nothing } from 'lit';
+import type { TemplateResult } from 'lit';
 import { customElement, query, state } from 'lit/decorators.js';
 import { classMap } from 'lit/directives/class-map.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
@@ -19,6 +20,8 @@ import type { OverlayEntry } from '@gitlens/utils/keys/keybinding.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { areEqual } from '@gitlens/utils/object.js';
 import { basename } from '@gitlens/utils/path.js';
+import type { GraphBranchesVisibility } from '../../../../config.js';
+import type { GlExtensionCommands } from '../../../../constants.commands.js';
 import type { GraphDetailsMode } from '../../../../constants.telemetry.js';
 import { mergeWebviewItems } from '../../../../system/webview.js';
 import type { CommitDetails } from '../../../commitDetails/protocol.js';
@@ -27,6 +30,7 @@ import type {
 	DidRequestOpenCompareModeParams,
 	DidRequestOpenTimelineScopeParams,
 	DidRequestSearchParams,
+	GraphCoachMarkType,
 	GraphComposeScopeSeed,
 	GraphDisplayMode,
 	GraphItemContext,
@@ -42,7 +46,6 @@ import type {
 	VisualizationMode,
 } from '../../../plus/graph/protocol.js';
 import {
-	ChooseGraphLayoutCommand,
 	createWipRowId,
 	EnableChangesColumnCommand,
 	GetRowHoverRequest,
@@ -59,11 +62,14 @@ import {
 	TrackGraphDetailsWipShownCommand,
 	TrackGraphScopeChangedCommand,
 	UpdateColumnModeCommand,
+	UpdateExcludeTypesCommand,
 	UpdateGraphConfigurationCommand,
 	UpdateGraphDisplayModeCommand,
+	UpdateIncludedRefsCommand,
+	UpdateRefsVisibilityCommand,
 } from '../../../plus/graph/protocol.js';
 import { ExecuteCommand } from '../../../protocol.js';
-import { noop } from '../../shared/actions/rpc.js';
+import { fireAndForget, noop } from '../../shared/actions/rpc.js';
 import { indexAgentSessionsByRepoAndWorktree, matchAgentSessionsForWorktree } from '../../shared/agentUtils.js';
 import type { CustomEventType } from '../../shared/components/element.js';
 import type { GlDragShiftOverlay } from '../../shared/components/overlays/drag-shift-overlay.js';
@@ -86,10 +92,13 @@ import { subscribeAll } from '../../shared/events/subscriptions.js';
 import '../shared/components/account-bar.js';
 import type { KeymapDispatcher } from '../../shared/keymap/keymapDispatcher.js';
 import { emitTelemetrySentEvent } from '../../shared/telemetry.js';
+import { graphCoachMarks } from './components/coachMarks.js';
+import type { CapturedComparison } from './components/detailsState.js';
+import { shouldRestoreCapturedComparison } from './components/detailsState.js';
 import type { BranchSheetRef } from './components/gl-graph-branch-sheet-pane.js';
 import type { GlGraphDetailsPanel } from './components/gl-graph-details-panel.js';
+import type { GraphJumpToastKind } from './components/gl-graph-jump-toast.js';
 import type { GlGraphKeyboardShortcuts } from './components/gl-graph-keyboard-shortcuts.js';
-import type { GraphLayoutPromptChoiceEventDetail } from './components/gl-graph-layout-prompt.js';
 import type {
 	OverviewBarItem,
 	OverviewBarJumpDetail,
@@ -109,7 +118,14 @@ import type { AppState } from './context.js';
 import { graphServicesContext, graphStateContext } from './context.js';
 import { getEffectiveDisplayMode } from './displayMode.js';
 import type { GlGraphHeader } from './graph-header.js';
-import type { GlGraphWrapper, GraphNavigationOptions, GraphNavigationResult } from './graph-wrapper/graph-wrapper.js';
+import type { GraphRowHiddenReason } from './graph-wrapper/gl-lit-graph.js';
+import type {
+	GlGraphWrapper,
+	GraphNavigationFailureReason,
+	GraphNavigationOptions,
+	GraphNavigationResult,
+	GraphNavigationSource,
+} from './graph-wrapper/graph-wrapper.js';
 import type { GraphCrossPaneState } from './graphCrossPaneState.js';
 import { abortRunningOperations, createGraphCrossPaneState, graphCrossPaneContext } from './graphCrossPaneState.js';
 import type { GraphLaunchpadState } from './graphLaunchpadState.js';
@@ -139,6 +155,7 @@ import { resolveMinimapShown } from './utils/minimap.utils.js';
 import { getSelectedRepoPath } from './utils/repository.utils.js';
 import { getCommitDateFromRow } from './utils/row.utils.js';
 import { serializeWipContext } from './utils/rowContext.utils.js';
+import { resolveScopeToBranchTarget, shouldDrainParkedScopeToBranch } from './utils/scopeToBranch.utils.js';
 import {
 	filterSecondariesForScopeAndVisibility,
 	hasDirtyCounts,
@@ -156,14 +173,13 @@ import './minimap/minimap-container.js';
 import '../../shared/components/split-panel/split-panel.js';
 import './sidebar/sidebar.js';
 import './sidebar/sidebar-panel.js';
-import '../../shared/components/mcp-banner.js';
 import '../../shared/components/button.js';
 import '../../shared/components/code-icon.js';
 import '../../shared/components/overlays/drag-shift-overlay.js';
 import './components/gl-graph-details-panel.js';
+import './components/gl-graph-jump-toast.js';
 import './components/gl-graph-kanban.js';
 import './components/gl-graph-keyboard-shortcuts.js';
-import './components/gl-graph-layout-prompt.js';
 import './components/gl-graph-overview-bar.js';
 import './components/gl-graph-timeline.js';
 import './components/gl-graph-visualizations.js';
@@ -196,6 +212,42 @@ function branchNameFromRef(branchRef: string | undefined): string | undefined {
  *  appear in VS Code's worktree list and tooling. Falls back to `(detached)` for safety. */
 function primaryFallbackLabel(repoPath: string): string {
 	return basename(repoPath) || '(detached)';
+}
+
+/** What the single jump-feedback toast (see `<gl-graph-jump-toast>`) is currently showing. `sha` is
+ *  the wrapper's pending-navigation id to disarm on dismissal (see `cancelNavigationFeedback`) —
+ *  undefined for a host-initiated reveal failure, which never armed one. `onAction` is undefined for a
+ *  message-only (dismiss-only) toast. */
+type GraphJumpToastState = {
+	kind: GraphJumpToastKind;
+	message: TemplateResult;
+	actionLabel?: string;
+	sha?: string;
+	onAction?: () => void;
+};
+
+/** User-facing name for a "branches visibility" mode, for the jump-feedback toast's hidden-by-view
+ *  message. Mirrors the labels the scope popover's mode menu renders for the same values. */
+function branchesVisibilityLabel(visibility: GraphBranchesVisibility | undefined): string {
+	switch (visibility) {
+		case 'smart':
+			return 'Smart Branches';
+		case 'current':
+			return 'Current Branch';
+		case 'favorited':
+			return 'Favorited Branches';
+		case 'agents':
+			return 'Agent Branches';
+		case 'all':
+		case undefined:
+			return 'current';
+	}
+}
+
+/** The jump-feedback toast's inline rendering of the jump target: a ref name reads as a name
+ *  (`<strong>`), a bare short sha reads as code (`<code>`) — the toast's styles key on the tags. */
+function jumpTargetLabel(ref: string | undefined, label: string): TemplateResult {
+	return ref != null ? html`<strong>${label}</strong>` : html`<code>${label}</code>`;
 }
 
 /** Maps a numeric-row `KeyboardEvent.code` (`Digit0`-`Digit9`) to the shortcut index it represents:
@@ -576,6 +628,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return repo?.commonPath ?? repo?.path;
 	}
 
+	/** Family key for a repository path — mirrors {@link fallbackRepoFamily}'s `commonPath ?? path`.
+	 *  Only called at RESTORE time, when the state carries a populated repository list. */
+	private familyOfRepoPath(repoPath: string | undefined): string | undefined {
+		if (!repoPath) return undefined;
+
+		const repo = this.graphState.repositories?.find(r => r.path === repoPath);
+		return repo?.commonPath ?? repo?.path ?? repoPath;
+	}
+
 	/** Whether the selected repository is virtual (GitHub/GitLab-hosted, no local git) — gates the
 	 *  `worktrees`/`stashes` sidebar panels, same rule `gl-graph-sidebar` applies to its rail. */
 	private get isVirtualRepo(): boolean {
@@ -598,6 +659,12 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  the flag below flips the live value and would lift the deferral in the session that set it. */
 	@state()
 	private _bannerDeferredBefore?: boolean;
+
+	/** True once the follow-terminal controller's first passive reveal (`revealOnly`) has landed —
+	 *  latched for the session; NEVER reset. The `followTerminal` coach mark's own dismissed/seen
+	 *  guards handle showing it only once ever. */
+	@state()
+	private _followTerminalRevealed = false;
 
 	@consume({ context: graphServicesContext, subscribe: true })
 	private services?: typeof graphServicesContext.__context__;
@@ -786,7 +853,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				scope: 'tree',
 				sheet: 'hidden',
 				run: e => {
-					this.graph?.suppressModifierChainUntilCtrlRelease?.();
+					this.graph?.suppressModifierChainUntilRelease?.();
 
 					const path = e.composedPath();
 
@@ -815,7 +882,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				when: [this.isGraphModeShortcut],
 				sheet: {
 					group: 'search',
-					label: 'Find a branch or tag',
+					label: 'Find a branch, tag, or worktree',
 					order: 1,
 					subline: ['ArrowUp', 'ArrowDown', 'text: matches · ', 'Enter', 'text: selects'],
 				},
@@ -839,7 +906,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					subline: ['Enter', 'text: steps · ', 'Escape', 'text: leaves'],
 				},
 				run: () => {
-					this.graph?.suppressModifierChainUntilCtrlRelease?.();
+					this.graph?.suppressModifierChainUntilRelease?.();
 					return this.graphHeader?.focusSearch() ?? false;
 				},
 			},
@@ -852,7 +919,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				// primary chord is shown — the `mod+/` alias would double the footer's width.
 				sheet: { group: 'footer', label: 'shows this reference', order: 2, keysOverride: ['?'] },
 				run: () => {
-					this.graph?.suppressModifierChainUntilCtrlRelease?.();
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.handleShowShortcuts();
 					return true;
 				},
@@ -909,6 +976,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					const panel = visibleSidebarPanels(this.isVirtualRepo)[digit];
 					if (panel == null) return false;
 
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.activateSidebarPanel(panel);
 					return true;
 				},
@@ -920,7 +988,8 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			// `webviewGlobal` scope's registration comment for the Option-character cost); Shift+letter
 			// would type a real character into a focused input.
 			// The two display-mode toggles route through `toggleDisplayMode`, the same path the rail's
-			// bottom toggle click takes.
+			// bottom toggle click takes. Alt also drives the lane dim now, and none of these toggle actions
+			// is lane navigation, so each calls `suppressModifierChainUntilRelease()` right before acting.
 			{
 				// `alt+KeyK`, not `alt+KeyA`: Option+A produces å on macOS, a real letter for Scandinavian
 				// layouts, so K was chosen to avoid shadowing it.
@@ -930,6 +999,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				run: () => {
 					if (!(this.graphState.config?.experimentalKanbanEnabled ?? false)) return false;
 
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.toggleDisplayMode('kanban');
 					return true;
 				},
@@ -939,6 +1009,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				scope: 'webviewGlobal',
 				sheet: { group: 'panels', label: 'Toggle visualizations', order: 3, keysOverride: ['alt+KeyV'] },
 				run: () => {
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.toggleDisplayMode('visualizations');
 					return true;
 				},
@@ -949,6 +1020,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				when: [this.isGraphModeShortcut],
 				sheet: { group: 'panels', label: 'Toggle minimap', order: 4, keysOverride: ['alt+KeyM'] },
 				run: () => {
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.handleToggleMinimap();
 					return true;
 				},
@@ -959,6 +1031,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				when: [this.isGraphModeShortcut],
 				sheet: { group: 'panels', label: 'Toggle side bar', order: 5, keysOverride: ['alt+KeyS'] },
 				run: () => {
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.handleToggleSidebar();
 					return true;
 				},
@@ -969,6 +1042,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				when: [this.isGraphModeShortcut],
 				sheet: { group: 'panels', label: 'Toggle details panel', order: 6, keysOverride: ['alt+KeyD'] },
 				run: () => {
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.handleToggleDetails(new CustomEvent('toggle-details'));
 					return true;
 				},
@@ -982,6 +1056,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				when: [this.isGraphModeShortcut],
 				sheet: { group: 'panels', label: 'Dock details elsewhere', order: 7 },
 				run: () => {
+					this.graph?.suppressModifierChainUntilRelease?.();
 					this.handleToggleDetails(new CustomEvent('toggle-details', { detail: { altKey: true } }));
 					return true;
 				},
@@ -1640,8 +1715,6 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		});
 	}
 
-	private _pendingScopeToBranch = false;
-
 	/** A task action that arrived — or was interrupted by a sign-out or plan change — while an access
 	 *  wall is up (#5534). While gated the graph is unreachable (the account screen replaces it, or the
 	 *  plan gate covers it with an undismissable modal), so consuming an action would silently drop it —
@@ -1649,10 +1722,14 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  task-specific messaging, and is consumed once access is granted. `@state` so a warm arrival
 	 *  re-renders the already-shown screen with the task copy. */
 	@state()
-	private _gatedPendingAction?: NonNullable<AppState['pendingAction']>;
+	private _gatedPendingAction?: NonNullable<AppState['pendingAction']> & {
+		/** An interrupted comparison from the wall capture — never host-delivered, so its
+		 *  presence marks the parked action as a capture and arms the restore guards */
+		capturedComparison?: CapturedComparison;
+	};
 	private _wasAccessGated = false;
 
-	/** Shows the post-sign-in welcome interstitial: armed when the account wall clears live (a
+	/** Drives the welcome's live-sign-in copy variant: armed when the account wall clears live (a
 	 *  sign-in completed while the account screen was showing) with no parked task to run — a task
 	 *  arrival goes straight to the graph instead, both for intent and because
 	 *  `consumePendingAction` drives the graph subtree, which doesn't mount while this screen is up.
@@ -1674,6 +1751,23 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return this.isAccountGated || !this.graphState.allowed;
 	}
 
+	/** Shows the first-run welcome (the `graph:intro` onboarding surface). Full-viewport early-return
+	 *  in `render`, so — unlike the old in-subtree dialog — it needs no `repositories > 0` guard and
+	 *  shows even with no repo open. Held back while the Pro gate is up (the gate is the proper first
+	 *  surface for an unentitled user; the welcome shows once they can use the graph) and while a
+	 *  deep-linked task action is parked/incoming (the action's intent trumps onboarding). */
+	private get shouldShowWelcome(): boolean {
+		return (
+			!this.isAccountGated &&
+			(this.graphState.allowed ?? false) &&
+			// Client-read onboarding flag: `undefined` until known (don't flash), `false` = not yet
+			// dismissed, `true` = dismissed.
+			this._dismissals?.get('graph:intro') === false &&
+			this._gatedPendingAction == null &&
+			this.graphState.pendingAction == null
+		);
+	}
+
 	private async consumePendingAction(pending: {
 		action: GraphShowAction;
 		target?: { sha: string; worktreePath: string; filePaths?: string[] };
@@ -1682,8 +1776,35 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		scopeOrigin?: GraphScopeOrigin;
 		composeInstructions?: string;
 		composeScope?: GraphComposeScopeSeed;
+		capturedComparison?: CapturedComparison;
+		agentSessionId?: string;
+		revealOnly?: boolean;
+		followed?: boolean;
+		onlyIfWipSelected?: boolean;
 	}): Promise<void> {
-		const { action, target, commitMessage, scopeBranch, scopeOrigin, composeInstructions, composeScope } = pending;
+		const {
+			action,
+			target,
+			commitMessage,
+			scopeBranch,
+			scopeOrigin,
+			composeInstructions,
+			composeScope,
+			capturedComparison,
+			agentSessionId,
+			revealOnly,
+			followed,
+			onlyIfWipSelected,
+		} = pending;
+
+		// Passive follow to the graph's own WIP row only lands while the user is already WIP-hopping
+		// (a WIP row selected) — otherwise it would yank a deliberately-taken position for a row
+		// that's one `w` keypress away. Dropping here skips everything: selection, reveal, the
+		// coach-mark latch, and the agent highlight.
+		if (onlyIfWipSelected === true) {
+			const { single, multi } = this.activeSelection;
+			if (multi != null || single == null || !isWipSelectionSha(single.sha)) return;
+		}
 
 		if (action === 'scope-to-branch') {
 			// A target branch (from a Focus on Branch/Worktree command) scopes to it; otherwise scope
@@ -1699,12 +1820,24 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			return;
 		}
 
+		if (action === 'open-compare' && capturedComparison != null) {
+			const capturedFamily = this.familyOfRepoPath(capturedComparison.graphRepoPath);
+			const live = this.detailsPanelEl?.liveComparison;
+			if (
+				!shouldRestoreCapturedComparison(capturedComparison.refs, capturedFamily, this.fallbackRepoFamily, live)
+			) {
+				return;
+			}
+		}
+
 		// When a target is supplied (e.g. context-menu invocation on a secondary WIP row), route
 		// the action to that row's worktree; otherwise fall back to the primary repo + uncommitted.
 		const repoPath = target?.worktreePath ?? this.fallbackRepoPath ?? '';
 		const sha = target?.sha ?? uncommitted;
-		this._selectedCommit = { sha: sha, repoPath: repoPath };
-		this._selectedCommits = undefined;
+		if (!(action === 'open-compare' && capturedComparison?.refs != null)) {
+			this._selectedCommit = { sha: sha, repoPath: repoPath };
+			this._selectedCommits = undefined;
+		}
 
 		// Reliably select the target row in the graph itself, not just the details panel. The host's
 		// selection notification is prop-driven and can drop the synthetic WIP row to a render race
@@ -1740,7 +1873,8 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 		if (action === 'open-compare') {
 			const compareParams =
-				target != null
+				capturedComparison?.refs ??
+				(target != null
 					? {
 							repoPath: repoPath,
 							leftRef: this.graphState.branch?.name ?? 'HEAD',
@@ -1752,7 +1886,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 							rightRef: this.graphState.branch?.name ?? 'HEAD',
 							rightRefType: 'branch' as const,
 							includeWorkingTree: true,
-						};
+						});
 			void this.withDetailsPanel(panel => panel.openCompareMode(compareParams), 'request-mode');
 			return;
 		}
@@ -1770,7 +1904,29 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			return;
 		}
 
-		showDetails();
+		// A host-resolved focus (Focus in Commit Graph on a terminal) scopes to the target worktree's
+		// branch once the selection above has landed. CONSTRAINT: `scopeBranch` must cover the target
+		// row — every producer resolves it from the target worktree's OWN current branch, so this
+		// scope can't re-hide the row `unscopeToRevealWip` just revealed. A producer scoping to some
+		// OTHER branch would break that.
+		if (scopeBranch != null) {
+			await this.scopeToBranchByName(scopeBranch.branchName, scopeBranch.upstreamName, {
+				remote: scopeBranch.remote,
+				origin: scopeOrigin,
+			});
+		}
+
+		// `revealOnly` (passive follow deliveries) selects/reveals the row above without opening the
+		// details panel.
+		const detailsAlreadyVisible = this.graphState.details?.visible === true;
+		if (revealOnly !== true) {
+			showDetails();
+		} else if (followed === true) {
+			// Only the follow controller's passive deliveries set `followed` — a manual Focus also
+			// sends `revealOnly` but must not trigger the follow coach mark.
+			// Latch — never reset; see `_followTerminalRevealed`'s own doc comment.
+			this._followTerminalRevealed = true;
+		}
 
 		await this.updateComplete;
 		// Seed the WIP details commit input AFTER the panel has reconciled to the target row —
@@ -1779,6 +1935,14 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// edit and re-commit the message in the same box they'd normally type into.
 		if (commitMessage != null && action === 'show-wip') {
 			this.detailsPanelEl?.setCommitMessage(repoPath, commitMessage);
+		}
+
+		// Highlights an agent session's card in an already-open details panel. Sidebar-tree
+		// highlighting has no equivalent API, so that stays out of scope here.
+		// Passive deliveries only highlight into an ALREADY-open panel; a manual invocation that just
+		// opened the panel (`revealOnly` unset) highlights into it too.
+		if (action === 'show-wip' && agentSessionId != null && (detailsAlreadyVisible || revealOnly !== true)) {
+			void this.dispatchAgentHighlight(agentSessionId);
 		}
 	}
 
@@ -1820,25 +1984,23 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	private async scopeToBranch(): Promise<void> {
-		const branch = this.graphState.branch;
-		if (branch == null) {
-			this._pendingScopeToBranch = true;
+		const target = resolveScopeToBranchTarget(this.graphState.branch, this.fallbackRepoPath);
+		if (target == null) {
+			this.graphState.pendingScopeToBranch = true;
 			return;
 		}
 
-		this._pendingScopeToBranch = false;
-		const repoPath = this.fallbackRepoPath;
-		if (repoPath != null) {
-			const branchRef = getBranchId(repoPath, false, branch.name);
-			await this.setScope(
-				{
-					branchRef: branchRef,
-					branchName: branch.name,
-					upstreamRef: branch.upstream?.name ? getBranchId(repoPath, true, branch.upstream.name) : undefined,
-				},
-				'overview-card',
-			);
-		}
+		this.graphState.pendingScopeToBranch = false;
+		const { branch, repoPath } = target;
+		const branchRef = getBranchId(repoPath, false, branch.name);
+		await this.setScope(
+			{
+				branchRef: branchRef,
+				branchName: branch.name,
+				upstreamRef: branch.upstream?.name ? getBranchId(repoPath, true, branch.upstream.name) : undefined,
+			},
+			'overview-card',
+		);
 	}
 
 	/** Shared WIP selection + details-open flow. Used by both the inline graph WIP row
@@ -1889,6 +2051,18 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			await this.updateComplete;
 		}
 		void this.graph?.navigateToCommit(e.detail.sha, { source: 'overview', flash: true });
+	};
+
+	/** A coach mark's content-supplied action button — the mark's content declares which host command
+	 *  it runs, so no per-mark dispatch lives here. The cast is needed because `gitlens.graph.`-prefixed
+	 *  ids collide with the webview-scoped naming heuristic (`GlWebviewCommands<'graph'>`) even for
+	 *  plain `registerCommand` commands. */
+	private readonly handleCoachMarkAction = async (e: CustomEvent<{ mark: GraphCoachMarkType }>): Promise<void> => {
+		const command = graphCoachMarks[e.detail.mark]?.action?.command;
+		if (command == null) return;
+
+		const commands = await this.services?.commands;
+		void commands?.execute(command as GlExtensionCommands);
 	};
 
 	private handleOverviewBarSelect = async (e: CustomEvent<OverviewBarSelectDetail>): Promise<void> => {
@@ -2315,7 +2489,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			if (!this._wasAccessGated && this._gatedPendingAction == null) {
 				const task = this.detailsPanelEl?.activeTaskAction;
 				if (task != null) {
-					this._gatedPendingAction = task;
+					this._gatedPendingAction =
+						task.action === 'open-compare'
+							? {
+									action: task.action,
+									capturedComparison: {
+										refs: task.compare,
+										graphRepoPath: task.compareGraphRepoPath,
+									},
+								}
+							: task;
 				}
 			}
 		} else if (this._wasAccessGated) {
@@ -2360,9 +2543,12 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		// config changes).
 		this.ensureSidebarOverlayEscHandling();
 
-		if (this.shouldShowLayoutPrompt && !this._layoutPromptShownReported) {
-			this._layoutPromptShownReported = true;
-			emitTelemetrySentEvent<'graph/layoutPrompt/shown'>(this, { name: 'graph/layoutPrompt/shown', data: {} });
+		if (this.shouldShowWelcome && !this._introShownReported) {
+			this._introShownReported = true;
+			emitTelemetrySentEvent<'graph/intro/shown'>(this, {
+				name: 'graph/intro/shown',
+				data: { withLayoutOptions: this.graphState.layoutPromptNeeded ?? false },
+			});
 		}
 
 		// Start the Launchpad pipeline once `services` first resolves. `services` is a `@consume`d
@@ -2540,8 +2726,18 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			void this.updateComplete.then(() => this.openCompareMode(pendingCompare));
 		}
 
-		if (this._pendingScopeToBranch && this.graphState.branch != null) {
-			void this.updateComplete.then(() => this.scopeToBranch());
+		if (
+			shouldDrainParkedScopeToBranch(
+				this.graphState.pendingScopeToBranch,
+				this.graphState.branch,
+				this.fallbackRepoPath,
+			)
+		) {
+			void this.updateComplete.then(() => {
+				if (!this.graphState.pendingScopeToBranch) return;
+
+				return this.scopeToBranch();
+			});
 		}
 
 		// Check for external search request (from file history command, etc.)
@@ -2575,12 +2771,19 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	}
 
 	override render() {
-		if (this.isAccountGated || this._postSignInPending) {
+		if (this.isAccountGated || this.shouldShowWelcome) {
 			return html`<gl-graph-access-account
 				.intentAction=${this._gatedPendingAction?.action}
-				.postSignIn=${this._postSignInPending}
-				@gl-continue=${this.onPostSignInContinue}
+				.welcome=${this.shouldShowWelcome}
+				.liveSignIn=${this._postSignInPending}
+				.showLayoutOptions=${this.graphState.layoutPromptNeeded ?? false}
+				.upgradedFromPreV19=${this.graphState.upgradedFromPreV19 ?? false}
+				@gl-continue=${this.onWelcomeContinue}
 			></gl-graph-access-account>`;
+		}
+
+		if (!this.graphState.allowed) {
+			return html`<gl-graph-gate .intentAction=${this._gatedPendingAction?.action}></gl-graph-gate>`;
 		}
 
 		const detailsVisible = this.graphState.details?.visible ?? false;
@@ -2618,14 +2821,6 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					`,
 				)}
 				<div class="graph__workspace">
-					${when(
-						!this.graphState.allowed,
-						() =>
-							html`<gl-graph-gate
-								class="graph__gate"
-								.intentAction=${this._gatedPendingAction?.action}
-							></gl-graph-gate>`,
-					)}
 					${
 						noRepos
 							? html`<gl-graph-empty-state class="graph__empty-state"></gl-graph-empty-state>`
@@ -2816,23 +3011,15 @@ export class GraphApp extends SignalWatcher(LitElement) {
 						? html`<div class="graph__graph-content">${this.renderKanbanMain()}</div>`
 						: nothing
 				}
-				${when(
-					this.shouldShowLayoutPrompt,
-					// Living inside the graph subtree means the no-repo empty state skips the prompt —
-					// deliberate: asking where the Graph should live is noise without a repo to show,
-					// and the prompt is one-shot on ANSWER (not on show), so it simply defers until a
-					// repository is open.
-					() =>
-						html`<gl-graph-layout-prompt
-							@gl-graph-layout-choice=${this.handleLayoutPromptChoice}
-						></gl-graph-layout-prompt>`,
-				)}
 			</div>
 		`;
 	}
 
 	private renderKanbanMain() {
-		return html`<gl-graph-kanban @gl-graph-kanban-close=${this.handleAlternateModeClose}></gl-graph-kanban>`;
+		return html`<gl-graph-kanban
+			?graph-ready=${this.coachMarksEligible}
+			@gl-graph-kanban-close=${this.handleAlternateModeClose}
+		></gl-graph-kanban>`;
 	}
 
 	private handleShowShortcuts = (): void => {
@@ -2921,6 +3108,395 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private readonly handleDetailSheetClosing = (): void => {
 		this.releaseSheetMaximize();
 	};
+
+	// ---- Jump feedback toast (issue #5699) ----
+	//
+	// A jump that can't land (hidden by a filter, or gone entirely) used to fail silently — the graph
+	// just didn't move. `gl-graph-wrapper` classifies why and reports it via
+	// `gl-graph-navigation-loading`/`gl-graph-navigation-failed`; this section owns the single toast
+	// instance that turns that classification into an actionable message, and the remedies that clear
+	// the blocker and re-run the jump.
+
+	/** The still-in-flight host row load a jump is waiting on, if any — rendered as a "searching" toast
+	 *  only while `graphState.ensureLoading` is ALSO true (see {@link renderJumpToast}), so a load that
+	 *  lands with a hit clears the toast with nothing here having to notice — the wrapper fires no
+	 *  "succeeded" event, only a failed one. `@state` so SETTING it (not just the later `ensureLoading`
+	 *  flip) schedules the render that reads `ensureLoading` and subscribes `SignalWatcher` to it. */
+	@state()
+	private _loadingJumpNav?: { sha: string; ref?: string };
+
+	/** A settled, reportable jump failure (or a host-initiated reveal failure) — takes priority over
+	 *  {@link _loadingJumpNav} once set. */
+	@state()
+	private _failedJumpToast?: GraphJumpToastState;
+
+	private _jumpToastTimer?: ReturnType<typeof setTimeout>;
+
+	/** The toast object last handed to `<gl-graph-jump-toast>` (see {@link renderJumpToast}) — its
+	 *  action/dismiss handlers fire DOM events with no payload, so they read this rather than
+	 *  re-deriving what's currently shown. */
+	private _renderedJumpToast?: GraphJumpToastState;
+
+	private handleGraphNavigationLoading = (e: CustomEventType<'gl-graph-navigation-loading'>): void => {
+		// A newer target supersedes whatever's currently shown, a still-visible failure included. An
+		// opted-out load (search stepping has its own progress UI) shows nothing, but still clears —
+		// it holds `ensureLoading` too, and a stale `_loadingJumpNav` would resurface under it with the
+		// wrong target.
+		this.clearJumpToast();
+		this._loadingJumpNav = e.detail.feedback ? { sha: e.detail.sha, ref: e.detail.ref } : undefined;
+	};
+
+	private handleGraphNavigationFailed = (e: CustomEventType<'gl-graph-navigation-failed'>): void => {
+		this.clearJumpToast();
+
+		const { sha, source, ref, reason } = e.detail;
+		const label = ref ?? sha.slice(0, 7);
+		const toast = this.buildJumpFailureToast(sha, ref, label, source, reason);
+		this._failedJumpToast = toast;
+		this.armJumpToastTimer(toast.actionLabel == null ? 6000 : 10000);
+
+		emitTelemetrySentEvent<'graph/jump/failed'>(this, {
+			name: 'graph/jump/failed',
+			data: {
+				reason: reason?.kind === 'hidden' ? reason.hidden : (reason?.kind ?? 'not-found'),
+				source: source ?? 'unknown',
+			},
+		});
+	};
+
+	/** Routed from {@link GraphAppHost} for the host's `reveal/didFail` notification — a host-initiated
+	 *  reveal (deep link, terminal link, "Open in Commit Graph") whose ref never resolved. No wrapper
+	 *  navigation was ever armed for it, so the toast carries no `sha` to disarm on dismissal. */
+	handleRevealFailed(id: string): void {
+		this.clearJumpToast();
+
+		this._failedJumpToast = {
+			kind: 'terminal',
+			message: html`'<strong>${id}</strong>' wasn't found in this repository`,
+		};
+		this.armJumpToastTimer(6000);
+
+		emitTelemetrySentEvent<'graph/jump/failed'>(this, {
+			name: 'graph/jump/failed',
+			data: { reason: 'invalid-ref', source: 'host' },
+		});
+	}
+
+	private readonly handleJumpToastAction = (): void => {
+		this._renderedJumpToast?.onAction?.();
+	};
+
+	private readonly handleJumpToastDismiss = (): void => this.clearJumpToast();
+
+	private armJumpToastTimer(ms: number): void {
+		this._jumpToastTimer = setTimeout(() => this.clearJumpToast(), ms);
+	}
+
+	private clearJumpToastTimer(): void {
+		if (this._jumpToastTimer == null) return;
+
+		clearTimeout(this._jumpToastTimer);
+		this._jumpToastTimer = undefined;
+	}
+
+	/** Hides whatever toast is showing. A settled failure disarms the reveal the wrapper left armed for
+	 *  it (`GlGraphWrapper.cancelNavigationFeedback`); a still-loading one does NOT — dismissing the
+	 *  "looking for…" card is a different ask than its own Cancel action, which goes through
+	 *  `GlGraphWrapper.cancelNavigation` instead. */
+	private clearJumpToast(): void {
+		this.clearJumpToastTimer();
+
+		const sha = this._failedJumpToast?.sha;
+		this._failedJumpToast = undefined;
+		this._loadingJumpNav = undefined;
+		if (sha != null) {
+			this.graph?.cancelNavigationFeedback(sha);
+		}
+	}
+
+	/** The toast to render this pass, or `nothing`. A failure always wins; the "searching" state is
+	 *  otherwise DERIVED (not stored) from the still-pending load and `ensureLoading`, per
+	 *  {@link _loadingJumpNav}'s doc comment. */
+	private renderJumpToast() {
+		// Read unconditionally (not behind `&&`) so `SignalWatcher` always re-subscribes to it on this
+		// render, even while `_loadingJumpNav` is unset — otherwise the FIRST render after a loading nav
+		// arrives (the one where the signal read would matter) is the one short-circuit skips it on.
+		const ensureLoading = this.graphState.ensureLoading;
+
+		let toast = this._failedJumpToast;
+		if (toast == null && this._loadingJumpNav != null && ensureLoading) {
+			const { sha, ref } = this._loadingJumpNav;
+			const label = ref ?? sha.slice(0, 7);
+			toast = {
+				kind: 'searching',
+				message: html`Looking for ${jumpTargetLabel(ref, label)} in older history…`,
+				actionLabel: 'Cancel',
+				sha: sha,
+				onAction: () => this.graph?.cancelNavigation(sha),
+			};
+		}
+
+		this._renderedJumpToast = toast;
+		if (toast == null) return nothing;
+
+		return html`<gl-graph-jump-toast
+			.kind=${toast.kind}
+			.message=${toast.message}
+			action-label=${ifDefined(toast.actionLabel)}
+			@gl-jump-toast-action=${this.handleJumpToastAction}
+			@gl-jump-toast-dismiss=${this.handleJumpToastDismiss}
+		></gl-graph-jump-toast>`;
+	}
+
+	/** Polls `predicate` (32ms tick, matching {@link waitForScopeCleared}) so a remedy that round-trips
+	 *  through the host has a settled state to re-navigate against instead of racing the push. Resolves
+	 *  either way once `timeoutMs` elapses — the retry navigation still runs; it just might not land yet. */
+	private waitForJumpRemedy(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+		if (predicate()) return Promise.resolve();
+
+		return new Promise<void>(resolve => {
+			const start = Date.now();
+			const check = (): void => {
+				if (predicate() || Date.now() - start >= timeoutMs) {
+					resolve();
+					return;
+				}
+
+				setTimeout(check, 32);
+			};
+			setTimeout(check, 32);
+		});
+	}
+
+	/** Applies a remedy, waits for its effect to settle (or times out), then re-runs the jump with the
+	 *  landing flash — the same sequence the WIP bar's scope-clear jump already relies on (see
+	 *  {@link selectOverviewBarItem}). */
+	private applyJumpRemedy(
+		sha: string,
+		ref: string | undefined,
+		source: GraphNavigationSource | undefined,
+		apply: () => void,
+		wait: () => Promise<void>,
+	): void {
+		this.clearJumpToast();
+		void (async () => {
+			apply();
+			await wait();
+			void this.graph?.navigateToCommit(sha, { source: source ?? 'jump', flash: true, ref: ref });
+		})();
+	}
+
+	private buildJumpFailureToast(
+		sha: string,
+		ref: string | undefined,
+		label: string,
+		source: GraphNavigationSource | undefined,
+		reason: GraphNavigationFailureReason | undefined,
+	): GraphJumpToastState {
+		if (reason == null) {
+			return { kind: 'terminal', message: html`Couldn't load ${jumpTargetLabel(ref, label)}`, sha: sha };
+		}
+
+		switch (reason.kind) {
+			case 'hidden':
+				return this.buildHiddenJumpFailureToast(sha, ref, label, source, reason.hidden);
+			case 'first-parent':
+				return {
+					kind: 'hidden',
+					message: html`${jumpTargetLabel(ref, label)} is hidden while following only first parents`,
+					actionLabel: 'Show All Commits',
+					sha: sha,
+					onAction: () =>
+						this.applyJumpRemedy(
+							sha,
+							ref,
+							source,
+							() =>
+								this._ipc.sendCommand(UpdateGraphConfigurationCommand, {
+									changes: { onlyFollowFirstParent: false },
+								}),
+							() => this.waitForJumpRemedy(() => this.graphState.config?.onlyFollowFirstParent !== true),
+						),
+				};
+			case 'not-found':
+				return {
+					kind: 'terminal',
+					message: html`${jumpTargetLabel(ref, label)} wasn't found in this repository`,
+					sha: sha,
+				};
+			case 'invalid-ref':
+				return {
+					kind: 'terminal',
+					message: html`${jumpTargetLabel(ref, label)} wasn't found in this repository`,
+					sha: sha,
+				};
+			case 'timeout':
+			case 'error':
+				return { kind: 'terminal', message: html`Couldn't load ${jumpTargetLabel(ref, label)}`, sha: sha };
+		}
+	}
+
+	private buildHiddenJumpFailureToast(
+		sha: string,
+		ref: string | undefined,
+		label: string,
+		source: GraphNavigationSource | undefined,
+		hidden: GraphRowHiddenReason,
+	): GraphJumpToastState {
+		switch (hidden) {
+			case 'excluded-ref': {
+				const entry =
+					ref != null
+						? Object.values(this.graphState.excludeRefs ?? {}).find(r => r.name === ref)
+						: undefined;
+				if (entry != null) {
+					return {
+						kind: 'hidden',
+						message: html`<strong>${ref}</strong> is hidden on the graph`,
+						actionLabel: 'Show Branch',
+						sha: sha,
+						onAction: () =>
+							this.applyJumpRemedy(
+								sha,
+								ref,
+								source,
+								() =>
+									this._ipc.sendCommand(UpdateRefsVisibilityCommand, {
+										refs: [entry],
+										visible: true,
+									}),
+								() => this.waitForJumpRemedy(() => !(entry.id in (this.graphState.excludeRefs ?? {}))),
+							),
+					};
+				}
+				return this.buildShowHiddenRefsJumpToast(sha, ref, label, source);
+			}
+			case 'excluded-type': {
+				const row = this.graphState.rows?.find(r => r.sha === sha);
+				if (row?.kind === 'stash') {
+					return {
+						kind: 'hidden',
+						message: html`${jumpTargetLabel(ref, label)} is hidden on the graph`,
+						actionLabel: 'Show Hidden Refs',
+						sha: sha,
+						onAction: () =>
+							this.applyJumpRemedy(
+								sha,
+								ref,
+								source,
+								() =>
+									this._ipc.sendCommand(UpdateExcludeTypesCommand, {
+										key: 'stashes',
+										value: false,
+									}),
+								() => this.waitForJumpRemedy(() => this.graphState.excludeTypes?.stashes !== true),
+							),
+					};
+				}
+				// The row's kind isn't knowable (not currently paged in) — no single exclude-type flag to
+				// flip with confidence, so degrade to the same generic remedy the bare-sha excluded-ref
+				// case uses below.
+				return this.buildShowHiddenRefsJumpToast(sha, ref, label, source);
+			}
+			case 'visibility': {
+				const modeLabel = branchesVisibilityLabel(this.graphState.branchesVisibility);
+				return {
+					kind: 'hidden',
+					message: html`${jumpTargetLabel(ref, label)} isn't shown in the ${modeLabel} view`,
+					actionLabel: 'Show All Branches',
+					sha: sha,
+					onAction: () =>
+						this.applyJumpRemedy(
+							sha,
+							ref,
+							source,
+							() =>
+								this._ipc.sendCommand(UpdateIncludedRefsCommand, {
+									branchesVisibility: 'all',
+									refs: undefined,
+								}),
+							() => this.waitForJumpRemedy(() => this.graphState.branchesVisibility === 'all'),
+						),
+				};
+			}
+			case 'scope':
+				return {
+					kind: 'hidden',
+					message: html`${jumpTargetLabel(ref, label)} is outside the current scope`,
+					actionLabel: 'Clear Scope',
+					sha: sha,
+					onAction: () =>
+						this.applyJumpRemedy(
+							sha,
+							ref,
+							source,
+							() => this.graphState.clearScope(),
+							() => this.waitForScopeCleared(),
+						),
+				};
+			case 'search-filter':
+				return {
+					kind: 'hidden',
+					message: html`${jumpTargetLabel(ref, label)} is hidden by the search filter`,
+					actionLabel: 'Exit Filter View',
+					sha: sha,
+					onAction: () =>
+						this.applyJumpRemedy(
+							sha,
+							ref,
+							source,
+							() =>
+								this.graphHeader?.handleSearchModeChanged(
+									new CustomEvent('gl-search-modechange', {
+										detail: {
+											searchMode: 'normal',
+											useNaturalLanguage: this.graphState.useNaturalLanguageSearch === true,
+										},
+									}),
+								),
+							() => this.waitForJumpRemedy(() => this.graphState.searchMode !== 'filter'),
+						),
+				};
+			case 'collapsed':
+			case 'unknown':
+				return {
+					kind: 'hidden',
+					message: html`${jumpTargetLabel(ref, label)} can't be shown on the graph right now`,
+					sha: sha,
+				};
+		}
+	}
+
+	/** Fallback remedy for a hidden target whose specific blocker can't be targeted directly (a
+	 *  bare-sha excluded ref with no name to match, or an excluded-type row whose kind isn't known) —
+	 *  the hidden-refs popover's own "Show All" precedent: clear every currently-excluded ref. */
+	private buildShowHiddenRefsJumpToast(
+		sha: string,
+		ref: string | undefined,
+		label: string,
+		source: GraphNavigationSource | undefined,
+	): GraphJumpToastState {
+		const excludeRefs = this.graphState.excludeRefs;
+		const refs = excludeRefs != null ? Object.values(excludeRefs) : [];
+		if (refs.length === 0) {
+			return { kind: 'hidden', message: html`${jumpTargetLabel(ref, label)} is hidden on the graph`, sha: sha };
+		}
+
+		return {
+			kind: 'hidden',
+			message: html`${jumpTargetLabel(ref, label)} is hidden on the graph`,
+			actionLabel: 'Show Hidden Refs',
+			sha: sha,
+			onAction: () =>
+				this.applyJumpRemedy(
+					sha,
+					ref,
+					source,
+					() => this._ipc.sendCommand(UpdateRefsVisibilityCommand, { refs: refs, visible: true }),
+					() => this.waitForJumpRemedy(() => Object.keys(this.graphState.excludeRefs ?? {}).length === 0),
+				),
+		};
+	}
 
 	/** Monotonic stamp for PR-sheet opens — the payload resolution below can await network, so a
 	 *  newer open (or any newer details reveal) must win over one still resolving. */
@@ -3218,6 +3794,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		return html`<gl-graph-visualizations
 			placement=${placement}
 			.scope=${this._timelineScope}
+			?graph-ready=${this.coachMarksEligible}
 			@gl-graph-visualization-mode-change=${this.handleVisualizationModeChange}
 			@gl-graph-timeline-commit-select=${this.handleTimelineCommitSelect}
 			@gl-graph-timeline-config-change=${this.handleTimelineConfigChange}
@@ -3259,6 +3836,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 				@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
 				@gl-graph-sidebar-toggle-pinned=${this.handleSidebarTogglePinned}
 				@gl-graph-sidebar-search-box-filter-change=${this.handleSidebarSearchBoxFilterChange}
+				@gl-graph-sidebar-show-completed-agents-change=${this.handleSidebarShowCompletedAgentsChange}
 				@gl-graph-overview-branch-selected=${this.handleOverviewBranchSelected}
 				@gl-graph-overview-recent-threshold-change=${this.handleOverviewRecentThresholdChange}
 				@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
@@ -3340,10 +3918,13 @@ export class GraphApp extends SignalWatcher(LitElement) {
 									.items=${overviewItems}
 									.selectedId=${selectedWipId}
 									.statsOnHover=${this.graphState.config?.showWorktreeWipStats !== false}
+									?graph-ready=${this.coachMarksEligible}
+									?follow-terminal-revealed=${this._followTerminalRevealed}
 									@gl-graph-overview-bar-jump=${this.handleOverviewBarJump}
 									@gl-graph-overview-bar-select=${this.handleOverviewBarSelect}
 									@gl-graph-overview-bar-stats-needed=${this.handleOverviewBarStatsNeeded}
 									@gl-graph-show-pr-sheet=${this.handleShowPrSheet}
+									@gl-coachmark-action=${this.handleCoachMarkAction}
 								></gl-graph-overview-bar>
 							`
 						: nothing
@@ -3360,6 +3941,8 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					@gl-graph-filter-column=${this.handleGraphFilterColumn}
 					@gl-graph-mouse-leave=${this.handleGraphMouseLeave}
 					@gl-graph-scope-to-branch=${this.handleScopeToBranchFromHeader}
+					@gl-graph-navigation-failed=${this.handleGraphNavigationFailed}
+					@gl-graph-navigation-loading=${this.handleGraphNavigationLoading}
 					@gl-graph-row-context-menu=${this.handleGraphRowContextMenu}
 					@gl-graph-row-double-click=${this.handleGraphRowDoubleClick}
 					@gl-graph-row-hover=${this.handleGraphRowHover}
@@ -3374,6 +3957,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 					@rowhoverstart=${this.handleGraphRowHoverStart}
 					@rowhovertrack=${this.handleGraphRowHoverTrack}
 				></gl-graph-wrapper>
+				${this.renderJumpToast()}
 			</div>
 		`;
 	}
@@ -3465,6 +4049,11 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	};
 
 	private handleSidebarSearchBoxFilterChange = (_e: CustomEvent<boolean>): void => {
+		// State has already been mutated by sidebar-panel; just trigger the debounced persist.
+		this.persistState();
+	};
+
+	private handleSidebarShowCompletedAgentsChange = (_e: CustomEvent<boolean>): void => {
 		// State has already been mutated by sidebar-panel; just trigger the debounced persist.
 		this.persistState();
 	};
@@ -3909,8 +4498,31 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		}
 	}
 
-	private onPostSignInContinue(): void {
+	private onWelcomeContinue(e: CustomEvent<{ layoutChoice?: 'sidebar' | 'panel' | 'dismissed' }>): void {
 		this._postSignInPending = false;
+		// Optimistic dismissal — flips `graph:intro` locally so `shouldShowWelcome` goes false and the
+		// welcome unmounts without waiting for the host echo; persists via the onboarding RPC.
+		this._dismissals?.dismiss('graph:intro');
+
+		const choice = e.detail?.layoutChoice ?? 'dismissed';
+		// Preserve layout analytics: fire only when the layout section was actually shown.
+		if (this.graphState.layoutPromptNeeded ?? false) {
+			emitTelemetrySentEvent<'graph/layoutPrompt/choice'>(this, {
+				name: 'graph/layoutPrompt/choice',
+				data: { choice: choice },
+			});
+		}
+
+		// One-and-done: dismisses `graph:layoutPrompt` host-side and moves the view for sidebar/panel;
+		// `dismissed` just dismisses with no move. Rides the `welcome` service, not `_ipc`, so the
+		// dismissal write and the view move ride the same causally-ordered RPC message (see
+		// docs/webview-architecture.md).
+		if (this.services != null) {
+			fireAndForget(
+				(async () => (await this.services!.welcome).continueToGraph({ layoutChoice: choice }))(),
+				'welcome/continueToGraph',
+			);
+		}
 	}
 
 	/** Opens `panel` with the same semantics the rail icon click uses: from a non-graph display mode,
@@ -3989,43 +4601,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		);
 	}
 
-	/** One-shot guard: `shown` telemetry per webview session, not per mount — the `when()` gate
-	 *  can unmount/remount the prompt (e.g. an onboarding reset re-shows the walkthrough banner
-	 *  mid-prompt), and a remount must not mint a second impression. */
-	private _layoutPromptShownReported = false;
-
-	private get shouldShowLayoutPrompt(): boolean {
-		return (
-			(this.graphState.layoutPromptNeeded ?? false) &&
-			// Not while the Pro gate is up: both the gate and this prompt are top-layer modals, so for a
-			// signed-in-but-unentitled user the prompt would stack over the gate — asking a placement
-			// question about a graph they can't see, and burning the one-shot answer
-			(this.graphState.allowed ?? false) &&
-			// The prompt lives inside the graph subtree, which the no-repository empty state
-			// doesn't render — require repositories to be RESOLVED and non-empty (stricter than
-			// the subtree's own `?.length === 0` check, which renders during the initial load
-			// window) so the prompt can't flash and the `shown` telemetry in `updated()` can't
-			// fire (burning its one-shot guard) before a no-repo profile lands on the empty state.
-			(this.graphState.repositories?.length ?? 0) > 0 &&
-			// Don't compete with the graph walkthrough popover on first entry — hold the layout
-			// prompt until that banner is dismissed, completed, or STARTED ("See what's new" tracks
-			// started without dismissing the banner, and the header only force-opens the popover
-			// while not started — so a started walkthrough isn't visually competing). Re-renders
-			// reactively as the walkthrough notifications land.
-			((this.graphState.graphWalkthroughBannerCollapsed ?? true) ||
-				(this.graphState.graphWalkthroughComplete ?? false) ||
-				(this.graphState.graphWalkthroughStarted ?? false))
-		);
-	}
-
-	private handleLayoutPromptChoice = (e: CustomEvent<GraphLayoutPromptChoiceEventDetail>): void => {
-		// Optimistic unmount — the prompt has already closed its native dialog, but without this
-		// it would stay mounted until the host echoes `DidChangeLayoutPromptNotification`.
-		// `layoutPromptNeeded` is a plain (non-signal) property, so trigger the re-render manually.
-		this.graphState.layoutPromptNeeded = false;
-		this.requestUpdate();
-		this._ipc.sendCommand(ChooseGraphLayoutCommand, { choice: e.detail.choice });
-	};
+	/** One-shot guard: `shown` telemetry per webview session, not per mount — the welcome screen's
+	 *  full-viewport early-return can unmount/remount (e.g. a sign-out/sign-in cycle, or the Pro gate
+	 *  toggling), and a remount must not mint a second impression. */
+	private _introShownReported = false;
 
 	private handleTimelineCommitSelect = (e: CustomEvent<GlGraphTimelineCommitSelectDetail>): void => {
 		// Defensive — the timeline element only exists in timeline mode, but a queued event could
@@ -4128,7 +4707,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private async dispatchAgentHighlight(sessionId: string): Promise<void> {
 		try {
 			await this.updateComplete;
-			this.detailsPanelEl?.highlightAgentSession(sessionId);
+			// On a cold graph the panel mounts a few frames after `setDetailsVisible(true)` — one
+			// update cycle isn't enough when the highlight's own invocation just opened it.
+			const panel = this.detailsPanelEl ?? (await this.waitForDetailsPanel());
+			panel?.highlightAgentSession(sessionId);
 		} catch (ex) {
 			Logger.error(ex, 'GraphApp.dispatchAgentHighlight');
 		}
@@ -4159,7 +4741,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 		const sha = this.getOverviewBranchSelectionSha(e.detail.branchId);
 		if (sha != null) {
-			void this.graph?.navigateToCommit(sha, { source: 'overview', flash: true });
+			void this.graph?.navigateToCommit(sha, { source: 'overview', flash: true, ref: e.detail.branchName });
 		}
 
 		// If the user clicked the card without first hovering, the merge-target tip SHA isn't known
@@ -4284,7 +4866,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 
 			const sha = this.getOverviewBranchSelectionSha(branch.id);
 			if (sha != null) {
-				void this.graph?.navigateToCommit(sha, { source: 'sidebar', flash: true });
+				void this.graph?.navigateToCommit(sha, { source: 'sidebar', flash: true, ref: branchName });
 			}
 			return;
 		}
@@ -4335,7 +4917,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			// If the helper returned the tip and tip isn't loaded, the IPC `LoadRowRequest`
 			// fallback in `navigateToCommit` will fetch it; otherwise the fast path or
 			// synthetic-WIP retry handles it.
-			void this.graph?.navigateToCommit(sha, { source: 'overview', flash: true });
+			void this.graph?.navigateToCommit(sha, { source: 'overview', flash: true, ref: branchName });
 			return;
 		}
 
@@ -4400,6 +4982,10 @@ export class GraphApp extends SignalWatcher(LitElement) {
 		) {
 			return;
 		}
+
+		// An accepted focus retires the parked walkthrough request — after the detached rejection
+		// (the park must survive it), before the equality early-out (which skips `setScope`'s own cancel).
+		this.graphState.pendingScopeToBranch = false;
 
 		// Skip re-assignment when structurally equal so the graph doesn't re-evaluate
 		// scope highlighting on unrelated graph updates. `additionalBranchRefs` and `origin` are part of

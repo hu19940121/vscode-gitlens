@@ -26,6 +26,7 @@ export interface Config {
 	readonly fileAnnotations: FileAnnotationsConfig;
 	readonly gitCommands: GitCommandsConfig;
 	readonly gitkraken: GitKrakenConfig;
+	readonly gitOptimizations: GitOptimizationsConfig;
 	readonly graph: GraphConfig;
 	readonly heatmap: HeatmapConfig;
 	readonly hovers: HoversConfig;
@@ -420,6 +421,10 @@ interface GitKrakenMcpConfig {
 	};
 }
 
+export interface GitOptimizationsConfig {
+	readonly enabled: boolean;
+}
+
 export interface GraphConfig {
 	readonly allowMultiple: boolean;
 	readonly autoFetch: {
@@ -449,6 +454,10 @@ export interface GraphConfig {
 			readonly enabled: boolean;
 			readonly activityDecay: GraphActivityDecay;
 		};
+	};
+	readonly followTerminal: {
+		readonly enabled: boolean;
+		readonly allowRepositorySwitching: boolean;
 	};
 	readonly initialRowSelection: 'head' | 'wip';
 	readonly issues: {
@@ -485,6 +494,11 @@ export interface GraphConfig {
 		readonly enabled: boolean;
 	};
 	readonly refFindAutoHide: boolean;
+	readonly refs: {
+		readonly maxInline: number | 'auto';
+		readonly maxStacked: number | 'auto';
+		readonly layout: 'inline' | 'stacked';
+	};
 	readonly scrollMarkers: {
 		readonly enabled: boolean;
 		readonly additionalTypes: GraphScrollMarkersAdditionalTypes[];

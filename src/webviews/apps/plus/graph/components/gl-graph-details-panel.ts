@@ -26,9 +26,7 @@ import type {
 } from '../../../../plus/graph/graphService.js';
 import type {
 	GetWipLineStatsResponse,
-	GraphActionTarget,
 	GraphComposeScopeSeed,
-	GraphShowAction,
 	GraphSidebarPullRequest,
 	State,
 } from '../../../../plus/graph/protocol.js';
@@ -75,8 +73,14 @@ import type { DetailsActions } from './detailsActions.js';
 import { countReviewFindingSeverities, getReviewDiffEndpoints, scopeSelectionEqual } from './detailsActions.js';
 import { detailsActionsContext, detailsStateContext, detailsWorkflowContext } from './detailsContext.js';
 import { resolveDetailsActions } from './detailsResolver.js';
-import type { DetailsContext, DetailsState, RunningOperation, RunningOperationExecState } from './detailsState.js';
-import { createDetailsState, getActiveTaskAction } from './detailsState.js';
+import type {
+	CompareModeParams,
+	DetailsContext,
+	DetailsState,
+	RunningOperation,
+	RunningOperationExecState,
+} from './detailsState.js';
+import { createDetailsState, getActiveTaskAction, getOpenComparison } from './detailsState.js';
 import type { DetailsSelection } from './detailsWorkflowController.js';
 import { DetailsWorkflowController } from './detailsWorkflowController.js';
 import type { ExpandState, GlDetailsAgentStatus } from './gl-details-agent-status.js';
@@ -289,9 +293,16 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	}
 
 	/** The live task the user is engaged in — see {@link getActiveTaskAction}. Read by the
-	 *  account-gate's task-specific sign-in messaging (#5534) when a sign-out interrupts it. */
-	get activeTaskAction(): { action: GraphShowAction; target?: GraphActionTarget } | undefined {
-		return getActiveTaskAction(this._state);
+	 *  access-gate's task-specific sign-in messaging when a wall interrupts it */
+	get activeTaskAction(): ReturnType<typeof getActiveTaskAction> {
+		return getActiveTaskAction(this._state, this.effectiveRepoPath);
+	}
+
+	/** The comparison currently open in this panel, regardless of any coexisting mode.
+	 * The access-gate restore probes this: an open live comparison
+	 * must win over a parked capture even while a mode sits on top of it. */
+	get liveComparison(): ReturnType<typeof getOpenComparison> {
+		return getOpenComparison(this._state, this.effectiveRepoPath);
 	}
 
 	/** Per-mode exec state + has-result of the engaged anchor's entry — drives the suffix-icon
@@ -608,6 +619,43 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		return wrapper?.shadowRoot?.querySelector<HTMLElement>('.title') ?? wrapper ?? undefined;
 	};
 
+	/** The `details` tip's mount for the commit / multi-commit surfaces — slotted into the panel's
+	 *  header (`slot="coachmark"`) so its lightbulb parks inline with the header content. Same mark
+	 *  as the WIP header's instance: ONE shared popover showing (whichever surface is up first
+	 *  claims it) and one dismissal, but the lightbulb offers the tip on every surface. Gated off
+	 *  while a mode is engaged — review can be active on either selection — matching the WIP
+	 *  header's one-context-one-tip invariant. */
+	private renderSelectionCoachMark() {
+		const eligible = this.graphReady && this._sheetStack.length === 0 && this._state.activeMode.get() == null;
+
+		return html`<gl-graph-coachmark
+			slot="coachmark"
+			mark="details"
+			placement="bottom"
+			.anchor=${this.queryCommitOrMultiCommitTitle}
+			?auto-show=${eligible}
+		></gl-graph-coachmark>`;
+	}
+
+	/** Anchor for the `details` mark on a commit/multi-commit selection. `gl-commit-author`, the
+	 *  commit panel's default header content, is `display: contents` and never passes
+	 *  `checkVisibility()`, so pierce one level further into the nested `gl-details-header`'s own
+	 *  shadow root for its content wrapper — a real box present regardless of what's slotted into
+	 *  it. */
+	private readonly queryCommitOrMultiCommitTitle = (): HTMLElement | undefined => {
+		const commitContent = this.renderRoot
+			.querySelector('gl-details-commit-panel')
+			?.shadowRoot?.querySelector('gl-details-header')
+			?.shadowRoot?.querySelector<HTMLElement>('.details-header__content');
+		if (commitContent != null) return commitContent;
+
+		return (
+			this.renderRoot
+				.querySelector('gl-details-multicommit-panel')
+				?.shadowRoot?.querySelector<HTMLElement>('.compare-header__title') ?? undefined
+		);
+	};
+
 	private get isMultiCommit(): boolean {
 		return this.shas != null && this.shas.length >= 2;
 	}
@@ -838,17 +886,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  explicit left/right refs (e.g. from a sidebar tree compare action). The current graph
 	 *  selection is left untouched; both sides of the comparison are driven by the supplied
 	 *  overrides. */
-	openCompareMode(
-		params: {
-			repoPath: string;
-			leftRef?: string;
-			leftRefType?: 'branch' | 'tag' | 'commit';
-			rightRef: string;
-			rightRefType?: 'branch' | 'tag' | 'commit';
-			includeWorkingTree?: boolean;
-		},
-		onReady?: () => void,
-	): boolean {
+	openCompareMode(params: CompareModeParams, onReady?: () => void): boolean {
 		if (this._workflow == null) {
 			this._pendingCompare = { params: params, onReady: onReady };
 			return false;
@@ -3269,7 +3307,8 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			@open-multiple-changes=${this.handleOpenMultipleChanges}
 			@copy-commit-patch=${this.handleCopyCommitPatch}
 			@gl-issue-pull-request-details=${this.handleOpenPullRequestDetails}
-		></gl-details-commit-panel>`;
+			>${this.renderSelectionCoachMark()}</gl-details-commit-panel
+		>`;
 	}
 
 	private renderMultiCommit() {
@@ -3367,7 +3406,8 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			@open-multiple-changes=${this.handleOpenMultipleChanges}
 			@copy-commit-patch=${this.handleCopyCommitPatch}
 			@gl-issue-pull-request-details=${this.handleOpenPullRequestDetails}
-		></gl-details-multicommit-panel>`;
+			>${this.renderSelectionCoachMark()}</gl-details-multicommit-panel
+		>`;
 	}
 
 	private renderReviewMode() {
@@ -3583,6 +3623,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				if (autoRebaseRun == null) return;
 
 				void this._actions.cancelAutoRebase(autoRebaseRun.repoPath);
+			}}
+			@auto-rebase-resume=${() => {
+				// Same repo reasoning as cancel above — resume the escalated session's own rebase
+				if (autoRebaseRun == null) return;
+
+				void this._actions.resumeAutoRebase(autoRebaseRun.repoPath);
 			}}
 			@auto-rebase-exit=${() => {
 				// The abort restored the branch, so there's nothing left to review — leave resolve mode
@@ -4266,7 +4312,9 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	};
 
 	private handleFileDiscard = (e: CustomEvent<FileChangeListItemDetail>) => {
-		// Batch inline discard (multi-selection) carries the full set; one combined confirm + discard.
+		// Batch inline discard (multi-selection) carries the full set; one combined confirm + discard,
+		// in full, of every selected file — the row a cursor happened to be over doesn't decide the
+		// rules for the whole selection. The combined confirm states the blast radius per category.
 		if (e.detail.files?.length) {
 			this._actions.discardFiles([...e.detail.files]);
 		} else {
@@ -4282,12 +4330,23 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		}
 	};
 
-	private handleDiscardUnstaged = () => {
-		this._actions.discardUnstagedFiles(this.effectiveRepoPath);
+	private handleDiscardUnstaged = (e: CustomEvent<{ files?: FileChangeListItemDetail['files'] } | undefined>) => {
+		// Toolbar "Discard Selected Changes" chip with a multi-selection fully discards the selected
+		// files (staged included) — otherwise it's the scope action (repo-wide unstaged).
+		if (e.detail?.files?.length) {
+			this._actions.discardFiles([...e.detail.files]);
+		} else {
+			this._actions.discardUnstagedFiles(this.effectiveRepoPath);
+		}
 	};
 
-	private handleDiscardStaged = () => {
-		this._actions.discardStagedFiles(this.effectiveRepoPath);
+	private handleDiscardStaged = (e: CustomEvent<{ files?: FileChangeListItemDetail['files'] } | undefined>) => {
+		// Same selection branch as `handleDiscardUnstaged` — only the scope fallback differs.
+		if (e.detail?.files?.length) {
+			this._actions.discardFiles([...e.detail.files]);
+		} else {
+			this._actions.discardStagedFiles(this.effectiveRepoPath);
+		}
 	};
 
 	private handleStageAll = () => {

@@ -10,7 +10,7 @@ import type { CopyWipPatchEventDetail, OpenMultipleChangesArgs, WipScope } from 
 import { renderCommitStatsIcons } from '../commit/commit-stats.js';
 import type { TreeItemAction, TreeItemBase } from './base.js';
 import type { FileGroup } from './file-tree-utils.js';
-import { renderOpenChangesAction } from './file-tree-utils.js';
+import { renderOpenChangesAction, selectFilesByPath, selectRowsByPath } from './file-tree-utils.js';
 import type { FileChangeListItemDetail, FileItem } from './gl-file-tree-pane.js';
 import './gl-file-tree-pane.js';
 import '../chips/action-chip.js';
@@ -271,10 +271,10 @@ export class GlWipTreePane extends LitElement {
 		const multiDiffLabel = hasStagedAndUnstaged ? 'Open Staged Changes' : 'Open All Changes';
 		const multiDiffAltLabel = hasStagedAndUnstaged ? 'Open Unstaged Changes' : undefined;
 
-		// With ≥2 rows selected the Stash/Copy toolbar buttons act on the selection (primary), demoting
-		// the scope action (staged-aware, the no-selection primary) to Alt — mirrors "Open Selected
-		// Changes". `> 1` matches `gl-file-tree-pane`'s `showOpenSelected` gate.
-		const hasSelection = this.multiSelectable && this._selectedFiles.length > 1;
+		// With ≥2 rows selected the Discard/Stash/Copy toolbar buttons act on the selection (primary),
+		// demoting the scope action (staged-aware, the no-selection primary) to Alt — mirrors "Open
+		// Selected Changes".
+		const hasSelection = this.hasMultiSelection;
 		// The scope action shown/run on the demoted Alt slot (and as primary when nothing is selected).
 		const stashScopeLabel = hasStagedAndUnstaged ? 'Stash Staged Changes' : 'Stash All Changes';
 
@@ -339,7 +339,9 @@ export class GlWipTreePane extends LitElement {
 									? renderOpenChangesAction({
 											label: multiDiffLabel,
 											altLabel: multiDiffAltLabel,
-											selectedCount: this._selectedFiles.length,
+											// Resolved, not the raw mirror — `onOpenSelectedChanges` opens the resolved
+											// set, so counting the mirror could label a count it won't open.
+											selectedCount: this.resolveSelectedFiles().length,
 											onOpenAll: (altKey: boolean) => this.onOpenMultiDiff(multiDiff, altKey),
 											onOpenSelected: () => this.onOpenSelectedChanges(multiDiff),
 										})
@@ -369,10 +371,18 @@ export class GlWipTreePane extends LitElement {
 		// Unstaged takes precedence; the button only switches to staged-discard when nothing
 		// unstaged remains, so it never destroys staged content while unstaged changes are present.
 		const stagedOnly = !hasUnstaged && hasStaged;
-		const label = stagedOnly ? 'Discard Staged Changes' : 'Discard Unstaged Changes';
+		const scopeLabel = stagedOnly ? 'Discard Staged Changes' : 'Discard Unstaged Changes';
+		// Same `> 1` selection gate as Stash/Copy. Reads the same gate the handlers do so the
+		// announced label can't drift from what they run.
+		const hasSelection = this.selectionForToolbarAction() != null;
+		// Alt demotes to the scope action, mirroring Stash/Copy — the destructive click handlers
+		// branch on `e.altKey` only (never Shift, the range-select key) and the host's confirmation
+		// dialog is the safety net for that fallthrough. No alt-label without a selection: there's
+		// no "Discard All" scope action to fall back to below the scope action itself.
 		return html`<gl-action-chip
 			icon="discard"
-			label=${label}
+			label=${hasSelection ? 'Discard Selected Changes' : scopeLabel}
+			alt-label=${hasSelection ? scopeLabel : nothing}
 			?disabled=${!hasUnstaged && !hasStaged}
 			@click=${stagedOnly ? this.onDiscardStaged : this.onDiscardUnstaged}
 		></gl-action-chip>`;
@@ -446,14 +456,43 @@ export class GlWipTreePane extends LitElement {
 		this._selectedFiles = e.detail?.files ?? [];
 	};
 
+	/** Re-resolves the selection's paths against the CURRENT `this.files`, rather than trusting the
+	 *  `FileItem` objects already sitting in `_selectedFiles` — those are only refreshed when
+	 *  `gl-file-tree-pane` re-emits `file-selection-changed`, which it does only when the selected
+	 *  id-set itself changes. A model swap (e.g. a different repo/worktree) whose dirty paths happen
+	 *  to overlap won't re-emit, so the stale objects can carry the previous model's shapes —
+	 *  including a stale `repoPath` a host could resolve the wrong target repo from. Shared by
+	 *  `onOpenSelectedChanges` and the discard handlers so "what's currently selected" can't diverge
+	 *  between them.
+	 *
+	 *  Goes through `selectFilesByPath` so each path is carried once — the raw file list holds TWO
+	 *  entries for a mixed path, which would otherwise count one selected row as two and hand Stash
+	 *  and Copy the same path twice. */
+	private resolveSelectedFiles(): readonly FileItem[] {
+		return selectFilesByPath(this.files, new Set(this._selectedFiles.map(f => f.path)));
+	}
+
+	/** The re-resolved selection when the toolbar chips should act on it (the `hasMultiSelection`
+	 *  gate), otherwise `undefined` for "run the scope action". One resolve per click, so the set a
+	 *  handler acts on is exactly the one the gate was evaluated against. */
+	private selectionForToolbarAction(): readonly FileItem[] | undefined {
+		if (!this.multiSelectable) return undefined;
+
+		const files = this.resolveSelectedFiles();
+		return files.length > 1 ? files : undefined;
+	}
+
 	private onStashSave(e: MouseEvent) {
 		// With a multi-selection, the primary stashes just the selected files; Alt falls back to the
-		// scope action below (mirrors "Open Selected Changes").
-		const hasSelection = this.multiSelectable && this._selectedFiles.length > 1;
-		if (hasSelection && e.altKey !== true) {
+		// scope action below (mirrors "Open Selected Changes"). Ships the re-resolved set, not the
+		// `_selectedFiles` mirror — the host reads the repo off `files[0].repoPath`, so a stale entry
+		// would stash in the repo the pane was showing before the model swapped.
+		const selected = this.selectionForToolbarAction();
+		const hasSelection = selected != null;
+		if (selected != null && e.altKey !== true) {
 			this.dispatchEvent(
 				new CustomEvent('stash-save', {
-					detail: { files: this._selectedFiles },
+					detail: { files: selected },
 					bubbles: true,
 					composed: true,
 				}),
@@ -469,11 +508,38 @@ export class GlWipTreePane extends LitElement {
 		);
 	}
 
-	private onDiscardUnstaged() {
+	private onDiscardUnstaged(e: MouseEvent) {
+		// With a multi-selection, the primary discards just the selected files; Alt falls back to the
+		// scope action below (mirrors Stash/Copy). Branches on `e.altKey` only — Shift is the
+		// range-select key and must never widen a destructive action, so an accidental Shift held
+		// into the click stays scoped to the selection. The host's confirmation dialog is the safety
+		// net for the Alt fallthrough. The host resolves staged vs unstaged per file, so this branch
+		// is identical to `onDiscardStaged`'s.
+		//
+		// Resolved once here and gated on the same rule the chip's label reads, so the selection can't
+		// be re-resolved to a different set between the two.
+		const selected = this.selectionForToolbarAction();
+		if (selected != null && e.altKey !== true) {
+			this.dispatchEvent(
+				new CustomEvent('discard-unstaged', { detail: { files: selected }, bubbles: true, composed: true }),
+			);
+			return;
+		}
+
 		this.dispatchEvent(new CustomEvent('discard-unstaged', { bubbles: true, composed: true }));
 	}
 
-	private onDiscardStaged() {
+	private onDiscardStaged(e: MouseEvent) {
+		// Same selection branch as `onDiscardUnstaged`, including its Alt-demotes/Shift-ignored and
+		// resolve-once rules — only the scope fallback differs.
+		const selected = this.selectionForToolbarAction();
+		if (selected != null && e.altKey !== true) {
+			this.dispatchEvent(
+				new CustomEvent('discard-staged', { detail: { files: selected }, bubbles: true, composed: true }),
+			);
+			return;
+		}
+
 		this.dispatchEvent(new CustomEvent('discard-staged', { bubbles: true, composed: true }));
 	}
 
@@ -513,8 +579,11 @@ export class GlWipTreePane extends LitElement {
 		wip?: boolean;
 		title?: string;
 	}): void {
-		const selectedPaths = new Set(this._selectedFiles.map(f => f.path));
-		const files = (this.files ?? []).filter(f => selectedPaths.has(f.path));
+		// Rows, not files: a mixed path occupies two rows and each is its own diff (`staged: true` →
+		// HEAD↔index, `staged: false` → index↔working, per `openWipMultipleChanges`), so de-duping
+		// here would open only the staged half. Everything that acts on the selection as a set of
+		// files uses `resolveSelectedFiles` instead.
+		const files = selectRowsByPath(this.files, new Set(this._selectedFiles.map(f => f.path)));
 		if (!files.length) return;
 
 		this.dispatchEvent(
@@ -537,14 +606,17 @@ export class GlWipTreePane extends LitElement {
 		// With a multi-selection, the primary copies a combined HEAD↔working patch of just the selected
 		// files (scope `all` + the selected paths as pathspec); Alt falls back to the scope action below
 		// (mirrors "Open Selected Changes").
-		const hasSelection = this.multiSelectable && this._selectedFiles.length > 1;
-		if (hasSelection && e.altKey !== true) {
+		// Re-resolved rather than the `_selectedFiles` mirror, for the same reason as Stash — and
+		// resolved once so the gate and the pathspecs can't come from different sets.
+		const selected = this.selectionForToolbarAction();
+		const hasSelection = selected != null;
+		if (selected != null && e.altKey !== true) {
 			this.dispatchEvent(
 				new CustomEvent('copy-wip-patch', {
 					detail: {
 						repoPath: repoPath,
 						scope: 'all',
-						uris: this._selectedFiles.flatMap(f => getFileDiffPathspecs(f)),
+						uris: selected.flatMap(f => getFileDiffPathspecs(f)),
 					} satisfies CopyWipPatchEventDetail,
 					bubbles: true,
 					composed: true,
@@ -574,6 +646,23 @@ export class GlWipTreePane extends LitElement {
 				composed: true,
 			}),
 		);
+	}
+
+	/** True when ≥2 rows are selected in multi-selectable mode — the single gate for whether the
+	 *  Discard/Stash/Copy toolbar chips act on the selection instead of the scope action, both in
+	 *  their rendered label and in their click handler. `> 1` matches `gl-file-tree-pane`'s
+	 *  `showOpenSelected` gate. One getter, used everywhere the gate is read, so a chip's announced
+	 *  label can never drift from what its handler actually does.
+	 *
+	 *  Derived from `resolveSelectedFiles()` — the SAME re-resolved-against-`this.files` set the
+	 *  discard handlers act on — rather than the raw `_selectedFiles` mirror, which can be stale
+	 *  against a swapped model (see `resolveSelectedFiles`'s doc comment). Reading the raw mirror
+	 *  here let the chip announce "Discard Selected Changes" for a selection that had already
+	 *  resolved to nothing, so the click did silently nothing. WIP file lists are small, so the
+	 *  extra filter per read is cheap; no caching. Shares `selectionForToolbarAction` with the click
+	 *  handlers so the label and the action apply literally the same gate. */
+	private get hasMultiSelection(): boolean {
+		return this.selectionForToolbarAction() != null;
 	}
 
 	/** True when BOTH staged and unstaged changes are present — the Copy/Open buttons then surface a

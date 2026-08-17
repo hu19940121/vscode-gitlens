@@ -34,6 +34,7 @@ import { EventBus } from './eventBus.js';
 import type { FeatureFlagService } from './featureFlags/featureFlagService.js';
 import { ConfigCatFeatureFlagService } from './featureFlags/featureFlagService.js';
 import { GitFileSystemProvider } from './git/fsProvider.js';
+import { GitHealthService } from './git/gitHealthService.js';
 import { GitOperationOriginTracker } from './git/gitOperationOriginTracker.js';
 import { GitProviderService } from './git/gitProviderService.js';
 import type { RepositoryLocationProvider } from './git/location/repositorylocationProvider.js';
@@ -51,6 +52,7 @@ import { ProductConfigProvider } from './plus/gk/productConfigProvider.js';
 import { ServerConnection } from './plus/gk/serverConnection.js';
 import { SubscriptionService } from './plus/gk/subscriptionService.js';
 import { UrlsProvider } from './plus/gk/urlsProvider.js';
+import { GraphFollowController } from './plus/graph/follow.js';
 import { GraphStatusBarController } from './plus/graph/statusbar.js';
 import { createIntegrationServiceContext } from './plus/integrations/host/context.js';
 import { EnrichmentService } from './plus/launchpad/enrichmentService.js';
@@ -296,6 +298,7 @@ export class Container {
 		this._disposables.push(graphPanels);
 		this._disposables.push(registerGraphWebviewCommands(this, graphPanels));
 		this._disposables.push(new GraphStatusBarController(this));
+		this._disposables.push(new GraphFollowController(this, graphPanels));
 
 		const timelinePanels = registerTimelineWebviewPanel(webviews);
 		this._disposables.push(timelinePanels);
@@ -738,6 +741,14 @@ export class Container {
 	private readonly _telemetry: TelemetryService;
 	get telemetry(): TelemetryService {
 		return this._telemetry;
+	}
+
+	private _gitHealth: GitHealthService | undefined;
+	get gitHealth(): GitHealthService {
+		if (this._gitHealth == null) {
+			this._disposables.push((this._gitHealth = new GitHealthService(this)));
+		}
+		return this._gitHealth;
 	}
 
 	private _treemapAggregator: TreemapAggregatorService | undefined;

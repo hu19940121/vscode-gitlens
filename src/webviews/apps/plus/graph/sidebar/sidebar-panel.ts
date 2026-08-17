@@ -41,8 +41,8 @@ import {
 } from '../../../../plus/graph/sidebarTooltips.js';
 import {
 	agentPhaseToCategory,
+	canResolvePermission,
 	describeAgentSession,
-	formatAgentElapsed,
 	getAgentSessionOpenAction,
 } from '../../../shared/agentUtils.js';
 import { scrollableBase, subPanelEnterStyles } from '../../../shared/components/styles/lit/base.css.js';
@@ -71,6 +71,8 @@ import {
 	createFocusRefAction,
 	focusRefActionId,
 	getBranchLeafActions,
+	isHiddenByRemoteWebviewItem,
+	isHiddenWebviewItem,
 	remoteProviderFolderIcon,
 	remoteProviderIconsByName,
 } from './branchActions.utils.js';
@@ -96,7 +98,7 @@ import './worktree-tooltip.js';
 import '../../../shared/components/actions/action-nav.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/code-icon.js';
-import '../../../shared/components/hooks-banner.js';
+import '../../../shared/components/agents-banner.js';
 import '../../../shared/components/progress.js';
 import '../../../shared/components/tree/tree-view.js';
 
@@ -139,6 +141,11 @@ const panelConfig: Record<GraphSidebarPanel, PanelConfig> = {
 				tooltip: 'Start PR Review with Agent...',
 				command: 'gitlens.startReview',
 				args: [{ source: 'graph-sidebar', showOpenInAgent: 'agent' }],
+			},
+			{
+				icon: 'gear',
+				tooltip: 'Manage Agents',
+				command: 'gitlens.showSettingsPage!agents',
 			},
 		],
 	},
@@ -262,6 +269,26 @@ const currentBranchDecoration: TreeItemDecoration = {
 	muted: true,
 };
 
+/** The repository's default remote. Replaces a former text "default" badge with a glyph matching
+ *  the current-branch pattern above. */
+const defaultRemoteDecoration: TreeItemDecoration = {
+	type: 'icon',
+	icon: 'check',
+	label: 'Default Remote',
+	position: 'after',
+	muted: true,
+};
+
+/** A ref (or, on a remote header row, the whole remote) hidden by the graph's hidden-refs filter.
+ *  Rows carrying it stay listed — dimmed via `muted` — rather than being filtered out. */
+const hiddenDecoration: TreeItemDecoration = {
+	type: 'icon',
+	icon: 'eye-closed',
+	label: 'Hidden',
+	position: 'after',
+	muted: true,
+};
+
 function formatWorktreeDescription(w: GraphSidebarWorktree): string | undefined {
 	if (w.upstream == null) return undefined;
 	return `\u21C6 ${w.upstream}`;
@@ -368,8 +395,18 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				border-bottom: var(--gl-border-width) solid transparent;
 			}
 
+			/* Flex row so the coach mark's popover/lightbulb ride inline instead of breaking the
+			   line (a block element inside the inline span would wrap the header to two lines);
+			   the inner text span carries the ellipsis. */
 			.header-title {
 				flex: 1;
+				min-width: 0;
+				display: flex;
+				align-items: center;
+				gap: 0.4rem;
+			}
+
+			.header-title__text {
 				min-width: 0;
 				overflow: hidden;
 				text-overflow: ellipsis;
@@ -857,13 +894,16 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// reactive notifications. Synthesize a `DidGetSidebarDataParams`-shaped value so the standard
 		// tree-view rendering flow (filter box + leaves) takes over.
 		if (this.activePanel === 'agents') {
+			const sessions = this._state.agentSessions ?? [];
+			const showCompleted = this._state.sidebar?.showCompletedAgentSessions ?? false;
 			const data: DidGetSidebarDataParams = {
 				panel: 'agents',
-				items: this._state.agentSessions ?? [],
+				items: showCompleted ? sessions : sessions.filter(s => s.phase !== 'completed'),
 				layout: this._actions.agentsLayout.get(),
 			};
+			// The banner is keyed to the unfiltered total — it means "no sessions at all", not "all hidden".
 			return html`<div class="panel">
-				${this.renderHeader(config, false)} ${this.renderAgentsBanner(data.items.length === 0)}
+				${this.renderHeader(config, false)} ${this.renderAgentsBanner(sessions.length === 0)}
 				<div class="content">${this.renderTreeContent(config, data)}</div>
 			</div>`;
 		}
@@ -974,20 +1014,22 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const pinTooltip = pinned ? 'Unpin Side Bar' : 'Pin Side Bar';
 		const pinIcon = pinned ? 'pinned' : 'pin';
 		return html`<div class="header">
-			<span class="header-title">${config.title}</span>
-			${
-				// Gated on `open` too: collapsing only zero-widths this panel (never unmounts it), so the
-				// title still passes `checkVisibility()` and the tip would open over the graph — spending
-				// the one force-open on a popover anchored off-screen.
-				this.activePanel === 'agents'
-					? html`<gl-graph-coachmark
-							mark="agents"
-							placement="bottom-start"
-							.anchor=${() => this.renderRoot.querySelector<HTMLElement>('.header-title')}
-							?auto-show=${this.graphReady && this.open}
-						></gl-graph-coachmark>`
-					: nothing
-			}
+			<span class="header-title"
+				><span class="header-title__text">${config.title}</span>${
+					// Inside the title row so the lightbulb lands inline with the text, not the actions
+					// toolbar. Gated on `open` too: collapsing only zero-widths this panel (never unmounts
+					// it), so the title still passes `checkVisibility()` and the tip would open over the
+					// graph — spending the one force-open on a popover anchored off-screen.
+					this.activePanel === 'agents'
+						? html`<gl-graph-coachmark
+								mark="agents"
+								placement="bottom"
+								.anchor=${() => this.renderRoot.querySelector<HTMLElement>('.header-title__text')}
+								?auto-show=${this.graphReady && this.open}
+							></gl-graph-coachmark>`
+						: nothing
+				}</span
+			>
 			<action-nav class="header-actions" role="toolbar" aria-label="${config.title} actions">
 				${config.actions?.map(
 					a =>
@@ -1019,14 +1061,19 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// Only pitch the install when there are no sessions to act on — once the list has agents,
 		// the banner becomes noise above their tree.
 		if (!listIsEmpty) return nothing;
-		// Only pitch the install when there's something to install — `canInstallClaudeHook` flips
-		// false the moment hooks are detected as installed (or claude isn't available).
-		if (!(this._state.canInstallClaudeHook ?? false)) return nothing;
-		// Respect the same dismissal as the graph-overview banner — `hooksBannerCollapsed` is true
+		// Only pitch the install when there's something to install — `canInstallHooks` flips
+		// false the moment every detected agent has hooks installed (or none support hooks).
+		if (!(this._state.canInstallHooks ?? false)) return nothing;
+		// Respect the same dismissal as the graph-overview banner — `agentsBannerCollapsed` is true
 		// when the user dismissed it via the onboarding service.
-		if (this._state.hooksBannerCollapsed ?? true) return nothing;
+		if (this._state.agentsBannerCollapsed ?? true) return nothing;
 		return html`<div class="agents-banner">
-			<gl-hooks-banner source="graph-sidebar-agents" layout="responsive"></gl-hooks-banner>
+			<gl-agents-banner
+				source="graph-sidebar-agents"
+				layout="responsive"
+				.mcpCanAutoRegister=${this._state.mcpCanAutoRegister ?? false}
+				.hooksAvailable=${(this._state.hooksAgents?.length ?? 0) > 0}
+			></gl-agents-banner>
 		</div>`;
 	}
 
@@ -1061,6 +1108,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			this.activePanel === 'agents';
 		const currentLayout = data.layout;
 		const showRemoteBranches = data.panel === 'branches' ? (data.showRemoteBranches ?? false) : undefined;
+		const showCompletedAgentSessions =
+			data.panel === 'agents' ? (this._state.sidebar?.showCompletedAgentSessions ?? false) : undefined;
 
 		const isPullRequests = this.activePanel === 'pullRequests';
 
@@ -1091,6 +1140,20 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 							aria-label="Show Remote Branches"
 							@click=${this.handleToggleShowRemoteBranches}
 							><code-icon icon="${showRemoteBranches ? 'gl-remote-filled' : 'gl-remote'}"></code-icon
+						></gl-button>`
+					: nothing
+			}${
+				showCompletedAgentSessions != null
+					? html`<gl-button
+							slot="filter-actions"
+							appearance="toolbar"
+							density="compact"
+							role="checkbox"
+							aria-checked=${showCompletedAgentSessions ? 'true' : 'false'}
+							tooltip="${showCompletedAgentSessions ? 'Hide Completed Sessions' : 'Show Completed Sessions'}"
+							aria-label="Show Completed Sessions"
+							@click=${this.handleToggleShowCompletedAgentSessions}
+							><code-icon icon="${showCompletedAgentSessions ? 'pass-filled' : 'pass'}"></code-icon
 						></gl-button>`
 					: nothing
 			}${
@@ -1282,6 +1345,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	private toBranchLeaf(b: GraphSidebarBranch, isTree: boolean): LeafProps {
 		const actions = getBranchLeafActions(b);
 		const tracking = trackingDecorations(b.tracking, b.upstream?.missing);
+		const webviewItem = b.context?.webviewItem;
+		const hidden = isHiddenWebviewItem(webviewItem) || isHiddenByRemoteWebviewItem(webviewItem);
 
 		return {
 			label: isTree ? (b.name.split('/').pop() ?? b.name) : b.name,
@@ -1289,6 +1354,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			tooltip: branchTooltip(b, this.dateFormat),
 			icon: branchTreeIcon(b),
 			description: b.date != null ? fromNow(b.date) : undefined,
+			muted: hidden,
 			context: [b.sha, undefined, undefined, b.name] as SidebarItemContext,
 			// Pin before check so the checkmark closes the row — it's the more permanent of the two states,
 			// and keeping it outermost stops it shifting when a pin comes and goes.
@@ -1296,6 +1362,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				...(tracking ?? []),
 				...(b.pinned ? [pinnedToEdgeDecoration] : []),
 				...(b.current ? [currentBranchDecoration] : []),
+				...(hidden ? [hiddenDecoration] : []),
 			],
 			actions: actions,
 			contextValue: b.context,
@@ -1480,14 +1547,21 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	private toTagLeaf(t: GraphSidebarTag, isTree: boolean): LeafProps {
+		const hidden = isHiddenWebviewItem(t.context?.webviewItem);
+
 		return {
 			label: isTree ? (t.name.split('/').pop() ?? t.name) : t.name,
 			filterText: isTree ? t.name : undefined,
 			tooltip: tagTooltip(t, this.dateFormat),
 			icon: 'tag',
 			description: t.message,
+			muted: hidden,
 			context: [t.sha] as SidebarItemContext,
-			actions: [{ icon: 'gl-switch', label: 'Switch to Tag...', action: 'gitlens.graph.switchToTag' }],
+			decorations: hidden ? [hiddenDecoration] : undefined,
+			actions: [
+				{ icon: 'gl-switch', label: 'Switch to Tag...', action: 'gitlens.graph.switchToTag' },
+				...(hidden ? [{ icon: 'eye', label: 'Show Tag', action: 'gitlens.graph.showTag' }] : []),
+			],
 			contextValue: t.context,
 		};
 	}
@@ -1629,16 +1703,14 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 	private toAgentLeaf(session: AgentSessionState, anchor: { wipSha?: string; scope?: SidebarItemScope }): LeafProps {
 		const category = agentPhaseToCategory[session.phase];
-		const elapsed = formatAgentElapsed(session.phaseSince);
-		// Description = last prompt; otherwise the describeSession line for needs-input / working
-		// (`Awaiting: tool` / `Running tool`). The "Last active …" fallback is intentionally
-		// excluded — elapsed time is already surfaced in the tooltip, no need to repeat it.
-		const description =
-			session.lastPrompt ||
-			describeAgentSession(session, category, elapsed, {
-				awaitingPrefix: 'short',
-				idleFallback: 'lastPrompt',
-			});
+		// Description = the describeSession line for needs-input / working (`Awaiting: tool` /
+		// `Running tool`), which falls back to the last prompt for everything else. The
+		// "Last active …" fallback is intentionally excluded — elapsed time is already surfaced
+		// in the tooltip, no need to repeat it.
+		const description = describeAgentSession(session, category, {
+			awaitingPrefix: 'short',
+			idleFallback: 'lastPrompt',
+		});
 
 		// `anchor.wipSha`/`anchor.scope` are pre-computed in `buildAgentTree` — all sessions in a
 		// group share workspace + worktree, so they share the same anchor. Avoids recomputing the
@@ -1647,7 +1719,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const scope = anchor.scope;
 
 		const permission = session.pendingPermission;
-		const canResolve = category === 'needs-input' && permission != null;
+		const canResolve = canResolvePermission(category, permission);
 		// Always-Allow is meaningful only for regular tool permissions — plan / question /
 		// elicitation have no recurring rule to persist.
 		const showAlwaysAllow =
@@ -1681,7 +1753,10 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				arguments: [{ sessionId: session.id, decision: 'deny' as const }],
 			});
 		}
-		if (canResolve && permission.kind === 'plan' && permission.planFilePath != null) {
+		// Not gated on `canResolve` — opening the plan file is local, so it stays available even for
+		// an ask this window can't route (peer-owned, or discovered by the poll). Still gated on the
+		// category: a stale ask left on a row that has moved on isn't something to offer actions for.
+		if (category === 'needs-input' && permission?.kind === 'plan' && permission.planFilePath != null) {
 			actions.push({
 				icon: 'tasklist',
 				label: 'View Plan',
@@ -1837,45 +1912,66 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				useTree,
 				compact,
 				b => b.name.split('/'),
-				(b, isTree) => ({
-					label: isTree ? (b.name.split('/').pop() ?? b.name) : b.name,
-					filterText: isTree ? b.name : undefined,
-					tooltip: `$(git-branch) \`${r.name}/${b.name}\``,
-					icon: 'git-branch',
-					context: [b.sha] as SidebarItemContext,
-					decorations: b.pinned ? [pinnedToEdgeDecoration] : undefined,
+				(b, isTree) => {
+					const webviewItem = b.context?.webviewItem;
+					const hiddenByRemote = isHiddenByRemoteWebviewItem(webviewItem);
+					const hidden = hiddenByRemote || isHiddenWebviewItem(webviewItem);
+
 					// Scope is keyed on local heads, so focus the local branch tracking this one when
 					// there is one; only an untracked remote branch is scoped as a `remotes/*` ref.
-					actions: [
+					// The un-hide chip goes last so it takes the row's right edge when present.
+					const actions: TreeItemAction[] = [
 						createFocusRefAction(
 							'Focus on Branch',
 							b.localBranch != null
 								? { branchName: b.localBranch, upstreamName: `${r.name}/${b.name}` }
 								: { branchName: `${r.name}/${b.name}`, remote: true },
 						),
-					],
-					contextValue: b.context,
-				}),
+					];
+					// Per-branch un-hide is the row-level action, whether the branch is individually hidden
+					// or covered by a whole-remote wildcard — the host turns the latter into an exception
+					// instead of un-hiding the whole remote. Whole-remote recovery stays on the remote
+					// header row's chip and the context menus.
+					if (hidden) {
+						actions.push({
+							icon: 'eye',
+							label: 'Show Remote Branch',
+							action: 'gitlens.graph.showRemoteBranch',
+						});
+					}
+
+					return {
+						label: isTree ? (b.name.split('/').pop() ?? b.name) : b.name,
+						filterText: isTree ? b.name : undefined,
+						tooltip: `$(git-branch) \`${r.name}/${b.name}\``,
+						icon: 'git-branch',
+						context: [b.sha] as SidebarItemContext,
+						muted: hidden,
+						decorations: [
+							...(b.pinned ? [pinnedToEdgeDecoration] : []),
+							...(hidden ? [hiddenDecoration] : []),
+						],
+						actions: actions,
+						contextValue: b.context,
+					};
+				},
 				2,
 			);
 
 			const remoteIcon =
 				r.providerIcon != null && r.providerIcon !== 'remote' ? `gl-provider-${r.providerIcon}` : 'cloud';
+			const hidden = isHiddenWebviewItem(r.context?.webviewItem);
 
 			const actions: TreeItemAction[] = [
 				{ icon: 'repo-fetch', label: 'Fetch', action: 'gitlens.fetchRemote:graph' },
 			];
+			// Connect is worth surfacing inline — it unlocks enrichment. Disconnect is not: rarely wanted,
+			// destructive-feeling next to Fetch, and still available on the context menu.
 			if (r.connected === false) {
 				actions.push({
 					icon: 'plug',
 					label: 'Connect Remote Integration',
 					action: 'gitlens.connectRemoteProvider:graph',
-				});
-			} else if (r.connected === true) {
-				actions.push({
-					icon: 'gl-unplug',
-					label: 'Disconnect Remote Integration',
-					action: 'gitlens.disconnectRemoteProvider:graph',
 				});
 			}
 			actions.push({
@@ -1886,6 +1982,9 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				altLabel: 'Copy Remote URL',
 				altAction: 'gitlens.copyRemoteRepositoryUrl:graph',
 			});
+			if (hidden) {
+				actions.push({ icon: 'eye', label: 'Show Remote', action: 'gitlens.graph.showRemote' });
+			}
 
 			return {
 				branch: true,
@@ -1900,7 +1999,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				context: [undefined],
 				contextData: r.context != null ? serializeWebviewItemContext(r.context) : undefined,
 				children: children,
-				decorations: r.isDefault ? [{ type: 'text' as const, label: 'default' }] : undefined,
+				muted: hidden,
+				decorations: [...(r.isDefault ? [defaultRemoteDecoration] : []), ...(hidden ? [hiddenDecoration] : [])],
 				actions: actions,
 			};
 		});
@@ -2016,6 +2116,26 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		this.dispatchEvent(
 			new CustomEvent<boolean>('gl-graph-sidebar-search-box-filter-change', {
 				detail: e.detail,
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	};
+
+	private handleToggleShowCompletedAgentSessions = () => {
+		const enabled = !(this._state.sidebar?.showCompletedAgentSessions ?? false);
+		emitTelemetrySentEvent<'graph/agents/showCompletedToggled'>(this, {
+			name: 'graph/agents/showCompletedToggled',
+			data: {
+				enabled: enabled,
+				'sessions.completed.count': (this._state.agentSessions ?? []).filter(s => s.phase === 'completed')
+					.length,
+			},
+		});
+		this._state.sidebar = { showCompletedAgentSessions: enabled };
+		this.dispatchEvent(
+			new CustomEvent<boolean>('gl-graph-sidebar-show-completed-agents-change', {
+				detail: enabled,
 				bubbles: true,
 				composed: true,
 			}),

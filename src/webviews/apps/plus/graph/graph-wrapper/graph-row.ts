@@ -2,7 +2,12 @@ import { buildAriaLabel } from '@gitkraken/commit-graph/a11y.js';
 import { colorForColumn, contrastColor, withAlpha } from '@gitkraken/commit-graph/colors.js';
 import type { GraphCommit, ProcessedGraphRow } from '@gitkraken/commit-graph/engine/types.js';
 import type { LaneWindow } from '@gitkraken/commit-graph/laneClamp.js';
-import { graphEdgeFadePx, rowShiftedGutterWidth } from '@gitkraken/commit-graph/laneClamp.js';
+import {
+	graphEdgeFadePx,
+	gutterMidY,
+	gutterTotalHeight,
+	rowShiftedGutterWidth,
+} from '@gitkraken/commit-graph/laneClamp.js';
 import type {
 	ChangesColumnMode,
 	ChangesColumnStage,
@@ -70,6 +75,13 @@ export interface RowRenderContext {
 	index: number;
 	total: number;
 	rowHeight: number;
+	/** Quantized-row unit span (row-units 'refs on their own line' consumer): 1 = an ordinary row, rendered
+	 *  BYTE-IDENTICAL to before this existed; `N > 1` spans `N` base `rowHeight`s. Absent means 1 — every
+	 *  call site treats `units ?? 1` and `dataUnit ?? 0` as the untouched-row default. */
+	units?: number;
+	/** 0-based unit within `units` the row's commit data (dot, sha/author/date, message) sits on. 0 for a
+	 *  1-unit row. */
+	dataUnit?: number;
 	/** Sticky-timeline hairline: this row's bucket (Today/Yesterday/This week/...) differs from the row
 	 *  above it — renders a `.gl-graph__row-timeline-sep` overlay (1px, no row/height cost; fades out
 	 *  before the lane gutter — see graph.scss). See `gl-lit-graph.ts`'s `renderRowItem`. */
@@ -262,31 +274,6 @@ function cachedInitials(name: string): string {
 	return value;
 }
 
-// Scope-anchor marker pills: a labeled, colored chip rendered BEFORE the branch pills so the thin rail
-// isn't the only cue for what a row is (legacy "TARGET" parity). Target wins as the primary label; when a
-// row is also the fork point a "Base" chip follows. The focal tip is skipped — its own branch pill already
-// names it. Inert (never a control): these annotate the row the user is already looking at.
-function anchorMarkerPill(kind: 'fork' | 'target', icon: string, label: string): TemplateResult {
-	const tooltip = label === 'Target' ? 'Merge Target' : 'Fork Point (Base)';
-	return html`<span
-		class="gl-graph__anchor-pill gl-graph__anchor-pill--${kind}"
-		aria-hidden="true"
-		data-tooltip=${tooltip}
-		><code-icon icon=${icon}></code-icon><span class="gl-graph__anchor-pill-label">${label}</span></span
-	>`;
-}
-
-function renderAnchorMarkers(ctx: RowRenderContext): TemplateResult | typeof nothing {
-	if (!ctx.isAnchor) return nothing;
-
-	// Every anchor the row plays, not just its dominant one — the focal tip of a branch level with its
-	// target is also that target and the fork point, and each is worth saying. No focal pill: the focal tip
-	// already carries the branch's own ref pill right next to it.
-	return html`${ctx.isTargetAnchor === true ? anchorMarkerPill('target', 'gl-merge-target', 'Target') : nothing}${
-		ctx.isForkAnchor === true ? anchorMarkerPill('fork', 'git-merge', 'Base') : nothing
-	}`;
-}
-
 /** The on-row row-marker indicator: a colored VERTICAL BAR pinned at the left edge of the graph column
  *  (`--row-graph-left`), rendered as a direct child of the row (a sibling of the anchor rail), NOT a member
  *  of the row-action strip. One bar carries every role the row plays — so a row that is HEAD *and* its
@@ -341,22 +328,16 @@ function renderRowMarkerRail(roles: number, targetName: string | undefined): Tem
 		</div>`;
 }
 
-/** A single ref-chip container for the first content column (inline refs), with any scope-anchor
- *  marker prepended before the branch/tag pills, and an optional resolved ghost ref appended. */
+/** A single ref-chip container for the first content column (inline refs), the branch/tag pills plus an
+ *  optional resolved ghost ref appended. */
 function renderInlineRefs(
 	row: ProcessedGraphRow,
 	refs: readonly TemplateResult[],
-	ctx: RowRenderContext,
 	ghost?: RowRenderContext['ghostRef'],
 ): TemplateResult {
 	return html`<span class="gl-graph__refs" data-sha=${row.sha}
-		>${renderAnchorMarkers(ctx)}${refs}${ghost != null ? renderGhostRefPill(ghost, row.column) : nothing}</span
+		>${refs}${ghost != null ? renderGhostRefPill(ghost, row.column) : nothing}</span
 	>`;
-}
-
-/** Whether the row has a scope-anchor marker to show (so the refs cell renders even with no branch pills). */
-function hasMarkerPills(ctx: RowRenderContext): boolean {
-	return ctx.isAnchor === true && (ctx.isTargetAnchor === true || ctx.isForkAnchor === true);
 }
 
 /** Whether a ref-less row gets the ghost pill: the config is on, the row is a normal commit/merge —
@@ -706,7 +687,10 @@ function changesSquareColor(fill: ChangesSquareFill): string {
  *  lookup — no geometry pass, no raster, no connector curves) plus a lane-colored dot at the row's lane
  *  x, pinned inside the visible width like the clamp pins real dots. `graph-edge` class so the lines pick
  *  up the real edges' stroke styling; the settle swap restores curves/connectors in place. The dot uses
- *  the ACTIVE node mode's radius so the settle swap fills it in place instead of jumping sizes. */
+ *  the ACTIVE node mode's radius so the settle swap fills it in place instead of jumping sizes.
+ *  `totalHeight`/`nodeY` default to the base `rowHeight`/its center — a promoted (quantized) row passes
+ *  its full span + shifted center so a fast-scroll burst doesn't draw the lane stopping short at the
+ *  base row height on the row's bottom (data) unit; the settle swap's real gutter reads the same span. */
 function renderSkeletonGutter(
 	row: ProcessedGraphRow,
 	width: number,
@@ -715,6 +699,8 @@ function renderSkeletonGutter(
 	singleColumn: boolean,
 	laneOffset: number,
 	nodeMode: NodeStyle['mode'],
+	totalHeight: number = rowHeight,
+	nodeY: number = rowHeight / 2,
 ): TemplateResult {
 	// SCREEN coordinates: subtract the active lane offset (grouped reveal / column h-scroll) so skeleton
 	// dots + lanes land where the real (clamp-written) geometry will — absolute x here would paint the
@@ -736,13 +722,13 @@ function renderSkeletonGutter(
 			if (lx < 0 || lx >= width || row.edges[col].passThrough == null) continue;
 
 			lanes.push(
-				svg`<line class="graph-edge" x1=${lx} y1="0" x2=${lx} y2=${rowHeight} stroke=${colorForColumn(col)} />`,
+				svg`<line class="graph-edge" x1=${lx} y1="0" x2=${lx} y2=${totalHeight} stroke=${colorForColumn(col)} />`,
 			);
 		}
 	}
-	return html`<svg class="graph-gutter" aria-hidden="true" role="presentation" width=${width} height=${rowHeight}>
+	return html`<svg class="graph-gutter" aria-hidden="true" role="presentation" width=${width} height=${totalHeight}>
 		${lanes}
-		<circle cx=${cx} cy=${rowHeight / 2} r=${r} fill=${colorForColumn(row.column)} />
+		<circle cx=${cx} cy=${nodeY} r=${r} fill=${colorForColumn(row.column)} />
 	</svg>`;
 }
 
@@ -767,9 +753,9 @@ function renderZoneContent(
 
 			// Dedicated Refs column: the same ref pills that otherwise render inline, in their own cell.
 			const refs = ctx.refsContent ?? [];
-			if (refs.length > 0 || hasMarkerPills(ctx)) return renderInlineRefs(row, refs, ctx);
+			if (refs.length > 0) return renderInlineRefs(row, refs);
 
-			return wantsGhostRef(row, ctx) ? renderInlineRefs(row, refs, ctx, ctx.ghostRef) : nothing;
+			return wantsGhostRef(row, ctx) ? renderInlineRefs(row, refs, ctx.ghostRef) : nothing;
 		}
 		case 'message':
 			return html`${
@@ -1101,6 +1087,12 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 	const isWorkdir = row.kind === 'workdir';
 	const refs = ctx.refsContent ?? [];
 	const hasRefs = refs.length > 0;
+	// Quantized-row unit span (row-units 'refs on their own line' consumer). `units`/`dataUnit` default to
+	// 1/0 — an ordinary row — so every markup path below that doesn't branch on `promoted` stays exactly
+	// what it rendered before this existed.
+	const units = ctx.units ?? 1;
+	const dataUnit = ctx.dataUnit ?? 0;
+	const promoted = units > 1;
 	// Format the relative date ONCE per row, then reuse for the date cell + both aria-label builds (one
 	// `new Date()` + Intl format per visible row instead of two producing the same string).
 	const relativeDate = ctx.commit.date ? (ctx.formatDate ?? relativeTime)(ctx.commit.date) : undefined;
@@ -1141,6 +1133,10 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 	// dominant cost of a full row, measured ~equal to everything else combined) for a single lane-colored
 	// dot at the row's lane x. Same `graph-gutter` class so the clamp walk finds a target and no-ops
 	// cleanly (no clamp hooks present); the settle swap restores the cached full gutter.
+	// `span` stays `undefined` (never `{ units: 1, dataUnit: 0 }`) for an ordinary row — see `GutterCache`'s
+	// own key/geometry contract: only `units > 1` changes the cache key or the built geometry at all, so an
+	// unpromoted row's gutter is byte-identical to before quantized rows existed.
+	const span = promoted ? { units: units, dataUnit: dataUnit } : undefined;
 	const gutter = (width: number, laneWindow: LaneWindow | undefined = ctx.laneWindow): TemplateResult =>
 		ctx.skeleton
 			? renderSkeletonGutter(
@@ -1151,6 +1147,8 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 					ctx.singleColumn === true,
 					ctx.laneOffset ?? 0,
 					ctx.nodeMode,
+					promoted ? gutterTotalHeight(rowHeight, units) : undefined,
+					promoted ? gutterMidY(rowHeight, dataUnit) : undefined,
 				)
 			: ctx.gutterCache.render(
 					row,
@@ -1163,6 +1161,7 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 					},
 					ctx.laneTipSha,
 					nodeStyle,
+					span,
 				);
 
 	// The dedicated fold strip prepended to the lanes (IDE code-folding gutter): a fixed-width column
@@ -1258,8 +1257,8 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 	// Ghost pills only ever render in the dedicated Refs column (`renderZoneContent` case 'ref') — inline
 	// placement (here) never reserves layout space for one on a ref-less row.
 	const inlineRefs =
-		ctx.skeleton !== true && ctx.refsPlacement !== 'hidden' && (hasRefs || hasMarkerPills(ctx)) && !refsInColumn
-			? renderInlineRefs(row, refs, ctx)
+		ctx.skeleton !== true && ctx.refsPlacement !== 'hidden' && hasRefs && !refsInColumn
+			? renderInlineRefs(row, refs)
 			: nothing;
 
 	// String concatenation (not array+filter+join) — this runs for every visible row on every
@@ -1387,14 +1386,31 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 			// Grouped refs render on their HOST zone by id (so the group moves as a unit); fall back to the
 			// first zone only when no host is set (refs as a column → `inlineRefs` is `nothing` anyway).
 			const refsHere = ctx.refsHostId != null ? zone.id === ctx.refsHostId : zoneIndex === 0;
-			const cellClass = `gl-graph__zone gl-graph__zone--${zone.id}${gutterHere ? ' is-flush' : ''}`;
-			const leading =
-				gutterHere || refsHere
-					? html`${gutterHere ? inlineGutter : nothing}${refsHere ? inlineRefs : nothing}`
-					: nothing;
-			return html`<div class=${cellClass} style=${cspStyleMap(zoneStyle(zone))}>
-				${leading}${renderZoneContent(zone, row, ctx, relativeDate)}
-			</div>`;
+			// A promoted row stacks the zones that CARRY the group — the refs host and the grouped gutter's
+			// host — into two lines (a pill line, then this zone's ordinary content) instead of prepending the
+			// pills inline before it; every other zone keeps today's single-line cell exactly and gets shrunk
+			// to the data unit by the `[data-units]` padding rule in graph.scss.
+			// The gutter's host earns the stack even when it hosts no pills (its top line renders empty, which
+			// is exactly right — it puts the zone's own content on the data line). Two cases reach it: a
+			// SKELETON render, which forces `inlineRefs` to nothing while the row stays promoted, and a
+			// grouped gutter hosted on a DIFFERENT zone than the refs. Without it, that zone falls into the
+			// padding rule and clips the gutter — which is a direct child of the zone and must span the row's
+			// full height — to the bottom unit.
+			const stackHere = promoted && (refsHere || gutterHere);
+			const cellClass = `gl-graph__zone gl-graph__zone--${zone.id}${gutterHere ? ' is-flush' : ''}${
+				stackHere ? ' gl-graph__zone--stacked' : ''
+			}`;
+			const zoneContent = renderZoneContent(zone, row, ctx, relativeDate);
+			const body = stackHere
+				? html`<div class="gl-graph__zone-stack">
+						<div class="gl-graph__refs-line">${refsHere ? inlineRefs : nothing}</div>
+						<div class="gl-graph__message-line">${zoneContent}</div>
+					</div>`
+				: html`${refsHere ? inlineRefs : nothing}${zoneContent}`;
+			// Outside the stack on purpose: the gutter is a DIRECT child of the zone so its lane art spans the
+			// row's full (possibly multi-unit) height — the stack's lines are one base row tall each.
+			const leading = gutterHere ? inlineGutter : nothing;
+			return html`<div class=${cellClass} style=${cspStyleMap(zoneStyle(zone))}>${leading}${body}</div>`;
 		});
 		// Movable graph column: splice the graph cell into the zone cells at `graphColumnPos` so it
 		// renders at the user-chosen slot (not always leftmost). Then it's part of `body`, not leading.
@@ -1426,10 +1442,14 @@ export function renderRow(row: ProcessedGraphRow, ctx: RowRenderContext): Templa
 		data-sha=${row.sha}
 		data-index=${ctx.index}
 		data-focused=${ctx.isFocused || nothing}
+		data-units=${promoted ? units : nothing}
 		data-vscode-context=${ctx.skeleton ? nothing : (ctx.commit.contextData ?? nothing)}
 		style=${cspStyleMap({
-			height: `${rowHeight}px`,
+			height: `${gutterTotalHeight(rowHeight, units)}px`,
+			// BASE row height, always — the per-unit pitch every zone/gutter/dot-centering calc below reads,
+			// same as an ordinary row. `--row-units` (below) is the only new signal a promoted row adds.
 			'--row-height': `${rowHeight}px`,
+			...(promoted ? { '--row-units': `${units}` } : undefined),
 			'--row-lane-color': colorForColumn(row.column),
 			'--row-lane-x': `${laneCenterX}px`,
 			'--row-lane-lead': `${laneLead}px`,

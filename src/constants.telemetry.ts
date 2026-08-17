@@ -1,6 +1,8 @@
 import type { AIProviders } from '@gitlens/ai/constants.js';
 import type { AIActionType } from '@gitlens/ai/models/model.js';
+import type { GitHealthDurationBucket, GitOptimizationTier } from '@gitlens/git/gitHealth.js';
 import type { GitContributionTiers } from '@gitlens/git/models/contributor.js';
+import type { GitOptimizationId } from '@gitlens/git/providers/maintenance.js';
 import type { IntegrationIds, SupportedCloudIntegrationIds } from '@gitlens/integrations/constants.js';
 import type { Flatten } from '@gitlens/utils/object.js';
 import type { Config, GraphBranchesVisibility, GraphConfig } from './config.js';
@@ -130,6 +132,9 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	'agents/hookInstalled': AgentProviderEvent;
 	/** Sent when an agent hook is uninstalled */
 	'agents/hookUninstalled': AgentProviderEvent;
+	/** Sent when an install-all/uninstall-all hooks operation (`gitlens.agents.installHooks` /
+	 *  `uninstallHooks` / the per-agent variants) completes across its target agents */
+	'agents/hooks/setup/completed': AgentHooksSetupCompletedEvent;
 	/** Sent when an agent session starts */
 	'agents/session/started': AgentProviderEvent;
 	/** Sent when an agent session ends */
@@ -247,6 +252,10 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	/** Sent when the user clicks on the "Open Repository on Remote" header button on the Commit Graph */
 	'graph/action/sidebar': GraphActionSidebarEvent;
 
+	/** Sent when a Commit Graph jump (a ref pill, sidebar/overview select, search step, host-initiated
+	 *  reveal, …) settles without landing on its row and shows the jump-feedback toast */
+	'graph/jump/failed': GraphJumpFailedEvent;
+
 	/** Sent when a contextual coach mark (feature how-to) is shown or dismissed on the Commit Graph */
 	'graph/coachMark': GraphCoachMarkEvent;
 
@@ -340,6 +349,8 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	'graph/agents/headerAction': GraphSidebarAgentsHeaderActionEvent;
 	/** Sent when the user toggles the tree/list layout in the sidebar agents panel */
 	'graph/agents/layoutToggled': GraphSidebarAgentsLayoutToggledEvent;
+	/** Sent when the user toggles completed sessions on/off in the sidebar agents panel */
+	'graph/agents/showCompletedToggled': GraphSidebarAgentsShowCompletedToggledEvent;
 	/** Sent when the sidebar agents filter toggles between empty and non-empty (not on every keystroke) */
 	'graph/agents/filtered': GraphSidebarAgentsFilteredEvent;
 
@@ -419,8 +430,8 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	/** Sent when the user types in the filter box in the sidebar tags panel */
 	'graph/tags/filtered': GraphSidebarTagsFilteredEvent;
 
-	/** Sent when the one-time layout-choice prompt is shown on first entry to the Graph view */
-	'graph/layoutPrompt/shown': GraphLayoutPromptShownEvent;
+	/** Sent when the one-time Graph intro (welcome + optional layout prompt) is shown on first entry */
+	'graph/intro/shown': GraphIntroShownEvent;
 	/** Sent when the user answers (or closes) the one-time layout-choice prompt */
 	'graph/layoutPrompt/choice': GraphLayoutPromptChoiceEvent;
 
@@ -618,8 +629,17 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	'mcp/setup/failed': MCPSetupFailedEvent;
 	/** Sent when GitKraken MCP registration fails */
 	'mcp/registration/failed': MCPSetupFailedEvent;
-	/** Sent when user selects agents for MCP installation */
-	'mcp/agents/selected': MCPAgentsSelectedEvent;
+	/** Sent when the user uninstalls GitKraken MCP for a single agent */
+	'mcp/agent/uninstalled': MCPAgentUninstalledEvent;
+
+	/** Sent when the Git Health cheap shape probe runs for a repo */
+	'gitHealth/probe': GitHealthProbeEvent;
+	/** Sent when the auto-tier runs a `git maintenance run --task=…` one-shot (or "Run Maintenance Now") */
+	'gitOptimizations/maintenance/run': GitOptimizationsMaintenanceRunEvent;
+	/** Sent when the per-repo commit-graph maintenance toggle is switched from the Repository Health view */
+	'gitOptimizations/commitGraph/toggled': GitOptimizationsCommitGraphToggledEvent;
+	/** Sent when a config-lever optimization is actually applied to a repo (auto tier or user-initiated) */
+	'gitOptimizations/optimization/applied': GitOptimizationsOptimizationAppliedEvent;
 
 	'op/gate/deadlock': OperationGateDeadlockEvent;
 	'op/git/aborted': OperationGitAbortedEvent;
@@ -642,10 +662,14 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 
 	/** Sent when the user starts a rebase (clicks "Start Rebase") */
 	'rebaseEditor/action/start': RebaseEditorCompletionEventData;
+	/** Sent when the user hands a pending rebase off to automatic (AI) conflict resolution */
+	'rebaseEditor/action/startWithAi': RebaseEditorCompletionEventData;
 	/** Sent when the user aborts a rebase */
 	'rebaseEditor/action/abort': RebaseEditorCompletionEventData;
 	/** Sent when the user continues a paused rebase */
 	'rebaseEditor/action/continue': RebaseEditorContextEventData;
+	/** Sent when the user hands a paused rebase over to automatic (AI) conflict resolution */
+	'rebaseEditor/action/continueWithAi': RebaseEditorContextEventData;
 	/** Sent when the user skips a commit during a paused rebase */
 	'rebaseEditor/action/skip': RebaseEditorContextEventData;
 	/** Sent when the user switches to the text editor */
@@ -791,10 +815,9 @@ type WebviewShowAbortedEvents = {
 	[K in `${WebviewTypes}/showAborted`]: WebviewShownEventData;
 };
 type WebviewShownEvents = {
-	[K in `${Exclude<
-		WebviewTypes,
-		'commitDetails' | 'graph' | 'rebaseEditor' | 'timeline'
-	>}/shown`]: WebviewShownEventData & Record<`context.${string}`, string | number | boolean | undefined>;
+	[
+		K in `${Exclude<WebviewTypes, 'commitDetails' | 'graph' | 'rebaseEditor' | 'timeline'>}/shown`
+	]: WebviewShownEventData & Record<`context.${string}`, string | number | boolean | undefined>;
 };
 
 type WebviewClosedEvents = {
@@ -819,6 +842,13 @@ interface AccountValidationFailedEvent {
 
 interface AgentProviderEvent {
 	'agent.provider': string;
+}
+
+interface AgentHooksSetupCompletedEvent {
+	operation: 'install' | 'uninstall';
+	source: Sources;
+	'agents.succeeded'?: string;
+	'agents.failed'?: string;
 }
 
 interface AgentPermissionResolvedEvent {
@@ -1003,6 +1033,9 @@ interface AutoRebaseLifecycleEvent {
 
 interface AutoRebaseStartedEvent {
 	takeover: boolean;
+	/** How the run was engaged: fresh rebase, takeover of a paused one, or a pre-start handoff from
+	 *  the Interactive Rebase Editor */
+	mode: 'started' | 'takeover' | 'handoff';
 }
 
 interface AutoRebaseStepResolvedEvent {
@@ -1042,6 +1075,8 @@ interface AutoRebaseEscalatedEvent extends AutoRebaseLifecycleEvent {
 		| 'ai-unavailable'
 		| 'skipped-files'
 		| 'non-conflict-pause'
+		| 'message-edit'
+		| 'edit-step'
 		| 'external-modification'
 		| 'step-cap'
 		| 'continue-error'
@@ -1125,10 +1160,9 @@ export interface MCPSetupFailedEvent {
 	'agents.failed'?: string;
 }
 
-export interface MCPAgentsSelectedEvent {
+export interface MCPAgentUninstalledEvent {
 	source: Sources;
-	'agents.count': number;
-	'agents.ids': string;
+	'agent.id': string;
 }
 
 interface CloudIntegrationsConnectingEvent {
@@ -1564,7 +1598,7 @@ interface GraphActionRefFindEvent extends GraphContextEventData {
 	/** How the finder was opened — tells us whether the header button is carrying its own discovery. */
 	source: 'shortcut' | 'button';
 	/** Which kind of reference was landed on. */
-	kind: 'head' | 'remote' | 'tag';
+	kind: 'head' | 'remote' | 'tag' | 'wip';
 	/** Whether the reference's commit had to be paged in first (the Enter-to-fetch path). */
 	loaded: boolean;
 	/** Whether the query used `/` path segments (e.g. `d/f/foo`) rather than a plain substring. */
@@ -1582,10 +1616,19 @@ interface GraphActionSidebarEvent extends GraphContextEventData {
 	action: string;
 }
 
+interface GraphJumpFailedEvent extends GraphContextEventData {
+	/** The classified failure kind — a hidden row's sub-reason when applicable, else the top-level kind
+	 *  (`not-found`, `invalid-ref`, `first-parent`, `timeout`, `error`). */
+	reason: string;
+	/** Diagnostic origin of the navigation that failed (a `GraphNavigationSource`, or `'host'` for a
+	 *  host-initiated reveal that never resolved its ref). */
+	source: string;
+}
+
 interface GraphCoachMarkEvent extends GraphContextEventData {
 	/** Which coach mark (`GraphCoachMarkType`) */
 	key: string;
-	action: 'shown' | 'dismissed';
+	action: 'shown' | 'dismissed' | 'actioned';
 	/** How the mark was shown — state-triggered (`auto`) or re-opened from its lightbulb (`lightbulb`) */
 	trigger?: 'auto' | 'lightbulb';
 }
@@ -2015,6 +2058,12 @@ interface GraphSidebarAgentsLayoutToggledEvent extends GraphContextEventData {
 	'sessions.count': number;
 }
 
+interface GraphSidebarAgentsShowCompletedToggledEvent extends GraphContextEventData {
+	enabled: boolean;
+	/** Completed session count BEFORE the toggle takes effect */
+	'sessions.completed.count': number;
+}
+
 interface GraphSidebarAgentsFilteredEvent extends GraphContextEventData {
 	hasFilter: boolean;
 	'filter.length': number;
@@ -2278,7 +2327,7 @@ interface GraphSidebarTagsTagSelectedEvent extends GraphContextEventData {
 	annotated: boolean;
 }
 
-export type GraphSidebarTagsActionName = 'switchTo' | 'delete' | 'createBranch' | 'reset';
+export type GraphSidebarTagsActionName = 'switchTo' | 'delete' | 'push' | 'createBranch' | 'reset';
 
 interface GraphSidebarTagsTagActionEvent extends GraphContextEventData {
 	action: GraphSidebarTagsActionName;
@@ -2306,10 +2355,12 @@ interface GraphSidebarTagsFilteredEvent extends GraphContextEventData {
 /** Flat key identifying a Graph visualization — collapses the two-axis
  *  (visualizationMode × treemapMode) state so one field names the active visualization,
  *  matching the switcher's tab model. */
-export type GraphVisualizationKey = 'timeline' | 'treemap-files' | 'treemap-commits' | 'treemap-activity';
+export type GraphVisualizationKey = 'timeline' | 'treemap-files' | 'treemap-commits' | 'treemap-activity' | 'health';
 
-/** No dimensions beyond the shared graph context */
-type GraphLayoutPromptShownEvent = GraphContextEventData;
+interface GraphIntroShownEvent extends GraphContextEventData {
+	/** True when the layout sub-section (Side Bar vs. Bottom Panel) was shown alongside the welcome */
+	withLayoutOptions: boolean;
+}
 
 interface GraphLayoutPromptChoiceEvent extends GraphContextEventData {
 	/** `dismissed` = closed the prompt without choosing (keeps the current layout, never re-asks) */
@@ -2533,6 +2584,60 @@ interface OperationGateDeadlockEvent {
 	timeout: number;
 	/** Whether this is just a warning or the gate was forcibly cleared */
 	status: 'warning' | 'aborted';
+}
+
+interface GitHealthProbeEvent {
+	/** Number of `*.pack` files in the object store */
+	'packs.count': number;
+	/** Total bytes of all pack files */
+	'packs.bytes': number;
+	/** Extrapolated loose-object count */
+	'estimate.looseObjects': number;
+	/** Tracked-file count — the exact index-header entry count when available, else the index-bytes proxy */
+	'estimate.trackedFiles': number;
+	/** Whether `estimate.trackedFiles` is the exact index-header count rather than the byte-size estimate */
+	'estimate.trackedFilesExact': boolean;
+	/** Whether a commit-graph is present */
+	'commitGraph.present': boolean;
+	/** Whether a multi-pack-index is present */
+	multiPackIndex: boolean;
+	/** Whether the repo is registered for system-scheduled maintenance */
+	maintenanceRegistered: boolean;
+	/** Whether the repo is "clearly large" per the banner gate */
+	clearlyLarge: boolean;
+	/** Total number of findings the report produced */
+	'findings.total': number;
+	/** Number of auto-tier findings */
+	'findings.auto': number;
+	/** Number of ask-tier findings */
+	'findings.ask': number;
+	/** Count of slow git commands observed for this repo — persisted across sessions, pruned after 30 days idle */
+	'slowness.count': number;
+}
+
+interface GitOptimizationsMaintenanceRunEvent {
+	/** The maintenance task that ran */
+	task: 'commit-graph' | 'loose-objects' | 'incremental-repack';
+	/** Duration of the run in ms */
+	duration: number;
+	/** Coarse duration bucket */
+	'duration.bucket': GitHealthDurationBucket;
+}
+
+interface GitOptimizationsCommitGraphToggledEvent {
+	/** The toggle's new state — `false` means the user opted this repo out of automatic commit-graph maintenance */
+	enabled: boolean;
+}
+
+interface GitOptimizationsOptimizationAppliedEvent {
+	/** The config lever that was applied */
+	optimization: GitOptimizationId;
+	/** Which tier applied it — `auto` is the silent daily pass, `ask` is user-initiated */
+	tier: GitOptimizationTier;
+	/** Duration of the apply in ms */
+	duration: number;
+	/** Coarse duration bucket */
+	'duration.bucket': GitHealthDurationBucket;
 }
 
 interface OperationGitAbortedEvent {
@@ -2837,10 +2942,9 @@ type AgentResolvedEventData =
 
 export type SubscriptionFeaturePreviewsEventData = {
 	[F in FeaturePreviews]: {
-		[K in Exclude<
-			keyof FeaturePreviewEventData,
-			'feature'
-		> as `subscription.featurePreviews.${F}.${K}`]: NonNullable<FeaturePreviewEventData[K]>;
+		[
+			K in Exclude<keyof FeaturePreviewEventData, 'feature'> as `subscription.featurePreviews.${F}.${K}`
+		]: NonNullable<FeaturePreviewEventData[K]>;
 	};
 }[FeaturePreviews];
 
@@ -3037,6 +3141,7 @@ export type TrackingContext = 'graph' | 'launchpad' | 'mcp' | 'visual_file_histo
 
 export type Sources =
 	| 'account'
+	| 'agents'
 	| 'ai'
 	| 'ai:markdown-preview'
 	| 'ai:markdown-editor'
@@ -3081,6 +3186,7 @@ export type Sources =
 	| 'startWork'
 	| 'statusbar:hover'
 	| 'subscription'
+	| 'terminal'
 	| 'timeline'
 	| 'trial-indicator'
 	| 'view'

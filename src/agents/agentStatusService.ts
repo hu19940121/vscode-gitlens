@@ -1,11 +1,14 @@
 import type { Disposable, QuickPickItem } from 'vscode';
-import { commands, EventEmitter, Uri, window, workspace } from 'vscode';
+import { commands, EventEmitter, ProgressLocation, Uri, window, workspace } from 'vscode';
 import { Logger } from '@gitlens/utils/logger.js';
 import { arePathsEqual } from '@gitlens/utils/path.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
+import type { Source, Sources } from '../constants.telemetry.js';
 import type { Container } from '../container.js';
+import { openWorktreeInNewWindow, showWorktreeInGraph } from '../plus/graph/worktreeActions.js';
 import { createQuickPickSeparator } from '../quickpicks/items/common.js';
 import { registerCommand } from '../system/-webview/command.js';
+import type { GkAgent } from './agentService.js';
 import type {
 	AgentSessionState,
 	AgentSessionWorktreeMetadata,
@@ -20,12 +23,18 @@ import type {
 	PermissionSuggestion,
 	ResumableSessionsResult,
 } from './provider.js';
-import { isClaudeExtensionAvailable, tryOpenClaudeSession } from './utils/-webview/claudeExtension.js';
+import { isActiveAgentPhase } from './provider.js';
+import {
+	isActiveClaudeTab,
+	isClaudeExtensionAvailable,
+	tryOpenClaudeSession,
+} from './utils/-webview/claudeExtension.js';
 import {
 	canResumeSession,
 	resumeClaudeSessionInTerminal,
 	toResumableSessionRef,
 } from './utils/-webview/claudeResume.js';
+import { areHooksAllowedForAgent, getHookClientId } from './utils/agentHooks.js';
 
 export class AgentStatusService implements Disposable {
 	private readonly _onDidChange = new EventEmitter<void>();
@@ -227,6 +236,135 @@ export class AgentStatusService implements Disposable {
 		}
 		for (const provider of this._providers) {
 			provider.setClaudeHooksInstalled?.(installed);
+		}
+	}
+
+	/** `gitlens.agents.installHooks` / `uninstallHooks` — install-all model: every detected,
+	 *  hooks-supported agent that doesn't already match the target state (no IDE-agent exclusion;
+	 *  `hooksSupported` alone decides eligibility, since cursor/antigravity are valid hook clients). */
+	private async handleHooksOperationCommand(op: 'install' | 'uninstall', source?: Sources): Promise<void> {
+		try {
+			const all = await this.container.agents.getAll();
+			const agents = all.filter(
+				a => a.detected && a.hooksSupported && (op === 'install' ? !a.hooksInstalled : a.hooksInstalled),
+			);
+			await this.runHooksOperation(agents, op, source ?? 'commandPalette');
+		} catch (ex) {
+			Logger.error(ex, `AgentStatusService.${op}Hooks`);
+			void window.showErrorMessage(
+				`Failed to ${op} GitKraken Hooks: ${ex instanceof Error ? ex.message : String(ex)}`,
+			);
+		}
+	}
+
+	/** `gitlens.agents.installHooksForAgent` / `uninstallHooksForAgent` — hidden, dispatched by the
+	 *  Settings → Agents table for a single agent's Hooks cell. */
+	private async handleHooksOperationForAgentCommand(
+		op: 'install' | 'uninstall',
+		args?: { agentId?: string; source?: Sources },
+	): Promise<void> {
+		const agentId = args?.agentId;
+		if (agentId == null) return;
+
+		const name = agentId.startsWith('cli:') ? agentId.slice(4) : agentId;
+
+		try {
+			const agent = (await this.container.agents.getAll()).find(a => a.name === name);
+			if (agent == null) {
+				void window.showWarningMessage(`Agent '${name}' is no longer available.`);
+				return;
+			}
+
+			await this.runHooksOperation([agent], op, args?.source ?? 'commandPalette');
+		} catch (ex) {
+			Logger.error(ex, `AgentStatusService.${op}HooksForAgent`);
+			void window.showErrorMessage(
+				`Failed to ${op} GitKraken Hooks for ${name}: ${ex instanceof Error ? ex.message : String(ex)}`,
+			);
+		}
+	}
+
+	/** Shared core for both the install-all and per-agent hooks commands: sequentially (un)installs
+	 *  hooks for `agents` — one at a time, so a slow/hung `gk ai hook install` for one agent doesn't
+	 *  race a concurrent CLI invocation for another — reports per-agent telemetry and an aggregate
+	 *  toast, then invalidates the cached agent state so dependent surfaces (AI RPC, Agents RPC,
+	 *  graph notify) pick up the new install state. */
+	private async runHooksOperation(
+		agents: readonly GkAgent[],
+		op: 'install' | 'uninstall',
+		source: Sources,
+	): Promise<void> {
+		// Honor the Claude-only hooks flag — silently drop any non-Claude targets before operating.
+		const targets = agents.filter(a => areHooksAllowedForAgent(a.name));
+		if (targets.length === 0) {
+			void window.showInformationMessage(
+				op === 'install'
+					? 'No additional hook-ready agents were detected on your machine.'
+					: 'No agents currently have GitKraken Hooks installed.',
+			);
+			return;
+		}
+
+		const { installAgentHook, uninstallAgentHook } = await import(
+			/* webpackChunkName: "agents" */ '@env/agents/agentHooks.js'
+		);
+
+		const succeeded: string[] = [];
+		const failed: { agent: string; error: string }[] = [];
+
+		await window.withProgress(
+			{
+				location: ProgressLocation.Notification,
+				title: `${op === 'install' ? 'Installing' : 'Uninstalling'} GitKraken Hooks for ${targets.length} agent${targets.length > 1 ? 's' : ''}...`,
+				cancellable: false,
+			},
+			async () => {
+				for (const agent of targets) {
+					const hookClientId = getHookClientId(agent.name);
+					try {
+						if (op === 'install') {
+							await installAgentHook(hookClientId);
+						} else {
+							await uninstallAgentHook(hookClientId);
+						}
+						succeeded.push(agent.displayName);
+						this.container.telemetry.sendEvent(
+							op === 'install' ? 'agents/hookInstalled' : 'agents/hookUninstalled',
+							{ 'agent.provider': hookClientId },
+						);
+					} catch (ex) {
+						Logger.error(ex, `AgentStatusService.runHooksOperation(${op})`, `agent=${agent.name}`);
+						failed.push({
+							agent: agent.displayName,
+							error: ex instanceof Error ? ex.message : 'Unknown error',
+						});
+					}
+				}
+			},
+		);
+
+		await this.invalidateHooksState();
+
+		this.container.telemetry.sendEvent('agents/hooks/setup/completed', {
+			operation: op,
+			source: source,
+			'agents.succeeded': succeeded.join(',') || undefined,
+			'agents.failed': failed.map(f => f.agent).join(',') || undefined,
+		});
+
+		const parts: string[] = [];
+		if (succeeded.length > 0) {
+			parts.push(`${op === 'install' ? 'Installed' : 'Uninstalled'} for ${succeeded.join(', ')}`);
+		}
+		if (failed.length > 0) {
+			parts.push(`Failed for ${failed.map(f => f.agent).join(', ')}`);
+		}
+
+		const message = `GitKraken Hooks: ${parts.join('. ')}.`;
+		if (failed.length > 0) {
+			void window.showWarningMessage(message);
+		} else {
+			void window.showInformationMessage(message);
 		}
 	}
 
@@ -446,7 +584,7 @@ export class AgentStatusService implements Disposable {
 		);
 	}
 
-	private maybeFireSessionsChanged(): void {
+	private maybeFireSessionsChanged(force?: boolean): void {
 		// Compared PER SESSION rather than as one stringified snapshot: the memo hands back the same
 		// key instance for a session that didn't change, making the comparison a pointer check, so a
 		// long tail of terminal rows costs a lookup each instead of being re-stringified on every
@@ -468,7 +606,7 @@ export class AgentStatusService implements Disposable {
 		if (!changed && keys.size !== this._lastSessionKeys.size) {
 			changed = true;
 		}
-		if (!changed) return;
+		if (!changed && !force) return;
 
 		this._lastSessionKeys = keys;
 		this._onDidChangeSessions.fire(states);
@@ -668,6 +806,14 @@ export class AgentStatusService implements Disposable {
 		return this._worktreeRefreshPromise;
 	}
 
+	/** Forces every provider to reconcile with its durable store, then re-publishes the snapshot
+	 *  unconditionally — the repair path behind the sidebar's Refresh action. The forced publish is
+	 *  the point: a change-gated one would skip a no-op reconcile and leave a diverged webview stale. */
+	async refresh(): Promise<void> {
+		await Promise.allSettled(this._providers.map(p => p.sync?.() ?? Promise.resolve()));
+		this.maybeFireSessionsChanged(true);
+	}
+
 	resolvePermission(
 		sessionId: string,
 		decision: PermissionDecision,
@@ -677,17 +823,30 @@ export class AgentStatusService implements Disposable {
 			const session = provider.sessions.find(s => s.id === sessionId);
 			if (session == null) continue;
 
-			// `false` means the session is peer-discovered (owned by another GitLens window);
-			// our local provider has no `_pendingPermissions` entry to fulfil. Surface a hint so
-			// the user knows where to act rather than seeing a silent no-op.
+			// `false` means the local provider holds no `_pendingPermissions` entry to fulfil, for one
+			// of two reasons: another GitLens window owns the session, or the ask arrived on a
+			// non-blocking path (an elicitation, or one the reconciliation poll discovered) and can
+			// only be answered in the agent's own session. Point at the right place rather than
+			// leaving a silent no-op.
 			const resolved = provider.resolvePermission?.(sessionId, decision, updatedPermissions) ?? false;
 			if (!resolved) {
-				const target = session.workspacePath
-					? `the GitLens window for ${session.workspacePath}`
-					: 'another GitLens window';
-				void window.showInformationMessage(
-					`This agent session is owned by ${target}. Resolve the request from there.`,
-				);
+				// The ask may have been answered in the agent's own session between the render and this
+				// click — a raced click, not an unroutable ask, so say nothing.
+				const refetched = provider.sessions.find(s => s.id === sessionId);
+				if (refetched?.pendingPermission == null) return;
+
+				if (session.isPeerOwned) {
+					const target = session.workspacePath
+						? `the GitLens window for ${session.workspacePath}`
+						: 'another GitLens window';
+					void window.showInformationMessage(
+						`This agent session is owned by ${target}. Resolve the request from there.`,
+					);
+				} else {
+					void window.showInformationMessage(
+						`This request can only be answered in the agent's session. Open the session to respond.`,
+					);
+				}
 			}
 			return;
 		}
@@ -695,36 +854,18 @@ export class AgentStatusService implements Disposable {
 
 	private registerCommands(): Disposable[] {
 		return [
-			registerCommand('gitlens.agents.installClaudeHook', async () => {
-				try {
-					const { installClaudeHook } = await import(
-						/* webpackChunkName: "agents" */ '@env/agents/installClaudeHook.js'
-					);
-					await installClaudeHook();
-					await this.invalidateHooksState();
-					this.container.telemetry.sendEvent('agents/hookInstalled', { 'agent.provider': 'claudeCode' });
-				} catch (ex) {
-					Logger.error(ex, 'AgentStatusService.installClaudeHook');
-					void window.showErrorMessage(
-						`Failed to install Claude Hooks: ${ex instanceof Error ? ex.message : String(ex)}`,
-					);
-				}
-			}),
-			registerCommand('gitlens.agents.uninstallClaudeHook', async () => {
-				try {
-					const { uninstallClaudeHook } = await import(
-						/* webpackChunkName: "agents" */ '@env/agents/uninstallClaudeHook.js'
-					);
-					await uninstallClaudeHook();
-					await this.invalidateHooksState();
-					this.container.telemetry.sendEvent('agents/hookUninstalled', { 'agent.provider': 'claudeCode' });
-				} catch (ex) {
-					Logger.error(ex, 'AgentStatusService.uninstallClaudeHook');
-					void window.showErrorMessage(
-						`Failed to uninstall Claude Hooks: ${ex instanceof Error ? ex.message : String(ex)}`,
-					);
-				}
-			}),
+			registerCommand('gitlens.agents.installHooks', (src?: Source) =>
+				this.handleHooksOperationCommand('install', src?.source),
+			),
+			registerCommand('gitlens.agents.uninstallHooks', (src?: Source) =>
+				this.handleHooksOperationCommand('uninstall', src?.source),
+			),
+			registerCommand('gitlens.agents.installHooksForAgent', (args?: { agentId?: string; source?: Sources }) =>
+				this.handleHooksOperationForAgentCommand('install', args),
+			),
+			registerCommand('gitlens.agents.uninstallHooksForAgent', (args?: { agentId?: string; source?: Sources }) =>
+				this.handleHooksOperationForAgentCommand('uninstall', args),
+			),
 			registerCommand('gitlens.agents.openSession', (sessionId?: string) => this.openSession(sessionId)),
 			registerCommand('gitlens.agents.resumeSession', (args?: { sessionId: string; cwd: string }) => {
 				if (args?.sessionId == null) return Promise.resolve();
@@ -736,6 +877,15 @@ export class AgentStatusService implements Disposable {
 
 				return this.showResumeSessionPicker(args.worktreePath);
 			}),
+			registerCommand('gitlens.agents.showSessionWorktreeInGraph', (sessionId?: string) =>
+				this.showSessionWorktreeInGraph(sessionId),
+			),
+			registerCommand('gitlens.agents.focusSessionWorktreeInGraph', (sessionId?: string) =>
+				this.focusSessionWorktreeInGraph(sessionId),
+			),
+			registerCommand('gitlens.agents.openSessionWorktreeInNewWindow', (sessionId?: string) =>
+				this.openSessionWorktreeInNewWindow(sessionId),
+			),
 			registerCommand('gitlens.agents.switchDefaultAgent', async () => {
 				const { pickAndSetDefaultAgent } = await import(
 					/* webpackChunkName: "agents" */ '../plus/agents/agentPicker.js'
@@ -857,6 +1007,106 @@ export class AgentStatusService implements Disposable {
 		if (session == null) return;
 
 		await this.dispatchSessionAction(session);
+	}
+
+	/** Opens the Commit Graph at a Claude session's worktree with its WIP row selected, highlighting
+	 *  the session's card in the details panel. Backs the editor-title button and tab context menu
+	 *  on Claude Code conversation tabs. Never prompts. */
+	private showSessionWorktreeInGraph(sessionId?: string): void {
+		const session = this.resolveSessionForCommand(sessionId);
+		if (session?.worktreePath == null) return;
+
+		void showWorktreeInGraph(this.container, session.worktreePath, {
+			source: 'agents',
+			agentSessionId: session.id,
+		});
+	}
+
+	/** Focus counterpart to {@link showSessionWorktreeInGraph}: also scopes the graph to the
+	 *  worktree's branch, keeping the details panel closed to match the in-graph Focus commands. */
+	private focusSessionWorktreeInGraph(sessionId?: string): void {
+		const session = this.resolveSessionForCommand(sessionId);
+		if (session?.worktreePath == null) return;
+
+		void showWorktreeInGraph(this.container, session.worktreePath, {
+			source: 'agents',
+			focus: true,
+			agentSessionId: session.id,
+		});
+	}
+
+	private openSessionWorktreeInNewWindow(sessionId?: string): void {
+		const session = this.resolveSessionForCommand(sessionId);
+		if (session?.worktreePath == null) return;
+
+		openWorktreeInNewWindow(session.worktreePath);
+	}
+
+	/** Shared resolution for the Claude tab worktree commands. `sessionId` is only a real id when a
+	 *  programmatic caller passes a string — tab buttons/menus invoke with VS Code's resource arg (a
+	 *  Uri), which is ignored in favor of the active tab's label (the Claude extension renames each
+	 *  tab to the conversation summary — the only handle it exposes), falling back to the
+	 *  most-recently-active local session. Shows a message instead of prompting when nothing matches. */
+	private resolveSessionForCommand(sessionId?: string): AgentSession | undefined {
+		let session: AgentSession | undefined;
+		if (typeof sessionId === 'string') {
+			session = this.sessions.find(s => s.id === sessionId && s.worktreePath != null);
+		} else {
+			session = this.resolveSessionForActiveClaudeTab({ fallbackToMostRecent: true });
+		}
+
+		if (session?.worktreePath == null) {
+			void window.showInformationMessage('No agent session with an associated worktree was found.');
+			return undefined;
+		}
+
+		return session;
+	}
+
+	/** Resolves the local, worktree-bearing agent session backing the active Claude Code
+	 *  conversation tab via label matching. With `fallbackToMostRecent`, an unmatched (or unnamed)
+	 *  tab resolves to the most-recently-active session instead — appropriate for explicit user
+	 *  invocations; passive callers should omit it so a failed match does nothing. */
+	resolveSessionForActiveClaudeTab(options?: { fallbackToMostRecent?: boolean }): AgentSession | undefined {
+		const local = this.sessions.filter(s => s.worktreePath != null && !s.isPeerOwned);
+		const session = this.matchSessionToActiveClaudeTab(local);
+		if (session != null || !options?.fallbackToMostRecent) return session;
+
+		return pickMostRecentSession(local);
+	}
+
+	/** Maps the active Claude Code conversation tab to one of `candidates` by label. The Claude
+	 *  extension sets the tab title to the session summary, truncated to 24 chars + `…` when longer
+	 *  than 25 (and left as the literal "Claude Code" until a summary exists). We mirror that
+	 *  truncation across each candidate's known names; a unique hit wins, multiple hits resolve by
+	 *  recency among them. Returns `undefined` when the active tab isn't a Claude tab, is still
+	 *  unnamed, or no candidate matches — the caller then falls back to recency rather than prompting. */
+	private matchSessionToActiveClaudeTab(candidates: readonly AgentSession[]): AgentSession | undefined {
+		if (!isActiveClaudeTab()) return undefined;
+
+		const label = window.tabGroups.activeTabGroup?.activeTab?.label?.trim();
+		if (!label || label === 'Claude Code') return undefined;
+
+		// Mirror the Claude extension's tab-title truncation exactly (summary > 25 chars → first 24 + `…`).
+		const matchesLabel = (name: string | undefined) => {
+			if (name == null) return false;
+
+			const trimmed = name.trim();
+			return (trimmed.length > 25 ? `${trimmed.substring(0, 24)}…` : trimmed) === label;
+		};
+
+		const matches = candidates.filter(s => {
+			const worktreeName = this.getWorktreeMetadataForSession(s)?.name;
+			return (
+				matchesLabel(s.name) ||
+				matchesLabel(s.transcriptTitles?.custom) ||
+				matchesLabel(s.transcriptTitles?.ai) ||
+				matchesLabel(getSessionDisplayName(s, worktreeName))
+			);
+		});
+		if (matches.length === 0) return undefined;
+		if (matches.length === 1) return matches[0];
+		return pickMostRecentSession(matches);
 	}
 
 	/**
@@ -1127,4 +1377,15 @@ function isSameWorktreeMetadata(a: AgentSessionWorktreeMetadata | undefined, b: 
 	if (a.branch == null) return b.branch == null;
 	if (b.branch == null) return false;
 	return a.branch.name === b.branch.name && a.branch.upstreamName === b.branch.upstreamName;
+}
+
+/** Most-recently-active session wins, preferring those currently working or awaiting input over
+ *  idle ones — the best-effort pick when the active Claude tab can't be mapped to a single session. */
+export function pickMostRecentSession(sessions: readonly AgentSession[]): AgentSession | undefined {
+	return [...sessions].sort((a, b) => {
+		const aActive = isActiveAgentPhase(a.phase) ? 0 : 1;
+		const bActive = isActiveAgentPhase(b.phase) ? 0 : 1;
+		if (aActive !== bActive) return aActive - bActive;
+		return b.lastActivity.getTime() - a.lastActivity.getTime();
+	})[0];
 }
