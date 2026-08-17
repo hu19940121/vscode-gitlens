@@ -1,8 +1,10 @@
 import type { AIReviewDetailResult, AIReviewResult } from '@gitlens/ai/models/results.js';
+import type { GitHealthLever, GitHealthReport } from '@gitlens/git/gitHealth.js';
 import type { GitDiffFileStats } from '@gitlens/git/models/diff.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
 import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
+import type { GitHealthDetails, GitMaintenanceTask, GitOptimizationId } from '@gitlens/git/providers/maintenance.js';
 import type { ConflictKind } from '@gitlens/git/utils/conflictResolution.utils.js';
 import type { GlCommands } from '../../../constants.commands.js';
 import type { ConsultedTool } from '../../../plus/coretools/conflict/consultation.js';
@@ -191,6 +193,18 @@ export type ScopeSelection =
 			toSha: string;
 			includeShas?: string[];
 	  };
+
+/** A file in a scope's file list. Files from the scope's committed range (rather than the working
+ *  tree) carry an `anchor`, so context-menu handlers resolve them against real commits instead of
+ *  misreading them as working-tree changes. */
+export type ScopeFile = GitFileChangeShape & {
+	/** Present when the file's change comes from the scope's committed range rather than the working tree */
+	anchor?: 'committed';
+	/** Newest sha of the committed range containing the change */
+	anchorSha?: string;
+	/** Resolved base (parent of the oldest included sha) of the range diff; absent for root-anchored ranges */
+	anchorBaseSha?: string;
+};
 
 export type ReviewResult = { result: AIReviewResult } | { error: { message: string } };
 
@@ -459,7 +473,7 @@ export interface GraphInspectService {
 		tagSha: string,
 		signal?: AbortSignal,
 	): Promise<string | undefined>;
-	getScopeFiles(repoPath: string, scope: ScopeSelection, signal?: AbortSignal): Promise<GitFileChangeShape[]>;
+	getScopeFiles(repoPath: string, scope: ScopeSelection, signal?: AbortSignal): Promise<ScopeFile[]>;
 	reviewChanges(
 		repoPath: string,
 		scope: ScopeSelection,
@@ -725,11 +739,43 @@ export interface GraphTreemapService {
 	getData(repoPath: string, mode: TreemapMode, config: TreemapConfig, signal?: AbortSignal): Promise<TreemapData>;
 }
 
+export interface GraphWelcomeService {
+	/** One message for the whole welcome-continue interaction — persists the dismissals and
+	 *  performs the layout move in one causally-ordered handler, so nothing races the webview
+	 *  teardown the move triggers. */
+	continueToGraph(options: { layoutChoice: 'sidebar' | 'panel' | 'dismissed' }): Promise<void>;
+}
+
+/**
+ * Repository Health data plane for the Health visualization. Every method delegates to the
+ * container's `GitHealthService`, which the auto tier already drives — this contract is what finally
+ * gives those APIs a consumer.
+ *
+ * Apply and revert deliberately PROPAGATE failures rather than swallowing them: the auto tier catches
+ * and logs because nothing is watching, but here a person clicked, so an error has to reach the view.
+ */
+export interface GraphHealthService {
+	getReport(repoPath: string, signal?: AbortSignal): Promise<GitHealthReport | undefined>;
+	/** Per-lever rows — status, ownership, and the verbatim reason when a lever can't be used here. */
+	getLevers(repoPath: string, signal?: AbortSignal): Promise<GitHealthLever[]>;
+	getDetails(repoPath: string, signal?: AbortSignal): Promise<GitHealthDetails>;
+	applyFix(repoPath: string, id: GitOptimizationId, signal?: AbortSignal): Promise<boolean>;
+	revertFix(repoPath: string, id: GitOptimizationId, signal?: AbortSignal): Promise<void>;
+	runMaintenance(repoPath: string, signal?: AbortSignal): Promise<{ task: GitMaintenanceTask; ran: boolean }[]>;
+	/** Enables or disables GitLens's automatic commit-graph maintenance for this repo. User-clicked, so failures propagate. */
+	setCommitGraphEnabled(repoPath: string, enabled: boolean, signal?: AbortSignal): Promise<void>;
+
+	/** Fires with the repo path after any probe, apply, revert, or maintenance pass changes that repo's report. */
+	readonly onHealthChanged: RpcEventSubscription<{ repoPath: string }>;
+}
+
 export interface GraphServices extends SharedWebviewServices {
 	readonly graphInspect: GraphInspectService;
+	readonly graphHealth: GraphHealthService;
 	readonly launchpad: GraphLaunchpadService;
 	readonly walkthrough: GraphWalkthroughService;
 	readonly sidebar: GraphSidebarService;
+	readonly welcome: GraphWelcomeService;
 	readonly graphTimeline: GraphTimelineService;
 	readonly graphTreemap: GraphTreemapService;
 }

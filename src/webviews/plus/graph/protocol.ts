@@ -124,7 +124,10 @@ export interface GraphRefOptData {
 	name: string;
 	type: GraphRefType;
 	owner?: string;
-	avatarUrl?: string;
+	/** For remote entries — the remote's provider icon name (e.g. `github`), rendered as its font glyph. */
+	providerIcon?: string;
+	/** For a whole-remote wildcard (`name: '*'`) only — ids of branches exempted from the hide. */
+	except?: string[];
 }
 
 export interface ExcludeByType {
@@ -422,7 +425,7 @@ export interface GraphScopeBranch {
  *  Adding a new visualization is a 4-step extension: extend this union, render its component in
  *  `gl-graph-visualizations`, persist any per-visualization config in `graph-app.persistStateNow`,
  *  and add the host-side data service to `GraphServices`. */
-export type VisualizationMode = 'timeline' | 'treemap';
+export type VisualizationMode = 'timeline' | 'treemap' | 'health';
 
 /** Aliased from the canonical treemap protocol so both the storage type and the graph state refer
  *  to the same union — adding a fourth mode in `treemap/protocol.ts` flows here automatically. */
@@ -572,15 +575,17 @@ export interface State extends WebviewState<'gitlens.graph' | 'gitlens.views.gra
 	featurePreview?: FeaturePreview;
 	orgSettings?: { ai: boolean; drafts: boolean };
 	overview?: GraphOverviewData;
-	mcpBannerCollapsed?: boolean;
+	agentsBannerCollapsed?: boolean;
 	mcpCanAutoRegister?: boolean;
-	hooksBannerCollapsed?: boolean;
-	canInstallClaudeHook?: boolean;
+	canInstallHooks?: boolean;
+	hooksAgents?: readonly { id: string; displayName: string; installed: boolean }[];
 	graphWalkthroughBannerCollapsed?: boolean;
 	graphWalkthroughComplete?: boolean;
 	graphWalkthroughStarted?: boolean;
 	/** Show the one-time layout-choice prompt (view host only, until `graph:layoutPrompt` is dismissed) */
 	layoutPromptNeeded?: boolean;
+	/** Upgraded from a pre-19 version — surfaces the "new home for the Commit Graph" notice on the sign-in screen */
+	upgradedFromPreV19?: boolean;
 
 	// Persisted UI state (from `graph:state` workspace memento)
 	displayMode?: GraphDisplayMode;
@@ -600,6 +605,8 @@ export interface State extends WebviewState<'gitlens.graph' | 'gitlens.views.gra
 		activePanel?: GraphSidebarPanel;
 		/** `true` = filter (hide non-matches), `false` = highlight (dim non-matches). */
 		searchBoxFilter?: boolean;
+		/** Whether the agents panel shows completed sessions. Defaults to false (hidden). */
+		showCompletedAgentSessions?: boolean;
 	};
 	minimap?: {
 		visible?: boolean;
@@ -613,6 +620,15 @@ export interface State extends WebviewState<'gitlens.graph' | 'gitlens.views.gra
 		scopeOrigin?: GraphScopeOrigin;
 		composeInstructions?: string;
 		composeScope?: GraphComposeScopeSeed;
+		/** For 'show-wip': highlight this agent session's card in the details panel. */
+		agentSessionId?: string;
+		/** Selects/reveals only — suppresses opening the details panel (passive follow deliveries). */
+		revealOnly?: boolean;
+		/** Set ONLY by the follow controller's passive deliveries — drives the one-time coach mark. */
+		followed?: boolean;
+		/** For passive follow deliveries targeting the graph's own WIP row: consume only while the
+		 *  current selection is a WIP row; otherwise drop the delivery entirely. */
+		onlyIfWipSelected?: boolean;
 	};
 	/** A two-ref compare seeded by a cold show request (e.g. a terminal-link range). Consumed on
 	 *  bootstrap by the app, mirroring {@link pendingAction}; warm shows notify directly instead. */
@@ -805,6 +821,12 @@ export interface GraphComponentConfig {
 	enabledRefMetadataTypes?: GraphRefMetadataType[];
 	experimentalKanbanEnabled?: boolean;
 	experimentalVisualizationsEnabled?: boolean;
+	/**
+	 * Whether this repo exposes the maintenance sub-provider (`repo.git.maintenance != null`). Absent on
+	 * web builds, virtual repos, and Live Share — the Repository Health tab is omitted entirely there,
+	 * since it would render with nothing to report and every lever unavailable.
+	 */
+	gitHealthAvailable?: boolean;
 	/** Raw setting value for the Activity-mode treemap decay window — drives the picker selection. */
 	activityDecay?: GraphActivityDecay;
 	/** Resolved decay window (ms) for the Activity-mode treemap heatmap. Drives how long a file's
@@ -852,6 +874,17 @@ export interface GraphComponentConfig {
 	 * Backed by the user setting `gitlens.graph.lanes.grouped.max`.
 	 */
 	lanesGroupedMax?: number;
+	/** Maximum number of branch/tag pills shown inline per row, as space allows; extras collapse behind
+	 *  a +N counter on the last pill. `'auto'` derives the cap from the available refs width instead of
+	 *  a fixed count. Backed by `gitlens.graph.refs.maxInline`. */
+	maxInlineRefs?: number | 'auto';
+	/** Maximum number of branch/tag pills shown on the stacked pill line per row, as space allows; extras
+	 *  collapse behind a +N counter on the last pill. `'auto'` derives the cap from the line's available
+	 *  width instead of a fixed count. Backed by `gitlens.graph.refs.maxStacked`. */
+	maxStackedRefs?: number | 'auto';
+	/** How branch/tag pills are laid out on each row — `'stacked'` grows an extra line to show them above
+	 *  the commit instead of inline with it. Backed by `gitlens.graph.refs.layout`. */
+	refsLayout?: 'inline' | 'stacked';
 	/** Whether the minimap is available at all; when `false` it is never shown and has no header toggle. */
 	minimap?: Config['graph']['minimap']['enabled'];
 	/** When to show an available minimap; the stored per-workspace toggle overrides this. */
@@ -1192,6 +1225,11 @@ export interface DidLoadRowParams {
 	id?: string; // `undefined` if the row was not found
 	/** Set when the host couldn't load the row. `id` is undefined alongside. */
 	error?: string;
+	/** Set only when `id` is undefined — why the targeted row load failed:
+	 *  - `notFound`: the walk exhausted history and the commit doesn't exist in the repository.
+	 *  - `firstParent`: the commit exists, but `gitlens.graph.onlyFollowFirstParent` excludes it from the walk.
+	 *  - `invalidRef`: the requested id couldn't resolve to a commit at all. */
+	reason?: 'notFound' | 'firstParent' | 'invalidRef';
 }
 export const LoadRowRequest = new IpcRequest<LoadRowParams, DidLoadRowParams>(scope, 'rows/load');
 
@@ -1675,23 +1713,12 @@ export interface DidChangeOrgSettingsParams {
 }
 export const DidChangeOrgSettings = new IpcNotification<DidChangeOrgSettingsParams>(scope, 'org/settings/didChange');
 
-export const DidChangeMcpBanner = new IpcNotification<boolean>(scope, 'mcp/didChange');
+export const DidChangeAgentsBanner = new IpcNotification<boolean>(scope, 'agents/banner/didChange');
 
-export const DidChangeHooksBanner = new IpcNotification<boolean>(scope, 'hooks/didChange');
-
-export const DidChangeCanInstallClaudeHook = new IpcNotification<boolean>(
-	scope,
-	'agents/canInstallClaudeHook/didChange',
-);
-
-export interface CloseGraphWalkthroughBannerParams {
-	openWelcome?: boolean;
-}
-
-export const CloseGraphWalkthroughBannerCommand = new IpcCommand<CloseGraphWalkthroughBannerParams>(
-	scope,
-	'graphWalkthrough/banner/close',
-);
+export const DidChangeCanInstallHooks = new IpcNotification<{
+	canInstallHooks: boolean;
+	agents: readonly { id: string; displayName: string; installed: boolean }[];
+}>(scope, 'agents/canInstallHooks/didChange');
 
 export interface GraphWalkthroughBannerState {
 	dismissed: boolean;
@@ -1712,13 +1739,6 @@ export const DidChangeGraphWalkthroughStarted = new IpcNotification<boolean>(
 	'graphWalkthrough/started/didChange',
 );
 
-/** The user's answer to the one-time layout prompt: move the Graph view to the side bar
- *  (vertical), keep/move it to the bottom panel (full width), or close without choosing. */
-export interface ChooseGraphLayoutParams {
-	choice: 'sidebar' | 'panel' | 'dismissed';
-}
-export const ChooseGraphLayoutCommand = new IpcCommand<ChooseGraphLayoutParams>(scope, 'layoutPrompt/choose');
-
 /** Pushed when the `graph:layoutPrompt` onboarding state changes (e.g. dismissed in another window) */
 export const DidChangeLayoutPromptNotification = new IpcNotification<boolean>(scope, 'layoutPrompt/didChange');
 
@@ -1729,8 +1749,14 @@ export const graphCoachMarkTypes = [
 	'review',
 	'conflicts',
 	'resolve',
+	'composeReady',
+	'resolveReady',
 	'agents',
 	'compare',
+	'overviewBar',
+	'kanban',
+	'visualizations',
+	'followTerminal',
 ] as const;
 export type GraphCoachMarkType = (typeof graphCoachMarkTypes)[number];
 
@@ -1740,6 +1766,15 @@ export interface DidRequestActiveSidebarPanelParams {
 export const DidRequestActiveSidebarPanelNotification = new IpcNotification<DidRequestActiveSidebarPanelParams>(
 	scope,
 	'sidebar/activePanel/didRequest',
+);
+
+export interface DidRequestVisualizationParams {
+	visualization: VisualizationMode;
+}
+/** Pushed when a command (e.g. `gitlens.showGitHealth`) opens the graph on a specific visualization. */
+export const DidRequestVisualizationNotification = new IpcNotification<DidRequestVisualizationParams>(
+	scope,
+	'visualization/didRequest',
 );
 
 export interface DidRequestGraphActionParams {
@@ -1756,6 +1791,15 @@ export interface DidRequestGraphActionParams {
 	composeInstructions?: string;
 	/** For 'enter-compose': resolved commit-range seed; absent = working-changes compose. */
 	composeScope?: GraphComposeScopeSeed;
+	/** For 'show-wip': highlight this agent session's card in the details panel. */
+	agentSessionId?: string;
+	/** Selects/reveals only — suppresses opening the details panel (passive follow deliveries). */
+	revealOnly?: boolean;
+	/** Set ONLY by the follow controller's passive deliveries — drives the one-time coach mark. */
+	followed?: boolean;
+	/** For passive follow deliveries targeting the graph's own WIP row: consume only while the
+	 *  current selection is a WIP row; otherwise drop the delivery entirely. */
+	onlyIfWipSelected?: boolean;
 }
 export const DidRequestGraphActionNotification = new IpcNotification<DidRequestGraphActionParams>(
 	scope,
@@ -1881,6 +1925,17 @@ export const DidChangeSelectionNotification = new IpcNotification<DidChangeSelec
 	scope,
 	'selection/didChange',
 );
+
+export interface DidFailRevealParams {
+	/** The ref/sha the host was asked to reveal. */
+	id: string;
+	reason: 'invalidRef' | 'notFound';
+}
+/** A host-initiated reveal/select (e.g. a deep link, "Open in Commit Graph", a terminal-link jump)
+ *  gave up without ever calling `setSelectedRows` — nothing else tells the webview the jump was a
+ *  no-op, so surface it explicitly instead of leaving the graph looking like it silently ignored the
+ *  request. */
+export const DidFailRevealNotification = new IpcNotification<DidFailRevealParams>(scope, 'reveal/didFail');
 
 export interface DidRequestOpenCompareModeParams {
 	repoPath: string;

@@ -118,8 +118,10 @@ export async function getBranchMergeTargetStatusInfo(
 	const targetBranch = await svc.branches.getBranch(target, cancellation);
 	// The tip SHA is required — without it the graph's scope anchor can't be placed.
 	if (targetBranch?.sha == null) return undefined;
-	// Must match the early-out in `computeScopeAnchor` (graphWebview.ts), or the graph anchors a merge
-	// target the sidebars say doesn't exist.
+	// Self target with equal tips (the default branch up to date with its own remote): 0/0 counts and a
+	// trivially-merged status say nothing, so the sidebars skip it. The graph's `computeScopeAnchor` still
+	// anchors this shape (scope always scopes) — the divergence is safe because `reconcileScopeMergeTarget`
+	// only backfills scope anchors from this enrichment, never strips them.
 	if (targetBranch.sha === branch.sha && isSelfMergeTarget(target, branch.name)) return undefined;
 
 	const [countsResult, conflictResult, mergedStatusResult] = await Promise.allSettled([
@@ -351,8 +353,9 @@ export async function getOverviewWip(
 					hasConflicts: status?.hasConflicts,
 					conflictsCount: status?.conflicts.length,
 					pausedOpStatus: pausedOpStatus,
-					// Keyed by the same worktree-aware path as the status above — the in-flight set holds the
-					// path of the repo that OWNS the paused op.
+					// Asked with the same worktree-aware path as the status above — the in-flight set holds
+					// the path of the repo that OWNS the paused op. `repoPath` may be a raw `Uri.fsPath`
+					// (backslashes on Windows); the lookup normalizes it to the set's key form.
 					pausedOpContinuing:
 						pausedOpStatus != null && isContinuingPausedOperation(repoPath) ? true : undefined,
 				};

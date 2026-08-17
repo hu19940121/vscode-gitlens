@@ -8,6 +8,7 @@ import type { AgentSessionState } from '../../../../home/protocol.js';
 import type { AgentSessionCategory, StickyDetailResolver } from '../../../shared/agentUtils.js';
 import {
 	agentPhaseToCategory,
+	canResolvePermission,
 	createAgentSessionOpenHref,
 	createStickyDetailResolver,
 	describeAgentSession,
@@ -37,6 +38,10 @@ export type ExpandState = 'collapsed' | 'partial' | 'expanded';
 /** Cap on cluster dots in the section heading. Beyond this, an `+N` overflow chip takes the slot
  *  so the heading width stays bounded. */
 const maxClusterDots = 5;
+
+/** Cap on completed rows in the session hovers. Active sessions are never truncated — only
+ *  completed ones accumulate (retained ~30 days), and the footer counts the remainder. */
+const maxHoverCompletedRows = 3;
 
 /** Periodic re-render driver matching the kanban's tick. Without this, the component's
  *  `shouldUpdate` short-circuit would freeze elapsed labels (`Working · 5m`) and prevent the
@@ -454,6 +459,13 @@ export class GlDetailsAgentStatus extends LitElement {
 		   via ellipsis instead of stretching the popover to the viewport edge. */
 				max-width: min(44rem, 60vw);
 				padding: var(--gl-space-2);
+
+				/* The heading popover slots its content inside .section__heading, so prose here would
+		   inherit that row's uppercase tag treatment while the compact popover — anchored
+		   outside the heading — renders the same text in sentence case. Reset it so both read
+		   alike; .section__hover-phase opts back into uppercase for its tag label. */
+				text-transform: none;
+				letter-spacing: 0;
 			}
 
 			.section__hover-row {
@@ -531,8 +543,18 @@ export class GlDetailsAgentStatus extends LitElement {
 				grid-column: 2 / -1;
 			}
 
+			.section__hover-footer {
+				padding-top: var(--gl-space-6);
+				border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border, var(--vscode-widget-border));
+			}
+
+			.section__hover-count {
+				font-size: 0.85em;
+				color: var(--vscode-descriptionForeground);
+			}
+
 			/* ---------- Card ----------
-	   Two-row grid: rail + body on top, action row spans the full body column on bottom.
+	   Two-row grid: rail + body on top, action row sits under the body column on bottom.
 	   The actions always sit at the bottom of the card regardless of panel width.
 	   needs-input and working cards adopt the prior banner treatment (gradient bg +
 	   icon-circle in the rail) so each surfaces as actionable on its own. */
@@ -704,6 +726,23 @@ export class GlDetailsAgentStatus extends LitElement {
 				gap: 0.3rem;
 				align-items: center;
 				justify-content: flex-end;
+			}
+
+			/* Unresolvable ask: the caption stacks under the lone Open/Resume Session button rather than
+	   sharing its row, so narrowing the panel can't squeeze the button. */
+			.card__actions--unresolvable {
+				flex-direction: column;
+				gap: var(--gl-space-4);
+				align-items: flex-end;
+			}
+
+			.card__actions-hint {
+				font-size: 0.85em;
+				color: var(--vscode-descriptionForeground);
+			}
+
+			.card__actions--unresolvable .card__actions-hint {
+				text-align: right;
 			}
 		`,
 	];
@@ -897,8 +936,11 @@ export class GlDetailsAgentStatus extends LitElement {
 		const counts = this.tally(sessions);
 		const visibleDots = sessions.slice(0, maxClusterDots);
 		const overflow = sessions.length - visibleDots.length;
+		// `.section__hover` has no max-height, and active sessions are deliberately uncapped, so a
+		// busy panel can produce a popover taller than the viewport. `auto-size-vertical` clamps and
+		// scrolls it instead of letting it render past the panel edge with no way to reach the bottom.
 		return html`
-			<gl-popover placement="bottom">
+			<gl-popover placement="bottom" auto-size-vertical>
 				<span slot="anchor" class="section__cluster" tabindex="0" role="button" aria-label="Agent sessions">
 					<span class="section__cluster-dots">
 						${visibleDots.map(
@@ -919,7 +961,7 @@ export class GlDetailsAgentStatus extends LitElement {
 					</span>
 					<span class="section__cluster-summary">${this.renderCountsSummary(counts)}</span>
 				</span>
-				<div slot="content" class="section__hover">${sessions.map(s => this.renderHoverRow(s))}</div>
+				${this.renderHoverList(sessions)}
 			</gl-popover>
 		`;
 	}
@@ -1065,7 +1107,7 @@ export class GlDetailsAgentStatus extends LitElement {
 						data-expand=${state}
 					></code-icon>
 					<span class="section__heading-label">Agents</span>
-					<gl-popover placement="bottom" ?disabled=${state === 'expanded'}>
+					<gl-popover placement="bottom" auto-size-vertical ?disabled=${state === 'expanded'}>
 						<span slot="anchor" class="section__cluster">
 							<span class="section__cluster-dots">
 								${visibleDots.map(
@@ -1086,7 +1128,7 @@ export class GlDetailsAgentStatus extends LitElement {
 							</span>
 							<span class="section__cluster-summary">${this.renderCountsSummary(counts)}</span>
 						</span>
-						<div slot="content" class="section__hover">${sessions.map(s => this.renderHoverRow(s))}</div>
+						${this.renderHoverList(sessions)}
 					</gl-popover>
 				</button>
 				${this.renderResumePickerAction()}
@@ -1157,6 +1199,44 @@ export class GlDetailsAgentStatus extends LitElement {
 		return out;
 	}
 
+	/** Shared body for both hover popovers (cluster-only and section-heading). Sessions arrive
+	 *  pre-sorted (`sortAgentSessions` upstream) with completed last and most-recent-first within a
+	 *  phase, so slicing the completed tail keeps the freshest completed rows. Active sessions are
+	 *  never truncated — the hover is the only per-session detail surface while collapsed. */
+	private renderHoverList(sessions: AgentSessionState[]): unknown {
+		const active: AgentSessionState[] = [];
+		const completed: AgentSessionState[] = [];
+		for (const s of sessions) {
+			if (agentPhaseToCategory[s.phase] === 'completed') {
+				completed.push(s);
+			} else {
+				active.push(s);
+			}
+		}
+
+		const shownCompleted = completed.slice(0, maxHoverCompletedRows);
+		return html`
+			<div slot="content" class="section__hover">
+				${[...active, ...shownCompleted].map(s => this.renderHoverRow(s))}
+				${this.renderHoverFooter(completed.length - shownCompleted.length)}
+			</div>
+		`;
+	}
+
+	/** Count-only overflow line for completed rows hidden by the hover cap. No link: the heading
+	 *  already has a separate `Resume Session…` picker chip, and compact mode has no `worktreePath`
+	 *  to scope a picker to. */
+	private renderHoverFooter(hidden: number): unknown {
+		if (hidden <= 0) return nothing;
+
+		const countText = pluralize('more completed session', hidden);
+		return html`
+			<div class="section__hover-footer">
+				<span class="section__hover-count">${countText}</span>
+			</div>
+		`;
+	}
+
 	private renderHoverRow(session: AgentSessionState): unknown {
 		const category = agentPhaseToCategory[session.phase];
 		const elapsed = formatAgentElapsed(session.phaseSince);
@@ -1169,7 +1249,7 @@ export class GlDetailsAgentStatus extends LitElement {
 		const detail =
 			stickyTool != null
 				? undefined
-				: describeAgentSession(session, category, elapsed, {
+				: describeAgentSession(session, category, {
 						awaitingPrefix: 'short',
 						idleFallback: 'lastPrompt',
 					});
@@ -1208,13 +1288,17 @@ export class GlDetailsAgentStatus extends LitElement {
 		const phaseContent = html`${phaseLabel}${
 			elapsed != null ? html` · <span class="agent-phase-elapsed">${elapsed}</span>` : nothing
 		}`;
-		const phaseTooltip = elapsed != null ? `Last active ${elapsed} ago` : undefined;
+		// Phase chip shows how long the session has been in this phase; its tooltip reports the
+		// last time the session actually did something, which is a different clock.
+		const lastActive = formatAgentElapsed(session.lastActivity);
+		const phaseTooltip = lastActive != null ? `Last active ${lastActive} ago` : undefined;
 		const openAction = getAgentSessionOpenAction(session);
 		const openHref = createAgentSessionOpenHref(session);
-		// Resolve actions surface whenever a pending permission exists. Peer-discovered sessions
-		// (owned by another GitLens window) reach the host's `resolvePermission`, which surfaces
-		// a notification rather than silently no-opping when the route is unavailable.
-		const canResolve = category === 'needs-input' && permission != null;
+		// Resolve actions surface only for an ask this window can actually route. An unresolvable
+		// one (elicitation, or discovered by the poll rather than the hook) still renders its
+		// detail block — the user needs to see what is being asked — but is answered in the
+		// agent's own session, which the title row's open action already reaches.
+		const canResolve = canResolvePermission(category, permission);
 		const isSelected = this.selectedSessionId != null && this.selectedSessionId === session.id;
 
 		return html`
@@ -1258,7 +1342,7 @@ export class GlDetailsAgentStatus extends LitElement {
 								: nothing
 						}
 					</div>
-					${this.renderCardDetail(session, category, elapsed)}
+					${this.renderCardDetail(session, category)}
 					${
 						session.lastPrompt
 							? html`<gl-tooltip content=${session.lastPrompt} placement="bottom">
@@ -1267,7 +1351,19 @@ export class GlDetailsAgentStatus extends LitElement {
 							: nothing
 					}
 				</div>
-				${canResolve ? html`<div class="card__actions">${this.renderCardActions(session)}</div>` : nothing}
+				${
+					canResolve
+						? html`<div class="card__actions">${this.renderCardActions(session)}</div>`
+						: category === 'needs-input'
+							? html`<div class="card__actions card__actions--unresolvable">
+									<gl-button appearance="secondary" density="compact" href=${openHref}>
+										<code-icon icon=${openAction.icon} slot="prefix"></code-icon>
+										${openAction.label}
+									</gl-button>
+									<span class="card__actions-hint">Answer in the agent's session</span>
+								</div>`
+							: nothing
+				}
 			</div>
 		`;
 	}
@@ -1281,11 +1377,7 @@ export class GlDetailsAgentStatus extends LitElement {
 	 *  brief inter-tool-call gap where `session.statusDetail` empties — without it the running-
 	 *  tool row would flicker out for hundreds of ms before the next tool call latches.
 	 */
-	private renderCardDetail(
-		session: AgentSessionState,
-		category: AgentSessionCategory,
-		elapsed: string | undefined,
-	): unknown {
+	private renderCardDetail(session: AgentSessionState, category: AgentSessionCategory): unknown {
 		const permission = session.pendingPermission;
 		if (category === 'needs-input' && permission != null) {
 			// Evict any prior working-phase sticky entry — see {@link createStickyDetailResolver}
@@ -1300,7 +1392,7 @@ export class GlDetailsAgentStatus extends LitElement {
 			return renderRunningTool(stickyTool);
 		}
 
-		const detailLine = describeAgentSession(session, category, elapsed, {
+		const detailLine = describeAgentSession(session, category, {
 			awaitingPrefix: 'long',
 			idleFallback: 'none',
 		});

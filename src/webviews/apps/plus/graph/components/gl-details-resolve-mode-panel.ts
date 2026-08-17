@@ -5,10 +5,19 @@ import { keyed } from 'lit/directives/keyed.js';
 import { repeat } from 'lit/directives/repeat.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
-import { classifyConflictAction } from '@gitlens/git/utils/conflictResolution.utils.js';
+import { uncommitted } from '@gitlens/git/models/revision.js';
+import {
+	canStageCurrent,
+	canStageIncoming,
+	classifyConflictAction,
+} from '@gitlens/git/utils/conflictResolution.utils.js';
 import type { ConflictKind } from '@gitlens/git/utils/conflictResolution.utils.js';
+import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
 import { pluralize } from '@gitlens/utils/string.js';
 import type { ViewFilesLayout } from '../../../../../config.js';
+import { serializeWebviewItemContext } from '../../../../../system/webview.js';
+import type { DetailsItemTypedContext } from '../../../../plus/graph/detailsProtocol.js';
+import { buildFolderContext } from '../../../../plus/graph/detailsProtocol.js';
 import type {
 	AutoRebaseRunPhase,
 	AutoRebaseRunUpdate,
@@ -939,6 +948,27 @@ export class GlDetailsResolveModePanel extends LitElement {
 						? html`<div class="resolve-results scrollable">${this.renderAutoRebaseSteps(run)}</div>`
 						: nothing
 				}
+				${
+					// An escalated run left the rebase paused for the user — keep the toast's actions
+					// available here durably, since the toast itself is transient and the palette command
+					// (`Continue Automatic Rebase`) isn't discoverable from the panel
+					run.phase === 'escalated'
+						? html`<div class="auto-rebase__actions">
+								<gl-tooltip
+									content="Let AI continue the rebase from here — resolving any remaining conflicts and finishing the remaining steps"
+								>
+									<gl-button @click=${() => this.emit('auto-rebase-resume')}
+										>Resume with AI</gl-button
+									>
+								</gl-tooltip>
+								<gl-tooltip content="Abort the rebase and restore the branch to its pre-rebase state">
+									<gl-button appearance="secondary" @click=${() => this.emit('auto-rebase-cancel')}
+										>Abort Rebase</gl-button
+									>
+								</gl-tooltip>
+							</div>`
+						: nothing
+				}
 			</div>
 		`;
 	}
@@ -1046,6 +1076,9 @@ export class GlDetailsResolveModePanel extends LitElement {
 						.collapsable=${false}
 						.filesLayout=${{ layout: this.fileLayout }}
 						.checkableStates=${checkableStates}
+						.fileContext=${this.getFileContext}
+						.folderContext=${(folder: { relativePath: string }) => buildFolderContext(this.repoPath, folder)}
+						.contextRevision=${this.repoPath}
 						selection-action="file-open"
 						check-verb="Resolve"
 						uncheck-verb="Skip"
@@ -1111,6 +1144,43 @@ export class GlDetailsResolveModePanel extends LitElement {
 			(checked ? userChecked : userUnchecked).add(path);
 		}
 	}
+
+	private getFileContext = (file: GitFileChangeShape): string | undefined => {
+		if (!this.repoPath) return undefined;
+
+		// Two-char `XY` conflict statuses (UU/AA/UD/DU/AU/UA/DD) carry the side semantics
+		// the stage-current/incoming commands need; the generic single-char 'U' from
+		// `isConflictStatus` doesn't, so we treat it as a regular unstaged file and skip
+		// the conflict modifiers.
+		let webviewItem: string;
+		if (isConflictStatus(file.status) && file.status !== 'U') {
+			const conflictStatus = file.status;
+			const modifiers: string[] = ['+conflict'];
+			if (canStageCurrent(conflictStatus)) {
+				modifiers.push('+canStageCurrent');
+			}
+			if (canStageIncoming(conflictStatus)) {
+				modifiers.push('+canStageIncoming');
+			}
+			webviewItem = `gitlens:file${modifiers.join('')}`;
+		} else {
+			webviewItem = file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged';
+		}
+
+		const context: DetailsItemTypedContext = {
+			webviewItem: webviewItem,
+			webviewItemValue: {
+				type: 'file',
+				path: file.path,
+				repoPath: this.repoPath,
+				sha: uncommitted,
+				staged: file.staged,
+				status: file.status,
+			},
+		};
+
+		return serializeWebviewItemContext(context);
+	};
 
 	/** Toggle the ready-state Apply/Refine posture from the "Refine Resolutions" gate checkbox. */
 	private handleToggleRefineMode(e: Event): void {

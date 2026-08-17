@@ -6,11 +6,8 @@ export const onboardingDefinitions = {
 	'home:integrationBanner': { schema: '17.8.0', scope: 'global' },
 	'home:walkthrough': { schema: '17.8.0', scope: 'global' },
 
-	// MCP Banner (shown in home and graph)
-	'mcp:banner': { schema: '17.8.0', scope: 'global' },
-
-	// AI Hooks Banner (shown in home and graph when MCP banner is hidden)
-	'hooks:banner': { schema: '17.12.0', scope: 'global' },
+	// Agents Banner (MCP + hooks combined; shown in home and graph)
+	'agents:banner': { schema: '18.3.0', scope: 'global' },
 
 	// Rebase Editor
 	'rebaseEditor:closeWarning': { schema: '17.8.0', scope: 'global' },
@@ -36,26 +33,35 @@ export const onboardingDefinitions = {
 	// Graph side bar Agents panel (first-interaction callout)
 	'graph:sidebar:agents:callout': { schema: '18.5.0', scope: 'global' },
 
+	// Graph Intro (welcome to the New Commit Graph; wraps the optional layout prompt)
+	'graph:intro': { schema: '18.5.0', scope: 'global' },
+
 	// Graph Layout Prompt (one-time layout choice on first entry to the Graph view)
 	'graph:layoutPrompt': { schema: '18.4.0', scope: 'global' },
 
 	// Graph Coach Marks (contextual feature popovers, #5516)
 	// Aggregate "already shown" set; the per-mark keys below carry the permanent "Got it" dismissal.
 	'graph:coachMarks': {
-		schema: '18.2.0',
+		schema: '19.0.0',
 		scope: 'global',
 		// oxlint-disable-next-line typescript/no-unnecessary-type-assertion
 		state: undefined as unknown as { seen: Partial<Record<string, true>> },
 	},
-	'graph:coachMark:details': { schema: '18.2.0', scope: 'global' },
-	'graph:coachMark:compose': { schema: '18.2.0', scope: 'global' },
-	'graph:coachMark:review': { schema: '18.2.0', scope: 'global' },
-	'graph:coachMark:conflicts': { schema: '18.2.0', scope: 'global' },
-	'graph:coachMark:resolve': { schema: '18.2.0', scope: 'global' },
-	'graph:coachMark:agents': { schema: '18.2.0', scope: 'global' },
-	'graph:coachMark:compare': { schema: '18.2.0', scope: 'global' },
+	'graph:coachMark:details': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:compose': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:review': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:conflicts': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:resolve': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:composeReady': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:resolveReady': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:agents': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:compare': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:overviewBar': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:kanban': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:visualizations': { schema: '19.0.0', scope: 'global' },
+	'graph:coachMark:followTerminal': { schema: '19.0.0', scope: 'global' },
 	// Not a tip: records that the marks have already stood down for the walkthrough banner once.
-	'graph:coachMarks:bannerDeferral': { schema: '18.2.0', scope: 'global' },
+	'graph:coachMarks:bannerDeferral': { schema: '19.0.0', scope: 'global' },
 
 	// Graph Walkthrough Banner
 	'graph-walkthrough:banner': {

@@ -8,7 +8,7 @@ import { isSubscriptionTrialOrPaidFromState } from '../../../../plus/gk/utils/su
 import { linkStyles } from '../../plus/shared/components/vscode.css.js';
 import { featureGateBaseStyles } from './feature-gate.css.js';
 import { focusableBaseStyles } from './styles/lit/a11y.css.js';
-import { scrollableBase } from './styles/lit/base.css.js';
+import { boxSizingBase, scrollableBase } from './styles/lit/base.css.js';
 import './button.js';
 import './code-icon.js';
 import '../../plus/shared/components/feature-gate-plus-state.js';
@@ -25,7 +25,7 @@ declare global {
 
 @customElement('gl-feature-gate')
 export class GlFeatureGate extends LitElement {
-	static override styles = [focusableBaseStyles, linkStyles, scrollableBase, featureGateBaseStyles];
+	static override styles = [boxSizingBase, focusableBaseStyles, linkStyles, scrollableBase, featureGateBaseStyles];
 
 	@query('dialog')
 	private readonly dialogEl!: HTMLDialogElement | null;
@@ -38,6 +38,9 @@ export class GlFeatureGate extends LitElement {
 
 	@property({ reflect: true })
 	appearance?: 'alert' | 'default';
+
+	@property({ reflect: true })
+	variant: 'dialog' | 'sheet' = 'dialog';
 
 	@property({ type: Object })
 	featurePreview?: FeaturePreview;
@@ -62,11 +65,17 @@ export class GlFeatureGate extends LitElement {
 
 	override disconnectedCallback(): void {
 		// Defensively tear down the modal so an unmounted gate can never leave a stuck top-layer backdrop.
-		this.dialogEl?.close();
+		if (this.variant !== 'sheet') {
+			this.dialogEl?.close();
+		}
+
 		super.disconnectedCallback?.();
 	}
 
 	protected override updated(_changedProperties: PropertyValues): void {
+		// Sheets render inline (no top-layer dialog), so there is nothing to promote.
+		if (this.variant === 'sheet') return;
+
 		// Promote the dialog into the top layer once it's rendered. Consumers mount the gate only while it
 		// should show, so the dialog opens here on mount; unmounting (or a Pro-state re-render that returns
 		// nothing) removes it from the DOM, which tears the modal back down.
@@ -84,26 +93,30 @@ export class GlFeatureGate extends LitElement {
 				? 'alert'
 				: 'default';
 
-		return html`
-			<dialog part="section" @cancel=${this.onCancel} @keydown=${this.onKeydown}>
-				<div class="content scrollable">
-					<slot></slot>
-					<gl-feature-gate-plus-state
-						appearance=${appearance}
-						.featurePreview=${this.featurePreview}
-						.featurePreviewCommandLink=${this.featurePreviewCommandLink}
-						.featureRestriction=${this.featureRestriction}
-						.featureWithArticleIfNeeded=${this.featureWithArticleIfNeeded}
-						.source=${this.source}
-						.state=${this.state}
-						.webroot=${this.webroot}
-					>
-						<slot name="feature" slot="feature"></slot>
-					</gl-feature-gate-plus-state>
-				</div>
-				${this.renderSwitchActions()}
-			</dialog>
+		const inner = html`
+			<div class="content scrollable">
+				<slot></slot>
+				<gl-feature-gate-plus-state
+					appearance=${appearance}
+					.featurePreview=${this.featurePreview}
+					.featurePreviewCommandLink=${this.featurePreviewCommandLink}
+					.featureRestriction=${this.featureRestriction}
+					.featureWithArticleIfNeeded=${this.featureWithArticleIfNeeded}
+					.source=${this.source}
+					.state=${this.state}
+					.webroot=${this.webroot}
+				>
+					<slot name="feature" slot="feature"></slot>
+				</gl-feature-gate-plus-state>
+			</div>
+			${this.renderSwitchActions()}
 		`;
+
+		if (this.variant === 'sheet') {
+			return html`<div part="section" class="sheet">${inner}</div>`;
+		}
+
+		return html` <dialog part="section" @cancel=${this.onCancel} @keydown=${this.onKeydown}>${inner}</dialog> `;
 	}
 
 	private renderSwitchActions() {

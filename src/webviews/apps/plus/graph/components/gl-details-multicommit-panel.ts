@@ -271,6 +271,7 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 														.fileContext=${this.getFileContext}
 														.folderContext=${(folder: { relativePath: string }) =>
 															buildFolderContext(this.commitTo?.repoPath, folder)}
+														.contextRevision=${`${this.commitTo?.sha}|${this.commitTo?.repoPath}|${this.commitFrom?.sha}`}
 														.searchContext=${this.searchContext}
 														.showSearchBox=${this.showSearchBox}
 														.searchBoxFilter=${this.searchBoxFilter}
@@ -457,6 +458,9 @@ export class GlDetailsMultiCommitPanel extends LitElement {
 							</span>`
 						: html`Comparing References`
 				}
+				<!-- The Graph slots its details coach mark here so the tip's lightbulb parks inline
+					 with the title text (same pattern as the compare sheet's title-hint slot). -->
+				<slot name="coachmark"></slot>
 			</span>
 			${this.activeMode == null && this.showMaximize ? renderDetailsMaximizeChip(this.maximized) : nothing}
 		</gl-details-header>`;
