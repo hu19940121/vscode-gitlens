@@ -1,11 +1,9 @@
 import type { MessageItem } from 'vscode';
 import { window } from 'vscode';
-import { proTrialLengthInDays } from '../../../../constants.subscription.js';
 import type { Source } from '../../../../constants.telemetry.js';
 import type { Container } from '../../../../container.js';
 import { configuration } from '../../../../system/-webview/configuration.js';
 import { getContext } from '../../../../system/-webview/context.js';
-import { isSubscriptionPaidPlan } from '../subscription.utils.js';
 
 export function arePlusFeaturesEnabled(): boolean {
 	const enabled = configuration.get('plusFeatures.enabled', undefined, true);
