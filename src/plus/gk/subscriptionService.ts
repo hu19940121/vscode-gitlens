@@ -12,6 +12,7 @@ import {
 	Disposable,
 	env,
 	EventEmitter,
+	l10n,
 	MarkdownString,
 	ProgressLocation,
 	StatusBarAlignment,
@@ -20,7 +21,7 @@ import {
 	window,
 } from 'vscode';
 import { getPlatform } from '@env/platform.js';
-import { createFromDateDelta, fromNow } from '@gitlens/utils/date.js';
+import { createFromDateDelta, fromNow, getNumericFormat } from '@gitlens/utils/date.js';
 import type { Deferrable } from '@gitlens/utils/debounce.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { debug, info, trace } from '@gitlens/utils/decorators/log.js';
@@ -31,8 +32,8 @@ import { microhash } from '@gitlens/utils/hash.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { flatten } from '@gitlens/utils/object.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { pauseOnCancelOrTimeout } from '@gitlens/utils/promise.js';
-import { pluralize } from '@gitlens/utils/string.js';
 import { satisfies } from '@gitlens/utils/version.js';
 import type { CoreColors } from '../../constants.colors.js';
 import type { GlCommands } from '../../constants.commands.js';
@@ -57,6 +58,7 @@ import type { Container } from '../../container.js';
 import {
 	AccountValidationError,
 	AuthenticationRequiredError,
+	getPresentableErrorMessage,
 	RequestsAreBlockedTemporarilyError,
 } from '../../errors.js';
 import type { FeaturePreview, FeaturePreviews } from '../../features.js';
@@ -127,7 +129,6 @@ export class SubscriptionService implements Disposable {
 
 	private _disposable: Disposable;
 	private _subscription!: Subscription;
-	private _getCheckInData: () => Promise<GKCheckInResponse | undefined>;
 	private _statusBarSubscription: StatusBarItem | undefined;
 	private _validationTimer: ReturnType<typeof setInterval> | undefined;
 
@@ -156,11 +157,6 @@ export class SubscriptionService implements Disposable {
 		);
 
 		const subscription = this.getStoredSubscription();
-		this._getCheckInData = () => Promise.resolve(undefined);
-		if (subscription?.account?.id != null) {
-			this._getCheckInData = () => this.loadStoredCheckInData(subscription.account!.id);
-		}
-
 		this.changeSubscription(subscription, undefined, { silent: true });
 		setTimeout(() => void this.ensureSession(false, undefined), 10000);
 
@@ -415,7 +411,10 @@ export class SubscriptionService implements Disposable {
 
 		if (status === 'expired') {
 			void window.showInformationMessage(
-				`Your ${proFeaturePreviewUsages}-day preview of the ${getFeaturePreviewLabel(feature)} has expired.`,
+				l10n.t('Your {days}-day preview of the {feature} has expired.', {
+					days: getNumericFormat()(proFeaturePreviewUsages),
+					feature: getFeaturePreviewLabel(feature),
+				}),
 			);
 			return;
 		}
@@ -462,12 +461,12 @@ export class SubscriptionService implements Disposable {
 		} = this._subscription;
 
 		if (account?.verified === false) {
-			const verify: MessageItem = { title: 'Resend Email' };
-			const confirm: MessageItem = { title: 'Continue', isCloseAffordance: true };
+			const verify: MessageItem = { title: l10n.t('Resend Email') };
+			const confirm: MessageItem = { title: l10n.t('Continue'), isCloseAffordance: true };
 
 			const result = await window.showInformationMessage(
-				'Welcome to GitLens',
-				{ modal: true, detail: 'Verify the email we just sent you to start your Pro trial.' },
+				l10n.t('Welcome to GitLens'),
+				{ modal: true, detail: l10n.t('Verify the email we just sent you to start your Pro trial.') },
 				verify,
 				confirm,
 			);
@@ -482,10 +481,10 @@ export class SubscriptionService implements Disposable {
 				}
 			}
 		} else if (isSubscriptionPaid(this._subscription)) {
-			const learn: MessageItem = { title: 'Learn More' };
-			const confirm: MessageItem = { title: 'Continue', isCloseAffordance: true };
+			const learn: MessageItem = { title: l10n.t('Learn More') };
+			const confirm: MessageItem = { title: l10n.t('Continue'), isCloseAffordance: true };
 			const result = await window.showInformationMessage(
-				`You are now on ${actual.name} and have full access to all GitLens Pro features.`,
+				l10n.t('You are now on {0} and have full access to all GitLens Pro features.', actual.name),
 				{ modal: true },
 				confirm,
 				learn,
@@ -496,16 +495,28 @@ export class SubscriptionService implements Disposable {
 			}
 		} else if (isSubscriptionTrial(this._subscription)) {
 			const days = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 0;
+			const message =
+				days < 1
+					? l10n.t(
+							'Welcome to your {0} Trial.\n\nYou now have full access to all GitLens Pro features for <1 more day.',
+							effective.name,
+						)
+					: formatPlural(
+							l10n.t(
+								'{1, plural, one{Welcome to your {0} Trial.\n\nYou now have full access to all GitLens Pro features for {1} more day.} other{Welcome to your {0} Trial.\n\nYou now have full access to all GitLens Pro features for {1} more days.}}',
+							),
+							[effective.name, days],
+						);
 
-			const learn: MessageItem = { title: 'Learn More' };
-			const confirm: MessageItem = { title: 'Continue', isCloseAffordance: true };
+			const learn: MessageItem = { title: l10n.t('Learn More') };
+			const confirm: MessageItem = { title: l10n.t('Continue'), isCloseAffordance: true };
 			const result = await window.showInformationMessage(
-				`Welcome to your ${effective.name} Trial.\n\nYou now have full access to all GitLens Pro features for ${
-					days < 1 ? '<1 more day' : pluralize('day', days, { infix: ' more ' })
-				}.`,
+				message,
 				{
 					modal: true,
-					detail: 'Your trial also includes access to the GitKraken DevEx platform, unleashing powerful Git visualization & productivity capabilities everywhere you work: IDE, desktop, browser, and terminal.',
+					detail: l10n.t(
+						'Your trial also includes access to the GitKraken DevEx platform, unleashing powerful Git visualization & productivity capabilities everywhere you work: IDE, desktop, browser, and terminal.',
+					),
 				},
 				confirm,
 				learn,
@@ -515,14 +526,16 @@ export class SubscriptionService implements Disposable {
 				void executeCommand('gitlens.showWelcomeView');
 			}
 		} else {
-			const upgrade: MessageItem = { title: 'Upgrade to Pro' };
-			const learn: MessageItem = { title: 'Community vs. Pro' };
-			const confirm: MessageItem = { title: 'Continue', isCloseAffordance: true };
+			const upgrade: MessageItem = { title: l10n.t('Upgrade to Pro') };
+			const learn: MessageItem = { title: l10n.t('Community vs. Pro') };
+			const confirm: MessageItem = { title: l10n.t('Continue'), isCloseAffordance: true };
 			const result = await window.showInformationMessage(
-				`You are now on ${actual.name}.`,
+				l10n.t('You are now on {0}.', actual.name),
 				{
 					modal: true,
-					detail: 'You only have access to Pro features on publicly-hosted repos. For full access to all Pro features, please upgrade to GitLens Pro.',
+					detail: l10n.t(
+						'You only have access to Pro features on publicly-hosted repos. For full access to all Pro features, please upgrade to GitLens Pro.',
+					),
 				},
 				upgrade,
 				learn,
@@ -684,15 +697,21 @@ export class SubscriptionService implements Disposable {
 			if (!rsp.ok) {
 				if (rsp.status === 409) {
 					void window.showErrorMessage(
-						'You are not eligible to reactivate your Pro trial. If you feel that is an error, please contact support.',
-						'OK',
+						l10n.t(
+							'You are not eligible to reactivate your Pro trial. If you feel that is an error, please contact support.',
+						),
+						l10n.t('OK'),
 					);
 					return;
 				}
 
 				void window.showErrorMessage(
-					`Unable to reactivate trial: (${rsp.status}) ${rsp.statusText}. Please try again. If this issue persists, please contact support.`,
-					'OK',
+					l10n.t(
+						'Unable to reactivate trial: ({0}) {1}. Please try again. If this issue persists, please contact support.',
+						rsp.status,
+						rsp.statusText,
+					),
+					l10n.t('OK'),
 				);
 				return;
 			}
@@ -701,15 +720,17 @@ export class SubscriptionService implements Disposable {
 
 			if (ex instanceof RequestsAreBlockedTemporarilyError) {
 				void window.showErrorMessage(
-					'Unable to reactivate trial: Too many failed requests. Please reload the window and try again.',
-					'OK',
+					l10n.t(
+						'Unable to reactivate trial: Too many failed requests. Please reload the window and try again.',
+					),
+					l10n.t('OK'),
 				);
 				return;
 			}
 
 			void window.showErrorMessage(
-				`Unable to reactivate trial. Please try again. If this issue persists, please contact support.`,
-				'OK',
+				l10n.t('Unable to reactivate trial. Please try again. If this issue persists, please contact support.'),
+				l10n.t('OK'),
 			);
 			scope?.error(ex);
 			return;
@@ -719,15 +740,17 @@ export class SubscriptionService implements Disposable {
 		try {
 			await this.checkInAndValidate(session, source, { force: true });
 			if (isSubscriptionTrial(this._subscription)) {
-				const remaining = getSubscriptionTimeRemaining(this._subscription, 'days');
+				const remaining = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 0;
 
-				const confirm: MessageItem = { title: 'OK', isCloseAffordance: true };
-				const learn: MessageItem = { title: "See What's New" };
+				const confirm: MessageItem = { title: l10n.t('OK'), isCloseAffordance: true };
+				const learn: MessageItem = { title: l10n.t("See What's New") };
 				const result = await window.showInformationMessage(
-					`Your GitLens Pro trial has been reactivated! Experience all the new Pro features for another ${pluralize(
-						'day',
-						remaining ?? 0,
-					)}.`,
+					formatPlural(
+						l10n.t(
+							'{0, plural, one{Your GitLens Pro trial has been reactivated! Experience all the new Pro features for another {0} day.} other{Your GitLens Pro trial has been reactivated! Experience all the new Pro features for another {0} days.}}',
+						),
+						[remaining],
+					),
 					{ modal: true },
 					confirm,
 					learn,
@@ -809,15 +832,18 @@ export class SubscriptionService implements Disposable {
 					`Unable to resend verification email; status=(${rsp.status}): ${rsp.statusText}`,
 				);
 
-				void window.showErrorMessage(`Unable to resend verification email; Status: ${rsp.statusText}`, 'OK');
+				void window.showErrorMessage(
+					l10n.t('Unable to resend verification email; Status: {0}', rsp.statusText),
+					l10n.t('OK'),
+				);
 
 				return false;
 			}
 
-			const confirm = { title: 'Recheck' };
-			const cancel = { title: 'Cancel' };
+			const confirm = { title: l10n.t('Recheck') };
+			const cancel = { title: l10n.t('Cancel') };
 			const result = await window.showInformationMessage(
-				"Once you have verified your email address, click 'Recheck'.",
+				l10n.t("Once you have verified your email address, click 'Recheck'."),
 				confirm,
 				cancel,
 			);
@@ -832,7 +858,7 @@ export class SubscriptionService implements Disposable {
 			scope?.error(ex);
 			debugger;
 
-			void window.showErrorMessage('Unable to resend verification email', 'OK');
+			void window.showErrorMessage(l10n.t('Unable to resend verification email'), l10n.t('OK'));
 		}
 
 		return false;
@@ -1039,7 +1065,7 @@ export class SubscriptionService implements Disposable {
 		const result = await pauseOnCancelOrTimeout(validating, undefined, 3000);
 		if (result.paused) {
 			return window.withProgress(
-				{ location: ProgressLocation.Notification, title: 'Validating your account...' },
+				{ location: ProgressLocation.Notification, title: l10n.t('Validating your account...') },
 				() => result.value,
 			);
 		}
@@ -1080,21 +1106,15 @@ export class SubscriptionService implements Disposable {
 			);
 
 			if (!rsp.ok) {
-				this._getCheckInData = () => Promise.resolve(undefined);
 				throw new AccountValidationError('Unable to validate account', undefined, rsp.status, rsp.statusText);
 			}
 
 			this._onDidCheckIn.fire({ force: force });
 
 			const data: GKCheckInResponse = (await rsp.json()) as GKCheckInResponse;
-			this._getCheckInData = () => Promise.resolve(data);
-			this.storeCheckInData(data);
-
-			await this.validateAndUpdateSubscriptions(data, session, source);
+			await this.validateAndUpdateSubscriptions(data, session, source, organizationId);
 			return data;
 		} catch (ex) {
-			this._getCheckInData = () => Promise.resolve(undefined);
-
 			scope?.error(ex);
 			debugger;
 
@@ -1124,67 +1144,39 @@ export class SubscriptionService implements Disposable {
 		);
 	}
 
-	private storeCheckInData(data: GKCheckInResponse): void {
-		if (data.user?.id == null) return;
-
-		void this.container.storage
-			.store(`gk:${data.user.id}:checkin`, {
-				v: 1,
-				timestamp: Date.now(),
-				data: data,
-			})
-			.catch();
-	}
-
-	@trace()
-	private async loadStoredCheckInData(userId: string): Promise<GKCheckInResponse | undefined> {
-		const scope = getScopedLogger();
-
-		const storedCheckIn = this.container.storage.get(`gk:${userId}:checkin`);
-		// If more than a day old, ignore
-		if (storedCheckIn?.timestamp == null || Date.now() - storedCheckIn.timestamp > 24 * 60 * 60 * 1000) {
-			// Attempt a check-in to see if we can get a new one
-			const session = await this.getAuthenticationSession(false);
-			if (session == null) return undefined;
-
-			try {
-				return await this.checkInAndValidate(session, undefined, { force: true });
-			} catch (ex) {
-				scope?.error(ex);
-				return undefined;
-			}
-		}
-
-		return storedCheckIn?.data;
-	}
-
 	@trace()
 	private async validateAndUpdateSubscriptions(
 		data: GKCheckInResponse,
 		session: AuthenticationSession,
 		source: Source | undefined,
+		organizationId?: string,
 	): Promise<void> {
 		const scope = getScopedLogger();
-		let organizations: Organization[];
+		let organizations: Organization[] | undefined;
 		try {
 			organizations =
 				(await this.container.organizations.getOrganizations({
 					force: true,
 					accessToken: session.accessToken,
 					userId: session.account.id,
-				})) ?? [];
+				})) ?? undefined;
 		} catch (ex) {
 			scope?.error(ex);
-			organizations = [];
+			organizations = undefined;
 		}
-		let chosenOrganizationId = getConfiguredActiveOrganizationId();
+		let chosenOrganizationId = organizationId ?? getConfiguredActiveOrganizationId();
 		if (chosenOrganizationId === '') {
 			chosenOrganizationId = undefined;
-		} else if (chosenOrganizationId != null && !organizations.some(o => o.id === chosenOrganizationId)) {
+		} else if (
+			chosenOrganizationId != null &&
+			organizations != null &&
+			!organizations.some(o => o.id === chosenOrganizationId)
+		) {
+			// Only reset the chosen organization when the fetched list actually excludes it, not when the list couldn't be fetched
 			chosenOrganizationId = undefined;
 			void updateActiveOrganizationId(undefined);
 		}
-		const subscription = getSubscriptionFromCheckIn(data, organizations, chosenOrganizationId);
+		const subscription = getSubscriptionFromCheckIn(data, organizations ?? [], chosenOrganizationId);
 		this._lastValidatedDate = new Date();
 		this.changeSubscription(
 			{
@@ -1312,11 +1304,18 @@ export class SubscriptionService implements Disposable {
 					if (createIfNeeded) {
 						const unauthorized = ex.statusCode === 401;
 						queueMicrotask(async () => {
-							const confirm: MessageItem = { title: 'Retry Sign In' };
+							const confirm: MessageItem = { title: l10n.t('Retry Sign In') };
 							const result = await window.showErrorMessage(
-								`Unable to sign in to your (${name}) account. Please try again. If this issue persists, please contact support.${
-									unauthorized ? '' : ` Error=${ex.message}`
-								}`,
+								unauthorized
+									? l10n.t(
+											'Unable to sign in to your ({0}) account. Please try again. If this issue persists, please contact support.',
+											name,
+										)
+									: l10n.t(
+											'Unable to sign in to your ({0}) account. Please try again. If this issue persists, please contact support. Error={1}',
+											name,
+											getPresentableErrorMessage(ex),
+										),
 								confirm,
 							);
 
@@ -1325,6 +1324,7 @@ export class SubscriptionService implements Disposable {
 									source: 'subscription',
 									detail: {
 										error: 'validation-failed',
+										// oxlint-disable-next-line @gitlens/no-raw-error-message -- telemetry (source.detail attributes, never shown to the user)
 										'error.message': ex.message,
 									},
 								});
@@ -1573,23 +1573,32 @@ export class SubscriptionService implements Disposable {
 			);
 			this._statusBarSubscription.tooltip = new MarkdownString(
 				trial
-					? `**GitLens Pro — verify your email**\n\nYou must verify your email before you can start your **${effective.name}** trial.`
-					: `**GitLens Pro — verify your email**\n\nYou must verify your email before you can unlock Pro features.`,
+					? l10n.t(
+							'**GitLens Pro — verify your email**\n\nYou must verify your email before you can start your **{0}** trial.',
+							effective.name,
+						)
+					: l10n.t(
+							'**GitLens Pro — verify your email**\n\nYou must verify your email before you can unlock Pro features.',
+						),
 				true,
 			);
 		} else {
 			let tooltip;
 			if (trialEligible) {
-				tooltip = `**GitLens Pro — reactivate your Pro trial**\n\nExperience full access to all the [new Pro features](${
-					urls.releaseNotes
-				}) — free for another ${pluralize('day', proTrialLengthInDays)}.`;
+				const formattedDays = getNumericFormat()(proTrialLengthInDays);
+				tooltip = l10n.t(
+					'**GitLens Pro — reactivate your Pro trial**\n\nExperience full access to all the [new Pro features]({0}) — free for another {1} days.',
+					urls.releaseNotes,
+					formattedDays,
+				);
 			} else if (trial) {
 				const remaining = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 0;
-				tooltip = `**GitLens Pro — trial**\n\nYou now have full access to all GitLens Pro features for ${pluralize(
-					'day',
-					remaining,
-					{ infix: ' more ' },
-				)}.`;
+				tooltip = formatPlural(
+					l10n.t(
+						'{0, plural, one{**GitLens Pro — trial**\n\nYou now have full access to all GitLens Pro features for {0} more day.} other{**GitLens Pro — trial**\n\nYou now have full access to all GitLens Pro features for {0} more days.}}',
+					),
+					[remaining],
+				);
 			}
 
 			this._statusBarSubscription.tooltip = new MarkdownString(tooltip, true);
@@ -1621,8 +1630,8 @@ export class SubscriptionService implements Disposable {
 		}));
 
 		const pick = await window.showQuickPick(picks, {
-			title: 'Switch Organization',
-			placeHolder: 'Choose an active organization for your account',
+			title: l10n.t('Switch Organization'),
+			placeHolder: l10n.t('Choose an active organization for your account'),
 		});
 
 		const currentActiveOrganization = this._subscription?.activeOrganization;
@@ -1642,23 +1651,9 @@ export class SubscriptionService implements Disposable {
 			return;
 		}
 
-		const checkInData = await this._getCheckInData();
-		if (checkInData == null) return;
-
-		const organizationSubscription = getSubscriptionFromCheckIn(checkInData, organizations, pick.org.id);
-
 		if (getConfiguredActiveOrganizationId() !== pick.org.id) {
 			await updateActiveOrganizationId(pick.org.id);
 		}
-
-		this.changeSubscription(
-			{
-				...this._subscription,
-				...organizationSubscription,
-			},
-			source,
-			{ store: true },
-		);
 	}
 
 	@info()
@@ -1669,18 +1664,17 @@ export class SubscriptionService implements Disposable {
 		const code = queryParams.get('code');
 		const state = queryParams.get('state');
 		const context = queryParams.get('context');
-		let contextMessage = 'sign in to GitKraken';
-
-		switch (context) {
-			case 'start_trial':
-				contextMessage = 'start a Pro trial';
-				break;
-		}
 
 		if (code == null) {
 			scope?.error(undefined, `No code provided. Link: ${uri.toString(true)}`);
 			void window.showErrorMessage(
-				`Unable to ${contextMessage} with that link. Please try clicking the link again. If this issue persists, please contact support.`,
+				context === 'start_trial'
+					? l10n.t(
+							'Unable to start a Pro trial with that link. Please try clicking the link again. If this issue persists, please contact support.',
+						)
+					: l10n.t(
+							'Unable to sign in to GitKraken with that link. Please try clicking the link again. If this issue persists, please contact support.',
+						),
 			);
 			return;
 		}
@@ -1767,7 +1761,6 @@ export class SubscriptionService implements Disposable {
 			void this.container.storage
 				.store(`gk:promo:${this._session?.account.id ?? '00000000'}:ai:allAccess:dismissed`, true)
 				.catch();
-			void this.container.views.home.refresh();
 		}
 
 		if (action !== 'cancel') {
@@ -1795,7 +1788,6 @@ export class SubscriptionService implements Disposable {
 				await this.container.storage
 					.store(`gk:promo:${newSession.account.id}:ai:allAccess:dismissed`, true)
 					.catch();
-				void this.container.views.home.refresh();
 			}
 		}
 	}

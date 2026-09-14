@@ -1,3 +1,5 @@
+import type { GitBranch } from '@gitlens/git/models/branch.js';
+import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { RemoteProviderId } from '@gitlens/git/models/remoteProvider.js';
 import type { GkProviderId } from '@gitlens/git/models/repositoryIdentities.js';
@@ -10,7 +12,12 @@ import {
 import type { Unbrand } from '@gitlens/utils/brand.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
 import type { GraphActivityDecay } from '../../../config.js';
-import type { StoredGraphExcludedRef } from '../../../constants.storage.js';
+import type {
+	StoredGraphColumn,
+	StoredGraphDefaultLayout,
+	StoredGraphExcludedRef,
+	StoredGraphState,
+} from '../../../constants.storage.js';
 import type { GlRepository } from '../../../git/models/repository.js';
 import { remoteSupportsIntegration } from '../../../git/utils/-webview/remote.utils.js';
 import { toRepositoryShape, toRepositoryShapeWithProvider } from '../../../git/utils/-webview/repository.utils.js';
@@ -62,8 +69,27 @@ export function getExcludedRefName(ref: StoredGraphExcludedRef): string | undefi
 	}
 }
 
-// Column layouts applied by the "Reset Columns" commands; shared by the host provider (column-settings
-// seed) and the extracted graph commands module.
+/**
+ * Re-stamps a stored filter ref id (`filters.pinnedRef.id`, an `excludeRefs` key/`.id`, or an `except[]`
+ * entry) onto `toRepoPath` — the invariant every `graph:filtersByRepo` consumer follows: the BUCKET is
+ * home-keyed (survives a rebind), but every id INSIDE it was minted at whatever path was live when it was
+ * stored, and both host and webview match those ids by EXACT equality against a LIVE row/ref/branch's
+ * `.id`, which is always stamped to the graph's CURRENT path. Re-stamp at the read/serve boundary or a
+ * pin/hide made pre-rebind (or while rebound onto a DIFFERENT worktree) silently stops matching.
+ *
+ * Unlike `restampRowIds`, which knows the EXACT prior path, a stored filter id could have been minted at
+ * ANY worktree of the family — there's no single `fromPath` to prefix-match. Ids all format as
+ * `${repoPath}|<type>/<name>`, so replacing everything BEFORE the first `|` is unambiguous for every id the
+ * scheme can round-trip. (`|` is legal in git paths and refnames; an id containing one is already
+ * unparseable everywhere ids are split, not just here.)
+ */
+export function restampFilterRefId(id: string, toRepoPath: string): string {
+	const sep = id.indexOf('|');
+	return sep === -1 ? id : `${toRepoPath}${id.slice(sep)}`;
+}
+
+// The shipped column layout — the base layer under stored column state, and what "Reset Layout"
+// writes back.
 export const defaultGraphColumnsSettings: GraphColumnsSettings = {
 	ref: { width: 130, isHidden: false, order: 0, isFilterable: true },
 	graph: { width: 150, mode: undefined, isHidden: false, order: 1 },
@@ -74,15 +100,61 @@ export const defaultGraphColumnsSettings: GraphColumnsSettings = {
 	sha: { width: 44, isHidden: false, order: 6, isFilterable: true },
 };
 
-export const compactGraphColumnsSettings: GraphColumnsSettings = {
-	ref: { width: 32, isHidden: false, isFilterable: true },
-	graph: { width: 150, mode: 'compact', isHidden: false },
-	author: { width: 34, isHidden: false, order: 2, isFilterable: true },
-	message: { width: 500, isHidden: false, order: 3, isFilterable: true },
-	changes: { width: 36, isHidden: false, order: 4, isFilterable: true },
-	datetime: { width: 130, isHidden: true, order: 5, isFilterable: true },
-	sha: { width: 130, isHidden: false, order: 6, isFilterable: true },
-};
+export interface DefaultLayoutSeeds {
+	/** Value to write to workspace `graph:columns`, or undefined to leave it untouched. */
+	columns?: Record<string, StoredGraphColumn>;
+	/** Value to write to workspace `graph:state`, or undefined to leave it untouched. */
+	state?: StoredGraphState;
+}
+
+/** Computes which workspace-storage writes (if any) seed a fresh workspace from the user's saved
+ *  default layout. Seed-once: a workspace that already has stored columns keeps them untouched, and
+ *  likewise for panels — the saved default only fills a void, it never merges over existing state. */
+export function getDefaultLayoutSeeds(
+	layout: StoredGraphDefaultLayout | undefined,
+	existingColumns: Record<string, StoredGraphColumn> | undefined,
+	existingState: StoredGraphState | undefined,
+): DefaultLayoutSeeds {
+	if (layout == null) return {};
+
+	const seeds: DefaultLayoutSeeds = {};
+	if (layout.columns != null && existingColumns == null) {
+		seeds.columns = layout.columns;
+	}
+
+	if (layout.panels != null && existingState?.panels == null) {
+		seeds.state = { ...existingState, panels: layout.panels };
+	}
+
+	return seeds;
+}
+
+/** Snapshots the workspace's current layout for `graph:defaultLayout`. Copies the raw stored records
+ *  (partial is fine — built-in defaults fill gaps at read time). `details.maximized` may linger in
+ *  mementos written before it was dropped from the persisted shape; strip it so it never round-trips
+ *  through the saved default. */
+export function createDefaultLayoutSnapshot(
+	columns: Record<string, StoredGraphColumn> | undefined,
+	state: StoredGraphState | undefined,
+): StoredGraphDefaultLayout {
+	const snapshot: StoredGraphDefaultLayout = {};
+	if (columns != null) {
+		snapshot.columns = columns;
+	}
+
+	const panels = state?.panels;
+	if (panels != null) {
+		if (panels.details != null) {
+			const { maximized: _leakedMaximized, ...details } = panels.details as NonNullable<typeof panels.details> &
+				Record<'maximized', boolean | undefined>;
+			snapshot.panels = { ...panels, details: details };
+		} else {
+			snapshot.panels = panels;
+		}
+	}
+
+	return snapshot;
+}
 
 /**
  * Scale the per-page row limit with how deep the graph is already loaded. `git log --skip=N` re-walks
@@ -148,6 +220,64 @@ export async function formatRepositories(repositories: GlRepository[]): Promise<
 		}),
 	);
 	return result.map(r => getSettledValue(r)).filter(r => r != null);
+}
+
+/**
+ * Builds the `gitlens:branch...` `webviewItem` context string — the single source shared by the sidebar
+ * branches panel and the Overview panel's branch cards (`GraphPanelsService.buildBranchContext`) and the
+ * WIP header's branch kebab (`GraphWipService`), so their menus can't drift.
+ *
+ * The `+worktree` token always derives from the branch's own worktree info, marking only NON-default
+ * worktrees — the worktree-aware derivation `GraphPanelsService` owns. Callers whose surface notion of
+ * "checked out" differs from "has a worktree" (the WIP header also counts its non-primary repo rows)
+ * supply it via `options.isCheckedOut`, which only feeds the `+checkedout` token.
+ */
+export function buildBranchContextSuffix(
+	branch: GitBranch,
+	options: {
+		/** Whether this surface considers the branch checked out — drives `+checkedout`. */
+		isCheckedOut: boolean;
+		pinnedRefId?: string;
+		hiddenIds?: ReadonlySet<string>;
+		hiddenByRemote?: boolean;
+	},
+): string {
+	return `gitlens:branch${branch.remote ? '+remote' : ''}${branch.current ? '+current' : ''}${
+		branch.upstream != null && !branch.upstream.missing ? '+tracking' : ''
+	}${
+		branch.worktree != null && branch.worktree !== false && !branch.worktree.isDefault ? '+worktree' : ''
+	}${branch.current || options.isCheckedOut ? '+checkedout' : ''}${
+		branch.upstream?.state.ahead ? '+ahead' : ''
+	}${branch.upstream?.state.behind ? '+behind' : ''}${
+		options.pinnedRefId != null && branch.id === options.pinnedRefId ? '+pinned' : ''
+	}${!branch.current && options.hiddenIds?.has(branch.id) ? '+hidden' : ''}${
+		options.hiddenByRemote ? '+hiddenbyremote' : ''
+	}`;
+}
+
+/**
+ * Builds the `gitlens:pullrequest...` `webviewItem` context string — shared by the graph row pills'
+ * producer (`GraphProducersService`) and the sidebar pull requests panel
+ * (`GraphPanelsService.toSidebarPullRequest`), so the two surfaces can't drift.
+ *
+ * Every suffix names a precondition some handler actually checks, because a suffix that merely says
+ * "a refs object exists" gates nothing: the providers-api path always builds `refs`, filling a gone head
+ * with empty strings. So — `+head` for an actionable head (branch and url both non-empty, what
+ * switch/worktree need), `+shas` for a diffable pair (changes/comparison), `+closed`, `+fork`. `+head`
+ * isn't fork-gated: those commands work for a fork off its own url, since the deep link adds the remote.
+ * `+current` withholds switch-style actions from the branch you're already on: without it the current
+ * branch's own pull request offers a Switch the deep link turns into "show WIP" and an Open in Worktree
+ * that opens the folder you're already in.
+ *
+ * Callers resolve that currency themselves (`isCurrent`): the graph rows compare a possibly-remote
+ * branch's name against the current branch's, while the panel compares the PR's head branch name.
+ */
+export function buildPullRequestContextSuffix(pr: PullRequest, isCurrent: boolean): string {
+	return `gitlens:pullrequest${
+		pr.refs?.head?.branch && pr.refs.head.url ? '+head' : ''
+	}${pr.refs?.base?.sha && pr.refs.head?.sha ? '+shas' : ''}${
+		pr.state !== 'opened' ? '+closed' : ''
+	}${pr.refs?.isCrossRepository === true ? '+fork' : ''}${isCurrent ? '+current' : ''}`;
 }
 
 function isGraphItemContext(item: unknown): item is GraphItemContext {
@@ -301,6 +431,9 @@ export function toGraphIssueTrackerType(id: string): GraphIssueTrackerType | und
 		// case 'bitbucketServer' satisfies Unbrand<GkProviderId>:
 		// case SelfHostedIntegrationId.BitbucketServer:
 		// 	return 'bitbucketServer';
+
+		case IssuesCloudHostIntegrationId.Trello:
+			return 'trello';
 
 		// case IssueIntegrationId.JiraServer:
 		// 	return 'jiraServer';

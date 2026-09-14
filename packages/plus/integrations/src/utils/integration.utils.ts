@@ -7,20 +7,11 @@ import {
 } from '../constants.js';
 import type { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type { Integration, IntegrationConnectedKey } from '../models/integration.js';
-import { isGitHubDotCom, isGitLabDotCom } from '../providers/models.js';
-
-// These two domain checks live here (rather than in their provider modules) to
-// break a top-level circular import. The provider modules synchronously read
-// `providersMetadata[...]` at module init time, so importing from them while
-// `providers/models.ts` is still loading triggers a TDZ on `providersMetadata`.
-const azureCloudDomainRegex = /^dev\.azure\.com$|\bvisualstudio\.com$/i;
-const bitbucketCloudDomainRegex = /^bitbucket\.org$/i;
-function isAzureCloudDomain(domain: string | undefined): boolean {
-	return domain != null && azureCloudDomainRegex.test(domain);
-}
-function isBitbucketCloudDomain(domain: string | undefined): boolean {
-	return domain != null && bitbucketCloudDomainRegex.test(domain);
-}
+// These domain checks come from `providers/models.ts` (already imported here) rather than the individual
+// provider modules: those read `providersMetadata[...]` synchronously at module init, so importing from them
+// while `providers/models.ts` is still loading triggers a TDZ on `providersMetadata`. Importing the shared
+// predicates keeps one definition of each regex — duplicating them let a fix land in only one place.
+import { isAzureCloudDomain, isBitbucketCloudDomain, isGitHubDotCom, isGitLabDotCom } from '../providers/models.js';
 
 const selfHostedIntegrationIds: GitSelfManagedHostIntegrationId[] = [
 	GitSelfManagedHostIntegrationId.CloudGitHubEnterprise,
@@ -35,8 +26,7 @@ export const supportedIntegrationIds: IntegrationIds[] = [
 	GitCloudHostIntegrationId.Bitbucket,
 	GitCloudHostIntegrationId.AzureDevOps,
 	IssuesCloudHostIntegrationId.Jira,
-	// Note: Trello is metadata-only (no auth provider), so it is intentionally absent — including it
-	// would make reset()'s ensureProvider() throw 'No authentication provider registered'.
+	IssuesCloudHostIntegrationId.Trello,
 	...selfHostedIntegrationIds,
 ] as const;
 
@@ -117,6 +107,20 @@ export function isCloudGitSelfManagedHostIntegrationId(
 	}
 }
 
+/**
+ * Whether a provider's cloud token uses `expiresIn: 0` to mean "never expires" (rather than "already
+ * expired"). GitHub and the cloud self-managed hosts always return 0 for their non-expiring tokens; Trello
+ * is issued with `expiration: never` (identity-service), so its cloud token comes back as 0 too. Callers
+ * must map 0 → a far-future expiry for these, or the session is immediately treated as expired.
+ */
+export function isNonExpiringZeroTokenIntegrationId(id: IntegrationIds): boolean {
+	return (
+		id === GitCloudHostIntegrationId.GitHub ||
+		id === IssuesCloudHostIntegrationId.Trello ||
+		isCloudGitSelfManagedHostIntegrationId(id)
+	);
+}
+
 export function isGitHostIntegration(integration: Integration): integration is GitHostIntegration {
 	return integration.type === 'git';
 }
@@ -135,4 +139,77 @@ export function isGitCloudHostIntegrationId(id: IntegrationIds): id is GitCloudH
 
 export function isGitSelfManagedHostIntegrationId(id: IntegrationIds): id is GitSelfManagedHostIntegrationId {
 	return selfHostedIntegrationIds.includes(id as GitSelfManagedHostIntegrationId);
+}
+
+/**
+ * Whether this id belongs to a dedicated issue tracker (resource → project) rather than a git host.
+ *
+ * Decided from the id alone, so a read can refuse a mismatched surface — a repo/PR read asked of Jira, or an
+ * issue-tracker project read asked of GitHub — before resolving a connection. The instance-level
+ * {@link isIssuesIntegration} answers the same question once an integration is in hand.
+ */
+export function isIssuesHostIntegrationId(id: IntegrationIds): id is IssuesCloudHostIntegrationId {
+	switch (id) {
+		case IssuesCloudHostIntegrationId.Jira:
+		case IssuesCloudHostIntegrationId.Linear:
+		case IssuesCloudHostIntegrationId.Trello:
+			return true;
+		default:
+			return false;
+	}
+}
+
+/**
+ * Whether a read targeted only by an explicit self-managed `domain` (no `connectionId`) must treat a
+ * session-less core result as a broken target instead of an empty account. Without this, a self-managed host
+ * addressed only by domain — the manual-token/external-auth case `domain` exists to cover — returns an empty
+ * success with no warning and no `fetchFailed`, indistinguishable from "this host has nothing".
+ */
+export function warnOnMissingSessionForDomain(id: IntegrationIds, domain: string | undefined): boolean {
+	return domain != null && isGitSelfManagedHostIntegrationId(id);
+}
+
+/** Maps an integration id to the git-remote provider type used by the remote-URL matcher. */
+export function remoteProviderTypeForIntegration(id: IntegrationIds): RemoteProviderId | undefined {
+	switch (id) {
+		case GitCloudHostIntegrationId.GitHub:
+		case GitSelfManagedHostIntegrationId.CloudGitHubEnterprise:
+			return 'github';
+		case GitCloudHostIntegrationId.GitLab:
+		case GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted:
+			return 'gitlab';
+		case GitCloudHostIntegrationId.Bitbucket:
+			return 'bitbucket';
+		case GitSelfManagedHostIntegrationId.BitbucketServer:
+			return 'bitbucket-server';
+		case GitCloudHostIntegrationId.AzureDevOps:
+		case GitSelfManagedHostIntegrationId.AzureDevOpsServer:
+			return 'azure-devops';
+		default:
+			return undefined;
+	}
+}
+
+/** Normalizes a host remote-config `type` string (e.g. `'GitHub'`) to a git-remote provider type. */
+export function remoteProviderTypeForConfig(type: string): RemoteProviderId | undefined {
+	switch (type.toLowerCase()) {
+		case 'github':
+			return 'github';
+		case 'gitlab':
+			return 'gitlab';
+		case 'bitbucket':
+			return 'bitbucket';
+		case 'bitbucket-server':
+		case 'bitbucketserver':
+			return 'bitbucket-server';
+		case 'azuredevops':
+		case 'azure-devops':
+			return 'azure-devops';
+		case 'gitea':
+			return 'gitea';
+		case 'gerrit':
+			return 'gerrit';
+		default:
+			return undefined;
+	}
 }

@@ -1,58 +1,32 @@
+import type { Remote } from '@eamodio/supertalk';
 import './rebase.scss';
 import type { LitVirtualizer } from '@lit-labs/virtualizer';
 import { flow } from '@lit-labs/virtualizer/layouts/flow.js';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { html, nothing } from 'lit';
 import { customElement, query, state } from 'lit/decorators.js';
 import { guard } from 'lit/directives/guard.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
+import { scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
 import type { ConflictDetectionResult } from '@gitlens/git/models/mergeConflicts.js';
 import type { RebaseTodoCommitAction } from '@gitlens/git/models/rebase.js';
 import type { HierarchicalItem } from '@gitlens/utils/array.js';
 import { makeHierarchical } from '@gitlens/utils/array.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
 import { filterMap, some } from '@gitlens/utils/iterable.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { isSubscriptionTrialOrPaidFromState } from '../../../plus/gk/utils/subscription.utils.js';
-import type {
-	ConflictFileInfo,
-	RebaseActiveStatus,
-	RebaseCommitEntry,
-	RebaseEntry,
-	State,
-} from '../../rebase/protocol.js';
-import {
-	AbortCommand,
-	ChangeEntriesCommand,
-	ChangeEntryCommand,
-	ContinueCommand,
-	ContinueWithAiCommand,
-	DismissCloseWarningCommand,
-	GetConflictsRequest,
-	isCommandEntry,
-	isCommitEntry,
-	MoveEntriesCommand,
-	MoveEntryCommand,
-	OpenConflictChangesCommand,
-	OpenConflictFileCommand,
-	RecomposeCommand,
-	ReorderCommand,
-	ResolveAllConflictsCommand,
-	ResolveConflictsInGraphCommand,
-	RevealRefCommand,
-	SearchCommand,
-	ShiftEntriesCommand,
-	SkipCommand,
-	StageConflictCommand,
-	StartCommand,
-	StartWithAiRequest,
-	SwitchCommand,
-	UpdateSelectionCommand,
-} from '../../rebase/protocol.js';
-import { GlAppHost } from '../shared/appHost.js';
+import type { ConflictFileInfo, RebaseActiveStatus, RebaseCommitEntry, RebaseEntry } from '../../rebase/protocol.js';
+import { isCommandEntry, isCommitEntry } from '../../rebase/protocol.js';
+import type { RebaseServices, RebaseStateChangedEvent } from '../../rpc/rebaseService.js';
+import { fireAndForget } from '../shared/actions/rpc.js';
+import { SignalWatcherWebviewApp } from '../shared/appBase.js';
 import type { GlPopoverConfirm } from '../shared/components/overlays/popover-confirm.js';
 import type { GlSelect } from '../shared/components/select/select.js';
-import { scrollableBase } from '../shared/components/styles/lit/base.css.js';
+import { splitButtonStyles } from '../shared/components/styles/lit/split-button.css.js';
 import type {
 	TreeItemActionDetail,
 	TreeItemDecoration,
@@ -63,9 +37,12 @@ import {
 	getConflictDecorations as getSharedConflictDecorations,
 	getConflictTooltip as getSharedConflictTooltip,
 } from '../shared/components/tree/conflictRendering.js';
-import type { LoggerContext } from '../shared/contexts/logger.js';
 import { ContextMenuProxyController } from '../shared/controllers/context-menu-proxy.js';
-import type { HostIpc } from '../shared/ipc.js';
+import { subscribeAll } from '../shared/events/subscriptions.js';
+import { getHost } from '../shared/host/context.js';
+import { RpcController } from '../shared/rpc/rpcController.js';
+import { SubscribeThenSeed } from '../shared/rpc/subscribeThenSeed.js';
+import { RebaseActions } from './actions.js';
 import type { GlRebaseEntryElement } from './components/rebase-entry.js';
 import { getConflictFileActions, getConflictFileContextData } from './conflictStatus.utils.js';
 import { rebaseStyles } from './rebase.css.js';
@@ -75,13 +52,12 @@ import './components/conflict-indicator.js';
 import './components/rebase-entry.js';
 import '../shared/components/banner/banner.js';
 import '../shared/components/branch-name.js';
-import { RebaseStateProvider } from './stateProvider.js';
 import '../shared/components/button.js';
 import '../shared/components/menu/menu-popover.js';
 import '../shared/components/checkbox/checkbox.js';
 import '../shared/components/commit-sha.js';
 import '../shared/components/overlays/popover-confirm.js';
-import '../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../shared/components/split-panel/split-panel.js';
 
 const filesPanelDefaultPct = 50;
@@ -108,8 +84,33 @@ const actionKeyMap: Record<string, RebaseTodoCommitAction> = {
 };
 
 @customElement('gl-rebase-editor')
-export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
-	static override styles = [scrollableBase, rebaseStyles];
+export class GlRebaseEditor extends SignalWatcherWebviewApp {
+	static override styles = [scrollableBase, splitButtonStyles, rebaseStyles];
+
+	private _host = getHost();
+
+	/** The resolved view-specific service — set per ready; UI handlers are no-ops before then. */
+	private _rebase?: Awaited<Remote<RebaseServices>['rebase']>;
+
+	/** Subscribe-then-seed choreography — released at disconnect and rerun per ready against the
+	 *  new session (the subscriber closes over this mount's state). */
+	private readonly _seed = new SubscribeThenSeed<RebaseServices>();
+
+	/** Optimistic updates, enrichment batching, and reconciliation over the host-pushed state. */
+	private readonly _actions: RebaseActions = new RebaseActions(this, () => this._rebase);
+
+	protected override readonly _rpc = new RpcController<RebaseServices>(this, {
+		rpcOptions: {
+			webviewId: () => this._webview?.webviewId,
+			webviewInstanceId: () => this._webview?.webviewInstanceId,
+			endpoint: () => this._host.createEndpoint(),
+		},
+		onReady: services => this._onRpcReady(services),
+	});
+
+	private get state(): RebaseStateChangedEvent | undefined {
+		return this._actions.state;
+	}
 
 	@query('lit-virtualizer')
 	private readonly _virtualizer?: LitVirtualizer;
@@ -222,22 +223,93 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		);
 	}
 
-	protected override createStateProvider(
-		bootstrap: string,
-		ipc: HostIpc,
-		logger: LoggerContext,
-	): RebaseStateProvider {
-		return new RebaseStateProvider(this, bootstrap, ipc, logger);
-	}
-
 	override connectedCallback(): void {
 		super.connectedCallback?.();
+
+		this.consumeContext();
+
 		document.addEventListener('keydown', this.onDocumentKeyDown);
+		// Listen for missing data events from entry components
+		this.addEventListener('missing-avatar', this.onMissingAvatar);
+		this.addEventListener('missing-commit', this.onMissingCommit);
 	}
 
 	override disconnectedCallback(): void {
 		document.removeEventListener('keydown', this.onDocumentKeyDown);
+		this.removeEventListener('missing-avatar', this.onMissingAvatar);
+		this.removeEventListener('missing-commit', this.onMissingCommit);
+
+		// Unsubscribe before resetting state: the retained handle would otherwise re-issue its
+		// subscriber — which closes over the reset state — on the next handshake. A fresh
+		// subscription is created per ready anyway, so nothing is lost by releasing it here.
+		// Also strands any seed still in flight from this mount — its deferred applications must
+		// not touch anything after teardown.
+		this._seed.reset();
+		this._rebase = undefined;
+		this._actions.reset();
+
 		super.disconnectedCallback?.();
+	}
+
+	private async _onRpcReady(services: Remote<RebaseServices>): Promise<void> {
+		const rebase = await services.rebase;
+		this._rebase = rebase;
+
+		// The promos context fetches through the session's promos service; without this its
+		// pre-connect waiters never fulfill, so e.g. the conflict-detection Pro promo never shows.
+		this._promos.connect(this._rpc.connection!);
+
+		// Subscribe to events FIRST so an update pushed during the initial fetch isn't missed, then
+		// fetch and apply the authoritative snapshot. This replaces the legacy deferred bootstrap:
+		// unlike the visibility-gated push pipeline, the fetch answers even while hidden, matching
+		// the old bootstrap semantics. The fetch parses the todo document host-side, so an event
+		// landing mid-parse could otherwise be regressed by the older snapshot — see
+		// `SubscribeThenSeed`'s docs for how buffering preserves event order without racing an
+		// unordered full-state response.
+		await this._seed.run({
+			connection: this._rpc.connection!,
+			subscriber: async remoteServices => {
+				const [svc, subscription] = await Promise.all([remoteServices.rebase, remoteServices.subscription]);
+
+				return subscribeAll([
+					() =>
+						svc.onStateChanged(state => {
+							this._seed.during(() => this._actions.applyIncomingState(state));
+						}),
+					() =>
+						svc.onAvatarsChanged(event => {
+							this._seed.during(() => this._actions.onAvatarsChanged(event));
+						}),
+					() =>
+						svc.onCommitsChanged(event => {
+							this._seed.during(() => this._actions.onCommitsChanged(event));
+						}),
+					() =>
+						subscription.onSubscriptionChanged(sub => {
+							this._seed.during(() => this._actions.onSubscriptionChanged(sub));
+						}),
+				]);
+			},
+			seed: () => rebase.getState(),
+			applySeed: state => this._actions.applyIncomingState(state),
+		});
+	}
+
+	private readonly onMissingAvatar = (e: Event): void => {
+		this._actions.onMissingAvatar((e as CustomEvent<{ email: string; sha?: string }>).detail);
+	};
+
+	private readonly onMissingCommit = (e: Event): void => {
+		this._actions.onMissingCommit((e as CustomEvent<{ sha: string }>).detail);
+	};
+
+	/** Fire-and-forget a command to the host — no-ops until the RPC session is ready. Errors are
+	 *  logged (not surfaced), matching the legacy IPC command path where host-side failures never
+	 *  reached the webview. */
+	private sendCommand(command: Promise<void> | undefined): void {
+		if (command != null) {
+			fireAndForget(command);
+		}
 	}
 
 	private onListKeyDown = (e: KeyboardEvent) => {
@@ -290,7 +362,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 				if (sortedIndex !== -1) {
 					const entry = this._sortedEntries[sortedIndex];
 					if (isCommitEntry(entry)) {
-						this._ipc.sendCommand(UpdateSelectionCommand, { sha: entry.sha });
+						this.sendCommand(this._rebase?.updateSelection({ sha: entry.sha }));
 					}
 				}
 				return;
@@ -526,9 +598,9 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 				this.focusedEntryId && this.selectedIds.has(this.focusedEntryId) ? this.focusedEntryId : orderedIds[0];
 
 			// Move all selected entries to the start (index 0)
-			this._stateProvider.moveEntries(orderedIds, 0);
+			this._actions.moveEntries(orderedIds, 0);
 			this.refreshIndices();
-			this._ipc.sendCommand(MoveEntriesCommand, { ids: orderedIds, to: 0 });
+			this.sendCommand(this._rebase?.moveEntries({ ids: orderedIds, to: 0 }));
 
 			this.scheduleConflictCheck('todo');
 		} else {
@@ -708,12 +780,12 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		const spliceIndex = isMovingToHigherIndex ? toIndex - 1 : toIndex;
 
 		// Apply optimistic update
-		this._stateProvider.moveEntry(fromIndex, spliceIndex);
+		this._actions.moveEntry(fromIndex, spliceIndex);
 		// Synchronously rebuild indices so subsequent operations use correct state
 		this.refreshIndices();
 
 		// Send absolute position to host
-		this._ipc.sendCommand(MoveEntryCommand, { id: entry.id, to: toIndex, relative: false });
+		this.sendCommand(this._rebase?.moveEntry({ id: entry.id, to: toIndex, relative: false }));
 
 		this.scheduleConflictCheck('todo');
 	}
@@ -780,12 +852,12 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		this.pendingFocusId = primaryId;
 
 		// Apply optimistic update
-		this._stateProvider.moveEntries(orderedIds, toIndex);
+		this._actions.moveEntries(orderedIds, toIndex);
 		// Synchronously rebuild indices so subsequent operations use correct state
 		this.refreshIndices();
 
 		// Send batch command to host
-		this._ipc.sendCommand(MoveEntriesCommand, { ids: orderedIds, to: toIndex });
+		this.sendCommand(this._rebase?.moveEntries({ ids: orderedIds, to: toIndex }));
 
 		this.scheduleConflictCheck('todo');
 	}
@@ -833,7 +905,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 
 		// Notify host of primary selection (only for commit entries)
 		if (sha) {
-			this._ipc.sendCommand(UpdateSelectionCommand, { sha: sha });
+			this.sendCommand(this._rebase?.updateSelection({ sha: sha }));
 		}
 	};
 
@@ -878,11 +950,11 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		}
 
 		if (entries.length === 1) {
-			this._stateProvider.changeEntryAction(entries[0].sha, entries[0].action);
-			this._ipc.sendCommand(ChangeEntryCommand, { sha: entries[0].sha, action: entries[0].action });
+			this._actions.changeEntryAction(entries[0].sha, entries[0].action);
+			this.sendCommand(this._rebase?.changeEntry({ sha: entries[0].sha, action: entries[0].action }));
 		} else {
-			this._stateProvider.changeEntryActions(entries);
-			this._ipc.sendCommand(ChangeEntriesCommand, { entries: entries });
+			this._actions.changeEntryActions(entries);
+			this.sendCommand(this._rebase?.changeEntries({ entries: entries }));
 		}
 
 		// If dropping commits, schedule todo conflict check (since that affects what gets applied)
@@ -949,12 +1021,12 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 			this.pendingFocusId = entry.id;
 
 			// Apply optimistic update
-			this._stateProvider.shiftEntries(ids, direction);
+			this._actions.shiftEntries(ids, direction);
 			// Synchronously rebuild indices so subsequent operations use correct state
 			this.refreshIndices();
 
 			// Send shift command to host
-			this._ipc.sendCommand(ShiftEntriesCommand, { ids: ids, direction: direction });
+			this.sendCommand(this._rebase?.shiftEntries({ ids: ids, direction: direction }));
 
 			this.scheduleConflictCheck('todo');
 		} else {
@@ -1053,22 +1125,25 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 	// ============================================================================
 
 	private onOrderToggle() {
-		this._ipc.sendCommand(ReorderCommand, { ascending: !this.ascending });
+		this.sendCommand(this._rebase?.swapOrdering({ ascending: !this.ascending }));
 	}
 
 	private onStartClicked() {
-		this._ipc.sendCommand(StartCommand, undefined);
+		this.sendCommand(this._rebase?.start());
 	}
 
 	private async onStartWithAiClicked() {
 		if (this._startingWithAi) return;
 
+		const rebase = this._rebase;
+		if (rebase == null) return;
+
 		// Disabled while the host runs its pre-flight (plan gate, AI model prompt) — a refusal
-		// responds `started: false` and the editor stays open, so re-enable for another try
+		// responds `false` and the editor stays open, so re-enable for another try
 		this._startingWithAi = true;
 		try {
-			const response = await this._ipc.sendRequest(StartWithAiRequest, undefined);
-			if (response.started) return;
+			const started = await rebase.startWithAi();
+			if (started) return;
 		} catch {
 			// Treat a failed request like a refusal — the editor is still open
 		}
@@ -1076,31 +1151,31 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 	}
 
 	private onAbortClicked() {
-		this._ipc.sendCommand(AbortCommand, undefined);
+		this.sendCommand(this._rebase?.abort());
 	}
 
 	private onContinueClicked() {
-		this._ipc.sendCommand(ContinueCommand, undefined);
+		this.sendCommand(this._rebase?.continue());
 	}
 
 	private onContinueWithAiClicked() {
-		this._ipc.sendCommand(ContinueWithAiCommand, undefined);
+		this.sendCommand(this._rebase?.continueWithAi());
 	}
 
 	private onSkipClicked() {
-		this._ipc.sendCommand(SkipCommand, undefined);
+		this.sendCommand(this._rebase?.skip());
 	}
 
 	private onSwitchClicked() {
-		this._ipc.sendCommand(SwitchCommand, undefined);
+		this.sendCommand(this._rebase?.switchToText());
 	}
 
 	private onSearch() {
-		this._ipc.sendCommand(SearchCommand, undefined);
+		this.sendCommand(this._rebase?.search());
 	}
 
 	private onRecomposeCommitsClicked() {
-		this._ipc.sendCommand(RecomposeCommand, undefined);
+		this.sendCommand(this._rebase?.recompose());
 	}
 
 	private onDocumentKeyDown = (e: KeyboardEvent) => {
@@ -1185,7 +1260,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 				id: onto.sha,
 				action: 'pick',
 				sha: onto.sha,
-				message: onto.commit?.message ?? 'Base commit',
+				message: onto.commit?.message ?? l10n.t('Base commit'),
 				line: 0,
 				commit: onto.commit,
 			};
@@ -1382,13 +1457,15 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 											? html`<div slot="start" class="entries-panel">
 													${this.renderEntries()}
 												</div>`
-											: html`<div slot="start" class="entries-empty">No commits to rebase</div>`
+											: html`<div slot="start" class="entries-empty">
+													${l10n.t('No commits to rebase')}
+												</div>`
 									}
 									${this.renderConflictPanel()}
 								</gl-split-panel>`
 							: !isEmptyOrNoop
 								? this.renderEntries()
-								: html`<div class="entries-empty">No commits to rebase</div>`
+								: html`<div class="entries-empty">${l10n.t('No commits to rebase')}</div>`
 					}
 				</div>
 				${this.renderFooter()}
@@ -1423,7 +1500,9 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 			class="preserves-merges-banner"
 			display="outline"
 			layout="responsive"
-			body="This rebase contains merge commits. Reordering is disabled to preserve the merge structure, but you can still change actions (drop, reword, etc.)."
+			body=${l10n.t(
+				'This rebase contains merge commits. Reordering is disabled to preserve the merge structure, but you can still change actions (drop, reword, etc.).',
+			)}
 		></gl-banner>`;
 	}
 
@@ -1437,7 +1516,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 			class="close-warning-banner"
 			display="outline"
 			layout="responsive"
-			body="The rebase will start automatically when you close this tab."
+			body=${l10n.t('The rebase will start automatically when you close this tab.')}
 			dismissible
 			@gl-banner-dismiss=${this.onDismissCloseWarning}
 		></gl-banner>`;
@@ -1445,7 +1524,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 
 	private onDismissCloseWarning() {
 		this.closeWarningDismissedLocal = true;
-		this._ipc?.sendCommand(DismissCloseWarningCommand, undefined);
+		this.sendCommand(this._rebase?.dismissCloseWarning());
 	}
 
 	private renderConflictIndicator() {
@@ -1455,21 +1534,26 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		// For active/paused rebases, show a compact inline status
 		if (this.isRebasing) {
 			if (loading) {
-				return html`<span class="conflict-loading" title="Checking remaining commits for conflicts...">
+				return html`<span
+					class="conflict-loading"
+					title=${l10n.t('Checking remaining commits for conflicts...')}
+				>
 					<code-icon icon="loading" modifier="spin"></code-icon>
 				</span>`;
 			}
 
 			const conflictCount = result?.status === 'conflicts' ? (result.conflict?.shas?.length ?? 0) : 0;
 			if (conflictCount) {
-				return html`<gl-tooltip
-					content="Potential conflicts detected in ${conflictCount} remaining commit${
-						conflictCount > 1 ? 's' : ''
-					}"
-				>
+				const conflictsTooltip = formatPlural(
+					l10n.t(
+						'{count, plural, one{Potential conflicts detected in {count} remaining commit} other{Potential conflicts detected in {count} remaining commits}}',
+					),
+					{ count: conflictCount },
+				);
+				return html`<gl-tooltip content=${conflictsTooltip}>
 					<span class="conflict-summary warning">
 						<code-icon icon="warning"></code-icon>
-						<span>${conflictCount}</span>
+						<span>${getNumericFormat()(conflictCount)}</span>
 					</span>
 				</gl-tooltip>`;
 			}
@@ -1511,7 +1595,8 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 
 		const currentCommitSha = status.currentCommit;
 		const pauseReason = status.pauseReason;
-		const revealTooltip = this.state?.revealLocation === 'graph' ? 'Open in Commit Graph' : 'Open in Inspect View';
+		const revealTooltip =
+			this.state?.revealLocation === 'graph' ? l10n.t('Open in Commit Graph') : l10n.t('Open in Inspect View');
 
 		// Determine icon based on pause reason
 		let icon: string;
@@ -1539,47 +1624,58 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		let statusContent;
 		switch (pauseReason) {
 			case 'break':
-				statusContent = html`Rebase paused at breakpoint`;
+				statusContent = l10n.t('Rebase paused at breakpoint');
 				break;
 
 			case 'conflict':
 				statusContent = currentCommitSha
-					? html`Rebase paused due to conflicts at ${sha}`
-					: html`Rebase paused due to conflicts`;
+					? localizedContent(l10n.t('Rebase paused due to conflicts at {commit}'), { commit: sha })
+					: l10n.t('Rebase paused due to conflicts');
 				break;
 
 			case 'exec':
-				statusContent = html`Rebase paused due to exec failure`;
+				statusContent = l10n.t('Rebase paused due to exec failure');
 				break;
 
 			case 'edit':
 				statusContent = currentCommitSha
-					? html`Rebase paused for editing at ${sha}`
-					: html`Rebase paused for editing`;
+					? localizedContent(l10n.t('Rebase paused for editing at {commit}'), { commit: sha })
+					: l10n.t('Rebase paused for editing');
 				break;
 
 			case 'reword':
 				statusContent = currentCommitSha
-					? html`Rebase paused for rewording at ${sha}`
-					: html`Rebase paused for rewording`;
+					? localizedContent(l10n.t('Rebase paused for rewording at {commit}'), { commit: sha })
+					: l10n.t('Rebase paused for rewording');
 				break;
 
 			default:
-				statusContent = currentCommitSha ? html`Rebase paused at ${sha}` : html`Rebase paused`;
+				statusContent = currentCommitSha
+					? localizedContent(l10n.t('Rebase paused at {commit}'), { commit: sha })
+					: l10n.t('Rebase paused');
 		}
+
+		const remaining = status.totalSteps - status.currentStep;
+		const remainingLabel = l10n.t('{count} remaining', { count: getNumericFormat()(remaining) });
+		const progress = l10n.t('({current}/{total})', {
+			current: getNumericFormat()(status.currentStep),
+			total: getNumericFormat()(status.totalSteps),
+		});
 
 		return html`<div class="rebase-banner ${pauseReason === 'conflict' ? 'has-conflicts' : ''}">
 			<code-icon icon="${icon}"></code-icon>
 			<span class="rebase-status">${statusContent}</span>
 			${
 				pauseReason === 'conflict'
-					? html`<gl-tooltip content="Show Conflicts">
-							<a class="rebase-action-link" href="${this.showConflictsCommandUrl}">Show conflicts</a>
+					? html`<gl-tooltip content=${l10n.t('Show Conflicts')}>
+							<a class="rebase-action-link" href="${this.showConflictsCommandUrl}"
+								>${l10n.t('Show conflicts')}</a
+							>
 						</gl-tooltip>`
 					: nothing
 			}
-			<span class="rebase-progress">(${status.currentStep}/${status.totalSteps})</span>
-			<span class="rebase-remaining">${status.totalSteps - status.currentStep} remaining</span>
+			<span class="rebase-progress">${progress}</span>
+			<span class="rebase-remaining">${remainingLabel}</span>
 		</div>`;
 	}
 
@@ -1587,48 +1683,53 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		const conflictFiles = this.state?.conflictFiles;
 		if (!conflictFiles?.length || !this.rebaseStatus?.hasConflicts) return nothing;
 
+		const conflictFilesLabel = formatPlural(
+			l10n.t('{count, plural, one{{count} conflicted file} other{{count} conflicted files}}'),
+			{
+				count: conflictFiles.length,
+			},
+		);
+		const layoutLabel =
+			this._conflictFilesLayout === 'tree' ? l10n.t('Switch to List Layout') : l10n.t('Switch to Tree Layout');
+
 		return html`<div slot="end" class="conflict-panel">
 			<div class="conflict-panel__header">
 				<code-icon icon="warning" aria-hidden="true"></code-icon>
-				<span>${pluralize('conflicted file', conflictFiles.length)}</span>
+				<span>${conflictFilesLabel}</span>
 				${
 					this.state?.aiAllowed
 						? html`<gl-button
 								appearance="toolbar"
 								density="compact"
-								tooltip="Resolve Conflicts in Commit Graph"
-								aria-label="Resolve Conflicts in Commit Graph"
+								tooltip=${l10n.t('Resolve Conflicts in Commit Graph')}
+								aria-label=${l10n.t('Resolve Conflicts in Commit Graph')}
 								@click=${this.onResolveConflictsInGraph}
-								><code-icon icon="gl-merge" slot="prefix" aria-hidden="true"></code-icon>Resolve
-								Conflicts</gl-button
+								><code-icon icon="gl-merge" slot="prefix" aria-hidden="true"></code-icon
+								>${l10n.t('Resolve Conflicts')}</gl-button
 							>`
 						: nothing
 				}
 				<gl-button
 					appearance="toolbar"
 					density="compact"
-					tooltip="Stage Current for All Conflicts"
-					aria-label="Stage Current for All Conflicts"
+					tooltip=${l10n.t('Stage Current for All Conflicts')}
+					aria-label=${l10n.t('Stage Current for All Conflicts')}
 					@click=${this.onStageAllCurrent}
 					><code-icon icon="gl-accept-all-left"></code-icon
 				></gl-button>
 				<gl-button
 					appearance="toolbar"
 					density="compact"
-					tooltip="Stage Incoming for All Conflicts"
-					aria-label="Stage Incoming for All Conflicts"
+					tooltip=${l10n.t('Stage Incoming for All Conflicts')}
+					aria-label=${l10n.t('Stage Incoming for All Conflicts')}
 					@click=${this.onStageAllIncoming}
 					><code-icon icon="gl-accept-all-right"></code-icon
 				></gl-button>
 				<gl-button
 					appearance="toolbar"
 					density="compact"
-					tooltip="${
-						this._conflictFilesLayout === 'tree' ? 'Switch to List Layout' : 'Switch to Tree Layout'
-					}"
-					aria-label="${
-						this._conflictFilesLayout === 'tree' ? 'Switch to List Layout' : 'Switch to Tree Layout'
-					}"
+					tooltip=${layoutLabel}
+					aria-label=${layoutLabel}
 					@click=${this.onToggleConflictFilesLayout}
 					><code-icon icon="${this._conflictFilesLayout === 'tree' ? 'list-flat' : 'list-tree'}"></code-icon
 				></gl-button>
@@ -1636,8 +1737,8 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 			<gl-tree-view
 				class="conflict-panel__list"
 				filterable
-				filter-placeholder="Filter conflicted files..."
-				aria-label="${pluralize('conflicted file', conflictFiles.length)}"
+				filter-placeholder=${l10n.t('Filter conflicted files...')}
+				aria-label=${conflictFilesLabel}
 				.model=${this._conflictTreeModel}
 				@gl-tree-generated-item-selected=${this.onConflictTreeItemSelected}
 				@gl-tree-generated-item-action-clicked=${this.onConflictTreeActionClicked}
@@ -1743,31 +1844,31 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 
 		switch (action) {
 			case 'current-changes':
-				this._ipc.sendCommand(OpenConflictChangesCommand, { path: path, side: 'current' });
+				this.sendCommand(this._rebase?.openConflictChanges({ path: path, side: 'current' }));
 				break;
 			case 'incoming-changes':
-				this._ipc.sendCommand(OpenConflictChangesCommand, { path: path, side: 'incoming' });
+				this.sendCommand(this._rebase?.openConflictChanges({ path: path, side: 'incoming' }));
 				break;
 			case 'stage':
-				this._ipc.sendCommand(StageConflictCommand, { path: path });
+				this.sendCommand(this._rebase?.stageConflict({ path: path }));
 				break;
 		}
 	}
 
 	private onResolveConflictsInGraph = () => {
-		this._ipc.sendCommand(ResolveConflictsInGraphCommand, undefined);
+		this.sendCommand(this._rebase?.resolveConflictsInGraph());
 	};
 
 	private onStageAllCurrent = () => {
-		this._ipc.sendCommand(ResolveAllConflictsCommand, { resolution: 'current' });
+		this.sendCommand(this._rebase?.resolveAllConflicts({ resolution: 'current' }));
 	};
 
 	private onStageAllIncoming = () => {
-		this._ipc.sendCommand(ResolveAllConflictsCommand, { resolution: 'incoming' });
+		this.sendCommand(this._rebase?.resolveAllConflicts({ resolution: 'incoming' }));
 	};
 
 	private onOpenConflictFile(path: string): void {
-		this._ipc.sendCommand(OpenConflictFileCommand, { path: path });
+		this.sendCommand(this._rebase?.openConflictFile({ path: path }));
 	}
 
 	private onToggleConflictFilesLayout = () => {
@@ -1786,7 +1887,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		const sha = this.rebaseStatus?.currentCommit;
 		if (!sha) return;
 
-		this._ipc.sendCommand(RevealRefCommand, { type: 'commit', ref: sha });
+		this.sendCommand(this._rebase?.revealRef({ type: 'commit', ref: sha }));
 	};
 
 	private onCurrentCommitKeydown = (e: KeyboardEvent) => {
@@ -1823,8 +1924,8 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		return html`<gl-rebase-entry
 			data-id=${entryId}
 			.entry=${entry}
-			.authors=${this.state.authors}
-			.revealLocation=${this.state.revealLocation}
+			.authors=${this.state?.authors}
+			.revealLocation=${this.state?.revealLocation ?? 'graph'}
 			?isBase=${entry.sha === this.state?.onto?.sha}
 			?isFirst=${isFirst}
 			?isLast=${isLast}
@@ -1845,9 +1946,13 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 	}
 
 	private renderHeader() {
+		const orderTooltip = this.ascending
+			? l10n.t('Showing Oldest Commits First')
+			: l10n.t('Showing Newest Commits First');
+
 		return html`<header tabindex="-1">
 			<div class="header__row">
-				<h1 class="header-title">GitLens Interactive Rebase</h1>
+				<h1 class="header-title">${l10n.t('GitLens Interactive Rebase')}</h1>
 				<div class="header-info">${this.renderSubhead()}</div>
 				<div class="header-actions">
 					${this.renderConflictIndicator()}
@@ -1855,7 +1960,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 						class="header-toggle"
 						appearance="toolbar"
 						density="compact"
-						tooltip="${this.ascending ? 'Showing Oldest Commits First' : 'Showing Newest Commits First'}"
+						tooltip=${orderTooltip}
 						@click=${this.onOrderToggle}
 					>
 						<code-icon slot="prefix" icon="sort-precedence"></code-icon>
@@ -1874,48 +1979,75 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 		const doneCommitCount = this.doneEntries.filter(e => e.type === 'commit').length;
 		const pendingCommitCount = this.state.entries.filter(e => e.type === 'commit').length;
 		const totalCommitCount = doneCommitCount + pendingCommitCount;
-		const revealTooltip = this.state.revealLocation === 'graph' ? 'Open in Commit Graph' : 'Open in Inspect View';
+		const revealTooltip =
+			this.state.revealLocation === 'graph' ? l10n.t('Open in Commit Graph') : l10n.t('Open in Inspect View');
+		const branch = html`<gl-tooltip content=${revealTooltip}>
+			<gl-branch-name
+				.name=${this.state.branch}
+				tabindex="0"
+				@click=${this.onBranchClick}
+				@keydown=${this.onBranchKeydown}
+				class="clickable"
+			></gl-branch-name>
+		</gl-tooltip>`;
+		const relation = this.state.onto
+			? html`<span class="header-onto"
+					>${localizedContent(l10n.t('onto {reference}'), {
+						reference: html`<gl-tooltip content=${revealTooltip}>
+							<gl-commit-sha
+								.sha=${this.state.onto.sha}
+								tabindex="0"
+								@click=${this.onOntoClick}
+								@keydown=${this.onOntoKeydown}
+								class="clickable"
+							></gl-commit-sha>
+						</gl-tooltip>`,
+					})}</span
+				>`
+			: nothing;
+		const count = html`<span class="header-count"
+			>${
+				this.isRebasing
+					? formatPlural(
+							l10n.t('{total, plural, one{{done}/{total} commit} other{{done}/{total} commits}}'),
+							{
+								done: doneCommitCount,
+								total: totalCommitCount,
+							},
+						)
+					: formatPlural(l10n.t('{count, plural, one{{count} commit} other{{count} commits}}'), {
+							count: pendingCommitCount,
+						})
+			}</span
+		>`;
 
-		return html`
-			<gl-tooltip content=${revealTooltip}>
-				<gl-branch-name
-					.name=${this.state.branch}
-					tabindex="0"
-					@click=${this.onBranchClick}
-					@keydown=${this.onBranchKeydown}
-					class="clickable"
-				></gl-branch-name>
-			</gl-tooltip>
-			${
-				this.state.onto
-					? html`<span class="header-onto"
-							>onto
-							<gl-tooltip content=${revealTooltip}>
-								<gl-commit-sha
-									.sha=${this.state.onto.sha}
-									tabindex="0"
-									@click=${this.onOntoClick}
-									@keydown=${this.onOntoKeydown}
-									class="clickable"
-								></gl-commit-sha>
-							</gl-tooltip>
-						</span>`
-					: nothing
-			}
-			<span class="header-count"
-				>${
-					this.isRebasing
-						? `${doneCommitCount}/${totalCommitCount} commits`
-						: pluralize('commit', pendingCommitCount)
-				}</span
-			>
-		`;
+		return this.state.onto
+			? localizedContent(
+					l10n.t({
+						message: '{branch} {relation} {count}',
+						comment: [
+							'{branch}, {relation}, and {count} are independently styled UI groups. {relation} identifies the target commit and includes the word “onto”.',
+						],
+					}),
+					{
+						branch: branch,
+						relation: relation,
+						count: count,
+					},
+				)
+			: localizedContent(
+					l10n.t({
+						message: '{branch} {count}',
+						comment: ['{branch} and {count} are independently styled UI groups.'],
+					}),
+					{ branch: branch, count: count },
+				);
 	}
 
 	private onBranchClick = () => {
 		if (!this.state?.branch) return;
 
-		this._ipc.sendCommand(RevealRefCommand, { type: 'branch', ref: this.state.branch });
+		this.sendCommand(this._rebase?.revealRef({ type: 'branch', ref: this.state.branch }));
 	};
 
 	private onBranchKeydown = (e: KeyboardEvent) => {
@@ -1928,7 +2060,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 	private onOntoClick = () => {
 		if (!this.state?.onto?.sha) return;
 
-		this._ipc.sendCommand(RevealRefCommand, { type: 'commit', ref: this.state.onto.sha });
+		this.sendCommand(this._rebase?.revealRef({ type: 'commit', ref: this.state.onto.sha }));
 	};
 
 	private onOntoKeydown = (e: KeyboardEvent) => {
@@ -1939,7 +2071,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 	};
 
 	private onRevealCommit = (e: CustomEvent<{ sha: string }>) => {
-		this._ipc.sendCommand(RevealRefCommand, { type: 'commit', ref: e.detail.sha });
+		this.sendCommand(this._rebase?.revealRef({ type: 'commit', ref: e.detail.sha }));
 	};
 
 	/** Computes a key that changes when the rebase advances externally (Continue/Skip/external edit).
@@ -2019,7 +2151,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 			// During an active rebase, done entries have been applied, so check from HEAD
 			const base = this.isRebasing ? 'HEAD' : undefined;
 
-			const response = await this._ipc.sendRequest(GetConflictsRequest, {
+			const result = await this._rebase?.getConflicts({
 				trigger: trigger,
 				onto: state.onto.sha,
 				commits: commits,
@@ -2028,7 +2160,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 
 			if (generation !== this._conflictCheckGeneration) return;
 
-			this._conflictResult = response.conflicts;
+			this._conflictResult = result;
 			this._conflictingShas =
 				this._conflictResult?.status === 'conflicts' ? (this._conflictResult.conflict?.shas ?? []) : undefined;
 		} catch {
@@ -2058,14 +2190,15 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 				<span class="shortcut"><kbd class="word">s</kbd><span>quash</span></span>
 				<span class="shortcut"><kbd class="word">f</kbd><span>ixup</span></span>
 				<span class="shortcut"><kbd class="word">d</kbd><span>rop</span></span>
-				<span class="shortcut"><kbd>alt</kbd> <kbd>↑↓</kbd><span class="label">move</span></span>
-				<span class="shortcut"><kbd>/</kbd><span class="label">search</span></span>
+				<span class="shortcut"><kbd>alt</kbd> <kbd>↑↓</kbd><span class="label">${l10n.t('move')}</span></span>
+				<span class="shortcut"><kbd>/</kbd><span class="label">${l10n.t('search')}</span></span>
 			</div>
 			<div class="actions">
 				${
-					// Pre-start, Recompose lives in the Start Auto-Rebase split button's menu instead
-					// (see renderStartRebaseActions)
-					isActive ? this.renderRecomposeAction(true) : nothing
+					// Recompose lives in the relevant split button's menu when AI is allowed (Start Auto-Rebase
+					// pre-start, Continue with Auto-Rebase once active) — the standalone form only appears when
+					// AI isn't allowed at all.
+					isActive && !(this.state?.aiAllowed ?? false) ? this.renderRecomposeAction(true) : nothing
 				}
 				${isActive ? this.renderActiveRebaseActions(hasConflicts) : this.renderStartRebaseActions()}
 			</div>
@@ -2088,15 +2221,15 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 				if (hasConflicts) {
 					variant = 'warning';
 					icon = 'warning';
-					tooltip = 'Start Rebase (Conflicts Detected)';
+					tooltip = l10n.t('Start Rebase (Conflicts Detected)');
 				} else if (!isStale) {
 					variant = 'success';
 					icon = 'check';
-					tooltip = 'Start Rebase (No Conflicts Detected)';
+					tooltip = l10n.t('Start Rebase (No Conflicts Detected)');
 				}
 			} else {
 				icon = 'loading';
-				tooltip = 'Checking for conflicts...';
+				tooltip = l10n.t('Checking for conflicts...');
 			}
 		}
 
@@ -2107,7 +2240,7 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 				@click=${this.onStartClicked}
 			>
 				<span
-					>Start Rebase
+					>${l10n.t('Start Rebase')}
 					${
 						icon
 							? html`<code-icon
@@ -2127,7 +2260,9 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 								class="split-btn__main"
 								appearance="secondary"
 								?disabled=${!this.state?.entries?.length || this._startingWithAi}
-								tooltip="Starts the rebase and automatically resolves any conflicts — pausing for input where you've marked edits, or when confidence is low, and completes with a reviewable summary you can undo"
+								tooltip=${l10n.t(
+									"Starts the rebase and automatically resolves any conflicts — pausing for input where you've marked edits, or when confidence is low, and completes with a reviewable summary you can undo",
+								)}
 								@click=${this.onStartWithAiClicked}
 							>
 								<code-icon
@@ -2135,14 +2270,14 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 									icon=${this._startingWithAi ? 'loading' : 'sparkle'}
 									modifier=${ifDefined(this._startingWithAi ? 'spin' : undefined)}
 								></code-icon>
-								Start Auto-Rebase
+								${l10n.t('Start Auto-Rebase')}
 							</gl-button>
 							<gl-popover-confirm
 								class="split-btn__confirm"
 								trigger="manual"
-								heading="Abort Rebase &amp; Recompose"
+								heading=${l10n.t('Abort Rebase & Recompose')}
 								message=${this.recomposeConfirmMessage}
-								confirm="Abort &gt; Recompose"
+								confirm=${l10n.t('Abort > Recompose')}
 								initial-focus="confirm"
 								icon="warning"
 								@gl-confirm=${this.onRecomposeCommitsClicked}
@@ -2151,17 +2286,17 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 									slot="anchor"
 									.items=${[
 										{
-											label: 'Open Commit Composer & Recompose...',
+											label: l10n.t('Recompose Commits...'),
 											value: 'recompose',
 										},
 									]}
-									@gl-menu-select=${this.onStartMenuSelect}
+									@gl-menu-select=${this.onRecomposeMenuSelect}
 								>
 									<gl-button
 										class="split-btn__menu"
 										slot="anchor"
 										appearance="secondary"
-										aria-label="More Actions"
+										aria-label=${l10n.t('More Actions')}
 									>
 										<code-icon icon="chevron-down"></code-icon>
 									</gl-button>
@@ -2171,10 +2306,12 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 					: // Without AI the split button is gone, so Recompose keeps its standalone (confirmed) form
 						this.renderRecomposeAction(false)
 			}
-			<gl-button appearance="secondary" @click=${this.onAbortClicked}>Abort</gl-button>`;
+			<gl-button appearance="secondary" @click=${this.onAbortClicked}>${l10n.t('Abort')}</gl-button>`;
 	}
 
-	private onStartMenuSelect = async (e: CustomEvent<{ value: string }>) => {
+	/** Handles the Recompose menu entry shared by both split buttons — the pre-start Start
+	 *  Auto-Rebase split button and the active-rebase Continue with Auto-Rebase split button. */
+	private onRecomposeMenuSelect = async (e: CustomEvent<{ value: string }>) => {
 		if (e.detail.value !== 'recompose') return;
 
 		// The selection rides the same confirmation the standalone Recompose button anchored — the
@@ -2187,47 +2324,84 @@ export class GlRebaseEditor extends GlAppHost<State, RebaseStateProvider> {
 	/** The standalone Recompose button's confirm copy, shared by the split menu's confirmation. */
 	private get recomposeConfirmMessage(): string {
 		return (this.state?.isInPlace ?? false)
-			? 'Let AI intelligently reorganize these commits with clearer messages and better logical grouping.'
-			: 'Let AI intelligently reorganize these commits with clearer messages and better logical grouping. <br><br> After recomposition, simply rebase again to apply these commits onto the target branch.';
+			? l10n.t('Let AI intelligently reorganize these commits with clearer messages and better logical grouping.')
+			: l10n.t(
+					'Let AI intelligently reorganize these commits with clearer messages and better logical grouping. \n\n After recomposition, simply rebase again to apply these commits onto the target branch.',
+				);
 	}
 
 	private renderRecomposeAction(isActive: boolean) {
 		return html`<gl-popover-confirm
-			heading="Abort Rebase &amp; Recompose"
+			heading=${l10n.t('Abort Rebase & Recompose')}
 			message=${this.recomposeConfirmMessage}
-			confirm="Abort &gt; Recompose"
+			confirm=${l10n.t('Abort > Recompose')}
 			confirm-variant=${ifDefined(isActive ? 'danger' : undefined)}
 			initial-focus=${isActive ? 'cancel' : 'confirm'}
 			icon=${isActive ? 'error' : 'warning'}
 			@gl-confirm=${this.onRecomposeCommitsClicked}
 		>
-			<gl-button slot="anchor" appearance="secondary" tooltip="Open Commit Composer &amp; Recompose using AI">
+			<gl-button
+				slot="anchor"
+				appearance="secondary"
+				tooltip=${l10n.t('Open Commit Composer & Recompose using AI')}
+			>
 				<code-icon slot=${ifDefined(isActive ? undefined : 'prefix')} icon="sparkle"></code-icon>
-				${isActive ? nothing : 'Recompose...'}
+				${isActive ? nothing : l10n.t('Recompose...')}
 			</gl-button>
 		</gl-popover-confirm>`;
 	}
 
 	private renderActiveRebaseActions(hasConflicts: boolean) {
 		return html`
-			${
-				this.state?.aiAllowed
-					? html`<gl-button
-							appearance="secondary"
-							tooltip="Resolves any conflicts automatically and continues the rest of the rebase — pausing for your input when confidence is low, with a reviewable, undoable summary at the end"
-							@click=${this.onContinueWithAiClicked}
-						>
-							<code-icon slot="prefix" icon="sparkle"></code-icon>
-							Continue with AI
-						</gl-button>`
-					: nothing
-			}
 			<gl-button @click=${this.onContinueClicked} ?disabled=${hasConflicts}>
-				<span>Continue</span>
+				<span>${l10n.t('Continue')}</span>
 				<span slot="suffix" class="button-shortcut">Ctrl+Enter</span>
 			</gl-button>
-			<gl-button appearance="secondary" @click=${this.onSkipClicked}>Skip</gl-button>
-			<gl-button variant="danger" @click=${this.onAbortClicked}>Abort</gl-button>
+			${
+				this.state?.aiAllowed
+					? html`<span class="split-btn">
+							<gl-button
+								class="split-btn__main"
+								appearance="secondary"
+								tooltip=${l10n.t(
+									'Resolves any conflicts automatically and continues the rest of the rebase — pausing for your input when confidence is low, with a reviewable, undoable summary at the end',
+								)}
+								@click=${this.onContinueWithAiClicked}
+							>
+								<code-icon slot="prefix" icon="sparkle"></code-icon>
+								${l10n.t('Continue with Auto-Rebase')}
+							</gl-button>
+							<gl-popover-confirm
+								class="split-btn__confirm"
+								trigger="manual"
+								heading=${l10n.t('Abort Rebase & Recompose')}
+								message=${this.recomposeConfirmMessage}
+								confirm=${l10n.t('Abort > Recompose')}
+								confirm-variant="danger"
+								initial-focus="cancel"
+								icon="error"
+								@gl-confirm=${this.onRecomposeCommitsClicked}
+							>
+								<gl-menu-popover
+									slot="anchor"
+									.items=${[{ label: l10n.t('Recompose Commits...'), value: 'recompose' }]}
+									@gl-menu-select=${this.onRecomposeMenuSelect}
+								>
+									<gl-button
+										class="split-btn__menu"
+										slot="anchor"
+										appearance="secondary"
+										aria-label=${l10n.t('More Actions')}
+									>
+										<code-icon icon="chevron-down"></code-icon>
+									</gl-button>
+								</gl-menu-popover>
+							</gl-popover-confirm>
+						</span>`
+					: nothing
+			}
+			<gl-button appearance="secondary" @click=${this.onSkipClicked}>${l10n.t('Skip')}</gl-button>
+			<gl-button variant="danger" @click=${this.onAbortClicked}>${l10n.t('Abort')}</gl-button>
 		`;
 	}
 }

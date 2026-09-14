@@ -1,12 +1,13 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { basename } from '@gitlens/utils/path.js';
 import type { PendingPermission } from '../../../../../agents/provider.js';
 import { createCommandLink } from '../../../../../system/commands.js';
 import '../chips/action-chip.js';
-import '../code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../copy-container.js';
-import '../overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 interface PlanActions {
 	openHref: string;
@@ -102,7 +103,7 @@ export class GlAgentPromptDetail extends LitElement {
 		}
 
 		/* gl-copy-container hosts a bare code-icon — give it the same hover affordance the
-	   sibling gl-action-chip has so the two buttons read as a matched pair. */
+  sibling gl-action-chip has so the two buttons read as a matched pair. */
 		.caption-copy {
 			display: inline-flex;
 			align-items: center;
@@ -119,8 +120,8 @@ export class GlAgentPromptDetail extends LitElement {
 		}
 
 		/* Only the agent-session detail sheet sets [expanded] — it has the room to show the
-		   full block and caption inline, so the clamp/ellipsis/tooltip that a cramped hover
-		   needs would just be noise there. */
+   full block and caption inline, so the clamp/ellipsis/tooltip that a cramped hover
+   needs would just be noise there. */
 		:host([expanded]) .block {
 			display: block;
 			-webkit-line-clamp: unset;
@@ -180,14 +181,14 @@ export class GlAgentPromptDetail extends LitElement {
 						? html`<span class="caption-actions">
 								<gl-action-chip
 									icon="tasklist"
-									label="View Plan"
+									label=${l10n.t('View Plan')}
 									overlay="tooltip"
 									href=${content.planActions.openHref}
 								></gl-action-chip>
 								<gl-copy-container
 									class="caption-copy"
 									.content=${content.planActions.copyContent}
-									copyLabel="Copy Plan Path"
+									copyLabel=${l10n.t('Copy Plan Path')}
 								>
 									<code-icon icon="copy"></code-icon>
 								</gl-copy-container>
@@ -201,7 +202,7 @@ export class GlAgentPromptDetail extends LitElement {
 	private resolveContent(permission: PendingPermission): ResolvedContent {
 		switch (permission.kind) {
 			case 'plan': {
-				const block = permission.planSummary ?? 'Plan ready for review';
+				const block = permission.planSummary ?? l10n.t('Plan ready for review');
 				const filename = permission.planFilePath != null ? basename(permission.planFilePath) : undefined;
 				// JSON.stringify the path so the command URI's query string is valid JSON; bare
 				// strings break VS Code's argument parser. Copy is handled client-side by
@@ -226,7 +227,7 @@ export class GlAgentPromptDetail extends LitElement {
 				};
 			}
 			case 'question': {
-				const block = permission.questionText ?? 'Awaiting your answer';
+				const block = permission.questionText ?? l10n.t('Awaiting your answer');
 				const count = permission.questionCount ?? 0;
 				const caption = count > 1 ? `1 of ${count} questions` : count === 1 ? '1 question' : undefined;
 				return {
@@ -240,9 +241,9 @@ export class GlAgentPromptDetail extends LitElement {
 			}
 			case 'elicitation': {
 				return {
-					block: permission.toolName || 'Input required',
+					block: permission.toolName || l10n.t('Input required'),
 					blockClass: 'block block--prose',
-					caption: 'Awaiting input',
+					caption: l10n.t('Awaiting input'),
 					captionTooltip: undefined,
 					planActions: undefined,
 					tooltip: undefined,

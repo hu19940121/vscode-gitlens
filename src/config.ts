@@ -1,10 +1,11 @@
-import type { GraphStyle } from '@gitkraken/commit-graph/view.js';
+import type { GraphStyle } from '@gitkraken/commit-graph/geometry.js';
 import type { AIProviderAndModel, SupportedAIModels } from '@gitlens/ai/constants.js';
 import type { DateTimeFormat } from '@gitlens/utils/date.js';
 import type { GroupableTreeViewTypes } from './constants.views.js';
 
 export interface Config {
 	readonly advanced: AdvancedConfig;
+	readonly agents: AgentsConfig;
 	readonly ai: AIConfig;
 	readonly autolinks: AutolinkConfig[] | null;
 	readonly blame: BlameConfig;
@@ -37,6 +38,7 @@ export interface Config {
 	readonly menus: boolean | MenuConfig;
 	readonly mode: ModeConfig;
 	readonly modes: ModesConfig | null;
+	readonly openInTerminalLocation: 'panel' | 'editor';
 	readonly partners: PartnersConfig | null;
 	readonly plusFeatures: PlusFeaturesConfig;
 	readonly rebaseEditor: RebaseEditorConfig;
@@ -195,7 +197,7 @@ export interface AdvancedConfig {
 	};
 	readonly commitOrdering: 'date' | 'author-date' | 'topo' | null;
 	readonly commits: {
-		readonly delayLoadingFileDetails: boolean;
+		readonly delayLoadingFileDetails: boolean | null;
 	};
 	readonly externalDiffTool: string | null;
 	readonly externalDirectoryDiffTool: string | null;
@@ -219,6 +221,10 @@ export interface AdvancedConfig {
 	readonly repositorySearchDepth: number | null;
 	readonly similarityThreshold: number | null;
 	readonly skipOnboarding: boolean;
+}
+
+interface AgentsConfig {
+	readonly resumeTarget: 'terminal' | 'extension' | null;
 }
 
 interface AIConfig {
@@ -451,13 +457,13 @@ export interface GraphConfig {
 		readonly maximizeOnMode: boolean;
 	};
 	readonly dimMergeCommits: boolean;
+	/** Double-clicking a secondary worktree (WIP row, overview bar pill, sidebar row) — `'scope'`
+	 *  re-perspectives the graph onto it (composing per {@link scopeBehavior}); `'focus'` is the classic
+	 *  branch-focus toggle, with no perspective involved. */
+	readonly doubleClickWorktreeAction: 'scope' | 'focus';
 	readonly editorOpeningBehavior: 'auto' | 'active';
 	readonly experimental: {
-		readonly kanban: {
-			readonly enabled: boolean;
-		};
 		readonly visualizations: {
-			readonly enabled: boolean;
 			readonly activityDecay: GraphActivityDecay;
 		};
 	};
@@ -505,6 +511,9 @@ export interface GraphConfig {
 		readonly maxStacked: number | 'auto';
 		readonly layout: 'inline' | 'stacked';
 	};
+	/** What "Scope to Worktree" composes — `'scopeAndFocus'` also focuses the worktree's branch (narrowing
+	 *  the visible rows); `'scope'` only re-perspectives HEAD-derived state, leaving every commit visible. */
+	readonly scopeBehavior: 'scope' | 'scopeAndFocus';
 	readonly scrollMarkers: {
 		readonly enabled: boolean;
 		readonly additionalTypes: GraphScrollMarkersAdditionalTypes[];
@@ -512,6 +521,10 @@ export interface GraphConfig {
 	readonly scrollRowPadding: number;
 	readonly searchAutocompleteOnFocus: boolean;
 	readonly searchItemLimit: number;
+	readonly shortcuts: {
+		readonly enabled: boolean;
+		readonly overrides: Record<string, string | string[] | false>;
+	};
 	readonly showGhostRefsOnRowHover: boolean;
 	readonly showRemoteNames: boolean;
 	readonly showUpstreamStatus: boolean;
@@ -1151,7 +1164,7 @@ interface VisualHistoryConfig {
 
 interface WorktreesConfig {
 	readonly defaultLocation: string | null;
-	readonly openAfterCreate: 'always' | 'alwaysNewWindow' | 'onlyWhenEmpty' | 'never' | 'prompt';
+	readonly openAfterCreate: 'newWindow' | 'currentWindow' | 'addToWorkspace' | 'none' | 'onlyWhenEmpty';
 	readonly promptForLocation: boolean;
 }
 

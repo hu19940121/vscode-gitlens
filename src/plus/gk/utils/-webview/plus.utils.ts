@@ -1,5 +1,5 @@
 import type { MessageItem } from 'vscode';
-import { window } from 'vscode';
+import { l10n, window } from 'vscode';
 import type { Source } from '../../../../constants.telemetry.js';
 import type { Container } from '../../../../container.js';
 import { configuration } from '../../../../system/-webview/configuration.js';
@@ -13,10 +13,10 @@ export function arePlusFeaturesEnabled(): boolean {
 export async function ensurePlusFeaturesEnabled(): Promise<boolean> {
 	if (arePlusFeaturesEnabled()) return true;
 
-	const confirm: MessageItem = { title: 'Enable' };
-	const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
+	const confirm: MessageItem = { title: l10n.t('Enable') };
+	const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
 	const result = await window.showInformationMessage(
-		'Pro features are currently disabled. Would you like to enable them?',
+		l10n.t('Pro features are currently disabled. Would you like to enable them?'),
 		{ modal: true },
 		confirm,
 		cancel,

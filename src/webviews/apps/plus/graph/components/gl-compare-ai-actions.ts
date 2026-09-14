@@ -1,12 +1,13 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
+import { boxSizingBase } from '@gitlens/components/components/styles/lit/base.css.js';
 import type { State } from '../../../../plus/graph/detailsProtocol.js';
 import type { AiModelInfo } from '../../../../rpc/services/types.js';
-import { elementBase } from '../../../shared/components/styles/lit/base.css.js';
 import '../../../shared/components/ai-input.js';
 import '../../../shared/components/gl-ai-model-chip.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 // Match gl-ai-input's `--angle` registration so the busy-border conic gradient picks up
 // the animated angle. Already registered if gl-ai-input loaded first; the try/catch makes
@@ -31,7 +32,7 @@ try {
 @customElement('gl-compare-ai-actions')
 export class GlCompareAIActions extends LitElement {
 	static override styles = [
-		elementBase,
+		boxSizingBase,
 		css`
 			:host {
 				display: block;
@@ -45,7 +46,7 @@ export class GlCompareAIActions extends LitElement {
 			}
 
 			/* The inner gl-ai-input is sized by flex, not by panelActionInputStyles (the latter
-	   targets the outer gl-compare-ai-actions host instead). */
+targets the outer gl-compare-ai-actions host instead). */
 			.row > gl-ai-input {
 				flex: 1;
 				width: auto;
@@ -55,9 +56,9 @@ export class GlCompareAIActions extends LitElement {
 			}
 
 			/* Default state mirrors the Explain input when unfocused (plain solid border +
-	   input background). On hover/focus the border swaps to the same conic-gradient
-	   that the Explain input shows when focused. Busy keeps the gradient border and
-	   animates --angle so the gradient sweeps around the perimeter. */
+input background). On hover/focus the border swaps to the same conic-gradient
+that the Explain input shows when focused. Busy keeps the gradient border and
+animates --angle so the gradient sweeps around the perimeter. */
 			.changelog-btn {
 				--gradient-start: var(--gl-ai-accent-1);
 				--gradient-mid: var(--gl-ai-accent-2);
@@ -121,8 +122,8 @@ export class GlCompareAIActions extends LitElement {
 			}
 
 			/* Scope chip — informational (or switchable) pill in the Explain input's footer, ahead of
-	   the model chip. flex: none keeps it compact against gl-ai-input's footer slot, which
-	   otherwise stretches its (single, historically) slotted child to fill the row. */
+the model chip. flex: none keeps it compact against gl-ai-input's footer slot, which
+otherwise stretches its (single, historically) slotted child to fill the row. */
 			.scope-chip {
 				display: inline-flex;
 				flex: none;
@@ -182,14 +183,19 @@ export class GlCompareAIActions extends LitElement {
 
 		const busy = this.generateChangelogBusy;
 		return html`<div class="row">
-			<gl-ai-input multiline floating-footer button-tooltip="Explain Changes" .busy=${this.explainBusy}>
+			<gl-ai-input
+				multiline
+				floating-footer
+				button-tooltip=${l10n.t('Explain Changes')}
+				.busy=${this.explainBusy}
+			>
 				<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
 				${this.renderScopeChip()}
 			</gl-ai-input>
-			<gl-tooltip content="Generate Changelog" placement="bottom"
+			<gl-tooltip content=${l10n.t('Generate Changelog')} placement="bottom"
 				><button
 					class=${busy ? 'changelog-btn is-busy' : 'changelog-btn'}
-					aria-label="Generate Changelog"
+					aria-label=${l10n.t('Generate Changelog')}
 					?disabled=${busy}
 					aria-busy=${busy ? 'true' : nothing}
 					@click=${this.onGenerateChangelog}

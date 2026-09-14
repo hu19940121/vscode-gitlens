@@ -1,10 +1,12 @@
-import type { Remote } from '@eamodio/supertalk';
+import type { Connection, Remote, Subscription } from '@eamodio/supertalk';
+import { subscribe } from '@eamodio/supertalk';
 import type { Signal } from '@lit-labs/signals';
 import { signal } from '@lit-labs/signals';
 import { createContext } from '@lit/context';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { GraphCoachMarkType } from '../../../plus/graph/protocol.js';
 import type { OnboardingRpcService } from '../../../rpc/services/onboarding.js';
+import { isConnectionClosedError } from '../../shared/actions/rpc.js';
 
 type OnboardingRemote = Awaited<Remote<{ onboarding: OnboardingRpcService }>['onboarding']>;
 
@@ -17,8 +19,9 @@ export interface CoachMarkSeenStore {
 	/** Reactive read: `undefined` until the persisted set is known (callers must not force-open yet). */
 	has(mark: GraphCoachMarkType): boolean | undefined;
 	markSeen(mark: GraphCoachMarkType): void;
-	/** Wire, or re-wire after an RPC reconnect — refetches each time. */
-	connect(onboarding: OnboardingRemote | PromiseLike<OnboardingRemote>): void;
+	/** Wire the remote. One-time: the library re-runs the subscription on every reconnect, refetching
+	 *  each time. */
+	connect(connection: Connection): void;
 	dispose(): void;
 }
 
@@ -28,7 +31,9 @@ export function createCoachMarkSeenStore(): CoachMarkSeenStore {
 	const pending = new Set<GraphCoachMarkType>();
 
 	let remote: OnboardingRemote | undefined;
-	// Bumped by connect()/dispose() so stale async resolutions no-op.
+	let storedConnection: Connection | undefined;
+	let subscription: Subscription | undefined;
+	// Bumped at subscriber start and in dispose() so a stale in-flight fetch() resolution no-ops.
 	let generation = 0;
 
 	function persist(): void {
@@ -36,20 +41,24 @@ export function createCoachMarkSeenStore(): CoachMarkSeenStore {
 		// Not connected yet — stays in `pending`; connect() replays it
 		if (r == null) return;
 
-		const current = seen.get();
-		if (current == null) return;
+		if (pending.size === 0) return;
 
+		// Send only local additions. The host merges them with marks learned by other Graph views.
 		// Only clear what this write covers — `markSeen()` can queue more while it's in flight.
-		const persisted = new Set(current);
-		const state = { seen: Object.fromEntries(Array.from(persisted, m => [m, true as const])) };
+		const persisted = [...pending];
 		/* oxlint-disable typescript/await-thenable -- Supertalk proxy method calls are thenable at runtime */
 		void (async () => {
 			try {
-				await r.setItemState(seenStateKey, state);
+				await r.markGraphCoachMarksSeen(persisted);
 				for (const m of persisted) {
 					pending.delete(m);
 				}
 			} catch (ex) {
+				if (isConnectionClosedError(ex)) {
+					Logger.debug('CoachMarkSeenStore: persist dropped by deliberate connection teardown');
+					return;
+				}
+
 				// Stays queued; retried on the next (re)connect
 				Logger.error(ex, 'CoachMarkSeenStore: failed to persist seen state');
 			}
@@ -84,6 +93,11 @@ export function createCoachMarkSeenStore(): CoachMarkSeenStore {
 					persist();
 				}
 			} catch (ex) {
+				if (isConnectionClosedError(ex)) {
+					Logger.debug('CoachMarkSeenStore: fetch dropped by deliberate connection teardown');
+					return;
+				}
+
 				// Leave `undefined` — no mark force-opens rather than risk re-showing a seen one
 				Logger.error(ex, 'CoachMarkSeenStore: failed to fetch seen state');
 			}
@@ -104,21 +118,28 @@ export function createCoachMarkSeenStore(): CoachMarkSeenStore {
 			persist();
 		},
 
-		connect: function (onboarding: OnboardingRemote | PromiseLike<OnboardingRemote>): void {
-			const gen = ++generation;
-			void Promise.resolve(onboarding).then(
-				resolved => {
-					if (gen !== generation) return;
+		connect: function (conn: Connection): void {
+			if (storedConnection === conn) return;
 
-					remote = resolved;
-					fetch(gen);
-				},
-				(ex: unknown) => Logger.error(ex, 'CoachMarkSeenStore: failed to connect'),
-			);
+			subscription?.unsubscribe();
+			storedConnection = conn;
+			subscription = subscribe<{ onboarding: OnboardingRpcService }>(conn, async services => {
+				const gen = ++generation;
+				const resolved = await services.onboarding;
+				// A dispose()/re-connect() while the resolution was in flight cleared this store's
+				// state — writing `remote` now would resurrect it for a dead session.
+				if (storedConnection !== conn) return;
+
+				remote = resolved;
+				fetch(gen);
+			});
 		},
 
 		dispose: function (): void {
 			generation++;
+			subscription?.unsubscribe();
+			subscription = undefined;
+			storedConnection = undefined;
 			remote = undefined;
 		},
 	};

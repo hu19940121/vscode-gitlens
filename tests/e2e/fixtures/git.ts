@@ -75,11 +75,22 @@ export class GitFixture {
 		await new Promise(resolve => setTimeout(resolve, 500));
 	}
 
-	async commit(message: string, fileName: string = 'test-file.txt', content: string = 'content'): Promise<void> {
+	async commit(
+		message: string,
+		fileName: string = 'test-file.txt',
+		content: string = 'content',
+		options?: { date?: string },
+	): Promise<void> {
 		const filePath = path.join(this.repoPath, fileName);
 		await fs.writeFile(filePath, content);
 		await this.git('add', undefined, fileName);
-		await this.git('commit', undefined, '-m', message);
+		// A fixed author/committer date makes row order deterministic: commits created within the same
+		// second otherwise sort arbitrarily, which floats a branch's row in the graph.
+		const commitOptions =
+			options?.date != null
+				? { env: { GIT_AUTHOR_DATE: options.date, GIT_COMMITTER_DATE: options.date } }
+				: undefined;
+		await this.git('commit', commitOptions, '-m', message);
 	}
 
 	/**
@@ -139,6 +150,29 @@ export class GitFixture {
 
 	async getShortSha(ref: string = 'HEAD'): Promise<string> {
 		return this.git('rev-parse', undefined, '--short', ref);
+	}
+
+	/**
+	 * Full sha for `ref`. Worth preferring over {@link getShortSha} whenever a test compares two repos'
+	 * positions (a worktree against its main checkout) — a short sha's length is repo-dependent.
+	 */
+	async getSha(ref: string = 'HEAD'): Promise<string> {
+		return this.git('rev-parse', undefined, ref);
+	}
+
+	/**
+	 * `git status --porcelain` lines — an empty array means a clean working tree AND index.
+	 *
+	 * The one observable that separates "this action ran against THIS working tree" from "it ran
+	 * somewhere else in the family": worktrees of one repository share every object and ref but have
+	 * their own index and checkout.
+	 */
+	async getStatusLines(): Promise<string[]> {
+		const out = await this.git('status', undefined, '--porcelain');
+		return out
+			.split('\n')
+			.map(l => l.trim())
+			.filter(l => l.length > 0);
 	}
 
 	/**
@@ -390,13 +424,25 @@ export class GitFixture {
 	}
 
 	/**
+	 * Remove a worktree the way a terminal would — an EXTERNAL deletion, not a GitLens-initiated one.
+	 * `--force` so a worktree left dirty by a prior journey doesn't block removal with a prompt.
+	 */
+	async removeWorktree(worktreePath: string): Promise<void> {
+		await this.git('worktree', undefined, 'remove', '--force', worktreePath);
+	}
+
+	/**
 	 * Prune stale worktree administrative entries left behind by a failed `worktree add`.
 	 */
 	async pruneWorktrees(): Promise<void> {
 		await this.git('worktree', undefined, 'prune');
 	}
 
-	private async git(command: string, options?: { configs?: string[] }, ...args: string[]): Promise<string> {
+	private async git(
+		command: string,
+		options?: { configs?: string[]; env?: Record<string, string> },
+		...args: string[]
+	): Promise<string> {
 		const fullArgs = [...(options?.configs ?? []), command, ...args];
 		return new Promise((resolve, reject) => {
 			// Fixture repos must not inherit the developer's global/system git config. A `merge.ff=only`,
@@ -406,7 +452,12 @@ export class GitFixture {
 			// on what these methods set explicitly.
 			const child = spawn('git', fullArgs, {
 				cwd: this.repoPath,
-				env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' },
+				env: {
+					...process.env,
+					GIT_CONFIG_GLOBAL: '/dev/null',
+					GIT_CONFIG_SYSTEM: '/dev/null',
+					...(options?.env ?? {}),
+				},
 			});
 
 			let stdout = '';

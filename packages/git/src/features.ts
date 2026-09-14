@@ -9,15 +9,18 @@ export type GitFeatures =
 	| 'git:ignoreRevsFile'
 	| 'git:index:skipHash'
 	| 'git:maintenance'
+	| 'git:maintenance:pack-refs'
 	| 'git:maintenance:start'
 	| 'git:maintenance:start:systemd'
 	| 'git:manyFiles'
-	| 'git:merge-tree'
+	| 'git:merge-tree:merge-base'
 	| 'git:merge-tree:write-tree'
 	| 'git:push:force-if-includes'
+	| 'git:rebase:autosquash'
 	| 'git:rev-parse:end-of-options'
 	| 'git:signing:ssh'
 	| 'git:signing:x509'
+	| 'git:sparse-index'
 	| 'git:stash:push:pathspecs'
 	| 'git:stash:push:staged'
 	| 'git:stash:push:stdin'
@@ -61,6 +64,8 @@ export const gitFeaturesByVersion = new Map<GitFeatures, string>([
 	// the loose-objects + incremental-repack tasks the auto tier uses landed in 2.30 (and `core.multiPackIndex`
 	// is default-on from 2.30, so no separate midx config write is needed) — 2.30 is the safe floor.
 	['git:maintenance', '2.30'],
+	// The pack-refs maintenance task landed one release after the maintenance builtin.
+	['git:maintenance:pack-refs', '2.31'],
 	// `git maintenance start` — the subcommands exist from 2.30 (cron only); launchctl (macOS) + schtasks
 	// (Windows) scheduling arrived in 2.31, so 2.31 is the cross-platform-safe floor.
 	['git:maintenance:start', '2.31'],
@@ -69,12 +74,20 @@ export const gitFeaturesByVersion = new Map<GitFeatures, string>([
 	['git:maintenance:start:systemd', '2.34'],
 	// `feature.manyFiles` umbrella (index v4 + untracked cache + skipHash where available).
 	['git:manyFiles', '2.24'],
-	['git:merge-tree', '2.33'],
+	['git:merge-tree:merge-base', '2.40'],
+	// `merge-tree --write-tree` mode with `-z`/`--name-only`/`--no-messages`; the older trivial mode can't check conflicts
 	['git:merge-tree:write-tree', '2.38'],
 	['git:push:force-if-includes', '2.30.0'],
+	// `--autosquash` WITHOUT `-i` (folding `fixup!`/`squash!` commits into a plain/automatic rebase).
+	// Interactive rebases support autosquash on every git version GitLens supports, so this floor only
+	// gates the non-interactive path.
+	['git:rebase:autosquash', '2.44'],
 	['git:rev-parse:end-of-options', '2.30'],
 	['git:signing:ssh', '2.34.0'],
 	['git:signing:x509', '2.19.0'],
+	// Sparse-index support debuted earlier, but 2.33 shipped a corruption fix and 2.34 broadened command
+	// support. Use 2.34 as the conservative floor before offering a repository mutation.
+	['git:sparse-index', '2.34'],
 	['git:stash:push:pathspecs', '2.13.2'],
 	['git:stash:push:staged', '2.35.0'],
 	['git:stash:push:stdin', '2.30.0'],

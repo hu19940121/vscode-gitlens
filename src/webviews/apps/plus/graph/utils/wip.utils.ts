@@ -1,19 +1,94 @@
+import type { WipRowInfo } from '@gitkraken/commit-graph-ui/rows/wip.js';
+import { formatDetachedHeadName } from '@gitlens/git/utils/branch.utils.js';
 import { hasKeys } from '@gitlens/utils/object.js';
-import type { GraphBranchesVisibility } from '../../../../../config.js';
-import type {
-	GraphIncludeOnlyRefs,
-	GraphScope,
-	GraphWipRowsById,
-	WorkDirStats,
-} from '../../../../plus/graph/protocol.js';
+import type { GraphBranchesVisibility, GraphOverviewBarVisibility } from '../../../../../config.js';
+import type { GraphIncludeOnlyRefs, GraphScope, GraphWipRowsById } from '../../../../plus/graph/protocol.js';
 
-/** Whether `stats` describes a working tree with anything in it. Shared so the WIP bar's pill, the node
- *  glyph, and the merge's probe/counts contradiction check can never disagree about what "dirty" means —
- *  `renamed` is optional and was the field the three used to differ on. */
-export function hasDirtyCounts(stats: Partial<WorkDirStats> | undefined): boolean {
-	if (stats == null) return false;
+/** The worktree's branch name for a WIP row, or `undefined` for a detached worktree. Prefers the
+ *  synced `branch` projection; falls back to parsing `branchRef` (`{repoPath}|heads/{name}`). */
+export function wipBranchName(meta: { branch?: { name?: string }; branchRef?: string }): string | undefined {
+	if (meta.branch?.name != null) return meta.branch.name;
 
-	return (stats.added ?? 0) + (stats.modified ?? 0) + (stats.deleted ?? 0) + (stats.renamed ?? 0) > 0;
+	const ref = meta.branchRef;
+	if (ref == null) return undefined;
+
+	const marker = '|heads/';
+	const index = ref.indexOf(marker);
+	return index === -1 ? undefined : ref.slice(index + marker.length);
+}
+
+/**
+ * Builds the per-row identity map from the same inputs `getDecoratedRows` synthesizes rows from.
+ * `peerWipRows` must already have the primary partitioned out (`partitionOutPrimaryWipRow`) — its
+ * `branchName` falls back to parsing `branchRef` via {@link wipBranchName} until the synced `branch`
+ * projection lands. `primaryWipRowId` is `undefined` when the primary row isn't shown, which omits it
+ * from the map entirely.
+ */
+export function buildWipRowInfoByRowSha(
+	peerWipRows: GraphWipRowsById | undefined,
+	primaryWipRowId: string | undefined,
+	primaryBranch:
+		| { name?: string; sha?: string; detached?: boolean; upstream?: { name: string; missing?: boolean } }
+		| undefined,
+	/** The primary branch's ALREADY-RESOLVED merge target (`rowMarkerMergeTarget`), when any. */
+	primaryTarget: { sha: string; name?: string } | undefined,
+	/** Overview-card enrichment keyed by branch id — a peer's merge target lands here when its card was
+	 *  hovered/clicked; read-only here, never fetched. */
+	enrichmentByBranchId: Readonly<Record<string, { mergeTarget?: { sha: string; name: string } }>> | undefined,
+): ReadonlyMap<string, WipRowInfo> {
+	const byRowSha = new Map<string, WipRowInfo>();
+	if (primaryWipRowId != null) {
+		const detached = primaryBranch?.detached === true;
+		byRowSha.set(primaryWipRowId, {
+			branchName: primaryBranch?.name,
+			// A detached HEAD has no upstream/merge-target to name — the pill has nothing to jump to.
+			upstreamName:
+				!detached && primaryBranch?.upstream?.missing !== true ? primaryBranch?.upstream?.name : undefined,
+			target: detached ? undefined : primaryTarget,
+			tipSha: primaryBranch?.sha,
+			isPrimary: true,
+			detached: detached,
+		});
+	}
+
+	if (peerWipRows != null) {
+		for (const [id, meta] of Object.entries(peerWipRows)) {
+			const branchName = wipBranchName(meta);
+			// No branch ⇒ a detached worktree. `parentSha` is its HEAD, so the same `(abc1234…)` label
+			// `GitStatus`/`GitBranch` synthesize for a detached HEAD names the row instead of leaving it
+			// nameless.
+			const detached = branchName == null;
+			const mergeTarget =
+				!detached && meta.branchRef != null ? enrichmentByBranchId?.[meta.branchRef]?.mergeTarget : undefined;
+			byRowSha.set(id, {
+				branchName: branchName ?? (meta.parentSha != null ? formatDetachedHeadName(meta.parentSha) : undefined),
+				upstreamName:
+					!detached && meta.branch?.upstream?.missing !== true ? meta.branch?.upstream?.name : undefined,
+				target: mergeTarget != null ? { sha: mergeTarget.sha, name: mergeTarget.name } : undefined,
+				worktreeName: meta.label,
+				tipSha: meta.parentSha,
+				isPrimary: false,
+				detached: detached,
+			});
+		}
+	}
+	return byRowSha;
+}
+
+/**
+ * Whether a peer worktree gets an overview-bar pill under the selected visibility policy:
+ * `always`/`worktrees` include every peer, `dirtyWorktrees` includes only dirty/unpushed peers,
+ * and `never` includes none.
+ */
+export function shouldIncludeOverviewBarSecondary(
+	visibility: GraphOverviewBarVisibility,
+	dirty: boolean,
+	hasUnpushed: boolean,
+): boolean {
+	if (visibility === 'never') return false;
+	if (visibility === 'always' || visibility === 'worktrees') return true;
+
+	return dirty || hasUnpushed;
 }
 
 /**
@@ -135,10 +210,11 @@ export function isScopeFocalHead(
  *
  * `branchesVisibility` check (runs after scope, and only when focus didn't already decide):
  * - `'all'` (and absent): always show.
- * - `'current'`, `'smart'`, `'favorited'`: these modes always include the current branch by
- *   construction, so this returns true in normal cases.
- * - `'agents'`: only shows if the current branch is in the host-computed include set
- *   (i.e. an active agent is running on the current branch's worktree).
+ * - `'current'`, `'smart'`: these modes always include the current branch by construction, so this
+ *   returns true in normal cases.
+ * - `'favorited'`, `'agents'`: only shows if the current branch is in the host-computed include set
+ *   (favorited: the current branch is itself starred; agents: an active agent is running on the
+ *   current branch's worktree). Neither mode auto-adds the current branch.
  *
  * Empty `{}` is treated as "no filter" — same convention as `filterSecondariesForIncludeOnlyRefs`.
  * If the current branch id is unknown, defaults to showing the primary — the user's local WIP

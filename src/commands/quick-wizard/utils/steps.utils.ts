@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import type { QuickInputButton, QuickPick, QuickPickItem } from 'vscode';
 import { getRevisionRangeParts, isRevisionRange, isSha } from '@gitlens/git/utils/revision.utils.js';
 import { createDisposable } from '@gitlens/utils/disposable.js';
@@ -41,16 +42,16 @@ export function canStepContinue<T extends QuickInputStep | QuickPickStep | Custo
 	return result != null && !isDirective(result);
 }
 
-export function createConfirmStep<T extends QuickPickItem, Context extends { title: string }>(
+export function createConfirmStep<T extends QuickPickItem>(
 	title: string,
 	confirmations: T[],
-	context: Context,
+	placeholder: string,
 	cancel?: DirectiveQuickPickItem,
-	options?: Partial<QuickPickStep<T>>,
+	options?: Omit<Partial<QuickPickStep<T>>, 'placeholder'>,
 ): QuickPickStep<T> {
 	return createPickStep<T>({
 		isConfirmationStep: true,
-		placeholder: `Confirm ${context.title}`,
+		placeholder: placeholder,
 		title: title,
 		ignoreFocusOut: true,
 		items: [
@@ -61,6 +62,57 @@ export function createConfirmStep<T extends QuickPickItem, Context extends { tit
 		selectedItems: [confirmations.find(c => c.picked) ?? confirmations[0]],
 		...options,
 	});
+}
+
+/** The separator label confirm steps use for their verb-modifier toggle group — shared so
+ *  `QuickCommand.createConfirmStep` can reliably join an existing group instead of stacking a second one. */
+export const confirmOptionsSeparatorLabel = l10n.t('Options');
+
+/**
+ * Rewrites a confirm step's rows in place with `rows`, re-appending the same separator + Cancel that
+ * `createConfirmStep` appends initially. Confirm steps can't refresh via `retry()` — that feeds
+ * `Directive.Noop` back into the generator, which fails `canPickStepContinue` and pops the wizard back a
+ * step — so a live update (an async notice arriving, a toggle flipping) has to mutate the shown quickpick
+ * in place instead. Updates both `step.items` and, once the quickpick exists, `step.quickpick.items` —
+ * quickWizardCommandBase.ts can restore `quickpick.items` from a stale `step.items` on a filter-text
+ * change, which would otherwise silently revert whatever this just composed. `activeItems` is captured
+ * before and restored after the reassignment so the active row survives, provided its identity did too.
+ */
+export function refreshConfirmStepItems<T extends QuickPickItem>(
+	step: QuickPickStep<T>,
+	rows: T[],
+	cancel?: DirectiveQuickPickItem,
+): void {
+	const composed = [
+		...rows,
+		...((step.appendedItems ?? []) as T[]),
+		createQuickPickSeparator<T>(),
+		cancel ?? createDirectiveQuickPickItem(Directive.Cancel),
+	];
+	step.items = composed;
+
+	if (step.quickpick == null) return;
+
+	const active = step.quickpick.activeItems;
+	step.quickpick.items = composed;
+	step.quickpick.activeItems = active;
+}
+
+/**
+ * Re-renders a confirm step's current rows in place — for when a shown row object was mutated
+ * (e.g. a toggle's checked state) and the quickpick needs an items reassignment to notice.
+ * Recomposing from a captured rows array here would revert any newer rows a command-driven
+ * `refreshConfirmStepItems` call has installed since — `step.items` is always the current
+ * composed list, so re-render from that.
+ */
+export function rerenderConfirmStepItems<T extends QuickPickItem>(step: QuickPickStep<T>): void {
+	if (step.quickpick == null) return;
+
+	if (!Array.isArray(step.items)) return;
+
+	const active = step.quickpick.activeItems;
+	step.quickpick.items = [...step.items];
+	step.quickpick.activeItems = active;
 }
 
 export function createCustomStep<T>(step: Optional<CustomStep<T>, 'type'>): CustomStep<T> {
@@ -166,7 +218,7 @@ export function appendReposToTitle<
 	} else if (repos?.length === 1) {
 		repoContext = `${additionalContext ?? ''} · ${repos[0].name}`;
 	} else {
-		repoContext = ` · ${repos?.length ?? 0} repositories`;
+		repoContext = ` · ${l10n.t('{0} repositories', repos?.length ?? 0)}`;
 	}
 
 	return `${title}${repoContext}`;
@@ -207,7 +259,9 @@ export function getValidateGitReferenceFn(
 
 				if (!getSettledValue(leftResult, false) || !getSettledValue(rightResult, false)) {
 					quickpick.items = [
-						createDirectiveQuickPickItem(Directive.Noop, true, { label: `Invalid Range: ${value}` }),
+						createDirectiveQuickPickItem(Directive.Noop, true, {
+							label: l10n.t('Invalid Range: {0}', value),
+						}),
 					];
 					return true;
 				}
@@ -228,7 +282,7 @@ export function getValidateGitReferenceFn(
 			if (allowRevs) {
 				quickpick.items = [
 					createDirectiveQuickPickItem(Directive.Noop, true, {
-						label: 'Enter a reference or commit SHA',
+						label: l10n.t('Enter a reference or commit SHA'),
 					}),
 				];
 				return true;

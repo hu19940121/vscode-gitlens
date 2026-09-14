@@ -10,6 +10,7 @@ import type { GitHostIntegration } from '@gitlens/integrations/models/gitHostInt
 import type { IntegrationBase } from '@gitlens/integrations/models/integration.js';
 import { isPromise } from '@gitlens/utils/promise.js';
 import { CacheController } from '@gitlens/utils/promiseCache.js';
+import type { ResourceUsage, ResourceUsageMetric } from '@gitlens/utils/resourceUsage.js';
 import type { Disposable } from './api/gitlens.d.js';
 import type { Container } from './container.js';
 
@@ -57,6 +58,18 @@ export class CacheProvider implements Disposable {
 
 	dispose(): void {
 		this._cache.clear();
+	}
+
+	/** Resource usage per cache type (plus total). Expired entries are included
+	 *  — they are only evicted on access, so they still count as retained memory. */
+	getResourceUsage(): ResourceUsage {
+		const usage: ResourceUsage = { 'entries.total.count': this._cache.size };
+		for (const key of this._cache.keys()) {
+			const cacheType = key.split(':', 1)[0];
+			const metric: ResourceUsageMetric = `entries.${cacheType}.count`;
+			usage[metric] = (usage[metric] ?? 0) + 1;
+		}
+		return usage;
 	}
 
 	delete<T extends Cache>(cache: T, key: CacheKey<T>): void {
@@ -133,10 +146,12 @@ export class CacheProvider implements Disposable {
 	getCurrentAccount(
 		integration: IntegrationBase,
 		cacheable: Cacheable<Account>,
-		options?: ExpiryOptions,
+		options?: ExpiryOptions & { connectionId?: string; etag?: string },
 	): CacheResult<Account> {
+		const { connectionId, etag: etagOverride, ...cacheOptions } = options ?? {};
 		const { key, etag } = this.getIntegrationKeyAndEtag(integration);
-		return this.get('currentAccount', `id:${key}`, etag, cacheable, options);
+		const connectionKey = connectionId ? `:${connectionId}` : '';
+		return this.get('currentAccount', `id:${key}${connectionKey}`, etagOverride ?? etag, cacheable, cacheOptions);
 	}
 
 	// getEnrichedAutolinks(
@@ -357,16 +372,20 @@ export class CacheProvider implements Disposable {
 		return cacheController => {
 			const item = cacheable(cacheController);
 			if (isPromise(item.value)) {
-				void item.value.then(v => {
-					if (v != null) {
-						this.set(
-							'issuesOrPrsById',
-							`id:${v.id}:${key}:${'pullrequest' satisfies IssueOrPullRequestType}`,
-							v,
-							etag,
-						);
-					}
-				});
+				void item.value.then(
+					v => {
+						if (v != null) {
+							this.set(
+								'issuesOrPrsById',
+								`id:${v.id}:${key}:${'pullrequest' satisfies IssueOrPullRequestType}`,
+								v,
+								etag,
+							);
+						}
+					},
+					// A lookup that opted to throw (`throwOnError`) rejects here too; the caller owns it.
+					() => {},
+				);
 			}
 
 			return item;
@@ -374,9 +393,10 @@ export class CacheProvider implements Disposable {
 	}
 
 	private getIntegrationKeyAndEtag(integration: IntegrationBase) {
+		const key = this.getIntegrationCacheKey(integration);
 		return {
-			key: integration.id,
-			etag: `${integration.id}:${integration.maybeConnected ?? false}:${integration.sessionFingerprint ?? ''}`,
+			key: key,
+			etag: `${key}:${integration.maybeConnected ?? false}:${integration.sessionFingerprint ?? ''}`,
 		};
 	}
 
@@ -384,13 +404,17 @@ export class CacheProvider implements Disposable {
 	private getResourceKeyAndEtag(resource: ResourceDescriptor, integration?: GitHostIntegration | IntegrationBase) {
 		let fingerprint = '';
 		if (integration != null) {
-			fingerprint =
-				this.peek('currentAccount', `id:${integration.id}`)?.id ?? integration.sessionFingerprint ?? '';
+			const { key } = this.getIntegrationKeyAndEtag(integration);
+			fingerprint = this.peek('currentAccount', `id:${key}`)?.id ?? integration.sessionFingerprint ?? '';
 		}
 		return {
 			key: resource.key,
 			etag: `${resource.key}:${integration?.maybeConnected ?? false}:${fingerprint}`,
 		};
+	}
+
+	private getIntegrationCacheKey(integration: IntegrationBase): string {
+		return `${integration.id}:${integration.domain}`;
 	}
 }
 

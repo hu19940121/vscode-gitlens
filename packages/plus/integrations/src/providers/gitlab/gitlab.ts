@@ -1,7 +1,9 @@
+import * as l10n from '@vscode/l10n';
 import type { Account } from '@gitlens/git/models/author.js';
 import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
 import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.js';
 import { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { PullRequestState } from '@gitlens/git/models/pullRequest.js';
 import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import { CancellationError } from '@gitlens/utils/cancellation.js';
@@ -18,10 +20,11 @@ import type { IntegrationServiceContext } from '../../context.js';
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
+	isRateLimitResponse,
 	ProviderFetchError,
 	RequestClientError,
 	RequestNotFoundError,
-	RequestRateLimitError,
+	toRateLimitError,
 } from '../../errors.js';
 import type { ProviderApiConfig } from '../apiConfig.js';
 import { baseProviderApiConfig } from '../apiConfig.js';
@@ -37,7 +40,12 @@ import type {
 	GitLabSshKey,
 	GitLabUser,
 } from './models.js';
-import { fromGitLabMergeRequest, fromGitLabMergeRequestREST, fromGitLabMergeRequestState } from './models.js';
+import {
+	fromGitLabMergeRequest,
+	fromGitLabMergeRequestREST,
+	fromGitLabMergeRequestState,
+	toGitLabMergeRequestState,
+} from './models.js';
 
 // drop it as soon as we switch to @gitkraken/providers-api
 const gitlabUserIdPrefix = 'gid://gitlab/User/';
@@ -550,9 +558,12 @@ export class GitLabApi implements Disposable {
 				provider,
 				{
 					id: buildGitLabUserId(pr.author?.id) ?? '',
-					name: pr.author?.name ?? 'Unknown',
-					avatarUrl: pr.author?.avatarUrl ?? '',
-					url: pr.author?.webUrl ?? '',
+					// An absent author stays absent: no `'Unknown'` name a consumer can't tell from a real one, and no
+					// `''` url/avatar that passes a presence check and renders as a link to nowhere. Matches
+					// `fromProviderAccount`/`toIssueShape`.
+					name: pr.author?.name ?? undefined,
+					avatarUrl: pr.author?.avatarUrl ?? undefined,
+					url: pr.author?.webUrl ?? undefined,
 				},
 				// oxlint-disable-next-line typescript/no-unnecessary-type-conversion
 				String(pr.iid),
@@ -789,7 +800,14 @@ export class GitLabApi implements Disposable {
 	async searchPullRequests(
 		provider: Provider,
 		token: TokenWithInfo,
-		options?: { search?: string; user?: string; repos?: string[]; baseUrl?: string; avatarSize?: number },
+		options?: {
+			search?: string;
+			user?: string;
+			repos?: string[];
+			baseUrl?: string;
+			avatarSize?: number;
+			include?: PullRequestState[];
+		},
 		cancellation?: AbortSignal,
 	): Promise<PullRequest[]> {
 		const scope = getScopedLogger();
@@ -800,17 +818,57 @@ export class GitLabApi implements Disposable {
 
 		try {
 			const perPageLimit = 20; // with bigger amount we exceed the max GraphQL complexity in the next query
-			const restPRs = await this.request<GitLabMergeRequestREST[]>(
-				provider,
-				token,
-				options?.baseUrl,
-				`v4/search/?scope=merge_requests&search=${search}&per_page=${perPageLimit}`,
-				{
-					method: 'GET',
-				},
-				cancellation,
-				scope,
-			);
+			const include = options?.include?.length ? options.include : undefined;
+			// GitLab's search API takes a single `state` value, so push it server-side when exactly one state is
+			// requested; that keeps the requested state from being crowded out of the `perPageLimit` slice. For
+			// multiple states there's no single-value qualifier, so those are filtered client-side below.
+			let searchPath = `v4/search/?scope=merge_requests&search=${encodeURIComponent(search)}&per_page=${perPageLimit}`;
+			if (include?.length === 1) {
+				searchPath += `&state=${encodeURIComponent(toGitLabMergeRequestState(include[0]))}`;
+			}
+
+			let restPRs: GitLabMergeRequestREST[];
+			if (include == null) {
+				// Unfiltered search returns the first page as-is (as it did before state filtering existed).
+				restPRs = await this.request<GitLabMergeRequestREST[]>(
+					provider,
+					token,
+					options?.baseUrl,
+					searchPath,
+					{ method: 'GET' },
+					cancellation,
+					scope,
+				);
+			} else {
+				// The search API returns MRs of all states in relevance order, so the requested state(s) may not
+				// appear on the first page. Server-side `&state=` narrows the single-state case when honored, but it
+				// can't express multiple states, so page through the results and accumulate matches until we fill the
+				// detail-query cap (`perPageLimit`) or exhaust the search results. This keeps correctness whether
+				// or not `&state=` takes effect. Bounded by `maxSearchPages` like the other paged provider drains in
+				// this package so a large, low-match result set can't fan out into an unbounded request loop.
+				const maxSearchPages = 20;
+				const matches: GitLabMergeRequestREST[] = [];
+				for (let page = 1; page <= maxSearchPages; page++) {
+					const pagePRs = await this.request<GitLabMergeRequestREST[]>(
+						provider,
+						token,
+						options?.baseUrl,
+						`${searchPath}&page=${page}`,
+						{ method: 'GET' },
+						cancellation,
+						scope,
+					);
+					for (const pr of pagePRs) {
+						if (include.includes(fromGitLabMergeRequestState(pr.state))) {
+							matches.push(pr);
+							if (matches.length >= perPageLimit) break;
+						}
+					}
+					// Stop once we've filled the cap or hit the last (partial or empty) page.
+					if (matches.length >= perPageLimit || pagePRs.length < perPageLimit) break;
+				}
+				restPRs = matches;
+			}
 			if (restPRs.length === 0) {
 				return [];
 			}
@@ -868,12 +926,18 @@ export class GitLabApi implements Disposable {
 						iid: String(restPR.iid),
 						id: String(restPR.id),
 						state: restPR.state,
-						author: {
-							id: buildGitLabUserId(restPR.author?.id) ?? '',
-							name: restPR.author?.name ?? 'Unknown',
-							avatarUrl: restPR.author?.avatar_url ?? '',
-							webUrl: restPR.author?.web_url ?? '',
-						},
+						// An absent REST author stays absent (`null`, as GitLab's own shape expresses it) rather than a
+						// synthesized `'Unknown'` stub: `fromGitLabMergeRequest` collapses `null` to an absent
+						// `PullRequestMember.name`, whereas a placeholder here would launder into a real-looking name.
+						author:
+							restPR.author != null
+								? {
+										id: buildGitLabUserId(restPR.author.id) ?? '',
+										name: restPR.author.name,
+										avatarUrl: restPR.author.avatar_url ?? null,
+										webUrl: restPR.author.web_url,
+									}
+								: null,
 						title: restPR.title,
 						description: restPR.description,
 						webUrl: restPR.web_url,
@@ -1086,7 +1150,8 @@ $search: String!
 					return data;
 				}
 
-				throw new ProviderFetchError('GitLab', rsp);
+				// Reads the body so the 403 branch below can tell a throttled request from a permission failure.
+				throw await ProviderFetchError.fromResponse('GitLab', rsp);
 			} finally {
 				const match = /(^[^({\n]+)/.exec(query);
 				const message = ` ${match?.[1].trim() ?? query}`;
@@ -1135,7 +1200,8 @@ $search: String!
 					return (await rsp.json()) as T;
 				}
 
-				throw new ProviderFetchError('GitLab', rsp);
+				// Reads the body so the 403 branch below can tell a throttled request from a permission failure.
+				throw await ProviderFetchError.fromResponse('GitLab', rsp);
 			} finally {
 				sw?.stop();
 			}
@@ -1164,34 +1230,27 @@ $search: String!
 			case 410: // Gone
 			case 422: // Unprocessable Entity
 				throw new RequestNotFoundError(ex);
-			// case 429: //Too Many Requests
+			case 429: // Too Many Requests
+				throw toRateLimitError(ex, accessToken);
 			case 401: // Unauthorized
 				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, ex);
 			case 403: // Forbidden
-				if (ex.message.includes('rate limit exceeded')) {
-					let resetAt: number | undefined;
+				// GitLab returns 403 for both a permission failure and a throttled request, so the message is the
+				// discriminant (see `isRateLimitResponse`, shared with Bitbucket/Azure).
+				if (isRateLimitResponse(ex)) throw toRateLimitError(ex, accessToken);
 
-					const reset = ex.response?.headers?.get('x-ratelimit-reset');
-					if (reset != null) {
-						resetAt = parseInt(reset, 10);
-						if (Number.isNaN(resetAt)) {
-							resetAt = undefined;
-						}
-					}
-
-					throw new RequestRateLimitError(ex, accessToken, resetAt);
-				}
 				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, ex);
 			case 500: // Internal Server Error
 				scope?.error(ex);
 				if (ex.response != null) {
 					provider?.trackRequestException();
 					this.config.onRequestFailed?.(
-						`${provider?.name ?? 'GitLab'} failed to respond and might be experiencing issues.${
-							provider == null || provider.id === 'gitlab'
-								? ' Please visit the [GitLab status page](https://status.gitlab.com) for more information.'
-								: ''
-						}`,
+						provider == null || provider.id === 'gitlab'
+							? l10n.t(
+									'{0} failed to respond and might be experiencing issues. Please visit the [GitLab status page](https://status.gitlab.com) for more information.',
+									provider?.name ?? 'GitLab',
+								)
+							: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
 					);
 				}
 				return;
@@ -1228,9 +1287,9 @@ $search: String!
 	private async showAuthenticationErrorMessage(ex: AuthenticationError, provider: Provider) {
 		if (ex.reason === AuthenticationErrorReason.Unauthorized || ex.reason === AuthenticationErrorReason.Forbidden) {
 			const reauthenticate = await this.config.onReauthenticationRequired?.(
-				`${ex.message}. Would you like to try reauthenticating${
-					ex.reason === AuthenticationErrorReason.Forbidden ? ' to provide additional access' : ''
-				}?`,
+				ex.reason === AuthenticationErrorReason.Forbidden
+					? l10n.t('{0}. Would you like to try reauthenticating to provide additional access?', ex.message)
+					: l10n.t('{0}. Would you like to try reauthenticating?', ex.message),
 			);
 
 			if (reauthenticate) {

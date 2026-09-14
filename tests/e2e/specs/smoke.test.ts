@@ -70,8 +70,14 @@ test.describe('Smoke Tests — Core', () => {
 	});
 
 	test('should contain GitLens & GitLens Inspect icons in activity bar', async ({ vscode }) => {
-		const tabCount = await vscode.gitlens.getActivityBarTabCount();
-		expect(tabCount).toBeGreaterThanOrEqual(1);
+		await expect(vscode.gitlens.gitlensTab).toBeVisible({ timeout: MaxTimeout });
+
+		// GitLens Inspect is its own view container, and VS Code registers a container the first time
+		// one of its views is shown — so the tab is simply absent on a freshly launched instance. Show
+		// an Inspect view here: this used to assert that at least one tab matched /GitLens/, which the
+		// GitLens tab satisfied alone, so it passed without ever seeing the second icon it is named for.
+		await vscode.gitlens.executeCommand('gitlens.showCommitDetailsView');
+		await expect(vscode.gitlens.gitlensInspectTab).toBeVisible({ timeout: MaxTimeout });
 	});
 
 	test('should show GitLens status bar items', async ({ vscode }) => {
@@ -137,7 +143,7 @@ test.describe('Smoke Tests — GitLens views', () => {
 
 	test('should show GitLens views (Pro - with simulated Pro subscription)', async ({ vscode }) => {
 		// Simulate a Pro subscription for this test
-		using _ = await vscode.gitlens.startSubscriptionSimulation({
+		await using _ = await vscode.gitlens.startSubscriptionSimulation({
 			state: 6 /* SubscriptionState.Paid */,
 			planId: 'pro',
 		});
@@ -205,6 +211,18 @@ test.describe('Smoke Tests — GitLens Inspect views', () => {
 	});
 
 	test('should show GitLens Inspect views when clicking GitLens Inspect icon', async ({ vscode }) => {
+		// Register the Inspect view container and wait for its tab before clicking it. Opening the file
+		// above happens to register it too, but relying on that side effect is what made this spec fail
+		// on Positron in CI: the tab had not appeared yet, so the click below spent its full actionability
+		// timeout waiting for an element that nothing had asked VS Code to create.
+		await vscode.gitlens.executeCommand('gitlens.showCommitDetailsView');
+		await expect(vscode.gitlens.gitlensInspectTab).toBeVisible({ timeout: MaxTimeout });
+
+		// Showing the view also makes Inspect the active container, and clicking the active tab collapses
+		// the sidebar. Go back to Explorer so the click below is what opens Inspect — which is the whole
+		// subject of this test.
+		await vscode.gitlens.executeCommand('workbench.view.explorer');
+
 		// open inspect
 		await vscode.gitlens.openGitLensInspect();
 		await expect(vscode.gitlens.inspectViewSection).toBeVisible({ timeout: MaxTimeout });
@@ -213,6 +231,19 @@ test.describe('Smoke Tests — GitLens Inspect views', () => {
 		expect(inspectWebview).not.toBeNull();
 		// Verify the Inspect webview has loaded with the commit details app
 		await expect(inspectWebview!.locator('gl-commit-details-app')).toBeVisible({ timeout: MaxTimeout });
+	});
+
+	test('should keep GitLens Inspect open when it is already the active container', async ({ vscode }) => {
+		// `openTab` is meant to skip the click when the container is already active, because clicking the
+		// active tab collapses the side bar. Nothing exercised that: every caller reached it from another
+		// container, so the click always did the right thing by accident and a broken guard looked fine.
+		await vscode.gitlens.executeCommand('gitlens.showCommitDetailsView');
+		await expect(vscode.gitlens.inspectViewSection).toBeVisible({ timeout: MaxTimeout });
+
+		await vscode.gitlens.openGitLensInspect();
+
+		// Still open — asking for a container that is already showing is not a request to hide it
+		await expect(vscode.gitlens.inspectViewSection).toBeVisible({ timeout: MaxTimeout });
 	});
 
 	test('should show File History view', async ({ vscode }) => {
@@ -252,7 +283,7 @@ test.describe('Smoke Tests — GitLens Inspect views', () => {
 
 	test('should show Visual File History view (Pro - with simulated Pro subscription)', async ({ vscode }) => {
 		// Simulate a Pro subscription for this test
-		using _ = await vscode.gitlens.startSubscriptionSimulation({
+		await using _ = await vscode.gitlens.startSubscriptionSimulation({
 			state: 6 /* SubscriptionState.Paid */,
 			planId: 'pro',
 		});
@@ -280,25 +311,6 @@ test.describe('Smoke Tests — GitLens Inspect views', () => {
 		await expect(vscode.page.getByRole('button', { name: 'Compare References...' })).toBeVisible({
 			timeout: MaxTimeout,
 		});
-	});
-});
-
-test.describe('Smoke Tests — Home view', () => {
-	test.describe.configure({ mode: 'serial' });
-	test.afterEach(async ({ vscode }) => {
-		await vscode.gitlens.resetUI();
-	});
-
-	test('should open home with the command', async ({ vscode }) => {
-		await vscode.gitlens.showHomeView();
-
-		await expect(vscode.gitlens.homeViewSection).toBeVisible({ timeout: MaxTimeout });
-
-		// Verify Home webview has actual content
-		const homeWebview = await vscode.gitlens.homeViewWebview;
-		expect(homeWebview).not.toBeNull();
-		// Verify meaningful content has loaded (the branch name from the active-work section)
-		await expect(homeWebview!.getByText(/main/).first()).toBeVisible({ timeout: MaxTimeout });
 	});
 });
 
@@ -336,7 +348,7 @@ test.describe('Smoke Tests — Commit Graph view', () => {
 
 	test('should show commit graph content (Pro - with simulated Pro subscription)', async ({ vscode }) => {
 		// Simulate a Pro subscription for this test
-		using _ = await vscode.gitlens.startSubscriptionSimulation({
+		await using _ = await vscode.gitlens.startSubscriptionSimulation({
 			state: 6 /* SubscriptionState.Paid */,
 			planId: 'pro',
 		});

@@ -1,12 +1,12 @@
 import type { ExtensionContext } from 'vscode';
-import { version as codeVersion, commands, env, ExtensionMode, LogLevel, Uri, window, workspace } from 'vscode';
+import { version as codeVersion, commands, env, ExtensionMode, l10n, LogLevel, Uri, window, workspace } from 'vscode';
 import { isWeb } from '@env/platform.js';
 import { defaultResolver as envDefaultResolver } from '@env/resolver.js';
-import { getBranchNameWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
 import { setAbbreviatedShaLength } from '@gitlens/git/utils/revision.utils.js';
 import { setDefaultDateLocales } from '@gitlens/utils/date.js';
 import { setDefaultResolver } from '@gitlens/utils/decorators/resolver.js';
 import { once } from '@gitlens/utils/event.js';
+import { getBranchNameWithoutRemote } from '@gitlens/utils/gitRefs.js';
 import { microhash } from '@gitlens/utils/hash.js';
 import { hrtime } from '@gitlens/utils/hrtime.js';
 import { isLoggable } from '@gitlens/utils/loggable.js';
@@ -27,6 +27,7 @@ import type { OpenPullRequestOnRemoteCommandArgs } from './commands/openPullRequ
 import { trackableSchemes } from './constants.js';
 import { SyncedStorageKeys } from './constants.storage.js';
 import { Container } from './container.js';
+import { setFeatureFlagTelemetryGlobalAttributes } from './featureFlags/featureFlagService.js';
 import { isGitUri } from './git/gitUri.js';
 import {
 	showCursorMcpCleanupMessage,
@@ -37,6 +38,7 @@ import {
 } from './messages.js';
 import { registerPartnerActionRunners } from './partners.js';
 import { needsCursorMcpCleanupNotice } from './plus/gk/utils/-webview/mcp.utils.js';
+import { registerResourceUsage } from './resourceUsage.js';
 import { settingsMigrations } from './settingsMigrations.js';
 import { executeCommand, executeCoreCommand, registerCommands } from './system/-webview/command.js';
 import { configuration, Configuration } from './system/-webview/configuration.js';
@@ -203,6 +205,7 @@ export async function activate(context: ExtensionContext): Promise<GitLensApi | 
 	const container = Container.create(context, storage, prerelease, gitlensVersion, previousVersion);
 	once(container.onReady)(() => {
 		context.subscriptions.push(...registerCommands(container));
+		context.subscriptions.push(...registerResourceUsage(container));
 		registerBuiltInActionRunners(container);
 		registerPartnerActionRunners(context);
 
@@ -270,6 +273,8 @@ export async function activate(context: ExtensionContext): Promise<GitLensApi | 
 		upgradedFrom: previousVersion != null && gitlensVersion !== previousVersion ? previousVersion : undefined,
 	});
 	setFeatureFlagTelemetryGlobalAttributes(container);
+	// Re-set once the fetch lands so a first activation still carries flag attribution
+	void container.featureFlags.whenReady.then(() => setFeatureFlagTelemetryGlobalAttributes(container));
 
 	const api = new Api(container);
 	const mode = container.mode;
@@ -304,7 +309,7 @@ export function deactivate(): void {
 	Container.instance.deactivate();
 }
 
-/** Consumes the one-shot flag set by the `views.legacy:hidden` migration, hiding Home, Cloud Patches
+/** Consumes the one-shot flag set by the `views.legacy:hidden` migration, hiding Cloud Patches
  *  and Cloud Workspaces for upgraded profiles. Best-effort by design: each hide command acts only
  *  while the container currently holding its view is the active composite of that container's
  *  location (verified — a programmatic call resolves without doing anything otherwise, so command
@@ -324,10 +329,10 @@ async function applyPendingLegacyViewHiding(container: Container): Promise<void>
 		}
 
 		// Profiles that disabled Plus features may have no Graph to land on (its `when` hangs off
-		// `gitlens:plus:disabled`) — Home stays their main surface, so don't hide anything. Read the
-		// SETTING, not the context: `gitlens:plus:disabled` is computed debounced-async after ready and
-		// cannot be set yet here. The flag stays ARMED (not consumed): if Plus features come back later,
-		// the next activation performs the hide.
+		// `gitlens:plus:disabled`) — leave their remaining views in place, so don't hide anything. Read
+		// the SETTING, not the context: `gitlens:plus:disabled` is computed debounced-async after ready
+		// and cannot be set yet here. The flag stays ARMED (not consumed): if Plus features come back
+		// later, the next activation performs the hide.
 		if (configuration.get('plusFeatures.enabled', undefined, true) === false) {
 			Logger.debug('applyPendingLegacyViewHiding: deferred (plus features disabled)');
 
@@ -366,7 +371,7 @@ async function applyPendingLegacyViewHiding(container: Container): Promise<void>
 		// A `when` that never comes true isn't showing its view anyway — the common case (no drafts
 		// entitlement) burns the full budget for it; accepted, this runs voided off the critical path,
 		// once per install.
-		let remaining: ('home' | 'drafts' | 'workspaces')[] = ['home', 'drafts', 'workspaces'];
+		let remaining: ('drafts' | 'workspaces')[] = ['drafts', 'workspaces'];
 		const deadline = Date.now() + 15000;
 		while (remaining.length) {
 			const cmds = await commands.getCommands(true);
@@ -443,20 +448,15 @@ function setKeysForSync(context: ExtensionContext, ...keys: (SyncedStorageKeys |
 	]);
 }
 
-function setFeatureFlagTelemetryGlobalAttributes(container: Container): void {
-	const flags = container.featureFlags.getAllFlags();
-	if (Object.keys(flags).length === 0) return;
-
-	container.telemetry.setGlobalAttribute(
-		'featureFlags',
-		JSON.stringify(Object.fromEntries(Object.entries(flags).sort(([a], [b]) => a.localeCompare(b)))),
-	);
-}
-
 function registerBuiltInActionRunners(container: Container): void {
 	container.context.subscriptions.push(
 		container.actionRunners.registerBuiltIn<CreatePullRequestActionContext>('createPullRequest', {
-			label: ctx => `Create Pull Request on ${ctx.remote?.provider?.name ?? 'Remote'}`,
+			label: ctx => {
+				const provider = ctx.remote?.provider?.name;
+				return provider == null
+					? l10n.t('Create Pull Request on Remote')
+					: l10n.t('Create Pull Request on {provider}', { provider: provider });
+			},
 			run: async ctx => {
 				if (ctx.type !== 'createPullRequest') return;
 
@@ -475,7 +475,12 @@ function registerBuiltInActionRunners(container: Container): void {
 			},
 		}),
 		container.actionRunners.registerBuiltIn<OpenPullRequestActionContext>('openPullRequest', {
-			label: ctx => `Open Pull Request on ${ctx.provider?.name ?? 'Remote'}`,
+			label: ctx => {
+				const provider = ctx.provider?.name;
+				return provider == null
+					? l10n.t('Open Pull Request on Remote')
+					: l10n.t('Open Pull Request on {provider}', { provider: provider });
+			},
 			run: async ctx => {
 				if (ctx.type !== 'openPullRequest') return;
 
@@ -485,7 +490,12 @@ function registerBuiltInActionRunners(container: Container): void {
 			},
 		}),
 		container.actionRunners.registerBuiltIn<OpenIssueActionContext>('openIssue', {
-			label: ctx => `Open Issue on ${ctx.provider?.name ?? 'Remote'}`,
+			label: ctx => {
+				const provider = ctx.provider?.name;
+				return provider == null
+					? l10n.t('Open Issue on Remote')
+					: l10n.t('Open Issue on {provider}', { provider: provider });
+			},
 			run: async ctx => {
 				if (ctx.type !== 'openIssue') return;
 

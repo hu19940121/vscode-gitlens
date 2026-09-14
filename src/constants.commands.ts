@@ -47,46 +47,7 @@ type InternalGraphWebviewCommands =
 	| 'gitlens.rebaseCurrentOnto:graph'
 	| 'gitlens.shareWipAsCloudPatch:graph';
 
-type InternalHomeWebviewCommands =
-	| 'gitlens.git.branch.setMergeTarget:home'
-	| 'gitlens.deleteBranchOrWorktree:home'
-	| 'gitlens.ai.explainBranch:home'
-	| 'gitlens.ai.explainWip:home'
-	| 'gitlens.composeCommits:home'
-	| 'gitlens.createBranch:home'
-	| 'gitlens.createCloudPatch:home'
-	| 'gitlens.createPullRequest:home'
-	| 'gitlens.fetch:home'
-	| 'gitlens.mergeIntoCurrent:home'
-	| 'gitlens.openInView.branch:home'
-	| 'gitlens.openMergeTargetComparison:home'
-	| 'gitlens.openPullRequestChanges:home'
-	| 'gitlens.openPullRequestComparison:home'
-	| 'gitlens.openPullRequestDetails:home'
-	// | 'gitlens.openPullRequestOnRemote:home'
-	| 'gitlens.openWorktree:home'
-	| 'gitlens.pausedOperation.abort:home'
-	| 'gitlens.pausedOperation.continue:home'
-	| 'gitlens.pausedOperation.open:home'
-	| 'gitlens.pausedOperation.showConflicts:home'
-	| 'gitlens.pausedOperation.skip:home'
-	| 'gitlens.publishBranch:home'
-	| 'gitlens.pull:home'
-	| 'gitlens.push:home'
-	| 'gitlens.pushBranch:home'
-	| 'gitlens.rebaseCurrentOnto:home'
-	| 'gitlens.showInCommitGraph:home'
-	| 'gitlens.startWork:home'
-	| 'gitlens.switchToBranch:home'
-	| 'gitlens.visualizeHistory.repo:home'
-	| 'gitlens.visualizeHistory.branch:home';
-
-type InternalAgentCommands =
-	| 'gitlens.agents.resolvePermission'
-	| 'gitlens.agents.openPlanFile'
-	| 'gitlens.agents.resumeSession'
-	| 'gitlens.agents.showResumeSessionPicker'
-	| 'gitlens.agents.archiveSession';
+type InternalAgentCommands = 'gitlens.agents.resolvePermission' | 'gitlens.agents.showResumeSessionPicker';
 
 type InternalLaunchPadCommands = 'gitlens.launchpad.indicator.action';
 
@@ -111,28 +72,7 @@ type InternalTimelineWebviewViewCommands = 'gitlens.views.timeline.openInTab';
 
 type InternalViewCommands = 'gitlens.views.loadMoreChildren';
 
-type InternalWalkthroughCommands =
-	| 'gitlens.walkthrough.enableAiSetting'
-	| 'gitlens.walkthrough.gitlensInspect'
-	| 'gitlens.walkthrough.openAcceleratePrReviews'
-	| 'gitlens.walkthrough.openAiCustomInstructionsSettings'
-	| 'gitlens.walkthrough.openAiSettings'
-	| 'gitlens.walkthrough.openCommunityVsPro'
-	| 'gitlens.walkthrough.openHelpCenter'
-	| 'gitlens.walkthrough.openInteractiveCodeHistory'
-	| 'gitlens.walkthrough.openLearnAboutAiFeatures'
-	| 'gitlens.walkthrough.openWalkthrough'
-	| 'gitlens.walkthrough.plus.login'
-	| 'gitlens.walkthrough.plus.signUp'
-	| 'gitlens.walkthrough.plus.upgrade'
-	| 'gitlens.walkthrough.plus.reactivate'
-	| 'gitlens.walkthrough.showDraftsView'
-	| 'gitlens.walkthrough.showGraph'
-	| 'gitlens.walkthrough.showComposer'
-	| 'gitlens.walkthrough.showLaunchpad'
-	| 'gitlens.walkthrough.switchAIProvider'
-	| 'gitlens.walkthrough.worktree.create'
-	| 'gitlens.walkthrough.openDevExPlatform';
+type InternalWalkthroughCommands = 'gitlens.walkthrough.openWelcome';
 
 type InternalWelcomeCommands =
 	| 'gitlens.welcome.openCommunityVsPro'
@@ -144,7 +84,6 @@ type InternalWelcomeCommands =
 	| 'gitlens.welcome.plus.upgrade'
 	| 'gitlens.welcome.showComposer'
 	| 'gitlens.welcome.showGraph'
-	| 'gitlens.welcome.showHomeView'
 	| 'gitlens.welcome.showLaunchpad';
 
 type InternalGlCommands =
@@ -160,6 +99,7 @@ type InternalGlCommands =
 	| 'gitlens.diffWithPrevious:views'
 	| 'gitlens.diffWithWorking:command'
 	| 'gitlens.diffWithWorking:views'
+	| 'gitlens.getKepler'
 	| 'gitlens.openChatAction'
 	| 'gitlens.openCloudPatch'
 	| 'gitlens.openOnRemote'
@@ -168,10 +108,12 @@ type InternalGlCommands =
 	| 'gitlens.refreshHover'
 	| 'gitlens.regenerateMarkdownDocument'
 	| 'gitlens.runPromptInAgent'
+	| 'gitlens.runTaskOnWorktree'
 	| 'gitlens.sendToChat'
 	| 'gitlens.showInCommitGraphView'
 	| 'gitlens.onboarding.dismiss'
 	| 'gitlens.showQuickCommitDetails'
+	| 'gitlens.startAgentSession'
 	| 'gitlens.toggleFileBlame:codelens'
 	| 'gitlens.toggleFileBlame:mode'
 	| 'gitlens.toggleFileBlame:statusbar'
@@ -185,7 +127,6 @@ type InternalGlCommands =
 	| InternalAgentCommands
 	| InternalGraphWebviewCommands
 	| InternalGraphWebviewViewCommands
-	| InternalHomeWebviewCommands
 	| InternalLaunchPadCommands
 	| InternalPlusCommands
 	| InternalPullRequestViewCommands
@@ -256,6 +197,7 @@ export type CoreCommands =
 	| 'workbench.action.reopenTextEditor'
 	| 'workbench.action.reopenWithEditor'
 	| 'workbench.action.reloadWindow'
+	| 'workbench.action.tasks.showTasks'
 	| 'workbench.action.terminal.paste'
 	| 'workbench.action.terminal.sendSequence'
 	| 'workbench.action.focusPanel'

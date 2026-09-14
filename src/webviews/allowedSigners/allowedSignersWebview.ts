@@ -1,25 +1,20 @@
-import { Uri, window, workspace } from 'vscode';
-import { getHomeDir, isWeb } from '@env/platform.js';
+import { l10n, Uri, workspace } from 'vscode';
+import { isWeb } from '@env/platform.js';
 import { base64, fromBase64 } from '@gitlens/utils/base64.js';
-import { isAbsolute } from '@gitlens/utils/path.js';
 import { getAvatarUri } from '../../avatars.js';
 import type { WebviewTelemetryContext } from '../../constants.telemetry.js';
 import type { Container } from '../../container.js';
+import { getPresentableErrorMessage } from '../../errors.js';
 import { getBestRemoteWithIntegration, getRemoteIntegration } from '../../git/utils/-webview/remote.utils.js';
-import type { AllowedSignerEntry } from '../../git/utils/allowedSignersFile.js';
-import { getExistingEntryKeys, mergeAllowedSigners, parsePublicKey } from '../../git/utils/allowedSignersFile.js';
-import type { IpcParams, IpcResponse } from '../ipc/handlerRegistry.js';
-import { ipcRequest } from '../ipc/handlerRegistry.js';
+import { getExistingEntryKeys, parsePublicKey } from '../../git/utils/allowedSignersFile.js';
+import type { AllowedSignersResultsChangedEvent, AllowedSignersServices } from '../rpc/allowedSignersService.js';
+import { AllowedSignersService, expandHome } from '../rpc/allowedSignersService.js';
+import type { EventVisibilityBuffer, SubscriptionTracker } from '../rpc/eventVisibilityBuffer.js';
+import { createSharedServices } from '../rpc/services/common.js';
+import { proxyServices } from '../rpc/services/proxy.js';
 import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from '../webviewProvider.js';
 import type { WebviewShowOptions } from '../webviewsController.js';
 import type { CandidateSigner, LoadingProgress, SignerProvider, State } from './protocol.js';
-import {
-	BrowseTargetPathRequest,
-	CheckPresenceRequest,
-	DidChangeProgressNotification,
-	DidChangeResultsNotification,
-	SaveRequest,
-} from './protocol.js';
 import type { AllowedSignersWebviewShowingArgs } from './registration.js';
 
 /**
@@ -53,6 +48,10 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 		  }
 		| undefined;
 
+	/** Created with (and cached by) `getRpcServices` so the discovery flow can fire its events. */
+	private _service: AllowedSignersService | undefined;
+	private _telemetryContext: Record<`context.${string}`, string | number | boolean | undefined> | undefined;
+
 	constructor(
 		private readonly container: Container,
 		private readonly host: WebviewHost<'gitlens.allowedSigners'>,
@@ -63,7 +62,7 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 	}
 
 	getTelemetryContext(): WebviewTelemetryContext {
-		return { ...this.host.getTelemetryContext() };
+		return { ...this.host.getTelemetryContext(), ...this._telemetryContext };
 	}
 
 	onShowing(
@@ -88,16 +87,33 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 		// the best repository with no pre-selection.
 
 		// This panel is single-instance, so the provider is reused across shows. Drop cached discovery whenever the
-		// show context changes, so a re-open never surfaces the previous repo's signers or a stale pre-check.
+		// show context changes, so a re-open never surfaces the previous repo's signers or a stale pre-check. The
+		// service's seed cache must drop with it — the webview's subscribe-then-query would otherwise apply the
+		// previous repo's signers (preselecting provider-verified ones) before discovery corrects the UI.
 		if (nextRepoPath !== this._repoPath || nextPreselectFingerprint !== this._preselectFingerprint) {
 			this._results = undefined;
 			this._provider = undefined;
 			this._loadStarted = false;
+			this._service?.clearResults();
 		}
 		this._repoPath = nextRepoPath;
 		this._preselectFingerprint = nextPreselectFingerprint;
 
 		return [true, undefined];
+	}
+
+	getRpcServices(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): AllowedSignersServices {
+		const shared = createSharedServices(this.container, this.host, buffer, tracker, context => {
+			this._telemetryContext = context;
+		});
+
+		this._service ??= new AllowedSignersService(this.container, () => this._repoPath, buffer, tracker);
+
+		return proxyServices({
+			...shared,
+
+			allowedSigners: this._service,
+		} satisfies AllowedSignersServices);
 	}
 
 	includeBootstrap(): Promise<State> {
@@ -109,103 +125,31 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 		void this.loadSigners();
 	}
 
-	@ipcRequest(SaveRequest)
-	private async onSave(params: IpcParams<typeof SaveRequest>): Promise<IpcResponse<typeof SaveRequest>> {
-		if (isWeb) {
-			return { written: false, configSet: false, added: 0, error: 'Writing files is not supported on the web.' };
-		}
-
-		try {
-			const resolved = this.resolveTargetUri(params.targetPath);
-			if (resolved == null) {
-				return {
-					written: false,
-					configSet: false,
-					added: 0,
-					error: 'Choose an absolute file path (no repository is available to resolve a relative path).',
-				};
-			}
-
-			const { uri, configPath } = resolved;
-
-			let existing = '';
-			try {
-				existing = new TextDecoder().decode(await workspace.fs.readFile(uri));
-			} catch {
-				// File doesn't exist yet — start from empty content.
-			}
-
-			const entries: AllowedSignerEntry[] = params.entries.map(e => ({
-				principal: e.email,
-				keyType: e.keyType,
-				keyData: e.keyData,
-			}));
-
-			const beforeCount = getExistingEntryKeys(existing).size;
-			const merged = mergeAllowedSigners(existing, entries);
-			const added = getExistingEntryKeys(merged).size - beforeCount;
-
-			await workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
-			await workspace.fs.writeFile(uri, new TextEncoder().encode(merged));
-
-			let configSet = false;
-			const svc = this._repoPath ? this.container.git.getRepositoryService(this._repoPath) : undefined;
-			if (params.setConfig && svc?.config.setSigningConfig != null) {
-				await svc.config.setSigningConfig(
-					{ allowedSignersFile: configPath },
-					{ global: params.scope === 'global' },
-				);
-				configSet = true;
-			}
-
-			return { written: true, configSet: configSet, added: added };
-		} catch (ex) {
-			return { written: false, configSet: false, added: 0, error: ex instanceof Error ? ex.message : String(ex) };
-		}
-	}
-
-	@ipcRequest(BrowseTargetPathRequest)
-	private async onBrowseTargetPath(): Promise<IpcResponse<typeof BrowseTargetPathRequest>> {
-		const uri = await window.showSaveDialog({
-			title: 'Choose allowed_signers file location',
-			saveLabel: 'Select',
-		});
-		return { path: uri?.fsPath };
-	}
-
-	@ipcRequest(CheckPresenceRequest)
-	private async onCheckPresence(
-		params: IpcParams<typeof CheckPresenceRequest>,
-	): Promise<IpcResponse<typeof CheckPresenceRequest>> {
-		const resolved = this.resolveTargetUri(params.targetPath);
-		if (resolved == null) return { keys: [] };
-
-		try {
-			const content = new TextDecoder().decode(await workspace.fs.readFile(resolved.uri));
-			return { keys: [...getExistingEntryKeys(content)] };
-		} catch {
-			// No file at that path (or unreadable) — nothing is present there yet.
-			return { keys: [] };
+	/** A soft-reconnected iframe re-booted from the ORIGINAL bootstrap, and discovery won't re-run
+	 *  (the `_loadStarted` guard) — re-push the cached results or the panel sits on its loading
+	 *  shell. If discovery is still in flight, its completion fires on the new session normally. */
+	onReconnect(): void {
+		if (!this._disposed && this._results != null) {
+			this._service?.fireResultsChanged(this._results);
 		}
 	}
 
 	/**
-	 * Resolves a user-entered target path to a file `Uri` (and the value to record in git config). `expandHome` handles
-	 * a leading `~`; a genuinely relative path is resolved against the repo root so the file we write and the path git
-	 * records point at the same place (`Uri.file()` would otherwise anchor a relative path to the filesystem root, e.g.
-	 * `/.git/allowed_signers`). Returns `undefined` when a relative path can't be resolved (no repository available).
+	 * Resolves the repository path to operate on. Uses the explicit/restored path when set; otherwise picks the best
+	 * repository, waiting for repository discovery to finish first — on a fresh launch the panel can be restored before
+	 * GitLens has discovered any repositories, which would otherwise leave it stuck on the empty state.
 	 */
-	private resolveTargetUri(targetPath: string): { uri: Uri; configPath: string } | undefined {
-		const expanded = expandHome(targetPath);
-		// Preserve the raw value (incl. a portable leading `~`) for git config unless we had to resolve a relative path.
-		if (isAbsolute(expanded)) return { uri: Uri.file(expanded), configPath: targetPath };
+	private async resolveRepoPath(): Promise<string | undefined> {
+		if (this._repoPath != null) return this._repoPath;
 
-		if (this._repoPath != null) {
-			const uri = Uri.joinPath(Uri.file(this._repoPath), expanded);
-			return { uri: uri, configPath: uri.fsPath };
+		let repo = this.container.git.getBestRepositoryOrFirst();
+		if (repo == null) {
+			await this.container.git.isDiscoveringRepositories;
+			if (this._disposed) return undefined;
+
+			repo = this.container.git.getBestRepositoryOrFirst();
 		}
-
-		return undefined;
+		return repo?.path;
 	}
 
 	private async getInitialState(): Promise<State> {
@@ -236,7 +180,7 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 			// With a repo and no results yet, paint the loading page immediately; discovery happens in onReady.
 			loading: loading,
 			verifying: results?.verifying ?? false,
-			progress: loading ? { message: 'Analyzing commit signatures…' } : undefined,
+			progress: loading ? { message: l10n.t('Analyzing commit signatures…') } : undefined,
 			signers: results?.signers ?? [],
 			error: results?.error,
 			targetPath: targetPath,
@@ -247,24 +191,6 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 			provider: results?.provider,
 			preselectFingerprint: this._preselectFingerprint,
 		};
-	}
-
-	/**
-	 * Resolves the repository path to operate on. Uses the explicit/restored path when set; otherwise picks the best
-	 * repository, waiting for repository discovery to finish first — on a fresh launch the panel can be restored before
-	 * GitLens has discovered any repositories, which would otherwise leave it stuck on the empty state.
-	 */
-	private async resolveRepoPath(): Promise<string | undefined> {
-		if (this._repoPath != null) return this._repoPath;
-
-		let repo = this.container.git.getBestRepositoryOrFirst();
-		if (repo == null) {
-			await this.container.git.isDiscoveringRepositories;
-			if (this._disposed) return undefined;
-
-			repo = this.container.git.getBestRepositoryOrFirst();
-		}
-		return repo?.path;
 	}
 
 	private async loadSigners(): Promise<void> {
@@ -315,7 +241,7 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 
 			const getSshSigners = svc.commits.getCommitsSshSigners;
 			if (getSshSigners != null) {
-				this.notifyProgress({ message: 'Analyzing commit signatures…' });
+				this.notifyProgress({ message: l10n.t('Analyzing commit signatures…') });
 
 				// Enumerate commit SHAs with a cheap `git log --format=%H` (no file stats), then read those objects in a
 				// single `cat-file --batch` — both committer identity and the SSH key come from the batched objects, so
@@ -406,14 +332,14 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 
 			// Surface a terminal error so the panel leaves the loading/verifying state instead of spinning forever,
 			// keeping any signers already discovered.
-			this.notifyResults(byId, integrationConnected, false, ex instanceof Error ? ex.message : String(ex));
+			this.notifyResults(byId, integrationConnected, false, getPresentableErrorMessage(ex));
 		}
 	}
 
 	private notifyProgress(progress: LoadingProgress): void {
 		if (this._disposed) return;
 
-		void this.host.notify(DidChangeProgressNotification, { progress: progress });
+		this._service?.fireProgressChanged(progress);
 	}
 
 	private notifyResults(
@@ -423,8 +349,7 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 		error?: string,
 	): void {
 		const signers = sortSigners(byId);
-		// Cache so a later re-show (which rebuilds the bootstrap) restores these instead of the loading shell.
-		this._results = {
+		const event: AllowedSignersResultsChangedEvent = {
 			signers: signers,
 			integrationConnected: integrationConnected,
 			provider: this._provider,
@@ -432,15 +357,12 @@ export class AllowedSignersWebviewProvider implements WebviewProvider<State, Sta
 			error: error,
 		};
 
+		// Cache so a later re-show (which rebuilds the bootstrap) restores these instead of the loading shell.
+		this._results = event;
+
 		if (this._disposed) return;
 
-		void this.host.notify(DidChangeResultsNotification, {
-			signers: signers,
-			integrationConnected: integrationConnected,
-			provider: this._provider,
-			verifying: verifying,
-			error: error,
-		});
+		this._service?.fireResultsChanged(event);
 	}
 }
 
@@ -496,14 +418,6 @@ function makeId(email: string, keyType: string, keyData: string): string {
 function basename(path: string): string {
 	const parts = path.split(/[\\/]/).filter(Boolean);
 	return parts.at(-1) ?? path;
-}
-
-/** Expands a leading `~` to the user's home directory. No-op when home can't be determined (e.g. on the web). */
-function expandHome(path: string): string {
-	if (!path.startsWith('~')) return path;
-
-	const home = getHomeDir();
-	return home ? `${home}${path.slice(1)}` : path;
 }
 
 /**

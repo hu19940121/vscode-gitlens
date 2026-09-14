@@ -3,12 +3,9 @@ import type { Disposable } from '@gitlens/utils/disposable.js';
 import type { Event } from '@gitlens/utils/event.js';
 import { Emitter } from '@gitlens/utils/event.js';
 import type { IntegrationIds } from '../constants.js';
-import { GitCloudHostIntegrationId } from '../constants.js';
 import type { Sources } from '../telemetry.js';
-import {
-	isCloudGitSelfManagedHostIntegrationId,
-	isGitSelfManagedHostIntegrationId,
-} from '../utils/integration.utils.js';
+import { areDomainsOnSameHost } from '../utils/domain.utils.js';
+import { isGitSelfManagedHostIntegrationId, isNonExpiringZeroTokenIntegrationId } from '../utils/integration.utils.js';
 import type { ConfiguredIntegrationService } from './configuredIntegrationService.js';
 import type { IntegrationAuthenticationService } from './integrationAuthenticationService.js';
 import type { ProviderAuthenticationSession } from './models.js';
@@ -35,6 +32,38 @@ export interface IntegrationAuthenticationSessionDescriptor {
 	[key: string]: unknown;
 }
 
+/**
+ * Options for {@link IntegrationAuthenticationProvider.getSession}. The two variants keep `sync` exclusive
+ * with the interactive flags: a sync resolves whatever the cloud already has, so it must never open a connect
+ * window.
+ *
+ * `refreshRejectedToken` marks the stored token as known-refused by the provider (an `AuthenticationError` on
+ * a previous read), which forces a cloud `/refresh` even when the token's expiry still claims it is valid —
+ * the case a purely time-based refresh cannot see. The refresh token itself never reaches the client: the GK
+ * cloud performs the exchange server-side.
+ */
+export type GetSessionOptions =
+	| {
+			createIfNeeded?: boolean;
+			forceNewSession?: boolean;
+			sync?: never;
+			refreshRejectedToken?: boolean;
+			source?: Sources;
+	  }
+	| {
+			createIfNeeded?: never;
+			forceNewSession?: never;
+			sync: boolean;
+			refreshRejectedToken?: boolean;
+			source?: Sources;
+	  };
+
+/**
+ * What {@link IntegrationAuthenticationProviderBase.getSession} passes down once it has decided the stored
+ * session can't be served as-is. `refreshIfExpired` is its own conclusion, not a caller's option.
+ */
+type GetNewSessionOptions = GetSessionOptions & { refreshIfExpired?: boolean };
+
 export interface IntegrationAuthenticationProvider extends Disposable {
 	/**
 	 * Clears the stored secret for one connection only (never the whole provider). Unlike
@@ -49,11 +78,13 @@ export interface IntegrationAuthenticationProvider extends Disposable {
 		options?: { preserveConfigured?: boolean },
 	): Promise<void>;
 	deleteAllSessions(descriptor?: IntegrationAuthenticationSessionDescriptor): Promise<void>;
+	/**
+	 * Resolves the session for `descriptor`, from storage when it is still usable and from the cloud
+	 * otherwise. See {@link GetSessionOptions}.
+	 */
 	getSession(
 		descriptor: IntegrationAuthenticationSessionDescriptor,
-		options?:
-			| { createIfNeeded?: boolean; forceNewSession?: boolean; sync?: never; source?: Sources }
-			| { createIfNeeded?: never; forceNewSession?: never; sync: boolean; source?: Sources },
+		options?: GetSessionOptions,
 	): Promise<ProviderAuthenticationSession | undefined>;
 	get onDidChange(): Event<void>;
 }
@@ -123,9 +154,7 @@ abstract class IntegrationAuthenticationProviderBase<
 	@trace()
 	async getSession(
 		descriptor: IntegrationAuthenticationSessionDescriptor,
-		options?:
-			| { createIfNeeded?: boolean; forceNewSession?: boolean; sync?: never; source?: Sources }
-			| { createIfNeeded?: never; forceNewSession?: never; sync: boolean; source?: Sources },
+		options?: GetSessionOptions,
 	): Promise<ProviderAuthenticationSession | undefined> {
 		let session;
 		let previousToken;
@@ -146,10 +175,15 @@ abstract class IntegrationAuthenticationProviderBase<
 		}
 
 		const isExpiredSession = session?.expiresAt != null && new Date(session.expiresAt).getTime() < Date.now();
-		if (session == null || isExpiredSession) {
+		// A rejected token has to re-resolve even when the stored session looks perfectly healthy: that is
+		// the whole point — the provider refused it while its expiry still says valid. Without this the
+		// stored session short-circuits here and the refresh below is never reached.
+		const refreshRejectedToken = options?.refreshRejectedToken === true && session != null;
+		if (session == null || isExpiredSession || refreshRejectedToken) {
 			session = await this.getNewSession(descriptor, {
 				...options,
 				refreshIfExpired: isExpiredSession,
+				refreshRejectedToken: refreshRejectedToken,
 			});
 
 			if (session != null) {
@@ -166,21 +200,7 @@ abstract class IntegrationAuthenticationProviderBase<
 
 	protected abstract getNewSession(
 		descriptor: IntegrationAuthenticationSessionDescriptor,
-		options?:
-			| {
-					createIfNeeded?: boolean;
-					forceNewSession?: boolean;
-					sync?: never;
-					refreshIfExpired?: boolean;
-					source?: Sources;
-			  }
-			| {
-					createIfNeeded?: never;
-					forceNewSession?: never;
-					sync: boolean;
-					refreshIfExpired?: boolean;
-					source?: Sources;
-			  },
+		options?: GetNewSessionOptions,
 	): Promise<ProviderAuthenticationSession | undefined>;
 
 	protected fireChange(): void {
@@ -205,21 +225,7 @@ export class CloudIntegrationAuthenticationProvider<
 
 	protected override async getNewSession(
 		descriptor: IntegrationAuthenticationSessionDescriptor,
-		options?:
-			| {
-					createIfNeeded?: boolean;
-					forceNewSession?: boolean;
-					sync?: never;
-					refreshIfExpired?: boolean;
-					source?: Sources;
-			  }
-			| {
-					createIfNeeded?: never;
-					forceNewSession?: never;
-					sync: boolean;
-					refreshIfExpired?: boolean;
-					source?: Sources;
-			  },
+		options?: GetNewSessionOptions,
 	): Promise<ProviderAuthenticationSession | undefined> {
 		if (options?.forceNewSession) {
 			if ((await this.disconnectCloudSession()) === 'failure') {
@@ -233,9 +239,15 @@ export class CloudIntegrationAuthenticationProvider<
 		// TODO: This is a stopgap to make sure we're not hammering the api on automatic calls to get the session.
 		// Ultimately we want to timestamp calls to syncCloudIntegrations and use that to determine whether we should
 		// make the call or not.
+		// `refreshRejectedToken` joins the list for the same reason `refreshIfExpired` is on it: both mean the
+		// session in hand is known-unusable, so skipping the cloud round trip would just re-serve it.
 		let session =
-			options?.refreshIfExpired || options?.createIfNeeded || options?.forceNewSession || options?.sync
-				? await this.getCloudSession(descriptor)
+			options?.refreshIfExpired ||
+			options?.refreshRejectedToken ||
+			options?.createIfNeeded ||
+			options?.forceNewSession ||
+			options?.sync
+				? await this.getCloudSession(descriptor, { refreshRejectedToken: options?.refreshRejectedToken })
 				: undefined;
 
 		const shouldCreateSession = options?.createIfNeeded && session == null;
@@ -272,6 +284,7 @@ export class CloudIntegrationAuthenticationProvider<
 
 	private async getCloudSession(
 		descriptor: IntegrationAuthenticationSessionDescriptor,
+		options?: { refreshRejectedToken?: boolean },
 	): Promise<ProviderAuthenticationSession | undefined> {
 		const loggedIn = (await this.authenticationService.ctx.account.getAccount()) != null;
 		if (!loggedIn) return undefined;
@@ -292,23 +305,40 @@ export class CloudIntegrationAuthenticationProvider<
 					)
 				: undefined);
 		let session = await cloudIntegrations.getConnectionSession(this.authProviderId, undefined, connectionId);
-
-		// Make an exception for GitHub and Cloud Self-Hosted integrations because they always return 0
 		if (
-			session?.expiresIn === 0 &&
-			(this.authProviderId === GitCloudHostIntegrationId.GitHub ||
-				isCloudGitSelfManagedHostIntegrationId(this.authProviderId))
+			session != null &&
+			isGitSelfManagedHostIntegrationId(this.authProviderId) &&
+			!areDomainsOnSameHost(session.domain, descriptor.domain)
 		) {
-			// It never expires so don't refresh it frequently:
+			return undefined;
+		}
+
+		// GitHub, the cloud self-managed hosts, and Trello return `expiresIn: 0` for a token that never
+		// expires; left as 0 the session would be built with `expiresAt = now` and rejected as expired on the
+		// next resolution. Map it to the maximum expiry so it isn't refreshed frequently.
+		if (session?.expiresIn === 0 && isNonExpiringZeroTokenIntegrationId(this.authProviderId)) {
 			session.expiresIn = maxSmallIntegerV8; // maximum expiration length
 		}
 
-		if (session != null && session.expiresIn < 60) {
+		// `expiresIn < 60` is a PREDICTION that the token is about to lapse, and it is the only trigger the
+		// refresh used to have. It cannot see a token the provider has already refused while the backend
+		// still believes it is valid — a revoked grant, retired scopes, an app removed from the org — where
+		// `expiresIn` stays high and the doomed token is re-sent on every read. `refreshRejectedToken` is
+		// the observed counterpart: the caller saw the provider reject this exact token, so refresh it
+		// regardless of what its expiry claims.
+		if (session != null && (session.expiresIn < 60 || options?.refreshRejectedToken)) {
 			session = await cloudIntegrations.getConnectionSession(
 				this.authProviderId,
 				session.accessToken,
 				connectionId,
 			);
+			if (
+				session != null &&
+				isGitSelfManagedHostIntegrationId(this.authProviderId) &&
+				!areDomainsOnSameHost(session.domain, descriptor.domain)
+			) {
+				return undefined;
+			}
 		}
 
 		if (!session) return undefined;
@@ -324,7 +354,6 @@ export class CloudIntegrationAuthenticationProvider<
 			}
 		}
 
-		// TODO: Once we care about domains, we should try to match the domain here against ours, and if it fails, return undefined
 		return {
 			// Prefer the backend's per-connection token id (multi-account); fall back to the resolved
 			// primary/legacy connection id so existing single-connection storage keys are preserved.
@@ -341,6 +370,8 @@ export class CloudIntegrationAuthenticationProvider<
 			// Note: do not use the session's domain, because the format is different than in our model
 			domain: descriptor.domain,
 			protocol: sessionProtocol ?? undefined,
+			// Carried for providers whose client needs an app key alongside the token (e.g. Trello).
+			appKey: session.appKey,
 		};
 	}
 

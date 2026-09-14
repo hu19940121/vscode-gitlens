@@ -1,10 +1,11 @@
 import type { CancellationToken } from 'vscode';
+import { l10n } from 'vscode';
 import { rootSha } from '@gitlens/git/models/revision.js';
 import { normalizePath } from '@gitlens/utils/path.js';
 import type { Source } from '../../../../constants.telemetry.js';
 import type { GitRepositoryService } from '../../../../git/gitRepositoryService.js';
 import { ComposeToolsIntegration } from '../../../../plus/coretools/compose/integration.js';
-import { coverCommitRange } from '../../../../plus/coretools/compose/recomposeScope.js';
+import { coverCommitRange, getInvalidComposeScopeMessage } from '../../../../plus/coretools/compose/recomposeScope.js';
 import type {
 	ComposeApplyPlan,
 	ComposeHunk,
@@ -36,6 +37,10 @@ export interface GeneratePlanForGraphDetailsInput {
 	aiExcludedFiles?: string[];
 	cancellation?: CancellationToken;
 	telemetrySource: Source;
+	/** Tracker for a single compose session, forwarded with every AI request that session makes — the
+	 *  initial generate, the library's validation retries, and every later refine of the resulting
+	 *  plan. Required: without it each request reads as a session of its own. */
+	conversationId: string;
 	suppressLargePromptWarning?: boolean;
 	onProgress?: (event: ComposeProgressEvent) => void;
 }
@@ -90,6 +95,10 @@ export interface RefinePlanForGraphDetailsInput {
 	excludedCommitIds?: readonly string[];
 	cancellation?: CancellationToken;
 	telemetrySource: Source;
+	/** Conversation ID of the session that produced `priorCacheKey`'s plan — see
+	 *  {@link GeneratePlanForGraphDetailsInput.conversationId}. A refine continues that session, so it
+	 *  reuses that ID rather than starting a new one. */
+	conversationId: string;
 	suppressLargePromptWarning?: boolean;
 	onProgress?: (event: RefineProgressEvent) => void;
 }
@@ -122,7 +131,7 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 		input: GeneratePlanForGraphDetailsInput,
 	): Promise<GeneratePlanForGraphDetailsResult> {
 		const git = this.createGitPort(input.svc);
-		const model = this.createAiModelPort(input.telemetrySource);
+		const model = this.createAiModelPort(input.telemetrySource, input.conversationId);
 		const { signal, dispose: disposeSignal } = cancellationTokenToSignal(input.cancellation);
 		const onBeforePrompt = this.buildLargePromptGate(input.suppressLargePromptWarning ?? false);
 
@@ -144,7 +153,9 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 			// UI disables exclusion for interior scopes; guard the host path too.
 			if (userExcluded?.size && resolved.tipSha !== resolved.headSha) {
 				throw new ComposeWorkflowInputError(
-					'Compose scope is invalid: files cannot be excluded when the range has commits above it — the newer commits depend on the excluded changes',
+					l10n.t(
+						'Compose scope is invalid: files cannot be excluded when the range has commits above it — the newer commits depend on the excluded changes',
+					),
 				);
 			}
 
@@ -246,7 +257,7 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 			throw new Error(`Cannot refine — prior cache entry lacks scope metadata. Regenerate a fresh plan first.`);
 		}
 
-		const model = this.createAiModelPort(input.telemetrySource);
+		const model = this.createAiModelPort(input.telemetrySource, input.conversationId);
 		const { signal, dispose: disposeSignal } = cancellationTokenToSignal(input.cancellation);
 		const onBeforePrompt = this.buildLargePromptGate(input.suppressLargePromptWarning ?? false);
 
@@ -318,7 +329,9 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 		const cachedExtras = cached.extras as GraphCacheExtras | undefined;
 		if (input.includedCommitIds != null && cachedExtras != null && cachedExtras.tipSha !== cachedExtras.headSha) {
 			throw new ComposeWorkflowInputError(
-				'Commits cannot be partially applied when the range has commits above it — apply the full plan instead',
+				l10n.t(
+					'Commits cannot be partially applied when the range has commits above it — apply the full plan instead',
+				),
 			);
 		}
 
@@ -582,17 +595,17 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 		kind: 'wip-only' | 'wip+commits' | 'commits-only';
 	}> {
 		if (scope.type !== 'wip') {
-			throw new Error(`Compose does not support scope type '${scope.type}' yet`);
+			throw new Error(l10n.t("Compose does not support scope type '{0}' yet", scope.type));
 		}
 
 		const branch = await svc.branches.getBranch();
 		if (branch == null || branch.detached || branch.remote) {
-			throw new Error('Compose requires a local checked-out branch');
+			throw new Error(l10n.t('Compose requires a local checked-out branch'));
 		}
 
 		const headCommit = await svc.commits.getCommit('HEAD');
 		if (headCommit == null) {
-			throw new Error('Unable to resolve HEAD');
+			throw new Error(l10n.t('Unable to resolve HEAD'));
 		}
 
 		const headSha = headCommit.sha;
@@ -612,7 +625,7 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 
 		const covered = await coverCommitRange(svc, headSha, new Set(scope.includeShas));
 		if (!covered.ok) {
-			throw new ComposeWorkflowInputError(`Compose scope is invalid: ${covered.message}`);
+			throw new ComposeWorkflowInputError(getInvalidComposeScopeMessage(covered));
 		}
 
 		// Working changes have no defined basis mid-range (the library's collect enforces this
@@ -620,7 +633,9 @@ export class GraphComposeIntegration extends ComposeToolsIntegration {
 		// newest commit — but guard the seeded paths.
 		if (hasWip && covered.tipSha !== headSha) {
 			throw new ComposeWorkflowInputError(
-				'Compose scope is invalid: working changes can only be included when the range ends at the branch head',
+				l10n.t(
+					'Compose scope is invalid: working changes can only be included when the range ends at the branch head',
+				),
 			);
 		}
 

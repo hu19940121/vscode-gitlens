@@ -53,6 +53,12 @@ import { createSignalGroup } from '../../../shared/state/signals.js';
 /** Selection-shape vocabulary. Identifies which kind of selection the details panel is showing. */
 export type DetailsContext = 'wip' | 'commit' | 'multicommit';
 
+/** The two sides of a branch comparison's progressive per-side load (Phase 2). */
+export type CompareSide = 'ahead' | 'behind';
+
+/** Iteration order for {@link CompareSide} resets and loops. */
+export const compareSides: readonly CompareSide[] = ['ahead', 'behind'];
+
 export interface ExplainState {
 	cancelled?: boolean;
 	error?: { message: string };
@@ -62,11 +68,11 @@ export interface ExplainState {
 /** Execution state of a running compose/review operation on a specific anchor.
  *  Invariants:
  *  - `'generating'` ⇒ `result == null && abortController != null && promise != null`
- *  - `'complete' | 'backed' | 'error'` ⇒ `result != null`
+ *  - `'complete' | 'error'` ⇒ `result != null`
+ *  - `'backed'` ⇒ idle input, optionally with a resumable result
  *  - `'orphaned'` ⇒ `result` may be absent (orphan can hit a still-generating entry)
- *  `'backed'` means the user clicked Back from `'complete'` — the result is preserved in the
- *  controller's `_*BackSnapshot` for `forward()`, and Close from this state destroys the entry
- *  (the Back-then-close destroy gate). Forward flips `'backed'` → `'complete'`. */
+ *  Back preserves the result for Resume; cancelling or editing the idle inputs may leave no
+ *  resumable result. Close hides every state; only Discard destroys the entry. */
 export type RunningOperationExecState = 'generating' | 'complete' | 'backed' | 'error' | 'orphaned';
 
 /** Identifies the selection a running operation is anchored to. */
@@ -99,18 +105,25 @@ interface RunningOperationBase {
 	 *  this so the idle box re-fills with the user's original compose instructions, not the
 	 *  last refine. Defaulted to `prompt` on cold-start by `dispatchOperation`. */
 	basePrompt?: string;
+	/** Unsubmitted idle instructions, including an intentionally emptied input. Captured on hide. */
+	idleDraft?: string;
+	/** User file exclusions; panels update these sets by replacement. */
+	excludedFiles?: ReadonlySet<string>;
+	/** Scope chosen before hiding; restored on re-entry instead of rebuilding the default scope. */
+	scope?: ScopeSelection;
+	/** Whether the hidden backed result can still be resumed; input edits invalidate this. */
+	resumeAvailable?: boolean;
 	/** Resolve-only: the conflict-file scope the run was dispatched with (the user-checked subset;
 	 *  undefined = all conflicts). Carried on the entry like {@link prompt} so a row-switch-and-return
 	 *  doesn't lose it — whole-run Refine / retry-after-error re-run the SAME scope instead of silently
 	 *  widening to every conflict when the engagement-scoped `resolveFocusedFilePaths` signal is cleared
 	 *  on hide. Undefined for non-resolve kinds. */
 	focusedFilePaths?: readonly string[];
-	/** Compose/resolve-only: the ready-state Refine gate posture (the "Recompose Changes" /
-	 *  "Refine Resolutions" checkbox), captured on mode-leave so toggling the mode chip off/on or
-	 *  switching rows restores it. Undefined = default (Commit / Apply). Dropped when a fresh run
+	/** Review/compose/resolve: the ready-state follow-up or Refine gate posture, captured on mode-leave so toggling the mode chip off/on or
+	 *  switching rows restores it. Undefined = the panel default. Dropped when a fresh run
 	 *  rebuilds the entry, so a completed recompose/refine lands back in the default posture. */
 	refineMode?: boolean;
-	/** Compose/resolve-only: the unsubmitted Refine-input text, captured on mode-leave alongside
+	/** Review/compose/resolve: the unsubmitted follow-up or Refine-input text, captured on mode-leave alongside
 	 *  {@link refineMode}. Undefined/empty = nothing to restore. Cleared on a fresh run (the
 	 *  submitted text becomes the run's {@link prompt}). */
 	refineDraft?: string;
@@ -127,8 +140,21 @@ export interface GenerateMessageResult {
  *  `generateMessage` is tracking-only: lives only as `'generating'`, removed on settle, carries no `result`/
  *  `prompt`/`'backed'`/`'orphaned'`. `kind` matches the bucket slot so `bucket[op.kind]` indexing holds. */
 export type RunningOperation =
-	| (RunningOperationBase & { kind: 'review'; result?: ReviewResult })
-	| (RunningOperationBase & { kind: 'compose'; result?: ComposeResult })
+	| (RunningOperationBase & { kind: 'review'; result?: ReviewResult; preErrorValue?: ReviewResult })
+	| (RunningOperationBase & {
+			kind: 'compose';
+			result?: ComposeResult;
+			/** Host-side cache key of this anchor's plan — the handle a refine continues. Lives here rather
+			 *  than being read back out of `result` so it survives the entry flipping to an error: a refine
+			 *  that fails must still be retryable as a refine, not silently restart the session. */
+			cacheKey?: string;
+			commitExcludedIds?: ReadonlySet<string>;
+			refineExcludedCommitIds?: ReadonlySet<string>;
+			/** Recovery belongs to this anchor even while another panel is engaged. */
+			preErrorValue?: ComposeResult;
+			lastFailedAction?: 'generate' | 'commit-all';
+			lastCommitAllIncludedIds?: readonly string[];
+	  })
 	| (RunningOperationBase & { kind: 'resolve'; result?: ResolveResult })
 	| (RunningOperationBase & {
 			kind: 'generateMessage';
@@ -223,27 +249,32 @@ function createDurableState() {
 	// Phase 2 (Side): per-side commits, each carrying its `files` inline. Loaded lazily on
 	// first activation of Ahead or Behind. Per-commit selection scoping is then a pure
 	// client-side filter — no fetch.
-	const branchCompareAheadCommits = repoScoped<BranchComparisonCommit[]>([]);
-	const branchCompareBehindCommits = repoScoped<BranchComparisonCommit[]>([]);
-	const branchCompareAheadFiles = repoScoped<BranchComparisonFile[]>([]);
-	const branchCompareBehindFiles = repoScoped<BranchComparisonFile[]>([]);
+	//
+	// Per-side data is held as records of signals keyed by side rather than paired flat
+	// signals (`branchCompareAheadCommits`/`branchCompareBehindCommits`, …), so writers
+	// address one side directly (`branchCompareLoadedBySide[side]`) instead of remembering
+	// to mirror every write across two signals. Each side still gets its own signal (and
+	// its own reference-typed initial value) so a side's updates don't invalidate the other.
+	const perSide = <T>(createInitial: () => T): Record<CompareSide, Signal.State<T>> => ({
+		ahead: repoScoped(createInitial()),
+		behind: repoScoped(createInitial()),
+	});
+
+	const branchCompareCommitsBySide = perSide<BranchComparisonCommit[]>(() => []);
+	const branchCompareFilesBySide = perSide<BranchComparisonFile[]>(() => []);
 	// Per-side "loaded for the current refs/wip" flag. Drives the per-tab loading state in the
 	// panel. Cleared whenever the comparison identity changes.
-	const branchCompareAheadLoaded = repoScoped(false);
-	const branchCompareBehindLoaded = repoScoped(false);
+	const branchCompareLoadedBySide = perSide<boolean>(() => false);
 	// Per-side "has more commits beyond the current limit" — drives the "Load More" affordance
 	// at the bottom of each commit list. Cleared on identity changes alongside the loaded flags.
-	const branchCompareAheadHasMore = repoScoped(false);
-	const branchCompareBehindHasMore = repoScoped(false);
+	const branchCompareHasMoreBySide = perSide<boolean>(() => false);
 	// Per-side current commit-limit. Bumped by `loadMoreCompareCommits` (limit-replace pattern
 	// matching `loadMoreBranchCommits`): we re-fetch with a larger limit and the resource value
 	// idempotently supersedes the smaller one. Reset to the default page size on identity change.
-	const branchCompareAheadLimit = repoScoped(100);
-	const branchCompareBehindLimit = repoScoped(100);
+	const branchCompareLimitBySide = perSide<number>(() => 100);
 	// Per-side "load-more in flight" flag. Drives the spinner inside the load-more row so the
 	// button visually indicates the fetch is happening and is disabled to prevent double-fires.
-	const branchCompareAheadLoadingMore = repoScoped(false);
-	const branchCompareBehindLoadingMore = repoScoped(false);
+	const branchCompareLoadingMoreBySide = perSide<boolean>(() => false);
 
 	// Branch-comparison enrichment caches keyed by scope (active tab). Switching tabs
 	// reads from these maps; only newly-visited scopes trigger a fetch. Caches reset only
@@ -321,18 +352,12 @@ function createDurableState() {
 		branchCompareBehindCount: branchCompareBehindCount,
 		branchCompareAllFiles: branchCompareAllFiles,
 		branchCompareAllFilesCount: branchCompareAllFilesCount,
-		branchCompareAheadCommits: branchCompareAheadCommits,
-		branchCompareBehindCommits: branchCompareBehindCommits,
-		branchCompareAheadFiles: branchCompareAheadFiles,
-		branchCompareBehindFiles: branchCompareBehindFiles,
-		branchCompareAheadLoaded: branchCompareAheadLoaded,
-		branchCompareBehindLoaded: branchCompareBehindLoaded,
-		branchCompareAheadHasMore: branchCompareAheadHasMore,
-		branchCompareBehindHasMore: branchCompareBehindHasMore,
-		branchCompareAheadLimit: branchCompareAheadLimit,
-		branchCompareBehindLimit: branchCompareBehindLimit,
-		branchCompareAheadLoadingMore: branchCompareAheadLoadingMore,
-		branchCompareBehindLoadingMore: branchCompareBehindLoadingMore,
+		branchCompareCommitsBySide: branchCompareCommitsBySide,
+		branchCompareFilesBySide: branchCompareFilesBySide,
+		branchCompareLoadedBySide: branchCompareLoadedBySide,
+		branchCompareHasMoreBySide: branchCompareHasMoreBySide,
+		branchCompareLimitBySide: branchCompareLimitBySide,
+		branchCompareLoadingMoreBySide: branchCompareLoadingMoreBySide,
 
 		branchCompareAutolinksByScope: branchCompareAutolinksByScope,
 		branchCompareEnrichedAutolinksByScope: branchCompareEnrichedAutolinksByScope,
@@ -373,22 +398,15 @@ function createTransientState() {
 	const swapped = signal(false);
 
 	// Workflow state machine — compose/review only. Compare is no longer a `mode`; it has its
-	// own lifecycle via `compareSheetOpen` + workflow `openCompare`/`closeCompare`.
+	// own lifecycle via `comparePresentation` + workflow `openCompare`/`closeCompare`.
 	const activeMode = signal<'review' | 'compose' | 'resolve' | null>(null);
 	const activeModeContext = signal<DetailsContext | null>(null);
 	const activeModeRepoPath = signal<string | undefined>(undefined);
 	const activeModeSha = signal<string | undefined>(undefined);
 	const activeModeShas = signal<string[] | undefined>(undefined);
 
-	// Compare sheet visibility. Independent of `activeMode` — compare can coexist with an
-	// active compose/review (the sheet sits over the panel, the panel is inert beneath).
-	const compareSheetOpen = signal(false);
-
-	// Compare in panel form — a dedicated nested split inside the details panel instead of the
-	// floating sheet. Mutually exclusive with `compareSheetOpen` at any given moment, but each
-	// can be flipped independently — the user can promote (sheet → panel), restore (panel →
-	// sheet), or close from either form.
-	const compareAsPanel = signal(false);
+	// Independent of activeMode: Compare can float over details or stay in a nested split.
+	const comparePresentation = signal<'closed' | 'sheet' | 'pinned'>('closed');
 	const compareSplitPosition = signal(50);
 	// undefined = auto: the pinned split follows the details panel's shape (wide → side-by-side,
 	// narrow → stacked) and re-adapts live as the panel resizes. Set only by an explicit user
@@ -459,11 +477,6 @@ function createTransientState() {
 	 *  All". Cleared on success / mode exit. */
 	const composeLastCommitAllIncludedIds = signal<readonly string[] | undefined>(undefined);
 
-	// Refine continuation. `composeCurrentCacheKey` is the host-side cache key for the plan
-	// currently displayed; threaded back into `composeChanges` on the next generate so the host
-	// routes to `refinePlanForGraphDetails` (chat-style continuation) instead of starting cold.
-	// Cleared on full-apply success, cold-start compose, cancel, and panel close.
-	const composeCurrentCacheKey = signal<string | undefined>(undefined);
 	// Commit ids the user has excluded from the AI recompose (a per-commit checkbox on each
 	// proposed commit row). Passed to `refinePlan` as `lockedCommits` so the AI preserves those
 	// commits' id/message/hunks across the refinement. Intentionally engagement-local — it carries
@@ -496,11 +509,11 @@ function createTransientState() {
 	// instead of the symmetric 2-dot diff. Cleared synchronously on identity changes.
 	const branchCompareMergeBase = signal<string | undefined>(undefined);
 	const branchCompareStale = signal(false);
-	const branchCompareActiveTab = signal<'all' | 'ahead' | 'behind'>('ahead');
+	const branchCompareActiveTab = signal<'all' | CompareSide>('ahead');
 	// Per-tab "scope to this commit" selection. Persisted across tab switches so that returning
 	// to e.g. Ahead with a previously-selected commit X restores the scoped file view (alongside
 	// the cached scroll/expand state). The 'all' tab has no commit list so isn't keyed here.
-	const branchCompareSelectedCommitShaByTab = signal<Map<'ahead' | 'behind', string>>(new Map());
+	const branchCompareSelectedCommitShaByTab = signal<Map<CompareSide, string>>(new Map());
 	// Active-tab convenience: derived from the per-tab map and the active tab. Read-only — to
 	// mutate, write to `branchCompareSelectedCommitShaByTab` directly via `selectCompareCommit`.
 	const branchCompareSelectedCommitSha = new Signal.Computed<string | undefined>(() => {
@@ -535,8 +548,7 @@ function createTransientState() {
 		activeModeSha: activeModeSha,
 		activeModeShas: activeModeShas,
 
-		compareSheetOpen: compareSheetOpen,
-		compareAsPanel: compareAsPanel,
+		comparePresentation: comparePresentation,
 		compareSplitPosition: compareSplitPosition,
 		compareSplitOrientation: compareSplitOrientation,
 
@@ -561,7 +573,6 @@ function createTransientState() {
 		reviewPreErrorValue: reviewPreErrorValue,
 		composeLastFailedAction: composeLastFailedAction,
 		composeLastCommitAllIncludedIds: composeLastCommitAllIncludedIds,
-		composeCurrentCacheKey: composeCurrentCacheKey,
 		composeRefineExcludedCommitIds: composeRefineExcludedCommitIds,
 		composeRegeneratingCommitId: composeRegeneratingCommitId,
 
@@ -653,7 +664,7 @@ export function getOpenComparison(
 	state: DetailsState,
 	compareRepoPath?: string,
 ): { compare?: CompareModeParams; graphRepoPath?: string } | undefined {
-	if (!state.compareSheetOpen.get() && !state.compareAsPanel.get()) return undefined;
+	if (state.comparePresentation.get() === 'closed') return undefined;
 
 	const graphRepoPath = state.branchCompareGraphRepoPath.get();
 	const rightRef = state.branchCompareRightRef.get();

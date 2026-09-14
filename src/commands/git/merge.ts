@@ -1,21 +1,27 @@
-import { ThemeIcon, window } from 'vscode';
+import { l10n, ThemeIcon, window } from 'vscode';
 import { MergeError, SigningError } from '@gitlens/git/errors.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitLog } from '@gitlens/git/models/log.js';
 import type { ConflictDetectionResult } from '@gitlens/git/models/mergeConflicts.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
+import { parseGitBoolean } from '@gitlens/git/utils/config.utils.js';
+import { getConflictDetectionErrorDisplayMessage } from '@gitlens/git/utils/mergeConflicts.utils.js';
 import { getReferenceLabel, isRevisionReference } from '@gitlens/git/utils/reference.utils.js';
 import { createRevisionRange } from '@gitlens/git/utils/revision.utils.js';
 import { Logger } from '@gitlens/utils/logger.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { Container } from '../../container.js';
 import { showPausedOperationStatus } from '../../git/actions/pausedOperation.js';
 import type { GlRepository } from '../../git/models/repository.js';
 import { showGitErrorMessage } from '../../messages.js';
 import { isSubscriptionTrialOrPaidFromState } from '../../plus/gk/utils/subscription.utils.js';
 import { createQuickPickSeparator } from '../../quickpicks/items/common.js';
-import type { DirectiveQuickPickItem } from '../../quickpicks/items/directive.js';
-import { createDirectiveQuickPickItem, Directive } from '../../quickpicks/items/directive.js';
+import type { ConfirmToggleQuickPickItem, DirectiveQuickPickItem } from '../../quickpicks/items/directive.js';
+import {
+	createConfirmToggleQuickPickItem,
+	createDirectiveQuickPickItem,
+	Directive,
+} from '../../quickpicks/items/directive.js';
 import type { FlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import { createFlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import type { ViewsWithRepositoryFolders } from '../../views/viewBase.js';
@@ -30,13 +36,18 @@ import type {
 } from '../quick-wizard/models/steps.js';
 import { StepResultBreak } from '../quick-wizard/models/steps.js';
 import type { QuickPickStep } from '../quick-wizard/models/steps.quickpick.js';
-import { PickCommitToggleQuickInputButton } from '../quick-wizard/quickButtons.js';
 import { QuickCommand } from '../quick-wizard/quickCommand.js';
 import { pickCommitStep } from '../quick-wizard/steps/commits.js';
 import { pickBranchOrTagStep } from '../quick-wizard/steps/references.js';
 import { canSkipRepositoryPick, pickRepositoryStep } from '../quick-wizard/steps/repositories.js';
 import { StepsController } from '../quick-wizard/stepsController.js';
-import { appendReposToTitle, assertStepState, canPickStepContinue } from '../quick-wizard/utils/steps.utils.js';
+import {
+	appendReposToTitle,
+	assertStepState,
+	canPickStepContinue,
+	confirmOptionsSeparatorLabel,
+	refreshConfirmStepItems,
+} from '../quick-wizard/utils/steps.utils.js';
 
 const Steps = {
 	PickRepo: 'merge-pick-repo',
@@ -72,8 +83,8 @@ export interface MergeGitCommandArgs {
 
 export class MergeGitCommand extends QuickCommand<State> {
 	constructor(container: Container, args?: MergeGitCommandArgs) {
-		super(container, 'merge', 'merge', 'Merge', {
-			description: 'integrates changes from a specified branch into the current branch',
+		super(container, 'merge', 'merge', l10n.t('Merge'), {
+			description: l10n.t('integrates changes from a specified branch into the current branch'),
 		});
 
 		this.initialState = { confirm: true, ...args?.state };
@@ -104,35 +115,44 @@ export class MergeGitCommand extends QuickCommand<State> {
 			const result = await state.repo.git.ops?.merge(state.reference.ref, options);
 			if (result?.conflicted) {
 				void window.showWarningMessage(
-					'Unable to merge due to conflicts. Resolve the conflicts before continuing, or abort the merge.',
+					l10n.t(
+						'Unable to merge due to conflicts. Resolve the conflicts before continuing, or abort the merge.',
+					),
 				);
 				void showPausedOperationStatus(this.container, state.repo.path, { source: { source: 'quick-wizard' } });
 			}
 		} catch (ex) {
 			// Don't show an error message if the user intentionally aborted the merge
 			if (MergeError.is(ex, 'aborted')) {
-				Logger.debug(ex.message, this.title);
+				Logger.debug(ex.message, 'Merge');
 				return;
 			}
 
-			Logger.error(ex, this.title);
+			Logger.error(ex, 'Merge');
 
 			if (MergeError.is(ex, 'uncommittedChanges') || MergeError.is(ex, 'wouldOverwriteChanges')) {
 				void window.showWarningMessage(
-					'Unable to merge. Your local changes would be overwritten. Please commit or stash your changes before trying again.',
+					l10n.t(
+						'Unable to merge. Your local changes would be overwritten. Please commit or stash your changes before trying again.',
+					),
 				);
 				return;
 			}
 
 			if (MergeError.is(ex, 'alreadyInProgress')) {
 				void window.showWarningMessage(
-					'Unable to merge. A merge is already in progress. Continue or abort the current merge first.',
+					l10n.t(
+						'Unable to merge. A merge is already in progress. Continue or abort the current merge first.',
+					),
 				);
 				void showPausedOperationStatus(this.container, state.repo.path, { source: { source: 'quick-wizard' } });
 				return;
 			}
 
-			void showGitErrorMessage(ex, MergeError.is(ex) || SigningError.is(ex) ? undefined : 'Unable to merge');
+			void showGitErrorMessage(
+				ex,
+				MergeError.is(ex) || SigningError.is(ex) ? undefined : l10n.t('Unable to merge'),
+			);
 		}
 	}
 
@@ -188,25 +208,35 @@ export class MergeGitCommand extends QuickCommand<State> {
 				context.destination = branch;
 			}
 
-			context.title = `${this.title} into ${getReferenceLabel(context.destination, {
-				icon: false,
-				label: false,
-			})}`;
+			context.title = l10n.t(
+				'Merge into {0}',
+				getReferenceLabel(context.destination, { icon: false, label: false }),
+			);
 			context.pickCommitForItem = false;
 
 			if (steps.isAtStep(Steps.PickBranchOrTag) || state.reference == null) {
 				using step = steps.enterStep(Steps.PickBranchOrTag);
 
-				const pickCommitToggle = new PickCommitToggleQuickInputButton(context.pickCommit, context, () => {
-					context.pickCommit = !context.pickCommit;
-					pickCommitToggle.on = context.pickCommit;
+				// A worded row at the top of the ref list rather than the old icon-only title-bar toggle —
+				// a modifier that changes what the next step does should say so where it can be read
+				const pickCommitRow = createConfirmToggleQuickPickItem({
+					label: l10n.t('Choose a Specific Commit'),
+					detail: l10n.t('After choosing the branch, pick the exact commit to merge'),
+					checked: context.pickCommit,
+					onDidChange: (item, quickpick) => {
+						context.pickCommit = item.checked;
+						quickpick.items = [...quickpick.items];
+					},
 				});
 
 				const result: StepResult<GitReference> = yield* pickBranchOrTagStep(state, context, {
-					placeholder: context => `Choose a branch${context.showTags ? ' or tag' : ''} to merge`,
+					placeholder: context =>
+						context.showTags
+							? l10n.t('Choose a branch or tag to merge')
+							: l10n.t('Choose a branch to merge'),
 					picked: context.selectedBranchOrTag?.ref,
 					value: context.selectedBranchOrTag == null ? state.reference?.ref : undefined,
-					additionalButtons: [pickCommitToggle],
+					prependItems: [pickCommitRow, createQuickPickSeparator()],
 				});
 				if (result === StepResultBreak) {
 					state.reference = undefined!;
@@ -242,8 +272,11 @@ export class MergeGitCommand extends QuickCommand<State> {
 				const result: StepResult<GitReference> = yield* pickCommitStep(state, context, {
 					emptyItems: [
 						createDirectiveQuickPickItem(Directive.Cancel, true, {
-							label: 'OK',
-							detail: `No commits found on ${getReferenceLabel(context.selectedBranchOrTag, { icon: false })}`,
+							label: l10n.t('OK'),
+							detail: l10n.t(
+								'No commits found on {0}',
+								getReferenceLabel(context.selectedBranchOrTag, { icon: false }),
+							),
 						}),
 					],
 					ignoreFocusOut: true,
@@ -251,8 +284,14 @@ export class MergeGitCommand extends QuickCommand<State> {
 					onDidLoadMore: log => context.cache.set(rev, Promise.resolve(log)),
 					placeholder: (context, log) =>
 						!log?.commits.size
-							? `No commits found on ${getReferenceLabel(context.selectedBranchOrTag, { icon: false })}`
-							: `Choose a commit to merge into ${getReferenceLabel(context.destination, { icon: false })}`,
+							? l10n.t(
+									'No commits found on {0}',
+									getReferenceLabel(context.selectedBranchOrTag, { icon: false }),
+								)
+							: l10n.t(
+									'Choose a commit to merge into {0}',
+									getReferenceLabel(context.destination, { icon: false }),
+								),
 					picked: state.reference?.ref,
 				});
 				if (result === StepResultBreak) {
@@ -292,73 +331,199 @@ export class MergeGitCommand extends QuickCommand<State> {
 			createRevisionRange(context.destination.ref, state.reference.ref, '...'),
 		);
 
-		const title = `Merge ${getReferenceLabel(state.reference, { icon: false, label: false })} into ${getReferenceLabel(context.destination, { icon: false, label: false })} `;
+		const sourceTitleLabel = getReferenceLabel(state.reference, { icon: false, label: false });
+		const destinationTitleLabel = getReferenceLabel(context.destination, { icon: false, label: false });
 		const count = counts != null ? counts.right : 0;
 		if (count === 0) {
 			const step: QuickPickStep<DirectiveQuickPickItem> = this.createConfirmStep(
-				appendReposToTitle(`Confirm ${title}`, state, context),
+				appendReposToTitle(
+					l10n.t('Confirm Merge {0} into {1}', sourceTitleLabel, destinationTitleLabel),
+					state,
+					context,
+				),
 				[],
+				l10n.t(
+					'Nothing to merge; {0} is already up to date',
+					getReferenceLabel(context.destination, { label: false, icon: false }),
+				),
 				createDirectiveQuickPickItem(Directive.Cancel, true, {
-					label: 'OK',
-					detail: `${getReferenceLabel(context.destination, {
-						capitalize: true,
-						label: false,
-					})} is already up to date with ${getReferenceLabel(state.reference, { label: false })}`,
+					label: l10n.t('OK'),
+					detail: l10n.t(
+						'{0} is already up to date with {1}',
+						getReferenceLabel(context.destination, { capitalize: true, label: false }),
+						getReferenceLabel(state.reference, { label: false }),
+					),
 				}),
-				{
-					placeholder: `Nothing to merge; ${getReferenceLabel(context.destination, {
-						label: false,
-						icon: false,
-					})} is already up to date`,
-				},
 			);
 			const selection: StepSelection<typeof step> = yield step;
 			canPickStepContinue(step, state, selection);
 			return StepResultBreak;
 		}
 
-		const items = [
-			createFlagsQuickPickItem<Flags>(state.flags, [], {
-				label: this.title,
-				detail: `Will merge ${pluralize('commit', count)} from ${getReferenceLabel(state.reference, {
-					label: false,
-				})} into ${getReferenceLabel(context.destination, { label: false })}`,
-				picked: true,
-			}),
-			createFlagsQuickPickItem<Flags>(state.flags, ['--ff-only'], {
-				label: `Fast-forward ${this.title}`,
-				description: '--ff-only',
-				detail: `Will fast-forward merge ${pluralize('commit', count)} from ${getReferenceLabel(
-					state.reference,
-					{ label: false },
-				)} into ${getReferenceLabel(context.destination, { label: false })}`,
-			}),
-			createFlagsQuickPickItem<Flags>(state.flags, ['--squash'], {
-				label: `Squash ${this.title}`,
-				description: '--squash',
-				detail: `Will squash ${pluralize('commit', count)} from ${getReferenceLabel(state.reference, {
-					label: false,
-				})} into one when merging into ${getReferenceLabel(context.destination, { label: false })}`,
-			}),
-			createFlagsQuickPickItem<Flags>(state.flags, ['--no-ff'], {
-				label: `No Fast-forward ${this.title}`,
-				description: '--no-ff',
-				detail: `Will create a merge commit when merging ${pluralize('commit', count)} from ${getReferenceLabel(
-					state.reference,
-					{ label: false },
-				)} into ${getReferenceLabel(context.destination, { label: false })}`,
-			}),
-			createFlagsQuickPickItem<Flags>(state.flags, ['--no-ff', '--no-commit'], {
-				label: `Don't Commit ${this.title}`,
-				description: '--no-commit --no-ff',
-				detail: `Will pause before committing the merge of ${pluralize(
-					'commit',
-					count,
-				)} from ${getReferenceLabel(state.reference, {
-					label: false,
-				})} into ${getReferenceLabel(context.destination, { label: false })}`,
-			}),
+		// Fast-forward is tri-state: a seeded wizard flag wins; otherwise, for the pair that doesn't already
+		// force a merge commit on its own, the `merge.ff` config decides, so the toggle reflects what git
+		// will actually do if left untouched.
+		let ff: 0 | 1 | 2;
+		if (state.flags.includes('--ff-only')) {
+			ff = 1;
+		} else if (state.flags.includes('--no-ff') && !state.flags.includes('--no-commit')) {
+			ff = 2;
+		} else {
+			const raw = await state.repo.git.config.getConfig?.('merge.ff');
+			if (raw?.trim().toLowerCase() === 'only') {
+				ff = 1;
+			} else {
+				ff = parseGitBoolean(raw) === false ? 2 : 0;
+			}
+		}
+		let noCommit = state.flags.includes('--no-commit');
+		// Don't Commit requires a merge commit, so it snaps Fast-forward to Never (and cycling
+		// Fast-forward away from Never unchecks Don't Commit) — states cascade, never silently override
+		if (noCommit) {
+			ff = 2;
+		}
+
+		const sourceLabel = getReferenceLabel(state.reference, { label: false });
+		const destinationLabel = getReferenceLabel(context.destination, { label: false });
+
+		const ffLabels = [l10n.t('If Possible'), l10n.t('Required'), l10n.t('Never')] as const;
+		const ffDetails = [
+			l10n.t('Fast-forward when possible, otherwise create a merge commit'),
+			l10n.t('Only fast-forward — fail rather than create a merge commit'),
+			l10n.t('Always create a merge commit'),
+		] as const;
+		const ffIcons = ['gitlens-checkbox-mixed', 'gitlens-checkbox-checked', 'gitlens-checkbox-unchecked'] as const;
+
+		// Folds the live Fast-forward/Don't Commit control values into each mode's flags and detail — the
+		// accepted item's flags are the whole contract with `execute()` — so the list says what will
+		// actually happen.
+		const buildItems = (): FlagsQuickPickItem<Flags>[] => {
+			const mergeFlags: Flags[] = noCommit
+				? ['--no-commit', '--no-ff']
+				: ff === 1
+					? ['--ff-only']
+					: ff === 2
+						? ['--no-ff']
+						: [];
+			const detail = noCommit
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Will merge {0} commit from {1} into {2}, always creating a merge commit, stopping before committing} other{Will merge {0} commits from {1} into {2}, always creating a merge commit, stopping before committing}}',
+						),
+						[count, sourceLabel, destinationLabel],
+					)
+				: ff === 0
+					? formatPlural(
+							l10n.t(
+								'{0, plural, one{Will merge {0} commit from {1} into {2}, fast-forwarding if possible} other{Will merge {0} commits from {1} into {2}, fast-forwarding if possible}}',
+							),
+							[count, sourceLabel, destinationLabel],
+						)
+					: ff === 1
+						? formatPlural(
+								l10n.t(
+									'{0, plural, one{Will merge {0} commit from {1} into {2}, only if it can fast-forward} other{Will merge {0} commits from {1} into {2}, only if it can fast-forward}}',
+								),
+								[count, sourceLabel, destinationLabel],
+							)
+						: formatPlural(
+								l10n.t(
+									'{0, plural, one{Will merge {0} commit from {1} into {2}, always creating a merge commit} other{Will merge {0} commits from {1} into {2}, always creating a merge commit}}',
+								),
+								[count, sourceLabel, destinationLabel],
+							);
+
+			return [
+				createFlagsQuickPickItem<Flags>(state.flags, mergeFlags, {
+					label: this.title,
+					description: mergeFlags.length ? mergeFlags.join(' ') : undefined,
+					detail: detail,
+					picked: !state.flags.includes('--squash'),
+				}),
+				createFlagsQuickPickItem<Flags>(state.flags, ['--squash'], {
+					label: l10n.t('Squash Merge'),
+					description: noCommit
+						? l10n.t('{0} · already stops before committing', '--squash')
+						: ff !== 0
+							? l10n.t('{0} · not affected — no merge commit involved', '--squash')
+							: '--squash',
+					detail: formatPlural(
+						l10n.t(
+							'{0, plural, one{Will combine {0} commit from {1} into one set of staged changes, stopping before committing} other{Will combine {0} commits from {1} into one set of staged changes, stopping before committing}}',
+						),
+						[count, sourceLabel],
+					),
+					picked: state.flags.includes('--squash'),
+				}),
+			];
+		};
+
+		let items = buildItems();
+
+		let step: QuickPickStep<DirectiveQuickPickItem | FlagsQuickPickItem<Flags>>;
+
+		const notices: DirectiveQuickPickItem[] = [];
+
+		interface Toggles {
+			ff?: DirectiveQuickPickItem;
+			noCommit?: ConfirmToggleQuickPickItem;
+		}
+		// A mutable holder rather than separate variables so each control's handler can reach the other
+		// without forward-referencing a not-yet-declared `const` (an `eslint(no-use-before-define)` build
+		// error) — both properties are always populated below before `buildRows` is ever called.
+		const toggles: Toggles = {};
+
+		/** Every row the confirm step shows, minus the separator + Cancel that `createConfirmStep` appends. */
+		const buildRows = (): (FlagsQuickPickItem<Flags> | DirectiveQuickPickItem)[] => [
+			...notices,
+			...items,
+			createQuickPickSeparator(confirmOptionsSeparatorLabel),
+			toggles.ff!,
+			toggles.noCommit!,
 		];
+
+		const updateFfRow = (): void => {
+			const row = toggles.ff!;
+			row.description = ffLabels[ff];
+			row.detail = ffDetails[ff];
+			row.iconPath = new ThemeIcon(ffIcons[ff]);
+		};
+
+		toggles.ff = createDirectiveQuickPickItem(Directive.Noop, false, {
+			label: l10n.t('Fast-forward'),
+			description: ffLabels[ff],
+			detail: ffDetails[ff],
+			iconPath: new ThemeIcon(ffIcons[ff]),
+			onDidSelect: () => {
+				ff = ((ff + 1) % 3) as 0 | 1 | 2;
+				updateFfRow();
+				// Anything other than Never can't stop before committing — cycling away unchecks Don't Commit
+				if (ff !== 2 && noCommit) {
+					noCommit = false;
+					toggles.noCommit!.checked = false;
+					toggles.noCommit!.iconPath = new ThemeIcon('gitlens-checkbox-unchecked');
+				}
+				items = buildItems();
+				refreshConfirmStepItems(step, buildRows());
+			},
+		});
+
+		toggles.noCommit = createConfirmToggleQuickPickItem({
+			label: l10n.t("Don't Commit"),
+			description: '--no-commit',
+			detail: l10n.t('Stop before committing so the result can be reviewed or edited'),
+			checked: noCommit,
+			onDidChange: item => {
+				noCommit = item.checked;
+				// A stop point needs a merge commit — checking snaps Fast-forward to Never
+				if (noCommit && ff !== 2) {
+					ff = 2;
+					updateFfRow();
+				}
+				items = buildItems();
+				refreshConfirmStepItems(step, buildRows());
+			},
+		});
 
 		let potentialConflict: Promise<ConflictDetectionResult | undefined> | undefined;
 		const subscription = await this.container.subscription.getSubscription();
@@ -369,9 +534,6 @@ export class MergeGitCommand extends QuickCommand<State> {
 			);
 		}
 
-		let step: QuickPickStep<DirectiveQuickPickItem | FlagsQuickPickItem<Flags>>;
-
-		const notices: DirectiveQuickPickItem[] = [];
 		if (potentialConflict) {
 			void potentialConflict?.then(result => {
 				if (result == null || result.status === 'clean') {
@@ -379,7 +541,7 @@ export class MergeGitCommand extends QuickCommand<State> {
 						0,
 						1,
 						createDirectiveQuickPickItem(Directive.Noop, false, {
-							label: 'No Conflicts Detected',
+							label: l10n.t('No Conflicts Detected'),
 							iconPath: new ThemeIcon('check'),
 						}),
 					);
@@ -388,8 +550,8 @@ export class MergeGitCommand extends QuickCommand<State> {
 						0,
 						1,
 						createDirectiveQuickPickItem(Directive.Noop, false, {
-							label: 'Unable to Detect Conflicts',
-							detail: result.message,
+							label: l10n.t('Unable to Detect Conflicts'),
+							detail: getConflictDetectionErrorDisplayMessage(result.reason, result.message),
 							iconPath: new ThemeIcon('error'),
 						}),
 					);
@@ -398,31 +560,24 @@ export class MergeGitCommand extends QuickCommand<State> {
 						0,
 						1,
 						createDirectiveQuickPickItem(Directive.Noop, false, {
-							label: 'Conflicts Detected',
-							detail: `Will result in ${pluralize(
-								'conflicting file',
-								result.conflict.files.length,
-							)} that will need to be resolved`,
+							label: l10n.t('Conflicts Detected'),
+							detail: formatPlural(
+								l10n.t(
+									'{0, plural, one{Will result in {0} conflicting file that will need to be resolved} other{Will result in {0} conflicting files that will need to be resolved}}',
+								),
+								[result.conflict.files.length],
+							),
 							iconPath: new ThemeIcon('warning'),
 						}),
 					);
 				}
 
-				if (step.quickpick != null) {
-					const active = step.quickpick.activeItems;
-					step.quickpick.items = [
-						...notices,
-						...items,
-						createQuickPickSeparator(),
-						createDirectiveQuickPickItem(Directive.Cancel),
-					];
-					step.quickpick.activeItems = active;
-				}
+				refreshConfirmStepItems(step, buildRows());
 			});
 
 			notices.push(
 				createDirectiveQuickPickItem(Directive.Noop, false, {
-					label: `$(loading~spin) \u00a0Detecting Conflicts...`,
+					label: `$(loading~spin) \u00a0${l10n.t('Detecting Conflicts...')}`,
 					// Don't use this, because the spin here causes the icon to spin incorrectly
 					//iconPath: new ThemeIcon('loading~spin'),
 				}),
@@ -430,7 +585,15 @@ export class MergeGitCommand extends QuickCommand<State> {
 			);
 		}
 
-		step = this.createConfirmStep(appendReposToTitle(`Confirm ${title}`, state, context), [...notices, ...items]);
+		step = this.createConfirmStep(
+			appendReposToTitle(
+				l10n.t('Confirm Merge {0} into {1}', sourceTitleLabel, destinationTitleLabel),
+				state,
+				context,
+			),
+			buildRows(),
+			l10n.t('Confirm Merge into {0}', destinationTitleLabel),
+		);
 		const selection: StepSelection<typeof step> = yield step;
 		return canPickStepContinue(step, state, selection) ? selection[0].item : StepResultBreak;
 	}

@@ -1,15 +1,11 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import type { AgentSessionState } from '../../../../../agents/models/agentSessionState.js';
 import type { GraphActivityDecay } from '../../../../../config.js';
-import type { AgentSessionState } from '../../../../home/protocol.js';
-import type { TreemapFileActionParams } from '../../../../plus/graph/protocol.js';
-import {
-	DidInvalidateGraphTreemapNotification,
-	TreemapFileActionCommand,
-	UpdateGraphConfigurationCommand,
-} from '../../../../plus/graph/protocol.js';
 import type { TimelinePeriod } from '../../../../plus/timeline/protocol.js';
 import { periodToMs } from '../../../../plus/timeline/utils/period.js';
 import type {
@@ -19,7 +15,8 @@ import type {
 	TreemapMode,
 	TreemapNode,
 } from '../../../../plus/treemap/protocol.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
+import { notifyService } from '../../../shared/actions/rpc.js';
+import { filterAgentSessionsForFamily, isAgentSessionCurrentInFamily } from '../../../shared/agentUtils.js';
 import type { Disposable } from '../../../shared/events.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import { periodLabels } from '../../timeline/components/header.js';
@@ -44,10 +41,10 @@ import '../../treemap/components/treemap-chart.js';
 import '../../../shared/components/badges/badge.js';
 import '../../../shared/components/breadcrumbs.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/agents-banner.js';
 import '../../../shared/components/menu/menu-popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 // Re-exported so external imports (graph-app, gl-graph-visualizations) keep working — the canonical
 // dispatch lives in `gl-graph-visualizations-switcher`.
@@ -59,9 +56,9 @@ export type { GraphTreemapModeChangeDetail } from './gl-graph-visualizations-swi
  *  Doubles as an anchor for the breadcrumbs / description that follow — "you are in <X> looking
  *  at <scope> · <counts>". */
 const treemapTitles: Record<TreemapMode, string> = {
-	files: 'FILES',
-	commits: 'COMMITS',
-	activity: 'AGENT ACTIVITY',
+	files: l10n.t('FILES'),
+	commits: l10n.t('COMMITS'),
+	activity: l10n.t('AGENT ACTIVITY'),
 };
 
 /** Decay-window picker labels for Activity mode. Parallel to the timeline's `periodLabels` but
@@ -69,12 +66,12 @@ const treemapTitles: Record<TreemapMode, string> = {
  *  heatmap after the agent finishes". Each label matches the contributions.json enum description
  *  so the picker reads consistently with the Settings UI. */
 const decayLabels: Record<GraphActivityDecay, string> = {
-	'30s': '30 seconds',
-	'1m': '1 minute',
-	'2m': '2 minutes',
-	'5m': '5 minutes',
-	'10m': '10 minutes',
-	'30m': '30 minutes',
+	'30s': l10n.t('30 seconds'),
+	'1m': l10n.t('1 minute'),
+	'2m': l10n.t('2 minutes'),
+	'5m': l10n.t('5 minutes'),
+	'10m': l10n.t('10 minutes'),
+	'30m': l10n.t('30 minutes'),
 };
 
 /** Per-file activity entry consumed by the chart renderer. `readAt`/`editedAt` are
@@ -181,12 +178,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 			min-height: 3.2rem;
 
 			/* 0.6rem horizontal so the switcher (left) and the close button (right) sit at matching
-		 * inset from the toolbar edges. Vertical kept at 0.4rem for the 32px toolbar height. */
+ * inset from the toolbar edges. Vertical kept at 0.4rem for the 32px toolbar height. */
 			padding: var(--gl-space-4) var(--gl-space-6);
 
 			/* Clip rather than overflow when content exceeds the toolbar width — at very narrow
-		 * widths even the shrunken description + pill may overflow the right edge. Clipping
-		 * keeps the right-edge controls anchored visually instead of pushing them off-screen. */
+ * widths even the shrunken description + pill may overflow the right edge. Clipping
+ * keeps the right-edge controls anchored visually instead of pushing them off-screen. */
 			overflow: hidden;
 			border-bottom: var(--gl-border-width) solid var(--vscode-editorWidget-border, transparent);
 		}
@@ -196,14 +193,14 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		}
 
 		/* Shrink priority when the toolbar is too narrow to fit everything: counts collapse first
-	 * (description + agent-status, flex-shrink: 1000), then breadcrumbs (100), then the title
-	 * (10). The switcher, EXP badge, and .toolbar__right never shrink, so the close button
-	 * stays pinned to the right edge regardless of width. min-width: 0 lets each shrinkable
-	 * item collapse below its intrinsic width; text-overflow / overflow:hidden ellipsizes
-	 * gracefully on the way down. */
+* (description + agent-status, flex-shrink: 1000), then breadcrumbs (100), then the title
+* (10). The switcher, EXP badge, and .toolbar__right never shrink, so the close button
+* stays pinned to the right edge regardless of width. min-width: 0 lets each shrinkable
+* item collapse below its intrinsic width; text-overflow / overflow:hidden ellipsizes
+* gracefully on the way down. */
 		.toolbar__title {
 			/* Always rendered (FILES / COMMITS / AGENT ACTIVITY) so the user keeps the view label
-		 * even after zooming into the tree. Shrinks last via the priority chain above. */
+ * even after zooming into the tree. Shrinks last via the priority chain above. */
 			flex: 0 10 auto;
 			min-width: 0;
 			overflow: hidden;
@@ -215,9 +212,9 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		}
 
 		/* Breadcrumbs flex-grow to fill leftover toolbar space so the component's own ResizeObserver
-	 * sees width changes when the toolbar widens/narrows — that's what drives its outer-in
-	 * collapse algorithm to run and re-run. Shrinks faster than the title but slower than the
-	 * counts so the path stays readable as the toolbar tightens. */
+* sees width changes when the toolbar widens/narrows — that's what drives its outer-in
+* collapse algorithm to run and re-run. Shrinks faster than the title but slower than the
+* counts so the path stays readable as the toolbar tightens. */
 		.toolbar__crumbs {
 			flex: 1 100 0;
 			min-width: 0;
@@ -226,7 +223,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 
 		.toolbar__description {
 			/* Counts (e.g. "2,173 files" / "N commits · M files") sit after the breadcrumbs when
-		 * present, else right after the EXP badge. Shrinks fastest in the priority chain. */
+ * present, else right after the EXP badge. Shrinks fastest in the priority chain. */
 			flex: 0 1000 auto;
 			min-width: 0;
 			overflow: hidden;
@@ -237,7 +234,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		}
 
 		/* Activity-mode counts (status pills + "N working · M idle"). Shares the shrink-first
-	 * priority with .toolbar__description so both collapse together as the toolbar narrows. */
+* priority with .toolbar__description so both collapse together as the toolbar narrows. */
 		.toolbar > gl-details-agent-status {
 			flex: 0 1000 auto;
 			min-width: 0;
@@ -245,8 +242,8 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		}
 
 		/* Matches the Visual History header's period pill — transparent background, tight padding —
-	 * so the same control reads consistently across both surfaces. Full-strength foreground (no
-	 * dimming) to match the rest of the toolbar text. */
+* so the same control reads consistently across both surfaces. Full-strength foreground (no
+* dimming) to match the rest of the toolbar text. */
 		.period-button {
 			display: inline-flex;
 			gap: var(--gl-space-2);
@@ -289,10 +286,10 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 			min-width: 0;
 
 			/* Always pin to the toolbar's right edge regardless of what sits to our left.
-		 * Files / Commits mode rely on the breadcrumbs (flex 1) to push us right; Activity
-		 * mode renders no breadcrumbs AND no description, so without an explicit auto-margin
-		 * the right group would sit flush against the title. Auto-margin collapses to zero
-		 * when another flex-grow element is already absorbing the slack. */
+ * Files / Commits mode rely on the breadcrumbs (flex 1) to push us right; Activity
+ * mode renders no breadcrumbs AND no description, so without an explicit auto-margin
+ * the right group would sit flush against the title. Auto-margin collapses to zero
+ * when another flex-grow element is already absorbing the slack. */
 			margin-left: auto;
 		}
 
@@ -315,8 +312,8 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		}
 
 		/* Wraps the chart so the error overlay can absolute-position over it without unmounting the
-	 * chart. Keeping the chart mounted preserves its internal zoom path across an error →
-	 * retry-success window so the user lands back at their prior drill-down depth. */
+* chart. Keeping the chart mounted preserves its internal zoom path across an error →
+* retry-success window so the user lands back at their prior drill-down depth. */
 		.chart-container {
 			position: relative;
 			display: flex;
@@ -355,14 +352,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	 *  auto-show trigger; mounting this view (in treemap mode) is itself the mode entry. */
 	@property({ type: Boolean, attribute: 'graph-ready' }) graphReady = false;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
 
 	@consume({ context: graphServicesContext, subscribe: true })
+	@state()
 	private services?: typeof graphServicesContext.__context__;
-
-	@consume({ context: ipcContext })
-	private _ipc?: typeof ipcContext.__context__;
 
 	@state()
 	private _data?: TreemapData;
@@ -388,6 +383,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	private _chart?: GlTreemapChart;
 
 	private readonly _subscriptions: Disposable[] = [];
+
+	/** Guards {@link subscribeToInvalidations} from firing twice for the same connection. `services`
+	 *  is unresolved on a cold open (RPC not yet connected) — `updated()` re-attempts once the
+	 *  `@state()`-tracked context arrives, mirroring `_servicesResolved` in gl-graph-details-panel.
+	 *  Reset on disconnect so a remount re-arms the subscription attempt. */
+	private _servicesSubscribed = false;
 
 	/** Repo path the currently-held `_data` was fetched for. Gates render against `effectiveRepo.path`
 	 *  so a cross-repo remount (where `_data` survives but the active repo flipped) doesn't paint
@@ -450,33 +451,53 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 
 	override connectedCallback(): void {
 		super.connectedCallback?.();
-		this.subscribeToInvalidations();
 		void this.refreshIfNeeded();
 	}
 
 	/** Subscribe to host treemap-invalidation pushes. The host fires this when its per-repo
 	 *  aggregator cache is dropped (file watcher edits, branch switches, repo unload). We bust
 	 *  BOTH fingerprint gates so the next refreshIfNeeded refetches fresh data rather than
-	 *  short-circuiting on a stale success or stale error fingerprint match. */
-	private subscribeToInvalidations(): void {
-		const ipc = this._ipc;
-		if (ipc == null) return;
+	 *  short-circuiting on a stale success or stale error fingerprint match.
+	 *
+	 *  `onDidInvalidate` is `save-last` buffered host-side, so an invalidation queued while this
+	 *  component is unmounted (or hidden) is replaced by the newest one rather than queued — matches
+	 *  the legacy notification's behavior, where a hidden webview only ever saw the latest pending
+	 *  postMessage on reveal. */
+	private async subscribeToInvalidations(): Promise<void> {
+		const services = this.services;
+		if (services == null) return;
 
-		this._subscriptions.push(
-			ipc.onReceiveMessage(msg => {
-				if (!DidInvalidateGraphTreemapNotification.is(msg)) return;
-				if (msg.params.repoPath !== this.effectiveRepo?.path) return;
+		let graphTreemap;
+		try {
+			graphTreemap = await services.graphTreemap;
+		} catch {
+			// The RPC surface can reject (channel torn down, service not yet available) — degrade to
+			// polling-free (refreshIfNeeded still runs on repo/mode changes) rather than leaving an
+			// unhandled rejection.
+			return;
+		}
 
-				this._lastFingerprint = undefined;
-				this._lastErrorFingerprint = undefined;
-				// Also abort any in-flight refresh — its result is now stale relative to the new
-				// host-side state, and the in-flight dedup would otherwise swallow this invalidation.
-				this._abortController?.abort();
-				this._abortController = undefined;
-				this._inFlightFingerprint = undefined;
-				void this.refreshIfNeeded();
-			}),
-		);
+		const unsub = graphTreemap.onDidInvalidate(payload => {
+			if (payload.repoPath !== this.effectiveRepo?.path) return;
+
+			this._lastFingerprint = undefined;
+			this._lastErrorFingerprint = undefined;
+			// Also abort any in-flight refresh — its result is now stale relative to the new
+			// host-side state, and the in-flight dedup would otherwise swallow this invalidation.
+			this._abortController?.abort();
+			this._abortController = undefined;
+			this._inFlightFingerprint = undefined;
+			void this.refreshIfNeeded();
+		});
+
+		// A disconnect (or reconnect) can race this await — unsub immediately instead of leaking the
+		// listener on an unmounted component.
+		if (!this.isConnected) {
+			void Promise.resolve(unsub).then(fn => fn?.());
+			return;
+		}
+
+		this._subscriptions.push({ dispose: () => void Promise.resolve(unsub).then(fn => fn?.()) });
 	}
 
 	override disconnectedCallback(): void {
@@ -502,6 +523,8 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		this._repoFamilySessionsCache = undefined;
 		// Re-arm the impression telemetry so the next mount records a fresh `shown`.
 		this._shownEmittedKey = undefined;
+		// Re-arm the subscription attempt for the next mount.
+		this._servicesSubscribed = false;
 	}
 
 	override willUpdate(): void {
@@ -528,6 +551,16 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	}
 
 	override updated(): void {
+		// Cold open races the RPC connection: `services` (a `@state()`-tracked `@consume`) is
+		// undefined on first render, so attempt the subscription here instead of only at connect —
+		// this re-fires once the context arrives. Flag-gated rather than `changedProperties`-gated:
+		// on a remount the context value is already set and never "changes", so the reset flag alone
+		// is what re-arms the subscription.
+		if (this.services != null && !this._servicesSubscribed) {
+			this._servicesSubscribed = true;
+			void this.subscribeToInvalidations();
+		}
+
 		void this.refreshIfNeeded();
 		// Dispatch lives in `updated()` (post-render) rather than `willUpdate()` — emitting an
 		// event mid-update can re-trigger Lit's render cycle and cause double renders or stale
@@ -557,7 +590,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		);
 		// The switcher emits `reason: 'user'` for its clicks; this forced flip is the only
 		// programmatic writer, so label it distinctly to keep user-action counts honest.
-		emitTelemetrySentEvent<'graph/visualizations/modeChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/visualizations/modeChanged',
 			data: { 'mode.old': 'treemap-commits', 'mode.new': 'treemap-files', reason: 'fallback' },
 		});
@@ -720,7 +753,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		if (key === this._shownEmittedKey) return;
 
 		this._shownEmittedKey = key;
-		emitTelemetrySentEvent<'graph/treemap/shown'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/treemap/shown',
 			data: {
 				mode: this.mode,
@@ -866,14 +899,23 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		if (sessions == null || sessions.length === 0) return emptyActivity;
 
 		const repoFamilyPath = repo.commonPath ?? repo.path;
+		const worktreePathsSet =
+			this.graphState.worktreePaths != null ? new Set(this.graphState.worktreePaths) : undefined;
 		// Scope to same-family sessions once, up front — both the root set and the activity merge
 		// below run off this list, so "which sessions count" is decided here and only here.
-		const familySessions = (sessions ?? []).filter(s => (s.commonPath ?? s.worktreePath) === repoFamilyPath);
+		const familySessions = filterAgentSessionsForFamily(sessions, repoFamilyPath, worktreePathsSet);
+		// Ghost sessions (admitted into `familySessions` only via visited history) run their live
+		// edits wherever they are NOW, not here — restrict the root set and the activity merge to
+		// sessions whose CURRENT identity is actually in-family, or a ghost's foreign-repo file
+		// paths would strip against a foreign root and paint onto this repo's tree.
+		const currentFamilySessions = familySessions.filter(s =>
+			isAgentSessionCurrentInFamily(s, repoFamilyPath, worktreePathsSet),
+		);
 		const familyRoots = this.collectFamilyRoots(
 			repo.path,
 			repo.commonPath,
 			this.graphState.worktreePaths,
-			familySessions,
+			currentFamilySessions,
 		);
 		let entries: Map<string, ActivityEntry> | undefined;
 
@@ -881,7 +923,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		// kinds are tracked independently (no write-wins) so the chart can blend the two
 		// chromes by relative heat. When multiple sessions touch the same path, the smaller
 		// `readAt`/`editedAt` (= more recent) wins and `reading`/`editing` OR-reduce.
-		for (const session of familySessions) {
+		for (const session of currentFamilySessions) {
 			const activity = session.fileActivity;
 			if (!activity?.length) continue;
 
@@ -984,7 +1026,11 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		if (sessions == null || sessions.length === 0) return emptySessions;
 
 		const repoFamilyPath = repo.commonPath ?? repo.path;
-		const result = sessions.filter(s => (s.commonPath ?? s.worktreePath) === repoFamilyPath);
+		const result = filterAgentSessionsForFamily(
+			sessions,
+			repoFamilyPath,
+			this.graphState.worktreePaths != null ? new Set(this.graphState.worktreePaths) : undefined,
+		);
 		return result.length > 0 ? result : emptySessions;
 	}
 
@@ -996,7 +1042,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		const previous = this.graphState.timeline?.period ?? '1|Y';
 		if (previous === period) return;
 
-		emitTelemetrySentEvent<'graph/treemap/periodChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/treemap/periodChanged',
 			data: { 'period.old': previous, 'period.new': period },
 		});
@@ -1009,11 +1055,11 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		);
 	};
 
-	/** Dispatches the activity-decay setting change as an IPC `UpdateGraphConfigurationCommand`
-	 *  so the host persists it to `gitlens.graph.experimental.visualizations.activityDecay`. The
-	 *  resolved `activityDecayMs` flows back via the normal config push, so the chart sees the
-	 *  new window on its next render. No optimistic local state — we lean on the config-changed
-	 *  round-trip rather than maintaining a parallel signal. */
+	/** Dispatches the activity-decay setting change via RPC so the host persists it to
+	 *  `gitlens.graph.experimental.visualizations.activityDecay`. The resolved `activityDecayMs`
+	 *  flows back via the normal config push, so the chart sees the new window on its next render.
+	 *  No optimistic local state — we lean on the config-changed round-trip rather than maintaining
+	 *  a parallel signal. */
 	private readonly onDecayMenuSelect = (e: CustomEvent<{ value: string }>): void => {
 		const decay = e.detail.value as GraphActivityDecay;
 		// Default to '5m' to match the picker's own default (see render()), so `decay.old` reports
@@ -1022,17 +1068,21 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		const previous = this.graphState.config?.activityDecay ?? '5m';
 		if (previous === decay) return;
 
-		emitTelemetrySentEvent<'graph/treemap/decayChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/treemap/decayChanged',
 			data: { 'decay.old': previous, 'decay.new': decay },
 		});
-		this._ipc?.sendCommand(UpdateGraphConfigurationCommand, { changes: { activityDecay: decay } });
+
+		const services = this.services;
+		if (services != null) {
+			notifyService(services.configuration, 'configuration/update', svc => svc.update({ activityDecay: decay }));
+		}
 	};
 
 	override render(): unknown {
 		const repo = this.effectiveRepo;
 		if (repo == null) {
-			return html`<div class="empty"><p>No repository selected</p></div>`;
+			return html`<div class="empty"><p>${l10n.t('No repository selected')}</p></div>`;
 		}
 
 		const mode = this.mode;
@@ -1074,10 +1124,10 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 				<gl-tooltip
 					class="toolbar__experimental"
 					placement="bottom"
-					content="This is an experimental feature"
+					content=${l10n.t('This is an experimental feature')}
 					.distance=${6}
 				>
-					<gl-badge appearance="experimental" aria-label="Experimental feature">EXP</gl-badge>
+					<gl-badge appearance="experimental" aria-label=${l10n.t('Experimental feature')}>EXP</gl-badge>
 				</gl-tooltip>
 				<gl-graph-coachmark
 					mark="visualizations"
@@ -1104,7 +1154,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 										slot="anchor"
 										class="period-button"
 										type="button"
-										aria-label="Change time range"
+										aria-label=${l10n.t('Change time range')}
 									>
 										${periodLabels[period]}<code-icon icon="chevron-down"></code-icon>
 									</button>
@@ -1123,12 +1173,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 										slot="anchor"
 										placement="bottom"
 										.distance=${6}
-										content="How long files stay highlighted after the agent reads or edits them"
+										content=${l10n.t('How long files stay highlighted after the agent reads or edits them')}
 									>
 										<button
 											class="period-button"
 											type="button"
-											aria-label="How long files stay highlighted after the agent reads or edits them"
+											aria-label=${l10n.t('How long files stay highlighted after the agent reads or edits them')}
 										>
 											${decayLabels[decay]}<code-icon icon="chevron-down"></code-icon>
 										</button>
@@ -1138,8 +1188,8 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 					}
 					<gl-button
 						appearance="toolbar"
-						tooltip="Close Visualizations"
-						aria-label="Close Visualizations"
+						tooltip=${l10n.t('Close Visualizations')}
+						aria-label=${l10n.t('Close Visualizations')}
 						@click=${this.onCloseClick}
 					>
 						<code-icon icon="close"></code-icon>
@@ -1172,8 +1222,10 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 				${
 					this._error
 						? html`<div class="overlay" role="alert">
-								<p>Failed to load treemap data</p>
-								<gl-button appearance="secondary" @click=${this.handleRetry}>Retry</gl-button>
+								<p>${l10n.t('Failed to load treemap data')}</p>
+								<gl-button appearance="secondary" @click=${this.handleRetry}
+									>${l10n.t('Retry')}</gl-button
+								>
 							</div>`
 						: nothing
 				}
@@ -1197,7 +1249,7 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		const zoom = classifyTreemapZoom(previous, next);
 		if (!zoom.changed) return;
 
-		emitTelemetrySentEvent<'graph/treemap/zoomed'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/treemap/zoomed',
 			data: { mode: this.mode, direction: zoom.direction, depth: zoom.depth },
 		});
@@ -1256,13 +1308,13 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 	};
 
 	private emitFileClickTelemetry(mode: TreemapMode, action: 'open' | 'history', sessionFocused?: boolean): void {
-		emitTelemetrySentEvent<'graph/treemap/fileClicked'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/treemap/fileClicked',
 			data: { mode: mode, action: action, 'session.focused': sessionFocused },
 		});
 	}
 
-	private sendFileAction(action: TreemapFileActionParams['action'], absPath: string): void {
+	private sendFileAction(action: 'open' | 'history', absPath: string): void {
 		// Send the repo-relative path + the repo it belongs to, so the host can scheme-preserve
 		// the URI rehydration (Uri.file() on the host would coerce virtual-workspace paths to
 		// non-resolving file:// URIs). Skip if we can't resolve a repo — shouldn't happen for a
@@ -1274,11 +1326,12 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		const relPath = toRepoRelative(rootPath, absPath);
 		if (relPath == null) return;
 
-		this._ipc?.sendCommand(TreemapFileActionCommand, {
-			action: action,
-			repoPath: rootPath,
-			path: relPath,
-		});
+		const services = this.services;
+		if (services == null) return;
+
+		notifyService(services.rowActions, 'rowActions/treemapFile', svc =>
+			svc.openTreemapFile(action, rootPath, relPath),
+		);
 	}
 
 	/** Locate the agent session currently reading or writing the clicked file. Both sides are
@@ -1337,9 +1390,10 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		const fileCount = countFiles(scope);
 		if (fileCount === 0) return nothing;
 
-		const filesText = `${fileCount.toLocaleString()} file${fileCount === 1 ? '' : 's'}`;
 		if (mode === 'files') {
-			return html`<span class="toolbar__description">${filesText}</span>`;
+			return html`<span class="toolbar__description"
+				>${formatPlural(l10n.t('{count, plural, one{{count} file} other{{count} files}}'), { count: fileCount })}</span
+			>`;
 		}
 
 		// Commits mode: pull the unique-commit count for the scope from the host's pre-computed
@@ -1347,12 +1401,19 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		// the average files-per-commit factor since each commit touches many leaves in a folder).
 		const freq = data.frequencies;
 		if (freq == null) {
-			return html`<span class="toolbar__description">${filesText}</span>`;
+			return html`<span class="toolbar__description"
+				>${formatPlural(l10n.t('{count, plural, one{{count} file} other{{count} files}}'), { count: fileCount })}</span
+			>`;
 		}
 
 		const commitCount = lookupCommitCount(scope, freq, root);
-		const commitsText = `${commitCount.toLocaleString()} commit${commitCount === 1 ? '' : 's'}`;
-		return html`<span class="toolbar__description">${commitsText} · ${filesText}</span>`;
+		const description = formatPlural(
+			l10n.t(
+				'{commits, plural, one{{files, plural, one{{commits} commit · {files} file} other{{commits} commit · {files} files}}} other{{files, plural, one{{commits} commits · {files} file} other{{commits} commits · {files} files}}}}',
+			),
+			{ commits: commitCount, files: fileCount },
+		);
+		return html`<span class="toolbar__description">${description}</span>`;
 	}
 
 	/** Breadcrumb chain shown in the toolbar between the visualization switcher and the
@@ -1369,11 +1430,11 @@ export class GlGraphTreemap extends SignalWatcher(LitElement) {
 		if (this._zoomPath.length === 0) return nothing;
 
 		const crumbs = [root, ...this._zoomPath];
-		return html`<gl-breadcrumbs class="toolbar__crumbs" density="compact" label="Treemap zoom path">
+		return html`<gl-breadcrumbs class="toolbar__crumbs" density="compact" label=${l10n.t('Treemap zoom path')}>
 			${crumbs.map((node, i) => {
 				const isRoot = i === 0;
 				const isCurrent = i === crumbs.length - 1;
-				const label = isRoot ? 'Back to Repository' : node.name;
+				const label = isRoot ? l10n.t('Back to Repository') : node.name;
 				const icon = isRoot ? 'gl-repository' : 'folder';
 				return html`<gl-breadcrumb-item
 					interactive

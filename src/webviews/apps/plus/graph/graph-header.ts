@@ -1,17 +1,25 @@
+import { createWipRowId } from '@gitkraken/commit-graph/wip/identity.js';
 import { computed, SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
-import { css, html, LitElement, nothing } from 'lit';
+import { css, html, LitElement, nothing, svg } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import { cache } from 'lit/directives/cache.js';
 import { repeat } from 'lit/directives/repeat.js';
 import { when } from 'lit/directives/when.js';
 import { getAltKeySymbol } from '@env/platform.js';
+import type { GlPopover } from '@gitlens/components/components/overlays/popover.js';
+import { srOnly } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { inlineCode } from '@gitlens/components/components/styles/lit/base.css.js';
+import { ModifierKeysController } from '@gitlens/components/controllers/modifierKeys.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { SearchOperatorsLongForm, SearchQuery } from '@gitlens/git/models/search.js';
 import { getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
 import { parseSearchQuery } from '@gitlens/git/utils/search.utils.js';
 import { debounce } from '@gitlens/utils/decorators/debounce.js';
 import { hasTruthyKeys } from '@gitlens/utils/object.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { wait } from '@gitlens/utils/promise.js';
 import type { BranchGitCommandArgs } from '../../../../commands/git/branch.js';
 import type { RepositoryShape } from '../../../../git/models/repositoryShape.js';
@@ -22,55 +30,46 @@ import type {
 	GraphExcludeRefs,
 	GraphRefOptData,
 	GraphSearchResults,
-	GraphSelectedRows,
 	GraphWipState,
 	State,
 } from '../../../plus/graph/protocol.js';
-import {
-	ChooseRepositoryCommand,
-	createWipRowId,
-	SearchCancelCommand,
-	SearchOpenInViewCommand,
-	SearchRequest,
-	UpdateGraphSearchModeCommand,
-	UpdateRefsVisibilityCommand,
-} from '../../../plus/graph/protocol.js';
+import { notifyService } from '../../shared/actions/rpc.js';
 import type { RepoButtonGroupClickEvent } from '../../shared/components/repo-button-group.js';
 import type { GlSearchBox } from '../../shared/components/search/search-box.js';
-import type { SearchNavigationEventDetail } from '../../shared/components/search/search-input.js';
-import { inlineCode } from '../../shared/components/styles/lit/base.css.js';
-import { ipcContext } from '../../shared/contexts/ipc.js';
-import type { TelemetryContext } from '../../shared/contexts/telemetry.js';
-import { telemetryContext } from '../../shared/contexts/telemetry.js';
+import type {
+	SearchModeChangeEventDetail,
+	SearchNavigationEventDetail,
+} from '../../shared/components/search/search-input.js';
+import type { SubscriptionContextState } from '../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../shared/contexts/subscription.js';
 import type { WebviewContext } from '../../shared/contexts/webview.js';
 import { webviewContext } from '../../shared/contexts/webview.js';
-import { ModifierKeysController } from '../../shared/controllers/modifier-keys.js';
+import { waitForFocusSettled } from '../../shared/focus.js';
 import { providerIconName } from '../../shared/git-utils.js';
 import { emitTelemetrySentEvent } from '../../shared/telemetry.js';
 import { ruleStyles } from '../shared/components/vscode.css.js';
 import { getDisplayedMode, isGraphFiltered } from './components/gl-graph-scope-popover.js';
 import type { GlGraphScopePopover } from './components/gl-graph-scope-popover.js';
-import { graphStateContext } from './context.js';
-import { getEffectiveDisplayMode } from './displayMode.js';
+import { graphServicesContext, graphStateContext } from './context.js';
 import type { GraphNavigationOptions, GraphNavigationResult } from './graph-wrapper/graph-wrapper.js';
 import { compareGraphRefOpts, getHiddenRefLabel } from './hiddenRefs.utils.js';
+import type { SearchActions } from './search/searchActions.js';
+import { searchActionsContext } from './search/searchContext.js';
 import { sidebarActionsContext } from './sidebar/sidebarContext.js';
 import type { SidebarActions } from './sidebar/sidebarState.js';
 import { isGraphSearchResultsError, shouldRestoreSearchQuery } from './stateProvider.js';
 import { actionButton, linkBase } from './styles/graph.css.js';
 import { graphHeaderControlStyles, titlebarStyles } from './styles/header.css.js';
-import { getSelectedRepoPath } from './utils/repository.utils.js';
-import '../shared/components/account-chip.js';
-import '../shared/components/integrations-chip.js';
+import { countOpenRepositories, getSelectedRepoPath, worktreeDisplayName } from './utils/repository.utils.js';
 import '../../shared/components/branch-name.js';
 import '../../shared/components/button.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../shared/components/menu/menu-divider.js';
 import '../../shared/components/menu/menu-item.js';
 import '../../shared/components/menu/menu-label.js';
 import '../../shared/components/progress.js';
-import '../../shared/components/overlays/popover.js';
-import '../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../shared/components/radio/radio.js';
 import '../../shared/components/radio/radio-group.js';
 import '../../shared/components/ref-button.js';
@@ -82,6 +81,7 @@ import './actions/gitActionsButtons.js';
 import './components/gl-graph-launchpad-indicator.js';
 import './components/gl-graph-account-indicator.js';
 import './components/gl-graph-header-promo.js';
+import './components/gl-graph-coachmark.js';
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -132,6 +132,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		inlineCode,
 		linkBase,
 		ruleStyles,
+		srOnly,
 		actionButton,
 		titlebarStyles,
 		graphHeaderControlStyles,
@@ -152,7 +153,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 			}
 
 			/* Search is meaningless in Timeline mode — visually dim it and let inert block focus
-			   + interactions natively (instead of removing it from the row entirely). */
+  + interactions natively (instead of removing it from the row entirely). */
 			.search-box--disabled {
 				cursor: not-allowed;
 				opacity: 0.5;
@@ -163,7 +164,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 			}
 
 			/* Create/Start menu rows: icon + label as an inline-flex pair. Color is inherited so the
-			   icon follows the menu-item's hover/selection foreground (no override). */
+  icon follows the menu-item's hover/selection foreground (no override). */
 			.action-menu__item {
 				display: inline-flex;
 				gap: var(--gl-space-6);
@@ -172,17 +173,20 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		`,
 	];
 
-	@consume({ context: ipcContext })
-	private _ipc!: typeof ipcContext.__context__;
+	@consume({ context: graphServicesContext, subscribe: true })
+	private _services?: typeof graphServicesContext.__context__;
 
-	@consume({ context: telemetryContext as { __context__: TelemetryContext } })
-	private _telemetry!: TelemetryContext;
-
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
+
+	@consume({ context: subscriptionContext, subscribe: true })
+	private _subscription!: SubscriptionContextState;
 
 	@consume({ context: sidebarActionsContext, subscribe: true })
 	private _sidebarActions?: SidebarActions;
+
+	@consume({ context: searchActionsContext, subscribe: true })
+	private _searchActions!: SearchActions;
 
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
@@ -203,11 +207,25 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	@property({ attribute: 'details-effective-location' })
 	detailsEffectiveLocation: 'right' | 'bottom' = 'right';
 
+	/** The configured details location (raw setting; `auto` also when unset). */
+	@property({ attribute: 'details-location' })
+	detailsLocation: 'auto' | 'right' | 'bottom' = 'auto';
+
+	/** The width-driven side `auto` would pick right now — independent of any explicit pin, so the
+	 *  popover's Auto option previews what choosing it would do. */
+	@property({ attribute: 'details-auto-location' })
+	detailsAutoLocation: 'right' | 'bottom' = 'right';
+
 	@property({ type: Boolean, attribute: 'minimap-visible' })
 	minimapVisible = false;
 
 	@property({ type: Boolean, attribute: 'has-selected-commit' })
 	hasSelectedCommit = false;
+
+	/** The app's coach-mark gate (see `coachMarksEligible` in graph-app), mirrored so the first-scope
+	 *  tip can't open before the graph is on screen. */
+	@property({ type: Boolean, attribute: 'graph-ready' })
+	graphReady = false;
 
 	get hasFilters() {
 		// Scope mode forces first-parent rendering, so it always counts as a filter.
@@ -228,22 +246,76 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	 *  matches: `setScope` rejects detached scopes, so there's nothing to unfocus. An unknown branch id
 	 *  reads as "not focused" so the click focuses rather than matching on `undefined`. */
 	private get isScopedToCurrentBranch(): boolean {
-		const { scope, branch } = this.graphState;
-		if (scope == null || branch == null || branch.detached || branch.id == null) return false;
+		const { scope, branch, worktreePerspective } = this.graphState;
+		if (scope == null) return false;
+
+		// While a worktree perspective's rebind is in flight, `branch` still describes the OLD binding and
+		// the scope is still keyed under the OLD repo path (it's re-stamped onto the worktree only once the
+		// rebind lands), so neither id can match yet. Compare by NAME against the perspective's own branch
+		// until the two converge — the same optimism as the pill label, so this toggle lights up on the same
+		// frame as the scope chip below it.
+		if (
+			worktreePerspective?.branchName != null &&
+			getSelectedRepoPath(this.graphState) !== worktreePerspective.path
+		) {
+			return scope.branchName === worktreePerspective.branchName;
+		}
+
+		if (branch == null || branch.detached || branch.id == null) return false;
 
 		return scope.branchRef === branch.id;
 	}
 
+	/** True when the graph is worktree-PERSPECTIVED — re-bound onto that worktree entirely (HEAD markers,
+	 *  WIP primary, action cwd), independent of the branch FOCUS projection (`scope`). Drives the
+	 *  whole-titlebar tint (`titlebar--worktree-scoped`, set in `render()`) and the matching highlight on
+	 *  the top-row branch button, so both read as the same signal. */
+	private get isWorktreeScoped(): boolean {
+		return this.graphState.worktreePerspective != null;
+	}
+
+	/** Display name for a worktree path — used by both the scoped pill's tooltip/accessible name and the
+	 *  scope-transition live-region announcement. */
+	private worktreeDisplayName(path: string): string {
+		return worktreeDisplayName(this.graphState.repositories, path);
+	}
+
 	// Local search query state (not in global context)
 	private _searchQuery: SearchQuery = { query: '' };
+	/** The user's own filter-toggle state from before an NL search forced filter mode, so clearing that
+	 *  search restores it — an explicit toggle click clears this (the user's choice supersedes it). */
+	private _nlForcedFilterRestore: boolean | undefined;
+	/** A full search cancel has been sent but the host's clearing notification hasn't landed yet. In that
+	 *  window the box is empty while `graphState.searchQuery`/results still hold the old search — the
+	 *  exact signature the reboot-restore effect in `updated()` looks for, so it must stand down or it
+	 *  restores the search the user just cleared. Cleared once the state reflects the cancel. */
+	private _searchCancelInFlight = false;
 
 	@state()
 	private _searchResultHidden = false;
 
 	private _lastNavigationRepoPath: string | undefined;
 
+	/** Text for the scope-transition `aria-live="polite"` region — updated only on an actual
+	 *  worktree-perspective TRANSITION (see `updated()`), so a screen reader announces it once per gesture
+	 *  rather than on every unrelated re-render. */
+	@state() private _scopeAnnouncement = '';
+	/** Last `worktreePerspective.path` this component announced — `undefined` means "not yet
+	 *  initialized" (skip the first render's announcement, since there was no transition), `null` means
+	 *  "unscoped". Compared against on every `updated()` pass to detect a transition. */
+	private _lastAnnouncedScopePath: string | null | undefined;
+
 	override updated(changedProperties: PropertyValues): void {
-		this.aiAllowed = (this.graphState.config?.aiEnabled ?? true) && (this.graphState.orgSettings?.ai ?? true);
+		this.aiAllowed = (this.graphState.config?.aiEnabled ?? true) && this._subscription.orgSettings.get().ai;
+
+		const scopePath = this.graphState.worktreePerspective?.path ?? null;
+		if (this._lastAnnouncedScopePath !== undefined && this._lastAnnouncedScopePath !== scopePath) {
+			this._scopeAnnouncement =
+				scopePath != null
+					? l10n.t('Scoped to worktree {0}', this.worktreeDisplayName(scopePath))
+					: l10n.t('Unscoped');
+		}
+		this._lastAnnouncedScopePath = scopePath;
 
 		const currentRepoPath = this.graphState.selectedRepository;
 		if (this._lastNavigationRepoPath !== currentRepoPath) {
@@ -257,7 +329,12 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		// `setExternalSearchQuery` — NOT the header's same-named method, which also RE-RUNS the search. The
 		// guard fires only when the local box is empty and the search is live (results present OR still
 		// searching), so it never clobbers an in-progress user query nor revives a just-cancelled search.
+		if (this._searchCancelInFlight && this.graphState.searchQuery == null) {
+			this._searchCancelInFlight = false;
+		}
+
 		if (
+			!this._searchCancelInFlight &&
 			shouldRestoreSearchQuery(
 				this._searchQuery?.query,
 				this.graphState.searchQuery,
@@ -284,6 +361,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	setExternalSearchQuery(query: SearchQuery) {
 		this._pendingNavigation = undefined;
 		this.cancelActiveSearchNavigation();
+		this._nlForcedFilterRestore = undefined;
 		this._searchQuery = query;
 		this.searchEl?.setExternalSearchQuery(query);
 		this.updateActiveFilterColumns();
@@ -349,7 +427,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	private handleJumpToRef(e: MouseEvent) {
 		// Alt: open the scope menu into the Focus Branch pane so the user can pick a branch to focus.
 		if (e.altKey) {
-			this._telemetry.sendEvent({ name: 'graph/action/jumpTo', data: { alt: true } });
+			emitTelemetrySentEvent(this, { name: 'graph/action/jumpTo', data: { alt: true } });
 			void this.scopePopoverEl?.openToFocusBranch();
 			return;
 		}
@@ -366,7 +444,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		}
 
 		if (this.scopeToCurrentBranch()) {
-			this._telemetry.sendEvent({ name: 'graph/action/jumpTo', data: { alt: false } });
+			emitTelemetrySentEvent(this, { name: 'graph/action/jumpTo', data: { alt: false } });
 		}
 	}
 
@@ -391,6 +469,34 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		return true;
 	}
 
+	/** The `gl-unscope` glyph on the worktree-scoped branch pill — a full "exit this worktree context":
+	 *  clears the PERSPECTIVE AND any FOCUS, however the focus was reached, since jumping home while
+	 *  silently keeping a projection would be surprising leftover state. The chip's unscope button is the
+	 *  deliberate asymmetric counterpart: focus is the subordinate mode, so clearing it never drops the
+	 *  perspective.
+	 *
+	 *  Both halves come BACK together too: a refused unscope restores the perspective, and the focus rides
+	 *  along as the restore target, or a failed exit would strip the projection off a graph that never
+	 *  actually left the worktree. */
+	private handleUnscopeWorktree(): void {
+		if (this.graphState.worktreePerspective == null) return;
+
+		// An action that removes the focused element must move focus with it: the unscope button unrenders
+		// once the perspective clears, dropping focus to <body>. `gl-ref-button` has no delegatesFocus,
+		// tabindex or focus() override of its own, so retarget `.jump-to-ref` — a real `gl-button` sibling
+		// that stays rendered and has a working public `focus()`. Guarded to a KEYBOARD activation of the
+		// unscope button, so a mouse click elsewhere doesn't steal focus from wherever it already was.
+		const clearButton = this.renderRoot.querySelector<HTMLElement>('.ref-button-group__clear');
+		if (this.shadowRoot?.activeElement === clearButton) {
+			this.renderRoot.querySelector<HTMLElement>('.jump-to-ref')?.focus();
+		}
+
+		// Captured before the clear below, which is what makes it a restorable snapshot.
+		const scope = this.graphState.scope;
+		this.graphState.clearWorktreePerspective({ restoreScopeOnRefusal: scope });
+		this.graphState.clearScope();
+	}
+
 	private onOpenPullRequest(pr: NonNullable<NonNullable<State['branchState']>['pr']>): void {
 		this.dispatchEvent(
 			new CustomEvent('gl-graph-show-pr-sheet', {
@@ -402,7 +508,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	}
 
 	private onSearchOpenInView() {
-		this._ipc.sendCommand(SearchOpenInViewCommand, { search: { ...this._searchQuery } });
+		this._searchActions.openInView({ ...this._searchQuery });
 	}
 
 	private _activeRowInfoCache: { row: string; info: { date: number; id: string } } | undefined;
@@ -548,13 +654,51 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		return (this._searchQuery.query?.length ?? 0) > 2;
 	}
 
+	/** Shared tail of the NL-forced-filter restore: applies `restore` to the search mode and the search
+	 *  box's filter toggle, and clears the forced-filter bookkeeping. Takes the value as a parameter —
+	 *  never reads `this._nlForcedFilterRestore` — so each call site controls its own `_searchQuery`
+	 *  write (in-place mutation vs. wholesale rebuild) around the call. */
+	private applyNlForcedFilterRestore(restore: boolean): void {
+		this.graphState.searchMode = restore ? 'filter' : 'normal';
+		this.searchEl?.setExternalFilter(restore);
+		this._nlForcedFilterRestore = undefined;
+	}
+
 	private cancelSearch(preserveResults: boolean) {
 		this._pendingNavigation = undefined;
 		this.cancelActiveSearchNavigation();
-		// Don't eagerly clear local state — the host sends a clear notification as part of
-		// processing the cancel (or starting a new search). Eagerly clearing causes a flash
-		// where old results/errors disappear briefly before the new state arrives.
-		this._ipc.sendCommand(SearchCancelCommand, { preserveResults: preserveResults });
+		if (!preserveResults) {
+			this._searchCancelInFlight = true;
+		}
+
+		// An NL-forced filter mode ends with its search — restore the user's own toggle state, and ONLY
+		// the toggle. This runs synchronously inside the box's own clear sequence (the box emits
+		// `gl-search-cancel`, then re-reads its props to emit the empty change) — funneling the full
+		// query through `setExternalSearchQuery` here resurrected the just-cleared text into the box,
+		// and the trailing change emission then re-ran it as a live search.
+		if (!preserveResults && this._nlForcedFilterRestore != null) {
+			const restore = this._nlForcedFilterRestore;
+			this._searchQuery.filter = restore;
+			this.applyNlForcedFilterRestore(restore);
+		}
+		// Don't eagerly clear local state — the host's cleared snapshot (or the next search's) lands via
+		// `onDidChange`. Eagerly clearing causes a flash where old results/errors disappear briefly before
+		// the new state arrives.
+		if (preserveResults) {
+			this._searchActions.cancel();
+			// The host answers an aborted search with nothing — right for a supersede, where the newer
+			// search's snapshots own the state, but a pause has no successor: nothing else will ever drop
+			// `searching` (the spinner, the header progress bar, and the graph's search-active styling all
+			// key off it) or surface the resume affordance. Settle both here; the host's own settled state
+			// (paused cursor included) already agrees — it just never emits for an abort.
+			this.graphState.searching = false;
+			const currentResults = this.graphState.searchResultsResponse;
+			if (currentResults != null && !isGraphSearchResultsError(currentResults)) {
+				this.graphState.searchResultsResponse = { ...currentResults, hasMore: true };
+			}
+		} else {
+			this._searchActions.clear();
+		}
 	}
 
 	private async waitForSearchComplete(
@@ -579,51 +723,84 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 
 	// Auto-reveal the first search match (new-search entry point only — next/prev navigation already
 	// reveals its own target via executeNavigation, so calling this there would double-reveal).
-	private revealFirstSearchMatch(selectedRows: GraphSelectedRows | undefined): void {
-		const firstSha = selectedRows != null ? Object.keys(selectedRows)[0] : undefined;
-		if (firstSha != null) {
-			void this.navigateToSearchResult(firstSha);
+	private revealFirstSearchMatch(revealSha: string | undefined): void {
+		if (revealSha != null) {
+			void this.navigateToSearchResult(revealSha);
 		}
 	}
 
 	private async startSearch() {
+		// A freshly-initiated search supersedes any stale cancel bookkeeping — otherwise a clear
+		// immediately followed by a new search can skip the null transition `updated()` watches for
+		// (Lit batches; save-last RPC replay collapses), leaving the flag stuck and suppressing the
+		// reconnect box-restore.
+		this._searchCancelInFlight = false;
+
 		if (!this.searchValid) {
 			this.cancelSearch(false);
 			return;
 		}
 
-		// Raise `searching` here rather than waiting for the host's first notification — that round-trip
-		// is a visible delay for anything keyed off it (the search spinner, and the minimap's auto-show,
-		// which is supposed to be up before results start streaming in). Every exit path below, plus the
-		// notification reducer, drives it back down.
+		// Captured BEFORE the request: the response's forced-filter detection must compare against the
+		// toggle state the user submitted with — by response time `_searchQuery.filter` may already have
+		// been rewritten by notification-driven syncs.
+		const preSearchFilter = this._searchQuery.filter ?? false;
+
+		// Raise `searching` here rather than waiting for the host's first snapshot — that round-trip is a
+		// visible delay for anything keyed off it (the search spinner, and the minimap's auto-show, which
+		// is supposed to be up before results start streaming in). Every exit path below, plus every
+		// snapshot `_searchActions` applies, drives it back down.
 		this.graphState.searching = true;
 		// A new search session starts here, not when the host answers — see `searchSession`. Resume and
-		// result-navigation issue their own `SearchRequest`s without coming through here, so they
-		// correctly leave the session (and any per-search UI state scoped to it) alone.
+		// result-navigation issue their own searches without coming through here, so they correctly leave
+		// the session (and any per-search UI state scoped to it) alone.
 		this.graphState.searchSession++;
 
 		try {
-			const rsp = await this._ipc.sendRequest(SearchRequest, { search: { ...this._searchQuery } });
+			const rsp = await this._searchActions.search({ search: { ...this._searchQuery } });
 
-			// Only log successful searches with at least 1 result
-			if (rsp.search && rsp.results && !('error' in rsp.results) && rsp.results.count > 0) {
-				this.searchEl.logSearch(rsp.search);
+			// Log whenever we have a search — the NL error message and "Query: <processed>" chip live
+			// inside logSearch, so a failed or zero-result NL search still needs it. Only a match
+			// (count > 0) is allowed into search history.
+			if (rsp?.state.query) {
+				const results = rsp.state.results;
+				const matched = results != null && !('error' in results) && results.count > 0;
+				this.searchEl?.logSearch(rsp.state.query, { store: matched });
 			}
 
-			// Guard: only update state if this response is still for the current search.
-			// Progressive notifications already handle results via searchId filtering,
-			// but error results only come through the IPC response.
-			if (rsp.searchId === this.graphState.currentSearchId) {
-				this.graphState.searchResultsResponse = rsp.results;
-				// The IPC response means the host-side search handler has completed —
-				// mark searching as done. For successful searches this is redundant
-				// (the final notification already set it), but for errors it's the
-				// only path that clears the searching state.
-				this.graphState.searching = false;
-				this.graphState.searchMode = this._searchQuery.filter ? 'filter' : 'normal';
-				if (rsp.selectedRows != null) {
-					this.graphState.selectedRows = rsp.selectedRows;
-					this.revealFirstSearchMatch(rsp.selectedRows);
+			// A superseded/aborted search resolves `undefined` — nothing more to do; the search that
+			// superseded it owns the state from here.
+			if (rsp == null) return;
+
+			// `applySearchState` already applied `rsp.state` (including `searchMode`) — only the
+			// header-local bookkeeping remains here.
+			//
+			// NL search can force filter mode server-side (see `updateSearchMode` in
+			// graphSearchService.ts) — sync the local query from the response so the toggle reflects it
+			// and subsequent requests (paging/navigation) carry the routed value forward instead of
+			// reverting to whatever the toggle showed before this search. The forced mode lasts only as
+			// long as its search: remember the user's own toggle state so clearing the search restores
+			// it (see `cancelSearch`).
+			const nlMode =
+				typeof rsp.state.query.naturalLanguage === 'object' ? rsp.state.query.naturalLanguage.mode : undefined;
+			if (nlMode === 'filter' && rsp.state.query.filter && !preSearchFilter) {
+				this._nlForcedFilterRestore ??= preSearchFilter;
+			}
+
+			this._searchQuery.filter = rsp.state.query.filter;
+
+			// The selection itself arrives on the rows plane; this only says where to scroll.
+			if (rsp.revealSha != null) {
+				if (nlMode === 'select') {
+					// "Take me to X" phrasing — jump the viewport deliberately through the same
+					// queued navigation path 'first'/'last' use, instead of the plain reveal below
+					// (avoids a double-jump from also calling revealFirstSearchMatch).
+					this._pendingNavigation = 'first';
+					if (!this._isNavigating) {
+						void this.processNavigation();
+					}
+				} else {
+					this.revealFirstSearchMatch(rsp.revealSha);
 				}
 			}
 		} catch {
@@ -633,7 +810,10 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	}
 
 	private handleOnToggleRefsVisibilityClick(_event: any, refs: GraphExcludedRef[], visible: boolean) {
-		this._ipc.sendCommand(UpdateRefsVisibilityCommand, { refs: refs, visible: visible });
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.filters, 'filters/refs', svc => svc.setRefsVisibility(refs, visible));
 	}
 
 	private handleSearch() {
@@ -643,12 +823,24 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	private handleSearchInput(e: CustomEvent<SearchQuery>) {
 		this._pendingNavigation = undefined;
 		this.cancelActiveSearchNavigation();
+		// Captured before the cancel below can consume it: a replacing query ends any NL-forced filter
+		// (the force lasts exactly its own search's lifetime), but the event's `filter` was built from
+		// the box's still-forced toggle — so the new search must take the user's own mode instead of
+		// inheriting the forced one.
+		const nlForcedRestore = this._nlForcedFilterRestore;
+
 		// Cancel any existing search before starting a new one
 		if (this.graphState.searching) {
 			this.cancelSearch(false);
 		}
 
-		this._searchQuery = e.detail;
+		if (nlForcedRestore != null) {
+			this._searchQuery = { ...e.detail, filter: nlForcedRestore };
+			this.applyNlForcedFilterRestore(nlForcedRestore);
+		} else {
+			this._searchQuery = e.detail;
+		}
+
 		this.updateActiveFilterColumns();
 		void this.startSearch();
 	}
@@ -666,40 +858,28 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		// Set searching state immediately for responsive UI
 		this.graphState.searching = true;
 
-		// Capture current searchId before async gap to detect staleness
-		const currentSearchId = this.graphState.currentSearchId;
-
-		// Preserve current search results but ensure hasMore is true
+		// Preserve current search results but ensure hasMore is true — the host resumes from the paused
+		// cursor and won't ship its own snapshot until the next batch lands.
 		// Read from searchResultsResponse (the source) not searchResults (the derived value)
 		const currentResults = this.graphState.searchResultsResponse;
 		if (currentResults != null && !isGraphSearchResultsError(currentResults)) {
-			// Only update if we're still on the same search
-			if (this.graphState.currentSearchId === currentSearchId) {
-				this.graphState.searchResultsResponse = {
-					...currentResults,
-					hasMore: true,
-				};
-			}
+			this.graphState.searchResultsResponse = {
+				...currentResults,
+				hasMore: true,
+			};
 		}
 
-		// Resume a paused search by requesting more results.
-		// The response is deliberately discarded (void) — progressive notifications
-		// handle state updates. The host's searchId guard in processSearchStream
-		// protects against stale processing if a new search starts before this completes.
-		void this._ipc.sendRequest(SearchRequest, {
-			search: this._searchQuery,
-			more: true,
-		});
+		// Resume a paused search by requesting more results. The response is deliberately discarded
+		// (void) — `_searchActions.search` applies the resulting snapshot itself via `applySearchState`,
+		// and a superseded/aborted resume resolves `undefined` and touches nothing.
+		void this._searchActions.search({ search: this._searchQuery, more: true });
 	}
 
-	/** Load-more for search navigation — the caller reads the results as locals, so nothing lands in state. */
+	/** Load-more for search navigation — the caller reads the results as locals, so nothing lands in state
+	 *  here (`_searchActions.search` still applies the snapshot for the rest of the app). */
 	private async onSearchPromise(search: SearchQuery, options?: { limit?: number; more?: boolean }) {
 		try {
-			return await this._ipc.sendRequest(SearchRequest, {
-				search: search,
-				limit: options?.limit,
-				more: options?.more,
-			});
+			return await this._searchActions.search({ search: search, limit: options?.limit, more: options?.more });
 		} catch {
 			return undefined;
 		}
@@ -725,7 +905,9 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				source: 'search',
 				// Search can legitimately contain a WIP row excluded by the active view. Unlike a
 				// scope/overview jump, it must skip that result rather than wait for a synthesis that
-				// cannot occur until the user changes the view.
+				// cannot occur until the user changes the view. It does NOT skip a WIP row that is merely
+				// unanchored — that one pages its anchor in like any other result (see
+				// `canSynthesizeWipRow`), so the count beside the search box stays steppable.
 				deferSynthetic: false,
 				signal: abort.signal,
 				// A landing: stepping results is driven from the search box in the header, so each hit needs
@@ -848,15 +1030,15 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				if (!isCurrent()) return;
 
 				if (
-					!moreResults?.results ||
-					isGraphSearchResultsError(moreResults.results) ||
-					count >= moreResults.results.count
+					!moreResults?.state.results ||
+					isGraphSearchResultsError(moreResults.state.results) ||
+					count >= moreResults.state.results.count
 				) {
 					break;
 				}
 
 				const priorCount = count;
-				searchResults = moreResults.results;
+				searchResults = moreResults.state.results;
 				count = searchResults.count;
 				searchIndex = direction === 'last' ? count - 1 : priorCount;
 				continue;
@@ -912,19 +1094,29 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		}
 	}
 
-	handleSearchModeChanged(e: CustomEvent) {
+	handleSearchModeChanged(e: CustomEvent<SearchModeChangeEventDetail>) {
+		// An NL on/off toggle reports the CURRENT filter state, which may be NL-forced — persist only
+		// the NL preference; the mode was not chosen, so it must neither become the sticky default nor
+		// supersede a pending forced-filter restore.
+		if (!e.detail.explicitMode) {
+			this._searchActions.setMode(undefined, e.detail.useNaturalLanguage);
+			return;
+		}
+
+		// Only an explicit user mode change cancels queued/in-flight navigation — a non-user state report
+		// (e.g. search-input's willUpdate dropping NL when aiAllowed flips) must not cancel it.
 		this._pendingNavigation = undefined;
 		this.cancelActiveSearchNavigation();
+
+		// An explicit mode choice supersedes any NL-forced filter restore
+		this._nlForcedFilterRestore = undefined;
 		// Update local state immediately for responsive UI
 		this.graphState.searchMode = e.detail.searchMode;
 
 		// Update the search query's filter property so it's included in the next search
 		this._searchQuery.filter = e.detail.searchMode === 'filter';
 
-		this._ipc.sendCommand(UpdateGraphSearchModeCommand, {
-			searchMode: e.detail.searchMode,
-			useNaturalLanguage: e.detail.useNaturalLanguage,
-		});
+		this._searchActions.setMode(e.detail.searchMode, e.detail.useNaturalLanguage);
 	}
 
 	handleMinimapToggled() {
@@ -934,12 +1126,22 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	@debounce(250)
 	private onRepositorySelectorClicked(e: CustomEvent<RepoButtonGroupClickEvent>) {
 		switch (e.detail.part) {
-			case 'label':
-				this._ipc.sendCommand(ChooseRepositoryCommand);
+			case 'label': {
+				const services = this._services;
+				if (services == null) break;
+
+				// Wait for a pending click focus grant to land before opening the quick pick —
+				// opening it mid-grant races the webview regaining focus after the picker shows,
+				// which dismisses it (see `waitForFocusSettled`).
+				void (async () => {
+					await waitForFocusSettled();
+					notifyService(services.pickers, 'pickers/chooseRepository', svc => svc.chooseRepository());
+				})();
 				break;
+			}
 
 			case 'icon':
-				emitTelemetrySentEvent<'graph/action/openRepoOnRemote'>(e.target!, {
+				emitTelemetrySentEvent(e.target!, {
 					name: 'graph/action/openRepoOnRemote',
 					data: {},
 				});
@@ -961,26 +1163,90 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 	@query('gl-graph-scope-popover')
 	private readonly scopePopoverEl!: GlGraphScopePopover | null;
 
+	@query('.split-toolbar__popover')
+	private readonly detailsPlacementPopoverEl!: GlPopover | null;
+
 	override render() {
 		const repo = this.graphState.repositories?.find(repo => repo.id === this.graphState.selectedRepository);
 
+		// The tint encodes the TWO-MODE state: scoped + focused tints the WHOLE titlebar; scoped WITHOUT a
+		// focus tints only the top (identity) row, so unfocusing visibly releases the search row; a plain
+		// focus tints the search row only (`rowClass` in `renderTitlebarSearchRow`).
+		const titlebarClass = this.isWorktreeScoped
+			? this.graphState.scope != null
+				? 'titlebar--worktree-scoped'
+				: 'titlebar--worktree-scoped-only'
+			: '';
+
 		return cache(
-			html`<header class="titlebar graph-app__header">
+			html`<header class="titlebar graph-app__header ${titlebarClass}">
 				<progress-indicator min-visible="300" ?active="${this.graphState.isBusy}"></progress-indicator>
 				<div class="titlebar__row titlebar__row--promo">
 					<gl-graph-header-promo></gl-graph-header-promo>
 				</div>
 				${this.renderTitlebarHeaderRow(repo)} ${this.renderTitlebarSearchRow(repo)}
+				<div class="sr-only" aria-live="polite">${this._scopeAnnouncement}</div>
 			</header>`,
 		);
 	}
 
 	private renderTitlebarHeaderRow(repo: RepositoryShape | undefined) {
-		const hasMultipleRepositories = (this.graphState.repositories?.length ?? 0) > 1;
+		// Count the repositories the user actually has OPEN, which is exactly what the picker lists —
+		// worktrees opened as workspace folders are genuine switch targets and count; only the
+		// bound-but-closed entry a rebind injects doesn't. The button group always renders: with a single
+		// entry it collapses to the provider icon on its own (`hideLabel` in `repo-button-group.ts`).
+		const hasMultipleRepositories = countOpenRepositories(this.graphState.repositories) > 1;
 
-		const { allowed, branch, branchState, config, lastFetched, loading } = this.graphState;
+		const { allowed, branch, branchState, config, lastFetched, loading, worktreePerspective } = this.graphState;
 		// Names what a plain jump-to-ref click will do, so the label can't drift from the behavior.
-		const focusLabel = this.isScopedToCurrentBranch ? 'Unfocus Current Branch' : 'Focus on Current Branch';
+		const focusLabel = this.isScopedToCurrentBranch
+			? l10n.t('Unfocus Current Branch')
+			: l10n.t('Focus on Current Branch');
+
+		// Optimistic pill label: while a perspective is set but its rebind push hasn't landed, show the
+		// perspective's OWN branch name — `branch` is still the OLD binding's until the push confirms the
+		// new one. Reduces to plain `branch` the instant the shapes match.
+		const pillBranch =
+			worktreePerspective?.branchName != null && branch != null && repo?.path !== worktreePerspective.path
+				? { ...branch, name: worktreePerspective.branchName }
+				: branch;
+
+		// The scoped worktree's display name + path, surfaced in both the pill's tooltip and its accessible
+		// name so the worktree identity isn't carried by color alone. `worktreePerspective`, not `repo`, is
+		// the source: it's set synchronously by the gesture, ahead of the rebind push that moves `repo`.
+		const worktreeScopedName =
+			this.isWorktreeScoped && worktreePerspective != null
+				? this.worktreeDisplayName(worktreePerspective.path)
+				: undefined;
+		// The accessible name REPLACES the one the slotted `<gl-ref-name>` would otherwise give this
+		// button, so the branch — the single most informative part, and the only part that matters in the
+		// unscoped case — has to be folded in rather than swapped out for the scope state.
+		const pillBranchLabel =
+			pillBranch?.name != null
+				? worktreeScopedName != null
+					? l10n.t('Switch Branch in Worktree — {0}', pillBranch.name)
+					: l10n.t('Switch Branch — {0}', pillBranch.name)
+				: worktreeScopedName != null
+					? l10n.t('Switch Branch in Worktree...')
+					: l10n.t('Switch Branch...');
+		const pillAriaLabel =
+			worktreeScopedName != null
+				? l10n.t('{0}, scoped to worktree {1}', pillBranchLabel, worktreeScopedName)
+				: pillBranchLabel;
+
+		// The window's HOME worktree name, for the unscope tooltip's "returns to X" line. Falls back to a
+		// nameless phrasing when `homeRepositoryPath` hasn't arrived yet (it's optional on `State`).
+		const homeName =
+			this.graphState.homeRepositoryPath != null
+				? this.worktreeDisplayName(this.graphState.homeRepositoryPath)
+				: undefined;
+
+		// While the optimistic pill hasn't converged, the PR chip, ahead/behind and worktree adornments
+		// would describe the PREVIOUS branch under the NEW name — suppress them rather than show stale
+		// state. Converges the instant `repo` catches up.
+		const pillConverged = worktreePerspective == null || repo?.path === worktreePerspective.path;
+		const pillPr = pillConverged ? branchState?.pr : undefined;
+		const pillWorktree = pillConverged ? branchState?.worktree : false;
 
 		return html`<div class="titlebar__row titlebar__row--wrap">
 			<div class="titlebar__group">
@@ -991,7 +1257,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 					.source=${{ source: 'graph' } as const}
 					@gl-click=${this.onRepositorySelectorClicked}
 					><span slot="tooltip">
-						Switch to Another Repository...
+						${l10n.t('Switch to Another Repository...')}
 						<hr />
 						${repo?.name}
 					</span></gl-repo-button-group
@@ -999,7 +1265,8 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				${when(
 					allowed && repo,
 					() => html`
-						<span><code-icon icon="chevron-right"></code-icon></span>${when(branchState?.pr, pr => {
+						<span><code-icon icon="chevron-right"></code-icon></span>
+						${when(pillPr, pr => {
 							const prNumber = getPullRequestNumberFromUrl(pr.url) ?? pr.id;
 							return html`
 								<gl-popover placement="bottom">
@@ -1036,22 +1303,86 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 								</gl-popover>
 							`;
 						})}
-						<gl-ref-button
-							href=${this._webview.createCommandLink('gitlens.switchToAnotherBranch:')}
-							icon
-							.ref=${branch}
-							?worktree=${branchState?.worktree}
+						<div
+							class="ref-button-group ${this.isWorktreeScoped ? 'ref-button-group--worktree-scoped' : ''}"
 						>
-							<div slot="tooltip">
-								Switch Branch...
-								<hr />
-								<gl-branch-name .name=${branch?.name}></gl-branch-name>${
-									branchState?.worktree ? html`<i> (in a worktree)</i> ` : ''
-								}
-							</div>
-						</gl-ref-button>
+							<gl-ref-button
+								class="ref-button-group__ref"
+								href=${this._webview.createCommandLink('gitlens.switchToAnotherBranch:')}
+								icon
+								.ref=${pillBranch}
+								?worktree=${pillWorktree}
+								aria-label=${pillAriaLabel}
+							>
+								<div slot="tooltip">
+									${
+										worktreeScopedName != null
+											? html`<div class="scope-banner">
+														<code-icon icon="gl-scope"></code-icon>
+														<span class="scope-banner__text">
+															<span class="scope-banner__label"
+																>${l10n.t('Scoped to Worktree')}</span
+															>
+															<span class="scope-banner__name"
+																>${worktreeScopedName}</span
+															>
+														</span>
+													</div>
+													${l10n.t('Switch Branch in Worktree...')}
+													<hr />
+													<gl-branch-name .name=${pillBranch?.name}></gl-branch-name>${
+														worktreePerspective != null
+															? html`<div class="scope-path">
+																	<code-icon icon="folder"></code-icon>
+																	<span>${worktreePerspective.path}</span>
+																</div>`
+															: ''
+													}`
+											: html`${l10n.t('Switch Branch...')}
+													<hr />
+													<gl-branch-name .name=${pillBranch?.name}></gl-branch-name>${
+														pillWorktree ? html`<i> (${l10n.t('in a worktree')})</i> ` : ''
+													}`
+									}
+								</div>
+							</gl-ref-button>
+							${when(
+								this.isWorktreeScoped,
+								() => html`
+									<gl-tooltip class="ref-button-group__clear-tooltip" placement="bottom">
+										<button
+											type="button"
+											class="ref-button-group__clear"
+											aria-label=${l10n.t('Unscope Worktree')}
+											@click=${this.handleUnscopeWorktree}
+										>
+											<code-icon icon="gl-unscope"></code-icon>
+										</button>
+										<div slot="content">
+											${l10n.t('Unscope Worktree')}
+											<hr />
+											${
+												homeName != null
+													? localizedContent(l10n.t('Returns to {home} {activeWorktree}'), {
+															home: html`<strong>${homeName}</strong>`,
+															activeWorktree: html`<i>${l10n.t('(active worktree)')}</i>`,
+														})
+													: l10n.t('Returns to your active worktree')
+											}
+										</div>
+									</gl-tooltip>
+								`,
+							)}
+						</div>
+						<gl-graph-coachmark
+							mark="worktreeScoped"
+							placement="bottom-start"
+							.anchor=${() => this.renderRoot.querySelector<HTMLElement>('.ref-button-group') ?? undefined}
+							.bodyContext=${{ worktreeName: worktreeScopedName }}
+							?auto-show=${this.graphReady && worktreeScopedName != null && pillConverged}
+						></gl-graph-coachmark>
 						<gl-button
-							class="jump-to-ref"
+							class="jump-to-ref ${this.isScopedToCurrentBranch ? 'jump-to-ref--active' : ''}"
 							appearance="toolbar"
 							aria-label=${focusLabel}
 							@click=${this.handleJumpToRef}
@@ -1060,8 +1391,8 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 							<span slot="tooltip">
 								${
 									this._modifiers.altKey
-										? html`Focus on a Branch...`
-										: html`${focusLabel}<br />[${getAltKeySymbol()}] Focus on a Branch...`
+										? html`${l10n.t('Focus on a Branch...')}`
+										: html`${focusLabel}<br />${l10n.t('[{0}] Focus on a Branch...', getAltKeySymbol())}`
 								}
 							</span>
 						</gl-button>
@@ -1074,7 +1405,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 					() => html`
 						<gl-git-actions-buttons
 							.branchName=${branch?.name}
-							.branchState=${branchState}
+							.branchState=${pillConverged ? branchState : undefined}
 							.lastFetched=${lastFetched}
 							.wipState=${this.primaryWipState}
 							.state=${this.graphState}
@@ -1106,19 +1437,21 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 			.distance=${0}
 		>
 			<gl-tooltip slot="anchor" placement="bottom">
-				<button type="button" class="action-button" aria-haspopup="true" aria-label="Start New">
+				<button type="button" class="action-button" aria-haspopup="true" aria-label=${l10n.t('Start New')}>
 					<code-icon icon="gl-start-new"></code-icon>
 					<code-icon class="action-button__more" icon="chevron-down" aria-hidden="true"></code-icon>
 				</button>
-				<span slot="content">Start New</span>
+				<span slot="content">${l10n.t('Start New')}</span>
 			</gl-tooltip>
 			<div slot="content">
 				<menu-item href=${createCommandLink('gitlens.startWork', { source: 'graph-header' })}>
-					<span class="action-menu__item"><code-icon icon="issues"></code-icon>Start Work on an Issue…</span>
+					<span class="action-menu__item"
+						><code-icon icon="issues"></code-icon>${l10n.t('Start Work on an Issue…')}</span
+					>
 				</menu-item>
 				<menu-item href=${createCommandLink('gitlens.startReview', { source: { source: 'graph-header' } })}>
 					<span class="action-menu__item"
-						><code-icon icon="git-pull-request"></code-icon>Start Review on a PR…</span
+						><code-icon icon="git-pull-request"></code-icon>${l10n.t('Start Review on a PR…')}</span
 					>
 				</menu-item>
 				<menu-divider></menu-divider>
@@ -1129,16 +1462,22 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 						state: { subcommand: 'create', reference: branch },
 					})}
 				>
-					<span class="action-menu__item"><code-icon icon="git-branch"></code-icon>Create Branch…</span>
+					<span class="action-menu__item"
+						><code-icon icon="git-branch"></code-icon>${l10n.t('Create Branch…')}</span
+					>
 				</menu-item>
 				<menu-item href=${createCommandLink('gitlens.views.createWorktree')}>
-					<span class="action-menu__item"><code-icon icon="gl-worktree"></code-icon>Create Worktree…</span>
+					<span class="action-menu__item"
+						><code-icon icon="gl-worktree"></code-icon>${l10n.t('Create Worktree…')}</span
+					>
 				</menu-item>
 				<menu-divider></menu-divider>
 				<menu-item
 					href=${createCommandLink('gitlens.stashesApply', { repoPath: this.graphState.selectedRepository })}
 				>
-					<span class="action-menu__item"><code-icon icon="gl-stash-pop"></code-icon>Apply / Pop Stash…</span>
+					<span class="action-menu__item"
+						><code-icon icon="gl-stash-pop"></code-icon>${l10n.t('Apply / Pop Stash…')}</span
+					>
 				</menu-item>
 			</div>
 		</gl-popover>`;
@@ -1148,7 +1487,10 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		if (!hasTruthyKeys(excludeRefs)) return nothing;
 
 		const refs = this.excludeRefs;
-		const countLabel = `${refs.length} hidden ${refs.length === 1 ? 'branch or tag' : 'branches and tags'}`;
+		const countLabel = formatPlural(
+			l10n.t('{0, plural, one{{0} hidden branch or tag} other{{0} hidden branches and tags}}'),
+			[refs.length],
+		);
 
 		return html`<gl-popover
 			appearance="menu"
@@ -1166,7 +1508,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 				<span slot="content">${countLabel}</span>
 			</gl-tooltip>
 			<div slot="content">
-				<menu-label>Hidden Branches / Tags</menu-label>
+				<menu-label>${l10n.t('Hidden Branches / Tags')}</menu-label>
 				${repeat(
 					refs,
 					ref => ref.id,
@@ -1178,7 +1520,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 						this.handleOnToggleRefsVisibilityClick(event, refs, true);
 					}}
 				>
-					Show All
+					${l10n.t('Show All')}
 				</menu-item>
 			</div>
 		</gl-popover>`;
@@ -1210,6 +1552,8 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 			config,
 			excludeRefs,
 			searching,
+			searchFallback,
+			searchRelaxations,
 			searchMode,
 			searchResults,
 			searchResultsError,
@@ -1220,13 +1564,18 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 		const filtered = isGraphFiltered(this.graphState);
 		const rowClass = scoped ? 'titlebar__row--scoped' : filtered ? 'titlebar__row--filtered' : '';
 
+		// Mid-typing an incomplete regex (e.g. `fix(`) silently matches literally instead of erroring — the
+		// toggle stays checked but dims, and only once the search has fully settled (not still streaming
+		// in) with zero matches do we offer the "Match literally" escape hatch.
+		const fallbackActive = searchFallback != null;
+		const settledWithNoResults = !searching && (searchResults?.count ?? 0) === 0;
+		const showFallbackHelper = fallbackActive && settledWithNoResults;
+		const showRelaxationsHelper = settledWithNoResults && (searchRelaxations?.length ?? 0) > 0;
+
 		// Search applies to the graph rows; any alternate display mode (visualizations, kanban)
 		// hides the graph body and shouldn't accept search input — typing would silently scroll
 		// a graph the user can't see and Prev/Next on results would jump the invisible viewport.
-		// Use the EFFECTIVE mode so a persisted `'kanban'` state that's been gated off (experimental
-		// flag toggled off after the user entered kanban) reads as `'graph'` here and the search
-		// box re-enables for the now-visible graph body.
-		const displayMode = getEffectiveDisplayMode(this.graphState);
+		const displayMode = this.graphState.displayMode ?? 'graph';
 		const isAlternateMode = displayMode !== 'graph';
 		return html`
 			<div class="titlebar__row titlebar__row--search ${rowClass}">
@@ -1239,6 +1588,16 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 						aria-disabled=${isAlternateMode ? 'true' : 'false'}
 						?aiAllowed=${this.aiAllowed}
 						errorMessage=${searchResultsError?.error ?? ''}
+						?errorCalm=${
+							searchResultsError?.reason === 'invalidRef' ||
+							searchResultsError?.reason === 'aiUnavailable'
+						}
+						?fallbackActive=${fallbackActive}
+						fallbackDetail=${searchFallback?.detail ?? ''}
+						?showFallbackHelper=${showFallbackHelper}
+						.relaxations=${searchRelaxations ?? []}
+						?showRelaxationsHelper=${showRelaxationsHelper}
+						?showSearchAsTextHelper=${searchResultsError?.reason === 'aiUnavailable'}
 						?filter=${searchMode === 'filter'}
 						?naturalLanguage=${Boolean(useNaturalLanguageSearch)}
 						.navigating=${this.graphState.navigating}
@@ -1267,7 +1626,7 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 							</span>
 						`,
 					)}
-					<action-nav class="button-group" role="toolbar" aria-label="Graph layout">
+					<action-nav class="button-group" role="toolbar" aria-label=${l10n.t('Graph layout')}>
 						${when(
 							config?.sidebar,
 							() => html`
@@ -1276,14 +1635,14 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 									tooltip=${
 										(this.graphState.sidebar?.visible ?? false) &&
 										this.graphState.sidebar?.activePanel != null
-											? 'Hide Side Bar'
-											: 'Show Side Bar'
+											? l10n.t('Hide Side Bar')
+											: l10n.t('Show Side Bar')
 									}
 									aria-label=${
 										(this.graphState.sidebar?.visible ?? false) &&
 										this.graphState.sidebar?.activePanel != null
-											? 'Hide Side Bar'
-											: 'Show Side Bar'
+											? l10n.t('Hide Side Bar')
+											: l10n.t('Show Side Bar')
 									}
 									@click=${this.handleSidebarToggled}
 								>
@@ -1303,8 +1662,8 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 							() => html`
 								<gl-button
 									appearance="toolbar"
-									tooltip=${this.minimapVisible ? 'Hide Minimap' : 'Show Minimap'}
-									aria-label=${this.minimapVisible ? 'Hide Minimap' : 'Show Minimap'}
+									tooltip=${this.minimapVisible ? l10n.t('Hide Minimap') : l10n.t('Show Minimap')}
+									aria-label=${this.minimapVisible ? l10n.t('Hide Minimap') : l10n.t('Show Minimap')}
 									@click=${() => this.handleMinimapToggled()}
 								>
 									<code-icon
@@ -1314,41 +1673,150 @@ export class GlGraphHeader extends SignalWatcher(LitElement) {
 								</gl-button>
 							`,
 						)}
-						${(() => {
-							// Source the side from the resolved effective location (handles `auto`); Alt+Click
-							// pins to the opposite side, so the alt preview/label use that opposite.
-							const currentLocation = this.detailsEffectiveLocation;
-							const altLocation = currentLocation === 'bottom' ? 'right' : 'bottom';
-							const previewLocation = this._modifiers.altKey ? altLocation : currentLocation;
-							const isBottom = previewLocation === 'bottom';
-							const baseLabel = this.detailsVisible ? 'Hide Details Panel' : 'Show Details Panel';
-							const altLabel = `Show Details Panel on ${altLocation === 'bottom' ? 'Bottom' : 'Right'}`;
-							const tooltip = this._modifiers.altKey
-								? altLabel
-								: `${baseLabel}\n[${getAltKeySymbol()}] ${altLabel}`;
-							return html`<gl-button
-								appearance="toolbar"
-								tooltip=${tooltip}
-								aria-label=${baseLabel}
-								@click=${this.handleToggleDetails}
-							>
-								<code-icon
-									icon=${
-										isBottom
-											? this.detailsVisible || this._modifiers.altKey
-												? 'layout-panel'
-												: 'layout-panel-off'
-											: this.detailsVisible || this._modifiers.altKey
-												? 'layout-sidebar-right'
-												: 'layout-sidebar-right-off'
-									}
-								></code-icon>
-							</gl-button>`;
-						})()}
+						${this.renderDetailsToggle()}
 					</action-nav>
 				</div>
 			</div>
 		`;
+	}
+
+	/** The details toggle as a split control: the main half toggles show/hide (and, per Alt+Click,
+	 *  pins the panel to the opposite side) and never writes configuration; the chevron half opens a
+	 *  popover of placement thumbnails that persist a pick. */
+	private renderDetailsToggle() {
+		// Source the side from the resolved effective location (handles `auto`); Alt+Click
+		// pins to the opposite side, so the alt preview/label use that opposite.
+		const currentLocation = this.detailsEffectiveLocation;
+		const altLocation = currentLocation === 'bottom' ? 'right' : 'bottom';
+		const previewLocation = this._modifiers.altKey ? altLocation : currentLocation;
+		const isBottom = previewLocation === 'bottom';
+		const baseLabel = this.detailsVisible ? l10n.t('Hide Details Panel') : l10n.t('Show Details Panel');
+		const altLabel =
+			altLocation === 'bottom' ? l10n.t('Show Details Panel on Bottom') : l10n.t('Show Details Panel on Right');
+		const tooltip = this._modifiers.altKey
+			? altLabel
+			: l10n.t('{0}\n[{1}] {2}', baseLabel, getAltKeySymbol(), altLabel);
+
+		return html`<span class="split-toolbar">
+			<gl-button
+				class="split-toolbar__main"
+				appearance="toolbar"
+				tooltip=${tooltip}
+				aria-label=${baseLabel}
+				@click=${this.handleToggleDetails}
+			>
+				<code-icon
+					icon=${
+						isBottom
+							? this.detailsVisible || this._modifiers.altKey
+								? 'layout-panel'
+								: 'layout-panel-off'
+							: this.detailsVisible || this._modifiers.altKey
+								? 'layout-sidebar-right'
+								: 'layout-sidebar-right-off'
+					}
+				></code-icon>
+			</gl-button>
+			<gl-popover
+				class="split-toolbar__popover"
+				placement="bottom-end"
+				trigger="click focus"
+				?arrow=${false}
+				.distance=${0}
+			>
+				<gl-button
+					slot="anchor"
+					class="split-toolbar__chevron"
+					appearance="toolbar"
+					aria-label=${l10n.t('Details Panel Placement')}
+					aria-haspopup="menu"
+				>
+					<code-icon icon="chevron-down"></code-icon>
+				</gl-button>
+				<div
+					slot="content"
+					class="details-placement"
+					role="menu"
+					aria-label=${l10n.t('Details Panel Placement')}
+				>
+					${this.renderDetailsPlacementOption('auto')} ${this.renderDetailsPlacementOption('right')}
+					${this.renderDetailsPlacementOption('bottom')}
+				</div>
+			</gl-popover>
+		</span>`;
+	}
+
+	private renderDetailsPlacementOption(location: 'auto' | 'right' | 'bottom') {
+		const checked = this.detailsLocation === location;
+		const label = location === 'auto' ? l10n.t('Auto') : location === 'right' ? l10n.t('Right') : l10n.t('Bottom');
+		const description =
+			location === 'auto'
+				? this.detailsAutoLocation === 'right'
+					? l10n.t("Picks a side to fit the window's shape — currently right")
+					: l10n.t("Picks a side to fit the window's shape — currently bottom")
+				: location === 'right'
+					? l10n.t('Always docked to the right')
+					: l10n.t('Always docked at the bottom');
+
+		return html`<gl-tooltip placement="bottom">
+			<button
+				type="button"
+				class="details-placement__option"
+				role="menuitemradio"
+				aria-checked=${checked}
+				aria-label=${label}
+				@click=${() => this.handleSelectDetailsLocation(location)}
+			>
+				${this.renderDetailsPlacementThumbnail(location)}
+				<span>${label}</span>
+			</button>
+			<span slot="content">${description}</span>
+		</gl-tooltip>`;
+	}
+
+	private renderDetailsPlacementThumbnail(location: 'auto' | 'right' | 'bottom') {
+		const panelSide = location === 'auto' ? this.detailsAutoLocation : location;
+		const panelOpacity = location === 'auto' ? 0.45 : 1;
+		const panelD =
+			panelSide === 'right'
+				? 'M33 2 h16 a2 2 0 0 1 2 2 v28 a2 2 0 0 1 -2 2 h-16 z'
+				: 'M2 21 h48 v11 a2 2 0 0 1 -2 2 h-44 a2 2 0 0 1 -2 -2 z';
+
+		return svg`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 52 36" aria-hidden="true">
+			<rect
+				x="1"
+				y="1"
+				width="50"
+				height="34"
+				rx="3"
+				stroke="var(--vscode-descriptionForeground)"
+				stroke-width="1.4"
+				fill="none"
+			></rect>
+			<path d=${panelD} fill="color-mix(in srgb, var(--vscode-focusBorder) 55%, transparent)" opacity=${panelOpacity}></path>
+			${
+				location === 'auto'
+					? svg`<text
+						x=${panelSide === 'right' ? 20 : 26}
+						y=${panelSide === 'right' ? 22 : 15}
+						text-anchor="middle"
+						font-size="13"
+						fill="currentColor"
+					>A</text>`
+					: nothing
+			}
+		</svg>`;
+	}
+
+	private handleSelectDetailsLocation(location: 'auto' | 'right' | 'bottom') {
+		this.dispatchEvent(
+			new CustomEvent('select-details-location', {
+				detail: { location: location },
+				bubbles: true,
+				composed: true,
+			}),
+		);
+		void this.detailsPlacementPopoverEl?.hide();
 	}
 
 	/** The leading glyph on a hidden-ref row. Decorative: the row's own text names the ref, so an alt/label

@@ -11,8 +11,8 @@ import {
 	getSupportedWorkspacesStorageProvider,
 	setTelemetryService,
 } from '@env/providers.js';
-import type { IntegrationManager } from '@gitlens/integrations/index.js';
-import { createIntegrationManager } from '@gitlens/integrations/index.js';
+import { createIntegrationService } from '@gitlens/integrations/integrationService.js';
+import type { IntegrationService } from '@gitlens/integrations/integrationService.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { memoize } from '@gitlens/utils/decorators/memoize.js';
 import { Logger } from '@gitlens/utils/logger.js';
@@ -47,6 +47,7 @@ import { AIProviderService } from './plus/ai/aiProviderService.js';
 import { AutoRebaseService } from './plus/coretools/conflict/autoRebaseService.js';
 import { DraftService } from './plus/drafts/draftsService.js';
 import { AccountAuthenticationProvider } from './plus/gk/authenticationProvider.js';
+import { FeedbackService } from './plus/gk/feedbackService.js';
 import { OrganizationService } from './plus/gk/organizationService.js';
 import { ProductConfigProvider } from './plus/gk/productConfigProvider.js';
 import { ServerConnection } from './plus/gk/serverConnection.js';
@@ -68,6 +69,7 @@ import { configuration } from './system/-webview/configuration.js';
 import { getContext, onDidChangeContext, setContext } from './system/-webview/context.js';
 import { Keyboard } from './system/-webview/keyboard.js';
 import type { Storage } from './system/-webview/storage.js';
+import { ResourceUsageRegistry } from './system/resourceUsage.js';
 import { AIFeedbackProvider } from './telemetry/aiFeedbackProvider.js';
 import { TelemetryService } from './telemetry/telemetry.js';
 import { GitTerminalLinkProvider } from './terminal/linkProvider.js';
@@ -91,6 +93,8 @@ import { RebaseEditorProvider } from './webviews/rebase/rebaseEditor.js';
 import { registerSettingsWebviewCommands, registerSettingsWebviewPanel } from './webviews/settings/registration.js';
 import { WebviewCommandRegistrar } from './webviews/webviewCommandRegistrar.js';
 import { WebviewsController } from './webviews/webviewsController.js';
+import { registerWelcomeWebviewPanel } from './webviews/welcome/registration.js';
+import { WorktreeTaskService } from './worktrees/worktreeTaskService.js';
 
 export type Environment = 'dev' | 'staging' | 'production';
 
@@ -99,8 +103,7 @@ export class Container {
 	static #proxy = new Proxy<Container>({} as Container, {
 		get: function (_target, prop) {
 			// In case anyone has cached this instance
-			// oxlint-disable-next-line typescript/no-unsafe-return
-			if (Container.#instance != null) return (Container.#instance as any)[prop];
+			if (Container.#instance != null) return Container.#instance[prop as keyof Container];
 
 			// Allow access to config before we are initialized
 			if (prop === 'config') return configuration.getAll();
@@ -199,6 +202,12 @@ export class Container {
 		return (this._agentService ??= new AgentService());
 	}
 
+	private _worktreeTaskService: WorktreeTaskService | undefined;
+
+	get worktreeTasks(): WorktreeTaskService {
+		return (this._worktreeTaskService ??= new WorktreeTaskService());
+	}
+
 	private readonly _gkCliService: GkCliService | undefined;
 
 	/** The GitKraken CLI service — owns binary install/update/version, IPC publish, authentication.
@@ -246,6 +255,7 @@ export class Container {
 		this._disposables = [
 			configuration,
 			(this._storage = storage),
+			(this._resourceUsage = new ResourceUsageRegistry()),
 			(this._onboarding = new OnboardingService(storage, version)),
 			(this._telemetry = new TelemetryService(this)),
 			(this._usage = new UsageTracker(this, storage)),
@@ -266,7 +276,10 @@ export class Container {
 
 		this._disposables.push((this._eventBus = new EventBus()));
 		this._disposables.push((this._ipc = new IpcService(this)));
-		this._disposables.push((this._git = new GitProviderService(this)));
+		this._disposables.push(
+			(this._git = new GitProviderService(this)),
+			this._resourceUsage.register('git', () => this._git.getResourceUsage()),
+		);
 		this._disposables.push(new GitFileSystemProvider(this));
 		this._disposables.push((this._virtualFs = new VirtualFileSystemService(this)));
 
@@ -274,8 +287,14 @@ export class Container {
 
 		this._disposables.push((this._actionRunners = new ActionRunners(this)));
 		this._disposables.push(registerPublishListener(this));
-		this._disposables.push((this._documentTracker = new GitDocumentTracker(this)));
-		this._disposables.push((this._lineTracker = new LineTracker(this, this._documentTracker)));
+		this._disposables.push(
+			(this._documentTracker = new GitDocumentTracker(this)),
+			this._resourceUsage.register('documentTracker', () => this._documentTracker.getResourceUsage()),
+		);
+		this._disposables.push(
+			(this._lineTracker = new LineTracker(this, this._documentTracker)),
+			this._resourceUsage.register('lineTracker', () => this._lineTracker.getResourceUsage()),
+		);
 		this._disposables.push((this._keyboard = new Keyboard()));
 		this._disposables.push((this._vsls = new VslsController(this)));
 		this._disposables.push((this._launchpadProvider = new LaunchpadProvider(this)));
@@ -309,6 +328,8 @@ export class Container {
 		const settingsPanels = registerSettingsWebviewPanel(webviews);
 		this._disposables.push(settingsPanels);
 		this._disposables.push(registerSettingsWebviewCommands(settingsPanels));
+
+		this._disposables.push(registerWelcomeWebviewPanel(webviews));
 
 		this._disposables.push(registerAllowedSignersWebviewPanel(webviews));
 
@@ -481,7 +502,11 @@ export class Container {
 	private _autolinks: AutolinksProvider | undefined;
 	get autolinks(): AutolinksProvider {
 		if (this._autolinks == null) {
-			this._disposables.push((this._autolinks = new AutolinksProvider(this)));
+			const autolinks = (this._autolinks = new AutolinksProvider(this));
+			this._disposables.push(
+				autolinks,
+				this._resourceUsage.register('autolinks', () => autolinks.getResourceUsage()),
+			);
 		}
 
 		return this._autolinks;
@@ -490,7 +515,11 @@ export class Container {
 	private _cache: CacheProvider | undefined;
 	get cache(): CacheProvider {
 		if (this._cache == null) {
-			this._disposables.push((this._cache = new CacheProvider(this)));
+			const cache = (this._cache = new CacheProvider(this));
+			this._disposables.push(
+				cache,
+				this._resourceUsage.register('cache', () => cache.getResourceUsage()),
+			);
 		}
 
 		return this._cache;
@@ -561,6 +590,15 @@ export class Container {
 		return this._enrichments;
 	}
 
+	private _feedback: FeedbackService | undefined;
+	get feedback(): FeedbackService {
+		if (this._feedback == null) {
+			this._disposables.push((this._feedback = new FeedbackService(this, this._connection)));
+		}
+
+		return this._feedback;
+	}
+
 	@memoize()
 	get env(): Environment {
 		if (this.prereleaseOrDebugging) {
@@ -629,10 +667,10 @@ export class Container {
 		return this._integrationContext;
 	}
 
-	private _integrations: IntegrationManager | undefined;
-	get integrations(): IntegrationManager {
+	private _integrations: IntegrationService | undefined;
+	get integrations(): IntegrationService {
 		if (this._integrations == null) {
-			this._disposables.push((this._integrations = createIntegrationManager(this.integrationContext)));
+			this._disposables.push((this._integrations = createIntegrationService(this.integrationContext)));
 		}
 		return this._integrations;
 	}
@@ -655,6 +693,11 @@ export class Container {
 	private readonly _lineTracker: LineTracker;
 	get lineTracker(): LineTracker {
 		return this._lineTracker;
+	}
+
+	private readonly _resourceUsage: ResourceUsageRegistry;
+	get resourceUsage(): ResourceUsageRegistry {
+		return this._resourceUsage;
 	}
 
 	private _mode: Mode | undefined;
@@ -746,7 +789,11 @@ export class Container {
 	private _gitHealth: GitHealthService | undefined;
 	get gitHealth(): GitHealthService {
 		if (this._gitHealth == null) {
-			this._disposables.push((this._gitHealth = new GitHealthService(this)));
+			const gitHealth = (this._gitHealth = new GitHealthService(this));
+			this._disposables.push(
+				gitHealth,
+				this._resourceUsage.register('gitHealth', () => gitHealth.getResourceUsage()),
+			);
 		}
 		return this._gitHealth;
 	}

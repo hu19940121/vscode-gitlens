@@ -1,7 +1,8 @@
+import type { Remote, Subscription } from '@eamodio/supertalk';
 import './timeline.scss';
-import type { Remote } from '@eamodio/supertalk';
+import * as l10n from '@vscode/l10n';
 import { html, nothing } from 'lit';
-import { customElement, property, query } from 'lit/decorators.js';
+import { customElement, query } from 'lit/decorators.js';
 import { isSubscriptionPaid } from '../../../../plus/gk/utils/subscription.utils.js';
 import type {
 	TimelineDatasetResult,
@@ -29,7 +30,7 @@ import { timelineBaseStyles, timelineStyles } from './timeline.css.js';
 import './components/chart.js';
 import './components/header.js';
 import '../../shared/components/button.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../shared/components/feature-badge.js';
 import '../../shared/components/feature-gate.js';
 import '../../shared/components/file-icon/file-icon.js';
@@ -47,9 +48,6 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		compactBreadcrumbsConsumerStyles,
 	];
 
-	@property({ type: String, noAccessor: true })
-	private context!: string;
-
 	@query('#chart')
 	private _chart?: GlTimelineChart;
 
@@ -62,12 +60,16 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 
 	private _actions?: TimelineActions;
 	private _datasetResource?: Resource<TimelineDatasetResult | undefined>;
-	private _unsubscribeEvents?: () => void;
+	/**
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
+	 */
+	private _eventsSubscription?: Subscription;
 	private _stopAutoPersist?: () => void;
 	private _chartDataset?: TimelineDatasetResult['dataset'];
 	private _chartDataPromise?: Promise<TimelineDatasetResult['dataset']>;
 
-	private _rpc = new RpcController<TimelineServices>(this, {
+	protected override readonly _rpc = new RpcController<TimelineServices>(this, {
 		rpcOptions: {
 			webviewId: () => this._webview?.webviewId,
 			webviewInstanceId: () => this._webview?.webviewInstanceId,
@@ -80,14 +82,16 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
-		this.context = undefined!;
-		this.initWebviewContext(context);
+		this.consumeContext();
 	}
 
 	override disconnectedCallback(): void {
-		this._unsubscribeEvents?.();
-		this._unsubscribeEvents = undefined;
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 
 		this._stopAutoPersist?.();
 		this._stopAutoPersist = undefined;
@@ -100,8 +104,10 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		this._actions?.dispose();
 		this._actions = undefined;
 
+		// `resetAll()` only — `dispose()` is permanent teardown (it clears the signal
+		// registrations), and this element can reconnect during startup churn; a disposed state
+		// group would make the next session's `startAutoPersist()` watch nothing.
 		this._state.resetAll();
-		this._state.dispose();
 
 		super.disconnectedCallback?.();
 	}
@@ -110,13 +116,10 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		const s = this._state;
 
 		// Resolve the timeline sub-service and domain sub-services
-		const [timeline, repositories, repository, subscription, config] = await Promise.all([
-			services.timeline,
-			services.repositories,
-			services.repository,
-			services.subscription,
-			services.config,
-		]);
+		const [timeline, repository] = await Promise.all([services.timeline, services.repository]);
+
+		// Subscription changes invalidate the promo cache.
+		this._promos.connect(this._rpc.connection!);
 
 		// Create dataset resource — fetcher reads current state signals via closure. `loadedSpanMs`
 		// is what powers progressive load-more: when the user zooms past the loaded oldest, the
@@ -154,10 +157,13 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 			onConfigChanged: () => void actions.fetchDisplayConfig(),
 			onRepoCountChanged: () => void actions.fetchRepoCount(),
 		};
-		this._unsubscribeEvents = await setupSubscriptions(
-			{ timeline: timeline, repositories: repositories, subscription: subscription, config: config },
-			subActions,
-		);
+		// Recreated per ready (not `??=`): the subscriber closes over this session's actions — see
+		// the equivalent note in commitDetails.ts.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = setupSubscriptions(this._rpc.connection!, subActions);
+		// Wait for the subscriptions to land before the initial fetch below, preserving the
+		// subscribe-before-fetch guarantee (`ready` settles once, so reconnects don't re-wait).
+		await this._eventsSubscription.ready;
 
 		// Cancel pending RPC requests on hide (responses would be silently dropped
 		// by VS Code); re-fetch data on visibility restore
@@ -237,8 +243,8 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 									slot="toolbox"
 									appearance="toolbar"
 									href="command:gitlens.views.timeline.openInTab"
-									tooltip="Open in Editor"
-									aria-label="Open in Editor"
+									tooltip=${l10n.t('Open in Editor')}
+									aria-label=${l10n.t('Open in Editor')}
 								>
 									<code-icon icon="link-external"></code-icon>
 								</gl-button>`
@@ -313,18 +319,18 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 						<div class="icon-cube feature__feature-icon"><code-icon icon="gl-gitlens"></code-icon></div>
 						<hgroup>
 							<h2 class="feature__title">
-								<span>Visual History</span>
+								<span>${l10n.t('Visual History')}</span>
 								<gl-feature-badge></gl-feature-badge>
 							</h2>
-							<p class="feature__lede">See how any file, folder, or branch evolved &mdash; at a glance</p>
+							<p class="feature__lede">
+								${l10n.t('See how any file, folder, or branch evolved — at a glance')}
+							</p>
 						</hgroup>
 					</header>
 					<p>
-						Visualize the evolution of a repository, branch, folder, or file and identify when the most
-						impactful changes were made and by whom. Quickly see unmerged changes in files or folders, when
-						slicing by branch.
+						${l10n.t('Visualize the evolution of a repository, branch, folder, or file and identify when the most impactful changes were made and by whom. Quickly see unmerged changes in files or folders, when slicing by branch.')}
 						<a href="https://help.gitkraken.com/gitlens/gitlens-features/#visual-file-history-pro"
-							>Learn More</a
+							>${l10n.t('Learn More')}</a
 						>
 					</p>
 				</section>
@@ -342,18 +348,18 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 					<div class="icon-cube feature__feature-icon"><code-icon icon="gl-gitlens"></code-icon></div>
 					<hgroup>
 						<h2 class="feature__title">
-							<span>Visual History</span>
+							<span>${l10n.t('Visual History')}</span>
 							<gl-feature-badge></gl-feature-badge>
 						</h2>
-						<p class="feature__lede">See how any file, folder, or branch evolved &mdash; at a glance</p>
+						<p class="feature__lede">
+							${l10n.t('See how any file, folder, or branch evolved — at a glance')}
+						</p>
 					</hgroup>
 				</header>
 				<p>
-					Visualize the evolution of a repository, branch, folder, or file and identify when the most
-					impactful changes were made and by whom. Quickly see unmerged changes in files or folders, when
-					slicing by branch.
+					${l10n.t('Visualize the evolution of a repository, branch, folder, or file and identify when the most impactful changes were made and by whom. Quickly see unmerged changes in files or folders, when slicing by branch.')}
 					<a href="https://help.gitkraken.com/gitlens/gitlens-features/#visual-file-history-pro"
-						>Learn More</a
+						>${l10n.t('Learn More')}</a
 					>
 				</p>
 			</section></gl-feature-gate
@@ -364,7 +370,7 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		const s = this._state;
 		if (!s.scope.get() && this.placement === 'view') {
 			return html`<div class="timeline__empty">
-				<p>There are no editors open that can provide file history information.</p>
+				<p>${l10n.t('There are no editors open that can provide file history information.')}</p>
 			</div>`;
 		}
 
@@ -374,9 +380,9 @@ export class GlTimelineApp extends SignalWatcherWebviewApp {
 		const emptySlot = html`<div slot="empty">
 			${
 				s.scope.get() == null
-					? html`<p>Something went wrong</p>
-							<p>Please close this tab and try again</p>`
-					: html`<p>No commits found for the specified time period</p>`
+					? html`<p>${l10n.t('Something went wrong')}</p>
+							<p>${l10n.t('Please close this tab and try again')}</p>`
+					: html`<p>${l10n.t('No commits found for the specified time period')}</p>`
 			}
 		</div>`;
 

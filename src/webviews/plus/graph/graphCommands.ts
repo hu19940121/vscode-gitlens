@@ -1,6 +1,7 @@
+import { createWipRowId } from '@gitkraken/commit-graph/wip/identity.js';
 import type { MessageItem, TextDocumentShowOptions, ViewColumn } from 'vscode';
-import { env, ProgressLocation, Uri, window } from 'vscode';
-import { getSquashSequenceEditor } from '@env/git/squashEditor.js';
+import { env, l10n, ProgressLocation, Uri, window } from 'vscode';
+import { getAcceptSequenceEditor, getSquashSequenceEditor } from '@env/git/squashEditor.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitCommit } from '@gitlens/git/models/commit.js';
 import { GitContributor } from '@gitlens/git/models/contributor.js';
@@ -18,8 +19,6 @@ import type {
 import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
 import type { GitWorktree } from '@gitlens/git/models/worktree.js';
-import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/git/utils/branch.utils.js';
-import { splitCommitMessage } from '@gitlens/git/utils/commit.utils.js';
 import { appendCoauthorsToMessage } from '@gitlens/git/utils/contributor.utils.js';
 import {
 	getComparisonRefsForPullRequest,
@@ -29,8 +28,14 @@ import {
 import { decodeReachabilitySet } from '@gitlens/git/utils/reachability.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import { isSha, shortenRevision } from '@gitlens/git/utils/revision.utils.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
+import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
+import { lazy } from '@gitlens/utils/lazy.js';
+import { Logger } from '@gitlens/utils/logger.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
+import { splitMessage } from '@gitlens/utils/string.js';
 import type { CreatePullRequestActionContext, OpenPullRequestActionContext } from '../../../api/gitlens.d.js';
 import type { CopyDeepLinkCommandArgs } from '../../../commands/copyDeepLink.js';
 import type { CopyMessageToClipboardCommandArgs } from '../../../commands/copyMessageToClipboard.js';
@@ -40,16 +45,20 @@ import type { ExplainCommitCommandArgs } from '../../../commands/explainCommit.j
 import type { ExplainStashCommandArgs } from '../../../commands/explainStash.js';
 import type { ExplainWipCommandArgs } from '../../../commands/explainWip.js';
 import type { GenerateChangelogCommandArgs } from '../../../commands/generateChangelog.js';
+import { generateChangelogAndOpenMarkdownDocument } from '../../../commands/generateChangelog.js';
 import type { OpenOnRemoteCommandArgs } from '../../../commands/openOnRemote.js';
 import type { OpenPullRequestOnRemoteCommandArgs } from '../../../commands/openPullRequestOnRemote.js';
 import type { ApplyPatchFromClipboardCommandArgs, CreatePatchCommandArgs } from '../../../commands/patches.js';
 import type { RecomposeBranchCommandArgs } from '../../../commands/recomposeBranch.js';
 import type { RecomposeFromCommitCommandArgs } from '../../../commands/recomposeFromCommit.js';
+import type { RunTaskOnWorktreeCommandArgs } from '../../../commands/runTaskOnWorktree.js';
+import type { StartAgentSessionCommandArgs } from '../../../commands/startAgentSession.js';
 import type { GraphScrollMarkersAdditionalTypes } from '../../../config.js';
 import type { GlWebviewCommandsOrCommandsWithSuffix } from '../../../constants.commands.js';
 import { GlyphChars } from '../../../constants.js';
 import type { StoredGraphWipDraft } from '../../../constants.storage.js';
 import type { Container } from '../../../container.js';
+import { getPresentableErrorMessage } from '../../../errors.js';
 import { executeGitCommand } from '../../../git/actions.js';
 import * as BranchActions from '../../../git/actions/branch.js';
 import {
@@ -79,10 +88,12 @@ import {
 	setBranchDisposition,
 } from '../../../git/utils/-webview/branch.utils.js';
 import { isCommitPushed } from '../../../git/utils/-webview/commit.utils.js';
+import { getChangesForChangelog } from '../../../git/utils/-webview/log.utils.js';
 import { getReferenceFromBranch } from '../../../git/utils/-webview/reference.utils.js';
 import { getBestRemoteWithIntegration } from '../../../git/utils/-webview/remote.utils.js';
 import { getWorktreesByBranch } from '../../../git/utils/-webview/worktree.utils.js';
 import type { RebaseTodoAction } from '../../../git/utils/rebaseTodo.js';
+import { showGenericErrorMessage } from '../../../messages.js';
 import { showPatchesView } from '../../../plus/drafts/actions.js';
 import { getPullRequestBranchDeepLink } from '../../../plus/launchpad/launchpadProvider.js';
 import { setupPullRequestBranch } from '../../../plus/launchpad/utils/-webview/startReview.utils.js';
@@ -90,42 +101,37 @@ import type { AssociateIssueWithBranchCommandArgs } from '../../../plus/startWor
 import { executeActionCommand, executeCommand, executeCoreCommand } from '../../../system/-webview/command.js';
 import { configuration } from '../../../system/-webview/configuration.js';
 import { getContext, setContext } from '../../../system/-webview/context.js';
+import { openTerminal } from '../../../system/-webview/terminal.js';
 import { getHostEditorCommand, revealInFileExplorer } from '../../../system/-webview/vscode.js';
 import type { OpenWorkspaceLocation } from '../../../system/-webview/vscode/workspaces.js';
 import { openWorkspace } from '../../../system/-webview/vscode/workspaces.js';
 import { createCommandDecorator } from '../../../system/decorators/command.js';
+import type { WebviewItemContext } from '../../../system/webview.js';
+import { isWebviewItemContext } from '../../../system/webview.js';
 import { DeepLinkActionType } from '../../../uris/deepLinks/deepLink.js';
 import type { BranchAndTargetRefs, BranchRef } from '../../shared/branchRefs.js';
-import type { WebviewHost } from '../../webviewProvider.js';
 import type { Change } from '../patchDetails/protocol.js';
 import * as branchRefCommands from '../shared/branchRefCommands.js';
 import type { DetailsItemTypedContext } from './detailsProtocol.js';
 import type { SelectedRowState } from './graphWebview.js';
-import {
-	compactGraphColumnsSettings,
-	defaultGraphColumnsSettings,
-	isGraphItemRefContext,
-	isGraphItemRefGroupContext,
-	isGraphItemTypedContext,
-} from './graphWebview.utils.js';
+import { isGraphItemRefContext, isGraphItemRefGroupContext, isGraphItemTypedContext } from './graphWebview.utils.js';
 import type {
+	DidRequestGraphActionParams,
 	DidRequestOpenCompareModeParams,
 	GraphColumnModeFor,
 	GraphColumnName,
-	GraphColumnsConfig,
 	GraphExcludedRef,
 	GraphItemContext,
 	GraphPinnedRef,
 	GraphPullRequestContextValue,
 	GraphScopeBranch,
+	GraphScopeOrigin,
 	GraphSelection,
 } from './protocol.js';
-import {
-	createWipRowId,
-	DidRequestGraphActionNotification,
-	DidRequestOpenCompareModeNotification,
-} from './protocol.js';
 import type { ShowInCommitGraphCommandArgs } from './registration.js';
+
+/** Rewrite verbs shown in "you can only rewrite…" warnings — `modify` has no `RebaseTodoAction` of its own. */
+type RewriteAction = 'drop' | 'squash' | 'reword' | 'fixup' | 'modify';
 
 type GraphItemRefs<T> = {
 	active: T | undefined;
@@ -143,18 +149,26 @@ function getPullRequestNumber(pr: { id: string; url: string }): string {
  *  read live provider state; the rest forward to provider methods that remain there. */
 export type GraphCommandsContext = {
 	container: Container;
-	host: WebviewHost<'gitlens.views.graph' | 'gitlens.graph'>;
 	getRepository: () => GlRepository | undefined;
 	getSession: () => GitGraphSession | undefined;
 	getActiveSelection: () => GitRevisionReference | undefined;
+	/** The `graph:filtersByRepo` storage key for the graph's CURRENT binding — home while rebound onto a
+	 *  worktree, so a filter change made from a row context menu doesn't fork into a second, worktree-keyed
+	 *  bucket the header filter panel never reads. Only the STORAGE KEY; ref-id values built from an item's
+	 *  own `repoPath` (which tracks the live perspective, as live rows do) are left alone. */
+	getFiltersRepoPath: () => string | undefined;
 	toggleColumn: (name: GraphColumnName, visible: boolean) => Promise<void>;
 	toggleColumnGrouping: (name: 'graph' | 'ref', grouped: boolean) => Promise<void>;
 	toggleScrollMarker: (type: GraphScrollMarkersAdditionalTypes, enabled: boolean) => Promise<void>;
 	setColumnMode: <T extends GraphColumnName>(name: T, mode?: GraphColumnModeFor<T>) => Promise<void>;
-	updateColumns: (columnsCfg: GraphColumnsConfig) => void;
+	saveAsDefaultLayout: () => Promise<void>;
+	applySavedLayout: () => Promise<void>;
+	resetLayout: () => Promise<void>;
 	setSelectedRows: (id: string | undefined, selection?: GraphSelection[], state?: SelectedRowState) => void;
-	notifyDidChangeSelection: () => Promise<boolean>;
-	writeWipDraftToStorage: (worktreePath: string, draft: StoredGraphWipDraft | null) => void;
+	/** Fires the `GraphSelectionService.onSelectionChanged` push with the selection just written by
+	 *  {@link setSelectedRows} — see `GraphWebviewProvider.createGraphCommandsContext()`. */
+	notifyDidChangeSelection: () => void;
+	writeWipDraftToStorage: (worktreePath: string, draft: StoredGraphWipDraft | null) => Promise<void>;
 	pushUpToCommit: (repoPath: string, sha: string) => Promise<void>;
 	getOpenEditorShowOptions: () => (TextDocumentShowOptions & { sourceViewColumn?: ViewColumn }) | undefined;
 	runStageConflictResolution: (
@@ -165,11 +179,148 @@ export type GraphCommandsContext = {
 	showRemoteRefs: (repoPath: string | undefined, remoteName: string) => void;
 	updatePinnedRef: (repoPath: string | undefined, ref: GraphPinnedRef | null) => void;
 	_undoCommit: (ref: GitRevisionReference, worktreePath: string | undefined) => Promise<void>;
+	/** Fires the warm `GraphNavigationService.onRequestAction`/`onRequestOpenCompareMode` events —
+	 *  see `GraphWebviewProvider.createGraphCommandsContext()`. Every caller here is a warm,
+	 *  already-open-graph command, so there's no cold/bootstrap counterpart to route through. */
+	fireRequestAction: (params: DidRequestGraphActionParams) => void;
+	fireRequestOpenCompareMode: (params: DidRequestOpenCompareModeParams) => void;
 };
 
 const graphCommandDecorator = createCommandDecorator<GlWebviewCommandsOrCommandsWithSuffix<'graph'>>();
 const command = graphCommandDecorator.command;
 export const getGraphCommands = graphCommandDecorator.getCommands;
+
+type GraphToggleCommandId = GlWebviewCommandsOrCommandsWithSuffix<'graph'>;
+
+/** One-shot toggle/setter commands for the graph's columns, grouping, scroll markers, and display
+ *  settings. VS Code menus need a distinct command id per menu item, but every handler funnels
+ *  through one of a handful of {@link GraphCommandsContext} methods or a config update, so instead
+ *  of 37 boilerplate methods they're table-driven here and registered imperatively below.
+ *
+ *  Like the `@command` decorators, registration runs once at module load; the webview binds each
+ *  stored handler to the live instance (`c.handler.bind(this._commands)`), so these plain functions
+ *  see the {@link GraphCommands} instance as `this`, exactly as prototype methods would. */
+type GraphToggleCommand =
+	| {
+			readonly action: 'column';
+			readonly id: GraphToggleCommandId;
+			readonly name: GraphColumnName;
+			readonly visible: boolean;
+	  }
+	| {
+			readonly action: 'grouping';
+			readonly id: GraphToggleCommandId;
+			readonly name: 'graph' | 'ref';
+			readonly grouped: boolean;
+	  }
+	| {
+			readonly action: 'scrollMarker';
+			readonly id: GraphToggleCommandId;
+			readonly marker: GraphScrollMarkersAdditionalTypes;
+			readonly enabled: boolean;
+	  }
+	| { readonly action: 'mode'; readonly id: GraphToggleCommandId; readonly mode?: 'compact' }
+	| {
+			readonly action: 'configuration';
+			readonly id: GraphToggleCommandId;
+			readonly section: 'graph.lanes.density';
+			readonly value: 'compact' | 'expanded';
+	  }
+	| {
+			readonly action: 'configuration';
+			readonly id: GraphToggleCommandId;
+			readonly section: 'graph.style';
+			readonly value: 'auto' | 'table' | 'list';
+	  };
+
+const toggleCommands: GraphToggleCommand[] = [
+	// Column visibility toggles
+	{ action: 'column', id: 'gitlens.graph.columnAuthorOn', name: 'author', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnAuthorOff', name: 'author', visible: false },
+	{ action: 'column', id: 'gitlens.graph.columnDateTimeOn', name: 'datetime', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnDateTimeOff', name: 'datetime', visible: false },
+	{ action: 'column', id: 'gitlens.graph.columnShaOn', name: 'sha', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnShaOff', name: 'sha', visible: false },
+	{ action: 'column', id: 'gitlens.graph.columnChangesOn', name: 'changes', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnChangesOff', name: 'changes', visible: false },
+	{ action: 'column', id: 'gitlens.graph.columnGraphOn', name: 'graph', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnGraphOff', name: 'graph', visible: false },
+	{ action: 'column', id: 'gitlens.graph.columnMessageOn', name: 'message', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnMessageOff', name: 'message', visible: false },
+	{ action: 'column', id: 'gitlens.graph.columnRefOn', name: 'ref', visible: true },
+	{ action: 'column', id: 'gitlens.graph.columnRefOff', name: 'ref', visible: false },
+
+	// Column grouping toggles
+	{ action: 'grouping', id: 'gitlens.graph.columnGraphGroup', name: 'graph', grouped: true },
+	{ action: 'grouping', id: 'gitlens.graph.columnGraphUngroup', name: 'graph', grouped: false },
+	{ action: 'grouping', id: 'gitlens.graph.columnRefGroup', name: 'ref', grouped: true },
+	{ action: 'grouping', id: 'gitlens.graph.columnRefUngroup', name: 'ref', grouped: false },
+
+	// Scroll marker toggles
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerLocalBranchOn', marker: 'localBranches', enabled: true },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerLocalBranchOff', marker: 'localBranches', enabled: false },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerRemoteBranchOn', marker: 'remoteBranches', enabled: true },
+	{
+		action: 'scrollMarker',
+		id: 'gitlens.graph.scrollMarkerRemoteBranchOff',
+		marker: 'remoteBranches',
+		enabled: false,
+	},
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerStashOn', marker: 'stashes', enabled: true },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerStashOff', marker: 'stashes', enabled: false },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerTagOn', marker: 'tags', enabled: true },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerTagOff', marker: 'tags', enabled: false },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerPullRequestOn', marker: 'pullRequests', enabled: true },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerPullRequestOff', marker: 'pullRequests', enabled: false },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerWipOn', marker: 'wip', enabled: true },
+	{ action: 'scrollMarker', id: 'gitlens.graph.scrollMarkerWipOff', marker: 'wip', enabled: false },
+
+	// Column mode toggles
+	{ action: 'mode', id: 'gitlens.graph.columnGraphCompact', mode: 'compact' },
+	{ action: 'mode', id: 'gitlens.graph.columnGraphDefault' },
+
+	// Lane density setters — toggle the `gitlens.graph.lanes.density` setting (not column state)
+	{
+		action: 'configuration',
+		id: 'gitlens.graph.setLaneDensityToCompact',
+		section: 'graph.lanes.density',
+		value: 'compact',
+	},
+	{
+		action: 'configuration',
+		id: 'gitlens.graph.setLaneDensityToExpanded',
+		section: 'graph.lanes.density',
+		value: 'expanded',
+	},
+
+	// Graph-style setters — toggle the `gitlens.graph.style` setting (whole-graph row layout, not column state)
+	{ action: 'configuration', id: 'gitlens.graph.setStyleAuto', section: 'graph.style', value: 'auto' },
+	{ action: 'configuration', id: 'gitlens.graph.setStyleTable', section: 'graph.style', value: 'table' },
+	{ action: 'configuration', id: 'gitlens.graph.setStyleList', section: 'graph.style', value: 'list' },
+];
+
+function executeGraphToggle(spec: GraphToggleCommand, context: GraphCommandsContext): Promise<void> | void {
+	switch (spec.action) {
+		case 'column':
+			return context.toggleColumn(spec.name, spec.visible);
+		case 'grouping':
+			return context.toggleColumnGrouping(spec.name, spec.grouped);
+		case 'scrollMarker':
+			return context.toggleScrollMarker(spec.marker, spec.enabled);
+		case 'mode':
+			return context.setColumnMode('graph', spec.mode);
+		default:
+			return void configuration.updateEffective(spec.section, spec.value);
+	}
+}
+
+for (const spec of toggleCommands) {
+	// Structural `this`: the webview binds each handler to the live GraphCommands instance before
+	// invocation, so `context` resolves here exactly as it does on the class's prototype methods.
+	graphCommandDecorator.register(spec.id, function (this: { context: GraphCommandsContext }) {
+		return executeGraphToggle(spec, this.context);
+	});
+}
 
 /** Host-side handlers for every `@command`-decorated graph action, split out of `GraphWebviewProvider`
  *  (R3). The provider owns state/IPC and injects the collaborators via {@link GraphCommandsContext}. */
@@ -179,28 +330,33 @@ export class GraphCommands {
 	private get container(): Container {
 		return this.context.container;
 	}
-	private get host(): WebviewHost<'gitlens.views.graph' | 'gitlens.graph'> {
-		return this.context.host;
-	}
 	private get repository(): GlRepository | undefined {
 		return this.context.getRepository();
 	}
 	private get _graphSession(): GitGraphSession | undefined {
 		return this.context.getSession();
 	}
+	private get filtersRepoPath(): string | undefined {
+		return this.context.getFiltersRepoPath();
+	}
 	private get activeSelection(): GitRevisionReference | undefined {
 		return this.context.getActiveSelection();
 	}
 
-	// Reset columns wrappers
-	@command('gitlens.graph.resetColumnsDefault')
-	private resetColumnsDefault() {
-		this.context.updateColumns(defaultGraphColumnsSettings);
+	// Layout wrappers
+	@command('gitlens.graph.resetLayout')
+	private resetLayout() {
+		void this.context.resetLayout();
 	}
 
-	@command('gitlens.graph.resetColumnsCompact')
-	private resetColumnsCompact() {
-		this.context.updateColumns(compactGraphColumnsSettings);
+	@command('gitlens.graph.saveAsDefaultLayout')
+	private saveAsDefaultLayout() {
+		void this.context.saveAsDefaultLayout();
+	}
+
+	@command('gitlens.graph.applySavedLayout')
+	private applySavedLayout() {
+		void this.context.applySavedLayout();
 	}
 
 	@command('gitlens.fetch:')
@@ -560,16 +716,20 @@ export class GraphCommands {
 
 		const { repoPath, ordered, published } = prepared;
 
-		const squash: MessageItem = { title: 'Squash' };
-		const fixup: MessageItem = { title: 'Keep First Message' };
-		const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
+		const squash: MessageItem = { title: l10n.t('Squash') };
+		const fixup: MessageItem = { title: l10n.t('Keep First Message') };
+		const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
 		const choice = await window.showWarningMessage(
-			`Squash ${ordered.length} commits into one?`,
+			l10n.t('Squash {0} commits into one?', getNumericFormat()(ordered.length)),
 			{
 				modal: true,
 				detail: published
-					? 'One or more of these commits have already been pushed. Squashing rewrites history and will require a force push.'
-					: 'Choose Squash to review and edit the combined message, or Keep First Message to keep only the oldest commit message.',
+					? l10n.t(
+							'One or more of these commits have already been pushed. Squashing rewrites history and will require a force push.',
+						)
+					: l10n.t(
+							'Choose Squash to review and edit the combined message, or Keep First Message to keep only the oldest commit message.',
+						),
 			},
 			squash,
 			fixup,
@@ -588,15 +748,17 @@ export class GraphCommands {
 
 		const { repoPath, ordered, published } = prepared;
 
-		const drop: MessageItem = { title: 'Drop' };
-		const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
+		const drop: MessageItem = { title: l10n.t('Drop') };
+		const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
 		const choice = await window.showWarningMessage(
-			`Drop ${ordered.length} commits?`,
+			l10n.t('Drop {0} commits?', getNumericFormat()(ordered.length)),
 			{
 				modal: true,
 				detail: published
-					? 'One or more of these commits have already been pushed. Dropping rewrites history and will require a force push.'
-					: 'This removes the selected commits from the current branch.',
+					? l10n.t(
+							'One or more of these commits have already been pushed. Dropping rewrites history and will require a force push.',
+						)
+					: l10n.t('This removes the selected commits from the current branch.'),
 			},
 			drop,
 			cancel,
@@ -609,23 +771,48 @@ export class GraphCommands {
 	private validateRewriteableSelection(
 		graph: GitGraph,
 		refs: readonly GitRevisionReference[],
-		verb: string,
+		action: RewriteAction,
 	): boolean {
 		const rewriteable = graph.rewriteableFromHEAD;
 		if (rewriteable == null || refs.every(ref => rewriteable.has(ref.ref))) return true;
 
-		void window.showWarningMessage(
-			`Unable to ${verb}: you can only rewrite commits on the current branch up to the first merge.`,
-		);
+		let message: string;
+		switch (action) {
+			case 'drop':
+				message = l10n.t(
+					'Unable to drop: you can only rewrite commits on the current branch up to the first merge.',
+				);
+				break;
+			case 'squash':
+				message = l10n.t(
+					'Unable to squash: you can only rewrite commits on the current branch up to the first merge.',
+				);
+				break;
+			case 'reword':
+				message = l10n.t(
+					'Unable to reword: you can only rewrite commits on the current branch up to the first merge.',
+				);
+				break;
+			case 'fixup':
+				message = l10n.t(
+					'Unable to fixup: you can only rewrite commits on the current branch up to the first merge.',
+				);
+				break;
+			case 'modify':
+				message = l10n.t(
+					'Unable to modify: you can only rewrite commits on the current branch up to the first merge.',
+				);
+				break;
+		}
+
+		void window.showWarningMessage(message);
 		return false;
 	}
 
 	private async prepareCommitsForRewrite(
 		item: GraphItemContext | undefined,
-		action: RebaseTodoAction,
+		action: 'drop' | 'squash',
 	): Promise<{ repoPath: string; ordered: GitRevisionReference[]; published: boolean } | undefined> {
-		const verb = action === 'drop' ? 'drop' : 'squash';
-
 		const { selection } = this.getGraphItemRefs(item, 'revision');
 		if (selection == null || selection.length < 2) return undefined;
 
@@ -636,7 +823,7 @@ export class GraphCommands {
 
 		const repoPath = selection[0].repoPath;
 		if (this.container.git.getRepositoryService(repoPath).ops?.rebase == null) {
-			void window.showWarningMessage(`Rewriting commits is not supported in this repository.`);
+			void window.showWarningMessage(l10n.t('Rewriting commits is not supported in this repository.'));
 			return undefined;
 		}
 
@@ -647,7 +834,11 @@ export class GraphCommands {
 			.filter(ref => rowIndexBySha.has(ref.ref))
 			.sort((a, b) => rowIndexBySha.get(a.ref)! - rowIndexBySha.get(b.ref)!);
 		if (ordered.length !== selection.length) {
-			void window.showWarningMessage(`Unable to ${verb}: some selected commits are not loaded in the graph.`);
+			void window.showWarningMessage(
+				action === 'drop'
+					? l10n.t('Unable to drop: some selected commits are not loaded in the graph.')
+					: l10n.t('Unable to squash: some selected commits are not loaded in the graph.'),
+			);
 			return undefined;
 		}
 
@@ -659,22 +850,30 @@ export class GraphCommands {
 				(ref, i) => i > 0 && graph.rows[rowIndexBySha.get(ordered[i - 1].ref)!]?.parents[0] !== ref.ref,
 			)
 		) {
-			void window.showWarningMessage(`Unable to ${verb}: select a contiguous range of commits.`);
+			void window.showWarningMessage(l10n.t('Unable to squash: select a contiguous range of commits.'));
 			return undefined;
 		}
 
 		if (ordered.some(ref => (graph.rows[rowIndexBySha.get(ref.ref)!]?.parents.length ?? 0) > 1)) {
-			void window.showWarningMessage(`Unable to ${verb}: the selection includes a merge commit.`);
+			void window.showWarningMessage(
+				action === 'drop'
+					? l10n.t('Unable to drop: the selection includes a merge commit.')
+					: l10n.t('Unable to squash: the selection includes a merge commit.'),
+			);
 			return undefined;
 		}
 
 		// Reject selections that leave the first-parent chain from HEAD before the first merge (e.g. HEAD
 		// is a merge, or the commits are an ancestor of one) — a plain interactive rebase would flatten it.
-		if (!this.validateRewriteableSelection(graph, ordered, verb)) return undefined;
+		if (!this.validateRewriteableSelection(graph, ordered, action)) return undefined;
 
 		const oldest = ordered.at(-1)!;
 		if ((graph.rows[rowIndexBySha.get(oldest.ref)!]?.parents.length ?? 0) === 0) {
-			void window.showWarningMessage(`Unable to ${verb}: the oldest selected commit has no parent.`);
+			void window.showWarningMessage(
+				action === 'drop'
+					? l10n.t('Unable to drop: the oldest selected commit has no parent.')
+					: l10n.t('Unable to squash: the oldest selected commit has no parent.'),
+			);
 			return undefined;
 		}
 
@@ -699,8 +898,6 @@ export class GraphCommands {
 
 		const svc = this.container.git.getRepositoryService(repoPath);
 		const oldest = ordered.at(-1)!;
-		const verb =
-			action === 'drop' ? 'Drop' : action === 'reword' ? 'Reword' : action === 'fixup' ? 'Fixup' : 'Squash';
 
 		try {
 			// Resolve inside the try so the browser/web stub's throw surfaces as a friendly message.
@@ -728,14 +925,52 @@ export class GraphCommands {
 				},
 			);
 			if (result?.conflicted) {
-				void window.showWarningMessage(
-					`${verb} stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.`,
-				);
+				let message: string;
+				switch (action) {
+					case 'drop':
+						message = l10n.t(
+							'Drop stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+						);
+						break;
+					case 'reword':
+						message = l10n.t(
+							'Reword stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+						);
+						break;
+					case 'fixup':
+						message = l10n.t(
+							'Fixup stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+						);
+						break;
+					case 'squash':
+						message = l10n.t(
+							'Squash stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+						);
+						break;
+				}
+
+				void window.showWarningMessage(message);
 			}
 		} catch (ex) {
-			void window.showErrorMessage(
-				`Unable to ${verb.toLowerCase()} commits: ${ex instanceof Error ? ex.message : String(ex)}`,
-			);
+			const error = getPresentableErrorMessage(ex);
+
+			let message: string;
+			switch (action) {
+				case 'drop':
+					message = l10n.t('Unable to drop commits: {0}', error);
+					break;
+				case 'reword':
+					message = l10n.t('Unable to reword commits: {0}', error);
+					break;
+				case 'fixup':
+					message = l10n.t('Unable to fixup commits: {0}', error);
+					break;
+				case 'squash':
+					message = l10n.t('Unable to squash commits: {0}', error);
+					break;
+			}
+
+			void window.showErrorMessage(message);
 		}
 	}
 
@@ -751,17 +986,17 @@ export class GraphCommands {
 
 		const repoPath = ref.repoPath;
 		if (this.container.git.getRepositoryService(repoPath).ops?.rebase == null) {
-			void window.showWarningMessage('Rewording commits is not supported in this repository.');
+			void window.showWarningMessage(l10n.t('Rewording commits is not supported in this repository.'));
 			return;
 		}
 
 		const row = graph.rows.find(r => r.sha === ref.ref);
 		if ((row?.parents.length ?? 0) === 0) {
-			void window.showWarningMessage('Unable to reword: the root commit has no parent to rebase onto.');
+			void window.showWarningMessage(l10n.t('Unable to reword: the root commit has no parent to rebase onto.'));
 			return;
 		}
 		if ((row?.parents.length ?? 0) > 1) {
-			void window.showWarningMessage('Unable to reword: cannot reword a merge commit.');
+			void window.showWarningMessage(l10n.t('Unable to reword: cannot reword a merge commit.'));
 			return;
 		}
 		// Also reject commits off the first-parent chain from HEAD before the first merge (e.g. HEAD is a
@@ -776,13 +1011,15 @@ export class GraphCommands {
 			// Ignore — fall back to opening the message editor without the published warning.
 		}
 		if (published) {
-			const confirm: MessageItem = { title: 'Reword' };
-			const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
+			const confirm: MessageItem = { title: l10n.t('Reword') };
+			const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
 			const choice = await window.showWarningMessage(
-				'Reword this commit?',
+				l10n.t('Reword this commit?'),
 				{
 					modal: true,
-					detail: 'This commit has already been pushed. Rewording rewrites history and will require a force push.',
+					detail: l10n.t(
+						'This commit has already been pushed. Rewording rewrites history and will require a force push.',
+					),
 				},
 				confirm,
 				cancel,
@@ -791,6 +1028,164 @@ export class GraphCommands {
 		}
 
 		await this.runRebaseRewrite(repoPath, [ref], 'reword');
+	}
+
+	@command('gitlens.graph.fixupCommit')
+	@debug()
+	private async fixupCommit(item?: GraphItemContext): Promise<void> {
+		const ref = this.getGraphItemRef(item, 'revision');
+		if (ref == null) return;
+
+		const graph = this._graphSession?.current;
+		if (graph == null) return;
+
+		const repoPath = ref.repoPath;
+		const row = graph.rows.find(r => r.sha === ref.ref);
+		if (row != null) {
+			if (row.parents.length === 0) {
+				void window.showWarningMessage(
+					l10n.t('Unable to fixup: the root commit has no parent to rebase onto.'),
+				);
+				return;
+			}
+			if (row.parents.length > 1) {
+				void window.showWarningMessage(l10n.t('Unable to fixup: cannot fixup a merge commit.'));
+				return;
+			}
+		}
+		if (!this.validateRewriteableSelection(graph, [ref], 'fixup')) return;
+
+		let subject: string;
+		if (row != null) {
+			subject = splitMessage(row.message).summary;
+		} else {
+			const commit = await this.container.git.getRepositoryService(repoPath).commits.getCommit(ref.ref);
+			if (commit == null) {
+				void window.showWarningMessage(l10n.t('Unable to fixup: the commit could not be found.'));
+				return;
+			}
+
+			subject = commit.summary;
+		}
+
+		const wipRowId = createWipRowId(repoPath);
+		const message = `fixup! ${subject}`;
+
+		void this.context.writeWipDraftToStorage(repoPath, { message: message, messageDirty: true });
+		this.context.setSelectedRows(wipRowId);
+		this.context.notifyDidChangeSelection();
+		this.context.fireRequestAction({
+			action: 'show-wip',
+			target: { sha: wipRowId, worktreePath: repoPath },
+			commitMessage: message,
+		});
+	}
+
+	@command('gitlens.graph.squashFixups')
+	@debug()
+	private async squashFixups(item?: GraphItemContext): Promise<void> {
+		const ref = this.getGraphItemRef(item);
+		const repoPath = ref?.repoPath ?? this.repository?.path;
+		if (repoPath == null) return;
+
+		const svc = this.container.git.getRepositoryService(repoPath);
+		if (svc.ops?.rebase == null) {
+			void window.showWarningMessage(l10n.t('Squashing fixups is not supported in this repository.'));
+			return;
+		}
+
+		const graph = this._graphSession?.current;
+		if (graph == null) return;
+
+		const rewriteable = graph.rewriteableFromHEAD;
+		const rewriteableRows = graph.rows.filter(r => rewriteable?.has(r.sha));
+		const fixupRows = rewriteableRows.filter(r => splitMessage(r.message).summary.startsWith('fixup! '));
+		if (fixupRows.length === 0) {
+			void window.showInformationMessage(l10n.t('No fixup commits found on the current branch.'));
+			return;
+		}
+
+		// Resolve each fixup's target by matching its (de-chained) subject against the newest
+		// rewriteable row with that subject — only to compute the rebase base. Git's own
+		// `--autosquash` does the real per-commit fixup/target matching during the rebase itself.
+		let oldestTargetIndex: number | undefined;
+		for (const fixupRow of fixupRows) {
+			let subject = splitMessage(fixupRow.message).summary;
+			while (subject.startsWith('fixup! ')) {
+				subject = subject.slice('fixup! '.length);
+			}
+
+			const targetIndex = rewriteableRows.findIndex(r => splitMessage(r.message).summary === subject);
+			if (targetIndex === -1) continue;
+
+			if (oldestTargetIndex == null || targetIndex > oldestTargetIndex) {
+				oldestTargetIndex = targetIndex;
+			}
+		}
+		if (oldestTargetIndex == null) {
+			void window.showWarningMessage(l10n.t("Couldn't locate the fixup targets on the current branch."));
+			return;
+		}
+
+		const oldestTargetSha = rewriteableRows[oldestTargetIndex].sha;
+
+		let published = false;
+		try {
+			published = await isCommitPushed(repoPath, oldestTargetSha);
+		} catch {
+			// Ignore — fall back to confirming without the published warning.
+		}
+		// Always confirm — this rewrites history from the oldest target up, like Squash/Drop do.
+		const confirm: MessageItem = { title: l10n.t('Squash') };
+		const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
+		const choice = await window.showWarningMessage(
+			formatPlural(l10n.t('{0, plural, one{Squash fixup commit?} other{Squash {0} fixup commits?}}'), [
+				fixupRows.length,
+			]),
+			{
+				modal: true,
+				detail: published
+					? l10n.t(
+							'One or more of the commits being rewritten have already been pushed. Squashing rewrites history and will require a force push.',
+						)
+					: formatPlural(
+							l10n.t(
+								'{0, plural, one{This squashes the fixup commit on the current branch into its target commit.} other{This squashes each fixup commit on the current branch into its target commit.}}',
+							),
+							[fixupRows.length],
+						),
+			},
+			confirm,
+			cancel,
+		);
+		if (choice !== confirm) return;
+
+		this.container.telemetry.sendEvent('gitCommand/run', { command: 'rebase' });
+
+		try {
+			const sequenceEditor = getAcceptSequenceEditor(this.container);
+			const result = await svc.ops.rebase(
+				`${oldestTargetSha}^`,
+				{
+					interactive: true,
+					autosquash: true,
+					editor: sequenceEditor.editor,
+					messageEditor: await getHostEditorCommand(true),
+					updateRefs: true,
+					autoStash: true,
+				},
+				{ env: sequenceEditor.env },
+			);
+			if (result?.conflicted) {
+				void window.showWarningMessage(
+					l10n.t(
+						'Squash Fixups stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+					),
+				);
+			}
+		} catch (ex) {
+			void window.showErrorMessage(l10n.t('Unable to squash fixups: {0}', getPresentableErrorMessage(ex)));
+		}
 	}
 
 	@command('gitlens.graph.modifyCommits')
@@ -811,14 +1206,16 @@ export class GraphCommands {
 			.filter(ref => rowIndexBySha.has(ref.ref))
 			.sort((a, b) => rowIndexBySha.get(a.ref)! - rowIndexBySha.get(b.ref)!);
 		if (ordered.length !== selection.length) {
-			void window.showWarningMessage('Unable to modify: some selected commits are not loaded in the graph.');
+			void window.showWarningMessage(
+				l10n.t('Unable to modify: some selected commits are not loaded in the graph.'),
+			);
 			return Promise.resolve();
 		}
 
 		// A standard interactive rebase flattens merges (no `--rebase-merges`), so a merge anywhere in the
 		// selection won't appear in the todo as the user expects — reject it (as squash/drop/reword do).
 		if (ordered.some(ref => (graph.rows[rowIndexBySha.get(ref.ref)!]?.parents.length ?? 0) > 1)) {
-			void window.showWarningMessage('Unable to modify: the selection includes a merge commit.');
+			void window.showWarningMessage(l10n.t('Unable to modify: the selection includes a merge commit.'));
 			return Promise.resolve();
 		}
 
@@ -830,7 +1227,7 @@ export class GraphCommands {
 		const parentSha = oldest != null ? graph.rows[rowIndexBySha.get(oldest.ref)!]?.parents[0] : undefined;
 		if (oldest == null || parentSha == null) {
 			void window.showWarningMessage(
-				'Unable to modify: the oldest selected commit has no parent to rebase onto.',
+				l10n.t('Unable to modify: the oldest selected commit has no parent to rebase onto.'),
 			);
 			return Promise.resolve();
 		}
@@ -847,16 +1244,21 @@ export class GraphCommands {
 	private async copy(item?: GraphItemContext) {
 		let data;
 
-		// Worktree sidebar rows carry the worktree path on their ref context — prefer that
+		// Worktree sidebar rows and WIP rows carry the worktree path on their ref context — prefer
+		// that. Branch ref pills for worktree branches ALSO carry `worktreePath` (so worktree-aware
+		// commands can target the right tree), but Copy on a ref should yield the ref's name, so
+		// gate on the item actually being a worktree/WIP item.
 		if (isGraphItemRefContext(item)) {
-			const values = item.webviewItemsValues?.length
-				? item.webviewItemsValues.map(i => i.webviewItemValue)
-				: [item.webviewItemValue];
-			const paths = values
-				.map(v => ('worktreePath' in v ? v.worktreePath : undefined))
-				.filter((p): p is string => p != null);
-			if (paths.length > 0 && paths.length === values.length) {
-				data = paths.join('\n');
+			const items = item.webviewItemsValues?.length
+				? item.webviewItemsValues
+				: [{ webviewItem: item.webviewItem, webviewItemValue: item.webviewItemValue }];
+			if (items.every(i => /^gitlens:(worktree|wip)\b/.test(i.webviewItem))) {
+				const paths = items
+					.map(i => ('worktreePath' in i.webviewItemValue ? i.webviewItemValue.worktreePath : undefined))
+					.filter((p): p is string => p != null);
+				if (paths.length > 0 && paths.length === items.length) {
+					data = paths.join('\n');
+				}
 			}
 		}
 
@@ -879,6 +1281,43 @@ export class GraphCommands {
 		if (data != null) {
 			await env.clipboard.writeText(data);
 		}
+	}
+
+	@command('gitlens.graph.copyBranchName')
+	@debug()
+	private async copyBranchName(item?: GraphItemContext) {
+		// WIP rows carry an uncommitted revision (no branch) — resolve the worktree's checked-out branch
+		if (!isGraphItemRefContext(item, 'revision')) return;
+
+		const { worktreePath } = item.webviewItemValue;
+		if (worktreePath == null) return;
+
+		const branch = await this.container.git.getRepositoryService(worktreePath).branches.getBranch();
+		if (branch == null) return;
+
+		await env.clipboard.writeText(branch.name);
+	}
+
+	@command('gitlens.graph.copyWorktreePath')
+	@debug()
+	private async copyWorktreePath(item?: GraphItemContext) {
+		if (!isGraphItemRefContext(item)) return;
+
+		const value = item.webviewItemValue;
+		let worktreePath = 'worktreePath' in value ? value.worktreePath : undefined;
+		if (worktreePath == null && value.type === 'branch') {
+			// Sidebar branch rows and the WIP-header kebab don't carry the path — resolve it from the branch
+			const branch = await this.container.git
+				.getRepositoryService(value.ref.repoPath)
+				.branches.getBranch(value.ref.name);
+			if (branch?.worktree != null && branch.worktree !== false) {
+				worktreePath = branch.worktree.path;
+			}
+		}
+
+		if (worktreePath == null) return;
+
+		await env.clipboard.writeText(worktreePath);
 	}
 
 	@command('gitlens.graph.copyMessage')
@@ -917,7 +1356,11 @@ export class GraphCommands {
 
 		await executeCoreCommand('workbench.view.scm');
 		if (ref != null) {
-			const scmRepo = await this.container.git.getRepositoryService(ref.repoPath).getScmRepository();
+			// Open the repo in the SCM if it isn't already, so the focus lands on this repo's input box
+			// rather than an ancestor's -- worktrees nested inside another repo are never registered on their own
+			const scmRepo = await this.container.git
+				.getRepositoryService(ref.repoPath)
+				.getOrOpenScmRepository({ source: 'graph', detail: 'commitViaSCM' });
 			if (scmRepo == null) return;
 
 			// Update the input box to trigger the focus event
@@ -1040,14 +1483,14 @@ export class GraphCommands {
 
 	@command('gitlens.ai.resolveConflicts:')
 	@debug()
-	private async resolveConflicts(item?: DetailsItemTypedContext): Promise<void> {
+	private resolveConflicts(item?: DetailsItemTypedContext): void {
 		const value = item?.webviewItemValue;
 		if (value?.type !== 'file' || !value.path || !value.repoPath) return;
 
 		// Enter the WIP details resolve mode scoped to this one conflicted file. Target that worktree's
 		// WIP ROW id — a bare `uncommitted` would select the graph's own primary WIP row instead.
 		const wipRowId = createWipRowId(value.repoPath);
-		await this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'enter-resolve',
 			target: { sha: wipRowId, worktreePath: value.repoPath, filePaths: [value.path] },
 		});
@@ -1055,7 +1498,7 @@ export class GraphCommands {
 
 	@command('gitlens.ai.resolveConflicts.multi:')
 	@debug()
-	private async resolveConflictsMulti(item?: DetailsItemTypedContext): Promise<void> {
+	private resolveConflictsMulti(item?: DetailsItemTypedContext): void {
 		// The right-clicked row carries the whole multi-selection in `webviewItemsValues`; keep just
 		// the conflicted file entries (the menu gates on `webviewItemsUnion`, which matches when ANY
 		// selected item is a conflict — others may be plain changes).
@@ -1069,7 +1512,7 @@ export class GraphCommands {
 		// Target the worktree's WIP ROW id — a bare `uncommitted` would select the primary WIP row.
 		const worktreePath = files[0].repoPath;
 		const wipRowId = createWipRowId(worktreePath);
-		await this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'enter-resolve',
 			target: { sha: wipRowId, worktreePath: worktreePath, filePaths: files.map(f => f.path) },
 		});
@@ -1077,7 +1520,7 @@ export class GraphCommands {
 
 	@command('gitlens.ai.resolveAllConflicts:')
 	@debug()
-	private async resolveAllConflicts(item?: GraphItemContext): Promise<void> {
+	private resolveAllConflicts(item?: GraphItemContext): void {
 		// Invoked from the WIP-row context menu (sibling to Compose/Review), so the item is a WIP-row
 		// ref — mirror `composeCommits`. For a secondary WIP row `ref.repoPath` is that worktree's path.
 		const ref = this.getGraphItemRef(item);
@@ -1087,7 +1530,7 @@ export class GraphCommands {
 		// Enter resolve mode for all conflicts (no `filePath`). Target that worktree's WIP ROW id — a
 		// bare `uncommitted` would select the graph's own primary WIP row instead.
 		const wipRowId = createWipRowId(repoPath);
-		await this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'enter-resolve',
 			target: { sha: wipRowId, worktreePath: repoPath },
 		});
@@ -1149,7 +1592,7 @@ export class GraphCommands {
 
 		if (ref == null) return Promise.resolve();
 
-		const { summary: title, body: description } = splitCommitMessage(ref.message);
+		const { summary: title, body: description } = splitMessage(ref.message);
 		return executeCommand<CreatePatchCommandArgs, void>('gitlens.createCloudPatch', {
 			to: ref.ref,
 			repoPath: ref.repoPath,
@@ -1166,7 +1609,7 @@ export class GraphCommands {
 
 		const status = await repo.git.status.getStatus();
 		if (status == null) {
-			void window.showErrorMessage('Unable to create cloud patch');
+			void window.showErrorMessage(l10n.t('Unable to create cloud patch'));
 			return;
 		}
 
@@ -1206,7 +1649,7 @@ export class GraphCommands {
 		const ref = this.getGraphItemRef(item, 'revision') ?? this.getGraphItemRef(item, 'stash');
 		if (ref == null) return Promise.resolve();
 
-		const { summary: title, body: description } = splitCommitMessage(ref.message);
+		const { summary: title, body: description } = splitMessage(ref.message);
 		return executeCommand<CreatePatchCommandArgs, void>('gitlens.copyPatchToClipboard', {
 			from: `${ref.ref}^`,
 			to: ref.ref,
@@ -1284,7 +1727,7 @@ export class GraphCommands {
 
 		if (refs != null) {
 			this.context.updateExcludedRefs(
-				this._graphSession?.repoPath,
+				this.filtersRepoPath,
 				refs.map(r => {
 					const remoteBranch = r.refType === 'branch' && r.remote;
 					return {
@@ -1313,8 +1756,11 @@ export class GraphCommands {
 	private hideRemote(item?: GraphItemContext) {
 		if (isGraphItemTypedContext(item, 'remote')) {
 			const { name, repoPath } = item.webviewItemValue;
+			// `repoPath` (the item's own, live-perspective path) stays in the wildcard id below — it's only
+			// ever matched back by `owner`/`type`, never by parsing the id's path prefix. Only the STORAGE
+			// KEY routes through `filtersRepoPath`.
 			this.context.updateExcludedRefs(
-				repoPath,
+				this.filtersRepoPath,
 				[{ id: `${repoPath}|remotes/${name}/*`, name: '*', owner: name, type: 'remote' }],
 				false,
 			);
@@ -1340,15 +1786,12 @@ export class GraphCommands {
 	@command('gitlens.graph.showRemote')
 	private showRemote(item?: GraphItemContext) {
 		if (isGraphItemTypedContext(item, 'remote')) {
-			const { name, repoPath } = item.webviewItemValue;
-			this.context.showRemoteRefs(repoPath, name);
+			const { name } = item.webviewItemValue;
+			this.context.showRemoteRefs(this.filtersRepoPath, name);
 		} else if (isGraphItemRefContext(item, 'branch')) {
 			const { ref } = item.webviewItemValue;
 			if (ref.remote) {
-				this.context.showRemoteRefs(
-					ref.repoPath ?? this._graphSession?.repoPath,
-					getRemoteNameFromBranchName(ref.name),
-				);
+				this.context.showRemoteRefs(this.filtersRepoPath, getRemoteNameFromBranchName(ref.name));
 			}
 		}
 
@@ -1364,7 +1807,7 @@ export class GraphCommands {
 		if (ref.refType !== 'branch' || ref.id == null) return Promise.resolve();
 
 		const remote = ref.remote;
-		this.context.updatePinnedRef(ref.repoPath ?? this._graphSession?.repoPath, {
+		this.context.updatePinnedRef(this.filtersRepoPath, {
 			id: ref.id,
 			name: remote ? getBranchNameWithoutRemote(ref.name) : ref.name,
 			owner: remote ? getRemoteNameFromBranchName(ref.name) : undefined,
@@ -1376,7 +1819,7 @@ export class GraphCommands {
 	@command('gitlens.graph.unpinBranchFromEdge')
 	@debug()
 	private unpinBranchFromEdge(_item?: GraphItemContext) {
-		this.context.updatePinnedRef(this._graphSession?.repoPath, null);
+		this.context.updatePinnedRef(this.filtersRepoPath, null);
 		return Promise.resolve();
 	}
 
@@ -1427,20 +1870,33 @@ export class GraphCommands {
 		});
 	}
 
-	// Two command ids, one handler — VS Code menu titles are static, so distinct ids let the menu
-	// read "Focus on Branch" on branch rows/leaves and "Focus on Worktree" on worktree/WIP rows.
+	// Two command ids, two thin wrappers over one resolver — VS Code menu titles are static, so distinct
+	// ids let the menu read "Focus on Branch" (branch focus only, never a worktree perspective) alongside
+	// "Scope to Worktree" (the perspective, plus focus per `graph.scopeBehavior`) on those same rows. The
+	// verb is threaded through explicitly rather than inferred from the item's shape, since both ids can
+	// land on the identical `gitlens:worktree`/`gitlens:wip` items.
 	@command('gitlens.focusBranch:graph')
-	@command('gitlens.focusWorktree:graph')
 	@debug()
-	private async focusReference(item?: GraphItemContext): Promise<void> {
-		const scopeBranch = await this.getScopeBranch(item);
-		if (scopeBranch == null) return;
+	private async focusBranchReference(item?: GraphItemContext): Promise<void> {
+		await this.focusOrScopeReference(item, 'focus');
+	}
+
+	@command('gitlens.scopeToWorktree:graph')
+	@debug()
+	private async scopeWorktreeReference(item?: GraphItemContext): Promise<void> {
+		await this.focusOrScopeReference(item, 'scope');
+	}
+
+	private async focusOrScopeReference(item: GraphItemContext | undefined, verb: 'focus' | 'scope'): Promise<void> {
+		const resolved = await this.getScopeBranch(item, verb);
+		if (resolved == null) return;
 
 		// Invoked from a context menu inside the open graph (warm), so notify the webview directly to
 		// focus (scope) onto the branch — mirrors the `scope-to-branch` action the popover/overview use.
-		void this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'scope-to-branch',
-			scopeBranch: scopeBranch,
+			scopeBranch: resolved.scopeBranch,
+			scopeOrigin: resolved.origin,
 		});
 	}
 
@@ -1460,7 +1916,7 @@ export class GraphCommands {
 
 			target = await this.resolvePullRequestHeadTarget(value);
 			if (target == null) {
-				void window.showErrorMessage(`Unable to find this pull request's branch after fetching.`);
+				void window.showErrorMessage(l10n.t("Unable to find this pull request's branch after fetching."));
 				return;
 			}
 		}
@@ -1470,7 +1926,7 @@ export class GraphCommands {
 		// One layer, and only that layer — a stacked pull request's own commits against the layer below are
 		// exactly the diff being reviewed, which is what makes a stack reviewable at all. Seeing the whole
 		// stack is a different question, asked from the stack row in the pull requests panel.
-		void this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'scope-to-branch',
 			scopeBranch:
 				target.localBranch != null
@@ -1536,7 +1992,9 @@ export class GraphCommands {
 			getContext('gitlens:hasVirtualFolders', false)
 		) {
 			void window.showWarningMessage(
-				`This pull request's branch isn't in your repository, and it can't be fetched in this workspace.`,
+				l10n.t(
+					"This pull request's branch isn't in your repository, and it can't be fetched in this workspace.",
+				),
 			);
 			return false;
 		}
@@ -1545,12 +2003,14 @@ export class GraphCommands {
 		const headUrl = refs.head.url;
 		const addsRemote = !(await svc.remotes.getRemotes({ filter: r => r.matches(headUrl) })).length;
 
-		const confirm = { title: 'Fetch' };
-		const cancel = { title: 'Cancel', isCloseAffordance: true };
+		const confirm = { title: l10n.t('Fetch') };
+		const cancel = { title: l10n.t('Cancel'), isCloseAffordance: true };
 		const result = await window.showWarningMessage(
-			`Unable to find this pull request's branch in your repository.\nWould you like to fetch it?${
-				addsRemote ? `\n\nThis will add a remote for the pull request's repository.` : ''
-			}`,
+			addsRemote
+				? l10n.t(
+						"Unable to find this pull request's branch in your repository.\nWould you like to fetch it?\n\nThis will add a remote for the pull request's repository.",
+					)
+				: l10n.t("Unable to find this pull request's branch in your repository.\nWould you like to fetch it?"),
 			{ modal: true },
 			confirm,
 			cancel,
@@ -1559,7 +2019,7 @@ export class GraphCommands {
 
 		try {
 			await window.withProgress(
-				{ location: ProgressLocation.Notification, title: `Fetching the pull request's branch...` },
+				{ location: ProgressLocation.Notification, title: l10n.t("Fetching the pull request's branch...") },
 				async () => {
 					const setup = await setupPullRequestBranch(repo, value);
 					if (setup.addRemote != null) {
@@ -1573,7 +2033,7 @@ export class GraphCommands {
 			);
 		} catch (ex) {
 			void window.showErrorMessage(
-				`Unable to fetch the pull request's branch: ${ex instanceof Error ? ex.message : String(ex)}`,
+				l10n.t("Unable to fetch the pull request's branch: {0}", getPresentableErrorMessage(ex)),
 			);
 			return false;
 		}
@@ -1621,26 +2081,68 @@ export class GraphCommands {
 		await this.container.deepLinks.processDeepLinkUri(deepLink, false, this.container.git.getRepository(repoPath));
 	}
 
-	private async getScopeBranch(item?: GraphItemContext): Promise<GraphScopeBranch | undefined> {
+	private async getScopeBranch(
+		item: GraphItemContext | undefined,
+		verb: 'focus' | 'scope',
+	): Promise<{ scopeBranch: GraphScopeBranch; origin?: GraphScopeOrigin } | undefined> {
 		const ref = this.getGraphItemRef(item, 'branch');
 		if (ref != null) {
-			if (!ref.remote) return { branchName: ref.name, upstreamName: ref.upstream?.name };
+			// Both ids can land on the identical `'branch'`-shaped contexts (a branch row/leaf, a row's
+			// branch pill, a sidebar worktree row), so `verb` — not the item's shape — decides whether an
+			// origin is stamped. A plain branch focus stays a plain branch focus, no rebind, even when the
+			// branch is checked out in a worktree, so `worktreePath` PRESENCE ALONE must not stamp one; the
+			// `gitlens:worktree` prefix check is an independent guard on top of the `verb` gate.
+			//
+			// No detached guard needed: the worktree-row builder only produces a `'branch'`-shaped context
+			// when the worktree has a real branch — a detached worktree gets the `'commit'`-shaped context
+			// handled below.
+			//
+			// The graph's HOME worktree is deliberately NOT excluded here (nor hidden from the menu):
+			// "Scope to Worktree" on it MEANS "go home" — exit any live scope and plain-focus its branch. The
+			// webview owns that decision in one place, and is the only layer that CAN: home is the graph's
+			// own binding, not the repo's default worktree.
+			const worktreePath =
+				verb === 'scope' &&
+				isGraphItemRefContext(item, 'branch') &&
+				item.webviewItem.startsWith('gitlens:worktree')
+					? item.webviewItemValue.worktreePath
+					: undefined;
+			const origin: GraphScopeOrigin | undefined =
+				worktreePath != null ? { kind: 'worktree', path: worktreePath } : undefined;
+
+			if (!ref.remote) {
+				return { scopeBranch: { branchName: ref.name, upstreamName: ref.upstream?.name }, origin: origin };
+			}
 
 			// Scope is keyed on local heads, so a remote branch focuses its local counterpart when one
 			// tracks it — only an untracked remote branch is scoped as a `remotes/*` ref.
 			const local = this.findLocalBranchTracking(ref.name);
-			return local != null
-				? { branchName: local, upstreamName: ref.name }
-				: { branchName: ref.name, remote: true };
+			return {
+				scopeBranch:
+					local != null
+						? { branchName: local, upstreamName: ref.name }
+						: { branchName: ref.name, remote: true },
+				origin: origin,
+			};
 		}
 
 		if (!isGraphItemRefContext(item, 'revision')) return undefined;
 
+		// The WIP-row context-menu binding, shared by both verbs — a WIP row has no branch pill of its own,
+		// so its worktree's checked-out branch is the only ref either verb can resolve.
 		const { worktreePath } = item.webviewItemValue;
 		if (worktreePath == null) return undefined;
 
 		const branch = await this.container.git.getRepositoryService(worktreePath).branches.getBranch();
-		return branch != null ? { branchName: branch.name, upstreamName: branch.upstream?.name } : undefined;
+		// A detached WIP row's `getBranch()` still returns a (synthetic, `(sha…)`-named) branch object —
+		// there's no real branch to focus, so this stays a plain reveal rather than a bogus scope+rebind.
+		if (branch == null || branch.detached) return undefined;
+
+		return {
+			scopeBranch: { branchName: branch.name, upstreamName: branch.upstream?.name },
+			// Stamped for the home worktree's WIP row too — see the origin comment above.
+			origin: verb === 'scope' ? { kind: 'worktree', path: worktreePath } : undefined,
+		};
 	}
 
 	/** Name of the local branch tracking `upstreamName`, read off the in-memory graph snapshot so
@@ -1653,6 +2155,45 @@ export class GraphCommands {
 			if (!b.remote && b.upstream?.name === upstreamName && !b.upstream.missing) return b.name;
 		}
 		return undefined;
+	}
+
+	/** WIP-row context menu — starts a new agent session in the row's worktree. */
+	@command('gitlens.graph.startAgentSession')
+	@debug()
+	private startAgentSession(item?: GraphItemContext): void {
+		if (!isGraphItemRefContext(item, 'revision')) return;
+
+		const { worktreePath } = item.webviewItemValue;
+		if (worktreePath == null) return;
+
+		void executeCommand<StartAgentSessionCommandArgs>('gitlens.startAgentSession', { cwd: worktreePath });
+	}
+
+	/** Alt variant of `startAgentSession` — always shows the agent picker. */
+	@command('gitlens.graph.startAgentSessionWith')
+	@debug()
+	private startAgentSessionWith(item?: GraphItemContext): void {
+		if (!isGraphItemRefContext(item, 'revision')) return;
+
+		const { worktreePath } = item.webviewItemValue;
+		if (worktreePath == null) return;
+
+		void executeCommand<StartAgentSessionCommandArgs>('gitlens.startAgentSession', {
+			cwd: worktreePath,
+			pick: true,
+		});
+	}
+
+	/** WIP-row context menu — runs a VS Code task (or ad-hoc command) with the row's worktree as cwd. */
+	@command('gitlens.runTaskOnWorktree:')
+	@debug()
+	private runTaskOnWorktree(item?: GraphItemContext): void {
+		if (!isGraphItemRefContext(item, 'revision')) return;
+
+		const { worktreePath } = item.webviewItemValue;
+		if (worktreePath == null) return;
+
+		void executeCommand<RunTaskOnWorktreeCommandArgs>('gitlens.runTaskOnWorktree', { worktreePath: worktreePath });
 	}
 
 	/** WIP-row context menu — opens the resume-session picker for the row's worktree. */
@@ -1894,7 +2435,9 @@ export class GraphCommands {
 		// the merge commits aren't available. There's nothing to diff, and saying so beats both the silent
 		// return this used to do and the `HEAD`...`HEAD` comparison the shas would coerce to.
 		if (!refs?.base?.sha || !refs.head?.sha) {
-			void window.showWarningMessage(`This pull request doesn't report the commits needed to compare it.`);
+			void window.showWarningMessage(
+				l10n.t("This pull request doesn't report the commits needed to compare it."),
+			);
 			return false;
 		}
 
@@ -1920,7 +2463,7 @@ export class GraphCommands {
 		// Without a head remote to fetch from there's nothing to try — but only when the head is the side
 		// that's missing; a missing base is fetched from the remote hosting the base's own repository.
 		if (repo == null || (missing.head && (!refs.head.url || !refs.head.branch))) {
-			void window.showErrorMessage(`Unable to find this pull request's commits in your repository.`);
+			void window.showErrorMessage(l10n.t("Unable to find this pull request's commits in your repository."));
 			return false;
 		}
 
@@ -1935,7 +2478,9 @@ export class GraphCommands {
 			getContext('gitlens:hasVirtualFolders', false)
 		) {
 			void window.showWarningMessage(
-				`Unable to find this pull request's commits in your repository, and they can't be fetched in this workspace.`,
+				l10n.t(
+					"Unable to find this pull request's commits in your repository, and they can't be fetched in this workspace.",
+				),
 			);
 			return false;
 		}
@@ -1950,12 +2495,16 @@ export class GraphCommands {
 				? !(await svc.remotes.getRemotes({ filter: r => r.matches(headUrl) })).length
 				: false;
 
-		const confirm = { title: 'Fetch' };
-		const cancel = { title: 'Cancel', isCloseAffordance: true };
+		const confirm = { title: l10n.t('Fetch') };
+		const cancel = { title: l10n.t('Cancel'), isCloseAffordance: true };
 		const result = await window.showWarningMessage(
-			`Unable to find this pull request's commits in your repository.\nWould you like to fetch them?${
-				addsRemote ? `\n\nThis will add a remote for the pull request's repository.` : ''
-			}`,
+			addsRemote
+				? l10n.t(
+						"Unable to find this pull request's commits in your repository.\nWould you like to fetch them?\n\nThis will add a remote for the pull request's repository.",
+					)
+				: l10n.t(
+						"Unable to find this pull request's commits in your repository.\nWould you like to fetch them?",
+					),
 			{ modal: true },
 			confirm,
 			cancel,
@@ -1965,7 +2514,7 @@ export class GraphCommands {
 
 		try {
 			await window.withProgress(
-				{ location: ProgressLocation.Notification, title: `Fetching the pull request's commits...` },
+				{ location: ProgressLocation.Notification, title: l10n.t("Fetching the pull request's commits...") },
 				async () => {
 					if (missing.head) {
 						const setup = await setupPullRequestBranch(repo, value);
@@ -2002,7 +2551,7 @@ export class GraphCommands {
 			);
 		} catch (ex) {
 			void window.showErrorMessage(
-				`Unable to fetch the pull request's commits: ${ex instanceof Error ? ex.message : String(ex)}`,
+				l10n.t("Unable to fetch the pull request's commits: {0}", getPresentableErrorMessage(ex)),
 			);
 			return false;
 		}
@@ -2010,7 +2559,7 @@ export class GraphCommands {
 		missing = await findMissing();
 		if (!missing.base && !missing.head) return true;
 
-		void window.showErrorMessage(`Unable to find this pull request's commits after fetching.`);
+		void window.showErrorMessage(l10n.t("Unable to find this pull request's commits after fetching."));
 		return false;
 	}
 
@@ -2069,7 +2618,7 @@ export class GraphCommands {
 		await openComparisonChanges(
 			this.container,
 			{ repoPath: refs.repoPath, lhs: refs.base.ref, rhs: refs.head.ref },
-			{ title: `Changes in Pull Request #${getPullRequestNumber(pr)}` },
+			{ title: l10n.t('Changes in Pull Request #{0}', getPullRequestNumber(pr)) },
 		);
 	}
 
@@ -2117,104 +2666,33 @@ export class GraphCommands {
 
 	@command('gitlens.graph.compareAncestryWithWorking')
 	@debug()
-	private async compareAncestryWithWorking(item?: GraphItemContext) {
-		const ref = this.getGraphItemRef(item);
-		if (ref == null) return Promise.resolve();
-
-		// Anchor on the user's current worktree — both the merge-base computation and the WT-files
-		// fetch resolve relative to this. Avoids the multi-worktree degenerate case where
-		// `getBranch(ref.repoPath)` returns the same ref as `ref.ref`.
-		const currentRepoPath = this.getCurrentRepoPath(ref.repoPath);
-		const svc = this.container.git.getRepositoryService(currentRepoPath);
-		const currentBranch = await svc.branches.getBranch();
-		if (currentBranch == null) return undefined;
-
-		const commonAncestor = await svc.refs.getMergeBase(currentBranch.ref, ref.ref);
-		if (commonAncestor == null) return undefined;
-
-		// Convention: leftRef = Base (older), rightRef = Compare (newer / has WT). The merge base
-		// is the older anchor; the current branch carries the working tree.
-		return this.notifyOpenCompareMode({
-			repoPath: currentRepoPath,
-			leftRef: commonAncestor,
-			leftRefType: 'commit',
-			rightRef: currentBranch.ref,
-			rightRefType: 'branch',
+	private compareAncestryWithWorking(item?: GraphItemContext) {
+		// Convention: leftRef = Base (older = merge base), rightRef = Compare (newer = the current
+		// branch, which carries the working tree).
+		return this.openCompareModeFor(item, {
+			baseOnMergeBase: true,
+			sideWithCurrentBranch: true,
 			includeWorkingTree: true,
 		});
 	}
 
 	@command('gitlens.graph.compareWithHead')
 	@debug()
-	private async compareHeadWith(item?: GraphItemContext) {
-		const ref = this.getGraphItemRef(item);
-		if (ref == null) return Promise.resolve();
-
-		// Resolve HEAD against the user's current worktree before ordering — `'HEAD'` as an opaque
-		// string would otherwise resolve against `ref.repoPath`, which may be a different worktree.
-		const currentRepoPath = this.getCurrentRepoPath(ref.repoPath);
-		const currentBranch = await this.container.git.getRepositoryService(currentRepoPath).branches.getBranch();
-		const headRef = currentBranch?.ref ?? 'HEAD';
-
-		// `getOrderedComparisonRefs` returns `[newer, older]`. Convention is leftRef = Base (older),
-		// rightRef = Compare (newer), so the older ref lands on the left.
-		const [newer, older] = await getOrderedComparisonRefs(this.container, currentRepoPath, headRef, ref.ref);
-		const newerIsHead = newer === headRef;
-		return this.notifyOpenCompareMode({
-			repoPath: currentRepoPath,
-			leftRef: older,
-			leftRefType: newerIsHead ? this.graphCompareRefType(ref.refType) : 'branch',
-			rightRef: newer,
-			rightRefType: newerIsHead ? 'branch' : this.graphCompareRefType(ref.refType),
-		});
+	private compareHeadWith(item?: GraphItemContext) {
+		return this.openCompareModeFor(item, { orderNewestRight: true });
 	}
 
 	@command('gitlens.graph.compareBranchWithHead')
 	@debug()
-	private async compareBranchWithHead(item?: GraphItemContext | BranchRef) {
-		const ref = await this.resolveBranchRef(item);
-		if (ref == null) return;
-
-		// Resolve HEAD to the user's current worktree's branch — passing `'HEAD'` as a string would
-		// resolve against the IPC `repoPath` on the host, which may be a different worktree.
-		const currentRepoPath = this.getCurrentRepoPath(ref.repoPath);
-		const currentBranch = await this.container.git.getRepositoryService(currentRepoPath).branches.getBranch();
-
-		await this.notifyOpenCompareMode({
-			repoPath: currentRepoPath,
-			leftRef: ref.ref,
-			leftRefType: 'branch',
-			rightRef: currentBranch?.ref ?? 'HEAD',
-			rightRefType: 'branch',
-		});
+	private compareBranchWithHead(item?: GraphItemContext | BranchRef) {
+		return this.openCompareModeFor(item, { resolveBranch: true, sideWithCurrentBranch: true });
 	}
 
 	@command('gitlens.graph.compareWithMergeBase')
 	@debug()
-	private async compareWithMergeBase(item?: GraphItemContext) {
-		const ref = this.getGraphItemRef(item);
-		if (ref == null) return Promise.resolve();
-
-		// "Compare with Common Base" is conceptually "where this branch diverged from where I'm
-		// working." Anchor the merge-base on the user's current worktree's branch, not the clicked
-		// ref's worktree's branch — otherwise in multi-worktree the merge-base degenerates to the
-		// ref itself when `getBranch(ref.repoPath)` returns `ref.ref`.
-		const currentRepoPath = this.getCurrentRepoPath(ref.repoPath);
-		const svc = this.container.git.getRepositoryService(currentRepoPath);
-		const currentBranch = await svc.branches.getBranch();
-		if (currentBranch == null) return undefined;
-
-		const commonAncestor = await svc.refs.getMergeBase(currentBranch.ref, ref.ref);
-		if (commonAncestor == null) return undefined;
-
-		// Convention: leftRef = Base (older = merge base), rightRef = Compare (newer = clicked ref).
-		return this.notifyOpenCompareMode({
-			repoPath: currentRepoPath,
-			leftRef: commonAncestor,
-			leftRefType: 'commit',
-			rightRef: ref.ref,
-			rightRefType: this.graphCompareRefType(ref.refType),
-		});
+	private compareWithMergeBase(item?: GraphItemContext) {
+		// "Compare with Common Base" is conceptually "where this branch diverged from where I'm working".
+		return this.openCompareModeFor(item, { baseOnMergeBase: true });
 	}
 
 	@command('gitlens.graph.openChangedFileDiffsWithMergeBase')
@@ -2255,9 +2733,13 @@ export class GraphCommands {
 			this.container,
 			{ repoPath: repoPath, lhs: commonAncestor, rhs: targetRef },
 			{
-				title: `Changes between ${targetName} (${shortenRevision(commonAncestor)}) ${
-					GlyphChars.ArrowLeftRightLong
-				} ${shortenRevision(targetRef, { strings: { working: 'Working Tree' } })}`,
+				title: l10n.t(
+					'Changes between {0} ({1}) {2} {3}',
+					targetName,
+					shortenRevision(commonAncestor),
+					GlyphChars.ArrowLeftRightLong,
+					shortenRevision(targetRef, { strings: { working: l10n.t('Working Tree') } }),
+				),
 			},
 		);
 	}
@@ -2295,27 +2777,12 @@ export class GraphCommands {
 
 	@command('gitlens.graph.compareWithWorking')
 	@debug()
-	private async compareWorkingWith(item?: GraphItemContext | BranchRef) {
-		const ref = await this.resolveBranchRef(item);
-		if (ref == null) return;
-
-		// Anchor against the user's *current* worktree — `getBranch()` and the host's WT-files
-		// fetch (`getBranchComparisonWorkingTreeFiles`) both run against this repoPath, so passing
-		// the current worktree's path makes the WT and the resolved branch ref both belong to
-		// where the user is actually working — not to whichever worktree the clicked ref happens
-		// to live in.
-		//
-		// Convention: leftRef = Base (the clicked ref we're comparing against),
-		// rightRef = Compare (the current branch, which carries the working tree).
-		const currentRepoPath = this.getCurrentRepoPath(ref.repoPath);
-		const currentBranch = await this.container.git.getRepositoryService(currentRepoPath).branches.getBranch();
-
-		await this.notifyOpenCompareMode({
-			repoPath: currentRepoPath,
-			leftRef: ref.ref,
-			leftRefType: 'branch',
-			rightRef: currentBranch?.ref ?? 'HEAD',
-			rightRefType: 'branch',
+	private compareWorkingWith(item?: GraphItemContext | BranchRef) {
+		// Convention: leftRef = Base (the clicked ref we're comparing against), rightRef = Compare
+		// (the current branch, which carries the working tree).
+		return this.openCompareModeFor(item, {
+			resolveBranch: true,
+			sideWithCurrentBranch: true,
 			includeWorkingTree: true,
 		});
 	}
@@ -2458,8 +2925,10 @@ export class GraphCommands {
 		if (branchesReachingAll.length !== 1) {
 			void window.showErrorMessage(
 				branchesReachingAll.length === 0
-					? 'The selected commits are not reachable from any single branch.'
-					: 'The selected commits are reachable from multiple branches. Please select commits unique to a single branch.',
+					? l10n.t('The selected commits are not reachable from any single branch.')
+					: l10n.t(
+							'The selected commits are reachable from multiple branches. Please select commits unique to a single branch.',
+						),
 			);
 			return;
 		}
@@ -2496,32 +2965,32 @@ export class GraphCommands {
 			r => r.refType === 'branch' && !r.remote,
 		);
 		if (localBranches?.length !== 1) {
-			void window.showErrorMessage('Unable to recompose: commit must belong to exactly one local branch');
+			void window.showErrorMessage(l10n.t('Unable to recompose: commit must belong to exactly one local branch'));
 			return;
 		}
 
 		const branchName = localBranches[0].name;
 		const branch = graph.branches.get(branchName);
 		if (branch == null) {
-			void window.showErrorMessage(`Branch '${branchName}' not found`);
+			void window.showErrorMessage(l10n.t("Branch '{0}' not found", branchName));
 			return;
 		}
 
 		const headCommitSha = branch.sha;
 		if (headCommitSha == null) {
-			void window.showErrorMessage(`Unable to determine head commit for branch '${branchName}'`);
+			void window.showErrorMessage(l10n.t("Unable to determine head commit for branch '{0}'", branchName));
 			return;
 		}
 
 		const commit = await this.container.git.getRepositoryService(ref.repoPath).commits.getCommit(ref.ref);
 		if (commit == null) {
-			void window.showErrorMessage(`Commit '${ref.ref}' not found`);
+			void window.showErrorMessage(l10n.t("Commit '{0}' not found", ref.ref));
 			return;
 		}
 
 		const baseCommitSha = commit.parents.length > 0 ? commit.parents[0] : undefined;
 		if (baseCommitSha == null) {
-			void window.showErrorMessage('Unable to determine parent commit');
+			void window.showErrorMessage(l10n.t('Unable to determine parent commit'));
 			return;
 		}
 
@@ -2540,8 +3009,8 @@ export class GraphCommands {
 	}
 
 	@command('gitlens.composeCommits:')
-	private composeCommitsCommand(item?: GraphItemContext) {
-		return this.composeCommits(item);
+	private composeCommitsCommand(item?: GraphItemContext): void {
+		this.composeCommits(item);
 	}
 
 	@command('gitlens.ai.recomposeSelectedCommits:')
@@ -2555,8 +3024,8 @@ export class GraphCommands {
 	}
 
 	@command('gitlens.reviewChanges:')
-	private reviewChangesCommand(item?: GraphItemContext) {
-		return this.reviewChanges(item);
+	private reviewChangesCommand(item?: GraphItemContext): void {
+		this.reviewChanges(item);
 	}
 
 	@command('gitlens.ai.explainCommit:')
@@ -2732,18 +3201,7 @@ export class GraphCommands {
 
 		// Webview action-link path (graph overview card): branch identity arrives as a BranchRef.
 		if (item != null && 'branchId' in item) {
-			const repoPath = item.repoPath;
-			let worktreesByBranch;
-			if (repoPath === this._graphSession?.repoPath) {
-				worktreesByBranch = this._graphSession?.current.worktreesByBranch;
-			} else {
-				const repo = this.container.git.getRepository(repoPath);
-				if (repo == null) return;
-
-				worktreesByBranch = await getWorktreesByBranch(repo);
-			}
-
-			const worktree = worktreesByBranch?.get(item.branchId);
+			const worktree = await this.getGraphItemBranchWorktree(item.repoPath, item.branchId);
 			if (worktree == null) return;
 
 			openWorkspace(worktree.uri, options);
@@ -2754,17 +3212,7 @@ export class GraphCommands {
 			const { ref } = item.webviewItemValue;
 			if (ref.id == null) return;
 
-			let worktreesByBranch;
-			if (ref.repoPath === this._graphSession?.repoPath) {
-				worktreesByBranch = this._graphSession?.current.worktreesByBranch;
-			} else {
-				const repo = this.container.git.getRepository(ref.repoPath);
-				if (repo == null) return;
-
-				worktreesByBranch = await getWorktreesByBranch(repo);
-			}
-
-			const worktree = worktreesByBranch?.get(ref.id);
+			const worktree = await this.getGraphItemBranchWorktree(ref.repoPath, ref.id);
 			if (worktree == null) return;
 
 			openWorkspace(worktree.uri, options);
@@ -2790,10 +3238,24 @@ export class GraphCommands {
 
 	@command('gitlens.openInIntegratedTerminal:')
 	@debug()
-	private async openInIntegratedTerminal(item?: GraphItemContext | { worktreeUri: string }): Promise<void> {
+	private async openInIntegratedTerminal(
+		item?: GraphItemContext | { worktreeUri: string } | WebviewItemContext<{ worktreePath?: string }>,
+	): Promise<void> {
 		// Header button path: a full URI string is provided so remote-dev schemes are preserved.
 		if (item != null && typeof item === 'object' && 'worktreeUri' in item && typeof item.worktreeUri === 'string') {
-			void executeCoreCommand('openInIntegratedTerminal', Uri.parse(item.worktreeUri));
+			openTerminal({ cwd: Uri.parse(item.worktreeUri) }).show();
+			return;
+		}
+
+		// Agent-session context menu path (sidebar row / details card): the session's worktree path
+		// rides on webviewItemValue.worktreePath rather than a host-serialized ref.
+		if (
+			isWebviewItemContext<{ worktreePath?: string }>(item) &&
+			item.webviewItem.startsWith('gitlens:agent-session')
+		) {
+			if (item.webviewItemValue.worktreePath != null) {
+				openTerminal({ cwd: Uri.file(item.webviewItemValue.worktreePath) }).show();
+			}
 			return;
 		}
 
@@ -2808,7 +3270,7 @@ export class GraphCommands {
 			uri = Uri.file(ref.repoPath);
 		}
 
-		void executeCoreCommand('openInIntegratedTerminal', uri);
+		openTerminal({ cwd: uri }).show();
 	}
 
 	@command('gitlens.graph.revealWorktreeInExplorer')
@@ -2867,204 +3329,14 @@ export class GraphCommands {
 		const existing = this.container.storage.getWorkspace('graph:wipDrafts')?.[repoPath];
 		const message = appendCoauthorsToMessage(existing?.message ?? '', [coauthor]);
 
-		this.context.writeWipDraftToStorage(repoPath, { ...existing, message: message, messageDirty: true });
+		void this.context.writeWipDraftToStorage(repoPath, { ...existing, message: message, messageDirty: true });
 		this.context.setSelectedRows(wipRowId);
-		void this.context.notifyDidChangeSelection();
-		void this.host.notify(DidRequestGraphActionNotification, {
+		this.context.notifyDidChangeSelection();
+		this.context.fireRequestAction({
 			action: 'show-wip',
 			target: { sha: wipRowId, worktreePath: repoPath },
 			commitMessage: message,
 		});
-	}
-
-	// Column toggle wrappers
-	@command('gitlens.graph.columnAuthorOn')
-	private columnAuthorOn() {
-		return this.context.toggleColumn('author', true);
-	}
-
-	@command('gitlens.graph.columnAuthorOff')
-	private columnAuthorOff() {
-		return this.context.toggleColumn('author', false);
-	}
-
-	@command('gitlens.graph.columnDateTimeOn')
-	private columnDateTimeOn() {
-		return this.context.toggleColumn('datetime', true);
-	}
-
-	@command('gitlens.graph.columnDateTimeOff')
-	private columnDateTimeOff() {
-		return this.context.toggleColumn('datetime', false);
-	}
-
-	@command('gitlens.graph.columnShaOn')
-	private columnShaOn() {
-		return this.context.toggleColumn('sha', true);
-	}
-
-	@command('gitlens.graph.columnShaOff')
-	private columnShaOff() {
-		return this.context.toggleColumn('sha', false);
-	}
-
-	@command('gitlens.graph.columnChangesOn')
-	private columnChangesOn() {
-		return this.context.toggleColumn('changes', true);
-	}
-
-	@command('gitlens.graph.columnChangesOff')
-	private columnChangesOff() {
-		return this.context.toggleColumn('changes', false);
-	}
-
-	@command('gitlens.graph.columnGraphOn')
-	private columnGraphOn() {
-		return this.context.toggleColumn('graph', true);
-	}
-
-	@command('gitlens.graph.columnGraphOff')
-	private columnGraphOff() {
-		return this.context.toggleColumn('graph', false);
-	}
-
-	@command('gitlens.graph.columnGraphGroup')
-	private columnGraphGroup() {
-		return this.context.toggleColumnGrouping('graph', true);
-	}
-
-	@command('gitlens.graph.columnGraphUngroup')
-	private columnGraphUngroup() {
-		return this.context.toggleColumnGrouping('graph', false);
-	}
-
-	@command('gitlens.graph.columnMessageOn')
-	private columnMessageOn() {
-		return this.context.toggleColumn('message', true);
-	}
-
-	@command('gitlens.graph.columnMessageOff')
-	private columnMessageOff() {
-		return this.context.toggleColumn('message', false);
-	}
-
-	@command('gitlens.graph.columnRefOn')
-	private columnRefOn() {
-		return this.context.toggleColumn('ref', true);
-	}
-
-	@command('gitlens.graph.columnRefOff')
-	private columnRefOff() {
-		return this.context.toggleColumn('ref', false);
-	}
-
-	@command('gitlens.graph.columnRefGroup')
-	private columnRefGroup() {
-		return this.context.toggleColumnGrouping('ref', true);
-	}
-
-	@command('gitlens.graph.columnRefUngroup')
-	private columnRefUngroup() {
-		return this.context.toggleColumnGrouping('ref', false);
-	}
-
-	// Scroll marker toggle wrappers
-	@command('gitlens.graph.scrollMarkerLocalBranchOn')
-	private scrollMarkerLocalBranchOn() {
-		return this.context.toggleScrollMarker('localBranches', true);
-	}
-
-	@command('gitlens.graph.scrollMarkerLocalBranchOff')
-	private scrollMarkerLocalBranchOff() {
-		return this.context.toggleScrollMarker('localBranches', false);
-	}
-
-	@command('gitlens.graph.scrollMarkerRemoteBranchOn')
-	private scrollMarkerRemoteBranchOn() {
-		return this.context.toggleScrollMarker('remoteBranches', true);
-	}
-
-	@command('gitlens.graph.scrollMarkerRemoteBranchOff')
-	private scrollMarkerRemoteBranchOff() {
-		return this.context.toggleScrollMarker('remoteBranches', false);
-	}
-
-	@command('gitlens.graph.scrollMarkerStashOn')
-	private scrollMarkerStashOn() {
-		return this.context.toggleScrollMarker('stashes', true);
-	}
-
-	@command('gitlens.graph.scrollMarkerStashOff')
-	private scrollMarkerStashOff() {
-		return this.context.toggleScrollMarker('stashes', false);
-	}
-
-	@command('gitlens.graph.scrollMarkerTagOn')
-	private scrollMarkerTagOn() {
-		return this.context.toggleScrollMarker('tags', true);
-	}
-
-	@command('gitlens.graph.scrollMarkerTagOff')
-	private scrollMarkerTagOff() {
-		return this.context.toggleScrollMarker('tags', false);
-	}
-
-	@command('gitlens.graph.scrollMarkerPullRequestOn')
-	private scrollMarkerPullRequestOn() {
-		return this.context.toggleScrollMarker('pullRequests', true);
-	}
-
-	@command('gitlens.graph.scrollMarkerPullRequestOff')
-	private scrollMarkerPullRequestOff() {
-		return this.context.toggleScrollMarker('pullRequests', false);
-	}
-
-	@command('gitlens.graph.scrollMarkerWipOn')
-	private scrollMarkerWipOn() {
-		return this.context.toggleScrollMarker('wip', true);
-	}
-
-	@command('gitlens.graph.scrollMarkerWipOff')
-	private scrollMarkerWipOff() {
-		return this.context.toggleScrollMarker('wip', false);
-	}
-
-	// Column mode wrappers
-	@command('gitlens.graph.columnGraphCompact')
-	private columnGraphCompact() {
-		return this.context.setColumnMode('graph', 'compact');
-	}
-
-	@command('gitlens.graph.columnGraphDefault')
-	private columnGraphDefault() {
-		return this.context.setColumnMode('graph', undefined);
-	}
-
-	// Lane density wrappers — these toggle the `gitlens.graph.lanes.density` setting (not column state)
-	@command('gitlens.graph.setLaneDensityToCompact')
-	private setLaneDensityToCompact() {
-		void configuration.updateEffective('graph.lanes.density', 'compact');
-	}
-
-	@command('gitlens.graph.setLaneDensityToExpanded')
-	private setLaneDensityToExpanded() {
-		void configuration.updateEffective('graph.lanes.density', 'expanded');
-	}
-
-	// Graph-style wrappers — toggle the `gitlens.graph.style` setting (whole-graph row layout, not column state)
-	@command('gitlens.graph.setStyleAuto')
-	private setStyleAuto() {
-		void configuration.updateEffective('graph.style', 'auto');
-	}
-
-	@command('gitlens.graph.setStyleTable')
-	private setStyleTable() {
-		void configuration.updateEffective('graph.style', 'table');
-	}
-
-	@command('gitlens.graph.setStyleList')
-	private setStyleList() {
-		void configuration.updateEffective('graph.style', 'list');
 	}
 
 	@command('gitlens.ai.generateChangelogFrom:')
@@ -3083,8 +3355,44 @@ export class GraphCommands {
 		return Promise.resolve();
 	}
 
+	@command('gitlens.ai.generateChangelogFromCommits:')
 	@debug()
-	private async composeCommits(item?: GraphItemContext) {
+	private async generateChangelogFromCommits(item?: GraphItemContext) {
+		const { selection } = this.getGraphItemRefs(item, 'revision');
+		if (!selection.length) return;
+
+		try {
+			const svc = this.container.git.getRepositoryService(selection[0].repoPath);
+
+			await generateChangelogAndOpenMarkdownDocument(
+				this.container,
+				lazy(async () => {
+					// Use exactly the selected commits (the selection can be discontiguous), newest first to
+					// match log order; the selection arrives in click order, not topological order
+					const results = await Promise.allSettled(selection.map(r => svc.commits.getCommit(r.ref)));
+					const commits = results
+						.map(r => getSettledValue(r))
+						.filter(c => c != null)
+						.sort((a, b) => b.committedDate.getTime() - a.committedDate.getTime());
+					if (commits.length !== selection.length) {
+						throw new Error(
+							`Unable to resolve ${selection.length - commits.length} of the ${selection.length} selected commits`,
+						);
+					}
+
+					return getChangesForChangelog(this.container, undefined, commits);
+				}),
+				{ source: 'graph', detail: 'commits' },
+				{ progress: { location: ProgressLocation.Notification } },
+			);
+		} catch (ex) {
+			Logger.error(ex, 'GraphCommands', 'generateChangelogFromCommits');
+			void showGenericErrorMessage(l10n.t('Unable to generate changelog'));
+		}
+	}
+
+	@debug()
+	private composeCommits(item?: GraphItemContext): void {
 		const ref = this.getGraphItemRef(item);
 		if (ref == null) return;
 
@@ -3094,14 +3402,14 @@ export class GraphCommands {
 		// select the graph's own primary WIP row instead, regardless of `worktreePath`.
 		const worktreePath = this.getGraphItemWorktreePath(item) ?? ref.repoPath;
 		const wipRowId = createWipRowId(worktreePath);
-		await this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'enter-compose',
 			target: { sha: wipRowId, worktreePath: worktreePath },
 		});
 	}
 
 	@debug()
-	private async reviewChanges(item?: GraphItemContext) {
+	private reviewChanges(item?: GraphItemContext): void {
 		const ref = this.getGraphItemRef(item);
 		if (ref == null) return;
 
@@ -3111,7 +3419,7 @@ export class GraphCommands {
 		// repo, so using it alone would review the wrong worktree's changes.
 		const worktreePath = this.getGraphItemWorktreePath(item) ?? ref.repoPath;
 		const wipRowId = createWipRowId(worktreePath);
-		await this.host.notify(DidRequestGraphActionNotification, {
+		this.context.fireRequestAction({
 			action: 'enter-review',
 			target: { sha: wipRowId, worktreePath: worktreePath },
 		});
@@ -3143,8 +3451,84 @@ export class GraphCommands {
 	}
 
 	private notifyOpenCompareMode(params: DidRequestOpenCompareModeParams): Promise<void> {
-		void this.host.notify(DidRequestOpenCompareModeNotification, params);
+		this.context.fireRequestOpenCompareMode(params);
 		return Promise.resolve();
+	}
+
+	/** Shared scaffolding for the compare commands that open compare mode against the user's current
+	 *  worktree: resolves the target ref from the action's item, anchors on the current worktree —
+	 *  both `'HEAD'` and the WT-files fetch resolve where the user is actually working rather than
+	 *  wherever the clicked ref happens to live (avoids the multi-worktree degenerate case where
+	 *  `getBranch(ref.repoPath)` returns the clicked ref itself) — optionally computes the merge
+	 *  base against the current branch, then fires the open-compare-mode request. Convention
+	 *  throughout: leftRef = Base (older), rightRef = Compare (newer).
+	 *
+	 *  Distinct null/fallback policies are preserved per command: `baseOnMergeBase` bails silently
+	 *  when the current branch or merge base can't be resolved, while the ordered and
+	 *  current-branch paths fall back to `'HEAD'` when there's no current branch. */
+	private async openCompareModeFor(
+		item: GraphItemContext | BranchRef | undefined,
+		options: {
+			/** Resolve the target as a branch ref, accepting the webview action-link BranchRef payload */
+			resolveBranch?: boolean;
+			/** Base the comparison on the merge base of the target and the current worktree's branch */
+			baseOnMergeBase?: boolean;
+			/** Put the current branch ('HEAD' fallback) on the Compare side instead of the target ref */
+			sideWithCurrentBranch?: boolean;
+			/** Order the two refs newest-right before comparing */
+			orderNewestRight?: boolean;
+			includeWorkingTree?: boolean;
+		},
+	): Promise<void> {
+		const ref = options.resolveBranch === true ? await this.resolveBranchRef(item) : this.getGraphItemRef(item);
+		if (ref == null) return;
+
+		const currentRepoPath = this.getCurrentRepoPath(ref.repoPath);
+
+		if (options.baseOnMergeBase === true) {
+			const svc = this.container.git.getRepositoryService(currentRepoPath);
+
+			const currentBranch = await svc.branches.getBranch();
+			if (currentBranch == null) return;
+
+			const commonAncestor = await svc.refs.getMergeBase(currentBranch.ref, ref.ref);
+			if (commonAncestor == null) return;
+
+			return void this.notifyOpenCompareMode({
+				repoPath: currentRepoPath,
+				leftRef: commonAncestor,
+				leftRefType: 'commit',
+				rightRef: options.sideWithCurrentBranch === true ? currentBranch.ref : ref.ref,
+				rightRefType: options.sideWithCurrentBranch === true ? 'branch' : this.graphCompareRefType(ref.refType),
+				...(options.includeWorkingTree ? { includeWorkingTree: true } : undefined),
+			});
+		}
+
+		const currentBranch = await this.container.git.getRepositoryService(currentRepoPath).branches.getBranch();
+		const headRef = currentBranch?.ref ?? 'HEAD';
+
+		if (options.orderNewestRight === true) {
+			// `getOrderedComparisonRefs` returns `[newer, older]`; the older ref lands on the left.
+			// The non-HEAD side carries the clicked ref's own type while the HEAD side stays 'branch'.
+			const [newer, older] = await getOrderedComparisonRefs(this.container, currentRepoPath, headRef, ref.ref);
+			const newerIsHead = newer === headRef;
+			return void this.notifyOpenCompareMode({
+				repoPath: currentRepoPath,
+				leftRef: older,
+				leftRefType: newerIsHead ? this.graphCompareRefType(ref.refType) : 'branch',
+				rightRef: newer,
+				rightRefType: newerIsHead ? 'branch' : this.graphCompareRefType(ref.refType),
+			});
+		}
+
+		await this.notifyOpenCompareMode({
+			repoPath: currentRepoPath,
+			leftRef: ref.ref,
+			leftRefType: 'branch',
+			rightRef: headRef,
+			rightRefType: 'branch',
+			...(options.includeWorkingTree ? { includeWorkingTree: true } : undefined),
+		});
 	}
 
 	private async resolveBranchRef(
@@ -3208,22 +3592,29 @@ export class GraphCommands {
 		return 'worktreePath' in value ? value.worktreePath : undefined;
 	}
 
+	/** Resolves the worktree that owns the given branch, preferring the live graph session's
+	 *  worktrees-by-branch cache when the branch belongs to the graph's repo and falling back to a
+	 *  fresh lookup against the branch's own repo otherwise. */
+	private async getGraphItemBranchWorktree(repoPath: string, branchId: string): Promise<GitWorktree | undefined> {
+		let worktreesByBranch;
+		if (repoPath === this._graphSession?.repoPath) {
+			worktreesByBranch = this._graphSession?.current.worktreesByBranch;
+		} else {
+			const repo = this.container.git.getRepository(repoPath);
+			if (repo == null) return undefined;
+
+			worktreesByBranch = await getWorktreesByBranch(repo);
+		}
+
+		return worktreesByBranch?.get(branchId);
+	}
+
 	private async getGraphItemWorktree(item?: GraphItemContext | unknown): Promise<GitWorktree | undefined> {
 		if (isGraphItemRefContext(item, 'branch')) {
 			const { ref } = item.webviewItemValue;
 			if (ref.id == null) return undefined;
 
-			let worktreesByBranch;
-			if (ref.repoPath === this._graphSession?.repoPath) {
-				worktreesByBranch = this._graphSession?.current.worktreesByBranch;
-			} else {
-				const repo = this.container.git.getRepository(ref.repoPath);
-				if (repo == null) return undefined;
-
-				worktreesByBranch = await getWorktreesByBranch(repo);
-			}
-
-			return worktreesByBranch?.get(ref.id);
+			return this.getGraphItemBranchWorktree(ref.repoPath, ref.id);
 		}
 		if (isGraphItemRefContext(item, 'revision')) {
 			const { ref, worktreePath } = item.webviewItemValue;

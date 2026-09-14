@@ -628,7 +628,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			const limit = options?.limit ?? cfg?.commits.maxItems ?? 0;
 			const isSingleCommit = limit === 1;
 
-			const cfgIncludeFiles = options?.includeFiles ?? cfg?.commits.includeFileDetails ?? true;
+			const cfgIncludeFiles = options?.includeFiles ?? cfg?.commits.includeFileDetails?.(repoPath) ?? true;
 			const includeFiles = cfgIncludeFiles || isSingleCommit || Boolean(options?.path?.pathspec);
 
 			const parser = getCommitsLogParser(includeFiles, Boolean(options?.path?.pathspec && options?.path?.range));
@@ -736,6 +736,10 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			const currentUser = await currentUserPromise.catch(() => undefined);
 			if (cancellation?.aborted) throw new CancellationError();
 
+			// Only the eager, paged, multi-commit log measures the cost this evidence switches off — a
+			// single-commit load and a pathspec-filtered log are cheap per numstat regardless of `includeFiles`.
+			const isEagerPagedFileLog = includeFiles && !isSingleCommit && !options?.path?.pathspec;
+
 			const cmdOpts: GitRunOptions = {
 				cwd: repoPath,
 				cancellation: cancellation,
@@ -752,6 +756,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 							},
 						}
 					: undefined),
+				...(isEagerPagedFileLog ? { slownessCategory: 'commitFiles' as const } : undefined),
 			};
 			let { commits, count } = await parseCommits(
 				parser,
@@ -1383,6 +1388,12 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			search = (await this.context.searchQuery?.preprocessQuery?.(search, options?.source)) ?? search;
 		}
 
+		// The conversion failed — `search.query` is still the raw English sentence, not a query; running
+		// it as an ERE would produce a regex error about text the user never wrote.
+		if (typeof search.naturalLanguage === 'object' && search.naturalLanguage.error) {
+			return { search: search, log: undefined };
+		}
+
 		try {
 			const cfg = this.context.config;
 			const currentUser = await this.provider.config.getCurrentUser(repoPath);
@@ -1399,6 +1410,11 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			];
 
 			const { args: searchArgs, files, shas, filters } = parseSearchQueryGitCommand(search, currentUser);
+			// Stash commits have 2-3 parents, so `--merges` matches them; excluded in parseCommits.
+			// Derived from the args git actually runs rather than `filters.type`, since a multi-value
+			// `type:` query (e.g. `type:merge type:tip`) leaves `--merges` in the args while
+			// `filters.type` reflects only the last value parsed
+			const mergesOnly = searchArgs.includes('--merges');
 
 			let stashes: Map<string, GitStashCommit> | undefined;
 			let stdin: string | undefined;
@@ -1431,9 +1447,22 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 			} else if (!filters.refs) {
 				// Don't include stashes when using ref: filter, as they would add unrelated commits
 				// There *HAS* to be a better way to get git log to return stashes, but this is the best we've found
-				({ stdin, stashes } = convertStashesToStdin(
+				const converted = convertStashesToStdin(
 					await this.provider.stash?.getStash(repoPath, undefined, cancellation),
-				));
+				);
+				stashes = converted.stashes;
+				// `--all` already surfaces refs/stash's tip on its own, so when merges-only there's no need
+				// to walk the rest of the stash stack via stdin -- parseCommits still excludes any stash
+				// sha that slips through via refs/stash
+				stdin = mergesOnly ? undefined : converted.stdin;
+			} else if (mergesOnly) {
+				// `ref:` skips walking stashes into the results (they're unrelated to the ref), but a
+				// stash's tip can still leak in via `--merges` if the ref reaches refs/stash -- fetch
+				// stashes here purely so parseCommits can exclude them, without widening the walk via
+				// stdin
+				stashes = convertStashesToStdin(
+					await this.provider.stash?.getStash(repoPath, undefined, cancellation),
+				).stashes;
 			}
 
 			if (stdin) {
@@ -1481,6 +1510,7 @@ export class CommitsGitSubProvider implements GitCommitsSubProvider {
 				stashes,
 				currentUser,
 				filters,
+				mergesOnly,
 			);
 
 			const log: GitLog = {
@@ -1710,6 +1740,11 @@ async function parseCommits(
 	stashes: Map<string, GitStashCommit> | undefined,
 	currentUser: GitUser | undefined,
 	searchFilters?: SearchQueryFilters,
+	// Stash commits have 2-3 parents, so `--merges` matches them; excluded below. Passed in by the
+	// caller (derived from the args git actually runs) rather than re-derived from `searchFilters.type`
+	// here, since a multi-value `type:` query (e.g. `type:merge type:tip`) leaves `--merges` in the
+	// args while `searchFilters.type` reflects only the last value parsed
+	mergesOnly: boolean = false,
 ): Promise<{ commits: Map<string, GitCommit>; count: number; countStashChildCommits: number }> {
 	let count = 0;
 	let countStashChildCommits = 0;
@@ -1729,6 +1764,7 @@ async function parseCommits(
 
 			for (const c of parser.parse(result.stdout)) {
 				if (stashesOnly && !stashes?.has(c.sha)) continue;
+				if (mergesOnly && stashes?.has(c.sha)) continue;
 				if (tipsOnly && !c.tips) continue;
 
 				count++;
@@ -1781,6 +1817,7 @@ async function parseCommits(
 
 		for await (const c of parser.parseAsync(resultOrStream)) {
 			if (stashesOnly && !stashes?.has(c.sha)) continue;
+			if (mergesOnly && stashes?.has(c.sha)) continue;
 			if (tipsOnly && !c.tips) continue;
 
 			count++;

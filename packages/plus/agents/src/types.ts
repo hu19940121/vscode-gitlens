@@ -1,8 +1,12 @@
 import type { IpcHandler } from '@gitlens/ipc/ipcServer.js';
 import type { UnifiedDisposable } from '@gitlens/utils/disposable.js';
 import type { Event } from '@gitlens/utils/event.js';
+import type { EndedTranscriptDetails } from './providers/claudeCodeTranscript.js';
 
-export const claudeCodeNonBlockingHookEvents = [
+/** Claude Code's native non-blocking hook event vocabulary, adopted as the canonical set for all
+ *  agents because it is a superset of every other supported agent's. Other agents map their native
+ *  event names onto these via `AgentCapabilities.eventMap` / `resolveEvent`. */
+export const canonicalNonBlockingHookEvents = [
 	'SessionStart',
 	'SessionEnd',
 	'UserPromptSubmit',
@@ -28,11 +32,11 @@ export const claudeCodeNonBlockingHookEvents = [
 	'CwdChanged',
 ] as const;
 
-export const claudeCodeBlockingHookEvents = ['PermissionRequest'] as const;
+export const canonicalBlockingHookEvents = ['PermissionRequest'] as const;
 
-export type ClaudeCodeHookEvent =
-	| (typeof claudeCodeNonBlockingHookEvents)[number]
-	| (typeof claudeCodeBlockingHookEvents)[number];
+export type AgentHookEvent =
+	| (typeof canonicalNonBlockingHookEvents)[number]
+	| (typeof canonicalBlockingHookEvents)[number];
 
 export type PermissionDecision = 'allow' | 'deny';
 
@@ -45,10 +49,14 @@ export type AgentSessionStatus =
 	| 'compacting'
 	| 'permission_requested'
 	// Terminal state: the session has ended (SessionEnd fired, or the CLI's durable store reports it
-	// `ended`). Kept in the list as a de-emphasized "completed" row until archived or 30-day-purged.
-	| 'completed';
+	// `ended`). Kept in the list as a de-emphasized "ended" row (shown as "Past" in the UI) until
+	// archived or 30-day-purged.
+	| 'ended';
 
-export type AgentSessionPhase = 'idle' | 'working' | 'waiting' | 'completed';
+export type AgentSessionPhase = 'idle' | 'working' | 'waiting' | 'ended';
+
+export type AgentSessionResumeTarget = 'terminal' | 'extension';
+export type AgentSessionResumeOutcome = 'extension' | 'terminal';
 
 export function getPhaseForStatus(status: AgentSessionStatus): AgentSessionPhase {
 	switch (status) {
@@ -62,8 +70,8 @@ export function getPhaseForStatus(status: AgentSessionStatus): AgentSessionPhase
 			return 'waiting';
 		case 'idle':
 			return 'idle';
-		case 'completed':
-			return 'completed';
+		case 'ended':
+			return 'ended';
 	}
 }
 
@@ -123,6 +131,11 @@ export interface AgentSession {
 	readonly phase: AgentSessionPhase;
 	readonly statusDetail?: string;
 	readonly worktreePath?: string;
+	/** Distinct worktree roots this session has been observed in (normalized), ordered by recency —
+	 *  most recently observed LAST (so the current `worktreePath` is normally the final entry).
+	 *  Accumulated from the CLI's `cwdTimeline` and the git probe; never pruned for the session's
+	 *  lifetime. */
+	readonly visitedWorktreePaths?: readonly string[];
 	/** Common (parent) repo path shared by every worktree in this session's repo. Set together
 	 *  with `worktreePath` by `resolveGitInfo` — equal to `worktreePath` for a default-worktree
 	 *  session, otherwise the parent repo's common path. Use this for "same repo" identity
@@ -167,7 +180,7 @@ export interface AgentSession {
 	 *  the CLI's durable session record. */
 	readonly model?: string;
 	/** Why the session ended: `session-end | rotated | stale | dead-pid | pid-zero-idle | archived`.
-	 *  Present only for `completed` sessions. */
+	 *  Present only for `ended` sessions. */
 	readonly endReason?: string;
 	/** Epoch ms the session ended — matches the RPC convention for dates crossing to a webview
 	 *  (see `PastAgentSessionState.lastActivity`), and keeps `SerializedAgentSession` free of
@@ -196,16 +209,6 @@ export interface AgentSession {
 	 *  Mutable array form so `Shape<AgentSession>` projects it cleanly (the `Shape<>` type mangles
 	 *  `readonly T[]` into a mapped object that loses its iterator). Treat as immutable. */
 	fileActivity?: { path: string; readAt?: number; editedAt?: number; reading?: true; editing?: true }[];
-	/** `true` when the session was discovered via peer IPC sync (i.e. another GitLens window hosts
-	 *  the agent's hook flow and Claude Code extension panel). Locally-owned sessions leave this
-	 *  unset. The dispatcher uses this to route opens through the peer's IPC route + an OS-level
-	 *  window focus, since calling `claude-vscode.editor.open` in *our* extension only opens an
-	 *  inert local view that isn't connected to the live session running in the peer.
-	 *
-	 *  Window-local: never serialized faithfully across the IPC wire. Each window decides locally
-	 *  based on how it received the session — `querySiblingWindowSessions` always overrides to
-	 *  `true` regardless of what the peer published. */
-	readonly isPeerOwned?: boolean;
 	/**
 	 * Titles discovered by tailing the Claude Code transcript JSONL at
 	 * `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`. Populated by
@@ -224,6 +227,14 @@ export interface AgentSessionProvider extends UnifiedDisposable {
 	readonly name: string;
 	readonly icon: string;
 
+	/** Every {@link AgentSession.providerId} this provider can host — a DIFFERENT namespace from
+	 *  {@link id}, which names the provider itself. A provider that fronts several agents needs this
+	 *  so the host can route an action for a session it isn't tracking (a historical row, or one
+	 *  optimistically removed), where ownership-by-session-id has no answer. Omit it when the
+	 *  provider hosts exactly one agent whose session provider id equals its own {@link id}.
+	 */
+	readonly agentProviderIds?: readonly string[];
+
 	readonly onDidChangeSessions: Event<void>;
 	readonly sessions: readonly AgentSession[];
 
@@ -238,7 +249,7 @@ export interface AgentSessionProvider extends UnifiedDisposable {
 	/** Pushed by the host from its cached agent detection. Lets the provider gate its reconciliation
 	 *  poll (the CLI `list-sessions` call) so an idle window with no sessions and no installed hooks
 	 *  doesn't spawn the CLI every interval. */
-	setClaudeHooksInstalled?(installed: boolean): void;
+	setHooksInstalled?(installed: boolean): void;
 
 	/** Resolves a pending permission. Returns `true` when the resolve was routed (the local IPC
 	 *  owns the session's pending entry); `false` when no local entry exists (typically a peer-
@@ -250,66 +261,110 @@ export interface AgentSessionProvider extends UnifiedDisposable {
 		updatedPermissions?: PermissionSuggestion[],
 	): boolean;
 
-	/** Asks the peer GitLens window that has `workspacePath` open (or any peer whose workspacePath
-	 *  contains, or is contained by, it) to open the given session in its Claude Code extension
-	 *  via the `agents/sessions/open` IPC route. Resolves to `true` when at least one peer claimed
-	 *  the workspace AND was reachable; `false` otherwise. Best-effort: never rejects. The boolean
-	 *  is currently a diagnostic signal only — the dispatcher fires this in parallel with
-	 *  `vscode.openFolder` and relies on VS Code's window-folder matching to focus the owning
-	 *  window (which works whether or not the peer runs GitLens). */
-	notifyPeerOpenSession?(workspacePath: string, sessionId: string): Promise<boolean>;
+	/** Relays an open-session request to whichever GitLens window hosts `sessionId`, via the GK
+	 *  CLI's `gk ai hook open-session` relay — the CLI (not this process) resolves the target
+	 *  window from its own view of every publishing GitLens window. Resolves to `true` when the
+	 *  CLI reports delivery; `false` otherwise, including when the CLI predates the relay command.
+	 *  Best-effort: never rejects. The boolean is currently a diagnostic signal only — the
+	 *  dispatcher fires this in parallel with `vscode.openFolder` and relies on VS Code's
+	 *  window-folder matching to focus the owning window (which works whether or not the peer
+	 *  runs GitLens). */
+	relayOpenSession?(sessionId: string, path: string): Promise<boolean>;
 
-	/** Lists past sessions that can be resumed from `cwd`, most-recently-active first. Omitted by
-	 *  providers with no durable per-directory session store to read. Live sessions are excluded by
-	 *  the caller, not here — this reports what the store holds. The caller may also pass its live
-	 *  set via {@link ResumableSessionsOptions.excludeSessionIds} so exclusion happens before `limit`
-	 *  applies rather than after. */
-	listResumableSessions?(cwd: string, options?: ResumableSessionsOptions): Promise<ResumableSessionsResult>;
+	/** Lists historical sessions for `cwd`, most-recently-active first. Omitted by providers with no
+	 *  historical-session source. The provider owns reconciliation of its durable store, tracked
+	 *  terminal records, and archive state; callers only pass provider-local live ids to exclude.
+	 *  Each item advertises its supported actions independently, so an ended session can remain
+	 *  visible even when its transcript is missing or the harness cannot resume it. */
+	listSessionHistory?(cwd: string, options?: AgentSessionHistoryOptions): Promise<AgentSessionHistoryResult>;
 
-	/** Archives a completed (non-live) session via the CLI, dismissing it from the list. Ends an
+	/** Resumes one historical session using this harness's launcher. Providers only advertise a
+	 *  history `resume` action when this operation is wired and can service it. */
+	resumeSession?(
+		providerId: string,
+		sessionId: string,
+		cwd: string,
+		target: AgentSessionResumeTarget,
+		name?: string,
+	): Promise<AgentSessionResumeOutcome | false>;
+
+	/** Monotonic count of terminal transitions — bumped whenever a session ends, is removed on end
+	 *  (legacy path), or is pruned. The host snapshots it around a history query and retries when it
+	 *  moved: any terminal transition mid-query means the answer may be missing a session, however
+	 *  the provider represents the transition (retained `ended` row or outright removal). Required —
+	 *  the host's consistency check depends on it, and an omitted counter would silently restore the
+	 *  missing-session race. A provider whose sessions never transition terminally exposes a
+	 *  constant `0`. */
+	readonly terminalGeneration: number;
+
+	/** Archives an ended (non-live) session via the CLI, dismissing it from the list. Ends an
 	 *  active session first (the CLI broadcasts a synthetic SessionEnd) — but callers should only
-	 *  offer this on `completed` sessions, and a provider refuses (returns `false`) any non-completed
+	 *  offer this on `ended` sessions, and a provider refuses (returns `false`) any non-ended
 	 *  row that resumed since the click, so the CLI never terminates live work. Resolves to `true` when
 	 *  the session was archived (removed locally; the next reconciliation poll confirms it). */
 	archiveSession?(sessionId: string): Promise<boolean>;
 
-	/** Resolves git identity + the transcript title and first/last prompt for a completed session
-	 *  lazily — called by the host when the user *opens* a completed row (the `Open Session` action),
-	 *  not on mere display. Completed sessions skip eager resolution during the poll so a 30-day
+	/** Resolves git identity + the transcript title and first/last prompt for an ended session
+	 *  lazily — called by the host when the user *opens* an ended row (the `Open Session` action),
+	 *  not on mere display. Ended sessions skip eager resolution during the poll so a 30-day
 	 *  cold-start doesn't fan out hundreds of git probes + transcript reads; the row shows its
-	 *  durable-store label until opened. No-op if the session isn't a tracked completed one. */
-	resolveCompletedSessionDetails?(sessionId: string): void;
+	 *  durable-store label until opened. No-op if the session isn't a tracked ended one. */
+	resolveEndedSessionDetails?(sessionId: string): void;
 
-	/** Lists the ids of sessions that have been archived. Used to exclude them from the "Past"
-	 *  transcript-store listing — the tracked row is gone once archived, but the transcript on disk
-	 *  survives and would otherwise resurface there. Resolves to `[]` on any error. */
-	getArchivedSessionIds?(): Promise<string[]>;
+	/** Resolves the transcript-backed detail (titles + first/last prompt) for a session lazily —
+	 *  called by the host when the user opens the past-session sheet, not on mere listing. No
+	 *  `_sessions` gate: works for a transcript-only id that was never tracked live this window. */
+	resolveSessionDetails?(sessionId: string, cwd?: string): Promise<EndedTranscriptDetails | undefined>;
 }
 
-export interface ResumableSessionsOptions {
-	/** How many sessions to detail. Discovery covers the whole store; only this many are read. */
+export type { EndedTranscriptDetails } from './providers/claudeCodeTranscript.js';
+
+export type AgentSessionHistoryDisposition = 'ended' | 'archived';
+
+export interface AgentSessionHistoryOptions {
+	/** How many sessions to detail. Discovery may cover the whole store while expensive summaries
+	 *  remain bounded. */
 	readonly limit?: number;
-	/** Session ids to skip before `limit` applies — typically the caller's live sessions.
-	 *  Excluded entries still count toward `total`. */
+	/** Provider-local session ids to skip before `limit` applies — typically the caller's live rows. */
 	readonly excludeSessionIds?: ReadonlySet<string>;
+	/** Restricts results to items that will advertise a resume action, and restricts `total` to
+	 *  counting only those — feeds the resume picker, whose "N of M" overflow header needs a
+	 *  resumable-only M. `total` stays a DISCOVERY count (an upper bound): a record whose transcript
+	 *  later proves empty or unreadable is dropped from `sessions` but still counted, since exact
+	 *  counting would mean summarizing every transcript in the store. */
+	readonly requireResume?: boolean;
 }
 
-/** A session that is no longer running but whose transcript survives, so it can be resumed. */
-export interface ResumableAgentSession {
+/** Actions a provider can perform on one historical item. Action presence is the capability: a
+ *  resume action carries its required directory, while archive is appropriate to the item's
+ *  disposition. */
+export interface AgentSessionHistoryActions {
+	readonly resume?: { readonly cwd: string; readonly targets: readonly AgentSessionResumeTarget[] };
+	readonly archive?: true;
+}
+
+/** A provider-local historical session. */
+export interface AgentSessionHistoryItem {
 	readonly id: string;
+	/** The owning agent's {@link AgentSession.providerId}. Set by the provider, which is the only
+	 *  side that knows it once one provider fronts several agents — and it has to match the live
+	 *  namespace exactly, because consumers dedupe a past row against a live one by
+	 *  `getAgentSessionIdentityKey(providerId, id)`. */
 	readonly providerId: string;
-	/** The directory the session must be resumed from — resolving it is the store's whole job. */
-	readonly cwd: string;
+	readonly disposition: AgentSessionHistoryDisposition;
+	readonly actions: AgentSessionHistoryActions;
 	readonly lastActivity: Date;
+	readonly name?: string;
 	/** Mirrors {@link AgentSession.transcriptTitles} — kept unresolved so naming stays the display
 	 *  cascade's job rather than being decided here. */
 	readonly titles?: { readonly custom?: string; readonly ai?: string; readonly agent?: string };
+	readonly firstPrompt?: string;
 	readonly lastPrompt?: string;
 }
 
-export interface ResumableSessionsResult {
-	readonly sessions: ResumableAgentSession[];
-	/** Everything the store holds for `cwd`, not just the detailed slice — drives "Showing N of M". */
+export interface AgentSessionHistoryResult {
+	readonly sessions: AgentSessionHistoryItem[];
+	/** Every matching historical record, not just the detailed slice — drives inline paging. */
 	readonly total: number;
 }
 
@@ -324,14 +379,28 @@ export interface ResumableSessionsResult {
  */
 export interface IpcRegistrar {
 	readonly port: number | undefined;
-	/** Directory scanned for peer-window agent discovery files. Omit to disable peer discovery (tests). */
-	readonly agentDiscoveryDir?: string;
+	/** This window's own IPC server address (e.g. `http://127.0.0.1:<port>`), or `undefined` when
+	 *  the server hasn't started. Passed to the CLI relay as `--exclude-address` so it doesn't
+	 *  route an open-session request back to the window that's already asking for it. */
+	readonly address: string | undefined;
 	registerHandler<Request = unknown, Response = unknown>(
 		name: string,
 		handler: IpcHandler<Request, Response>,
 	): UnifiedDisposable;
 	publishAgents(workspacePaths: string[]): Promise<void>;
 	unpublishAgents(): Promise<void>;
+}
+
+/** One entry of the host's current-agent listing, independent of the CLI's durable store.
+ *  `kind: 'background'` entries carry `state` and no `pid`, including terminal states the listing
+ *  retains; interactive entries carry `pid` and `status`. */
+export interface LiveAgentSession {
+	pid?: number;
+	cwd?: string;
+	kind?: string;
+	status?: string;
+	state?: string;
+	waitingFor?: string;
 }
 
 export interface AgentProviderCallbacks {
@@ -394,10 +463,35 @@ export interface AgentProviderCallbacks {
 		| undefined
 	>;
 
+	/** Reveals a session hosted in THIS window — its Claude Code tab or the integrated terminal
+	 *  running it. Invoked by the `agents/sessions/open` IPC handler, the receiving end of
+	 *  `gk ai hook open-session`. Resolves `false` when nothing in this window can show it. */
+	revealSession?(sessionId: string): Promise<boolean>;
+
+	/** Host-computed resume destinations for a session of `providerId` homed at `cwd`; always ends
+	 *  with `'terminal'`. Omitted callback (or omitted result) defaults to `['terminal']`. */
+	getResumeTargets?(providerId: string, cwd: string): readonly AgentSessionResumeTarget[];
+
+	/** Host-side launcher wired into providers that support resumable history. Kept generic at the
+	 *  provider boundary: each harness chooses whether and when to expose it as a capability. */
+	resumeSession?(
+		providerId: string,
+		sessionId: string,
+		cwd: string,
+		target: AgentSessionResumeTarget,
+		name?: string,
+	): Promise<AgentSessionResumeOutcome | false>;
+
 	/**
-	 * Open a Claude Code session in the Claude Code VS Code extension. Invoked by the IPC handler
-	 * when a peer GitLens window asks this window to open a session on its behalf — the host wires
-	 * this to `claude-vscode.editor.open`. Throws if the extension isn't installed/active.
+	 * Host-supplied lookup of Claude's current interactive/background session listing, keyed by
+	 * session id. It revives stale durable `ended` records and narrowly corrects active records
+	 * whose last event is stale: first discovery and synthesized, unresolvable permission asks.
+	 * Terminal background states (`done`, `failed`, `stopped`) are listed but are not live; absence
+	 * from the map is unknown and must preserve record-derived state. `status` is set for
+	 * `kind: 'interactive'` entries (`'waiting'`, `'busy'`, …); `state` is set for
+	 * `kind: 'background'` entries instead (no `pid`). Declared structurally (not imported from
+	 * `@env/`) because this package cannot depend on the host's environment abstraction. Optional
+	 * on hosts with no such lookup; without it, durable records are trusted as-is.
 	 */
-	openSessionInClaudeExtension?(sessionId: string): Promise<void>;
+	getLiveAgentSessions?(): Promise<ReadonlyMap<string, LiveAgentSession>>;
 }

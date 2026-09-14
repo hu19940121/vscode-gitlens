@@ -1,5 +1,6 @@
-import { CancellationTokenSource, window } from 'vscode';
+import { CancellationTokenSource, l10n, window } from 'vscode';
 import type { AIChatMessage, AIProviderResponse, AIResponseFormat } from '@gitlens/ai/models/provider.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
 import type { GitRepositoryService } from '../../../git/gitRepositoryService.js';
@@ -111,8 +112,8 @@ export class ComposeToolsIntegration {
 		return createComposeGitPort(svc);
 	}
 
-	protected createAiModelPort(telemetrySource: Source): AiModelPort {
-		return createAiModelPort(this.container, telemetrySource);
+	protected createAiModelPort(telemetrySource: Source, conversationId: string): AiModelPort {
+		return createAiModelPort(this.container, telemetrySource, conversationId);
 	}
 
 	protected buildLargePromptGate(initiallySuppressed: boolean): OnBeforePrompt {
@@ -177,8 +178,13 @@ function createComposeGitPort(svc: GitRepositoryService): ComposeGitPort {
  * Cancellation (`'cancelled'` outcome from sendRequest) surfaces as a thrown
  * `ComposeWorkflowError('CANCELLED')` from the library, because the library catches
  * adapter errors and wraps cancellation.
+ *
+ * `conversationId` tracks one compose session — every call this port makes, including the library's
+ * own validation retries, shares it. Required, not optional: a missing ID silently splits one session
+ * into as many sessions as it made calls. It also aggregates the session's usage reporting, so
+ * whoever minted the ID MUST call `AIProviderService.flushBYOKUsage` when the session ends.
  */
-export function createAiModelPort(container: Container, source: Source): AiModelPort {
+export function createAiModelPort(container: Container, source: Source, conversationId: string): AiModelPort {
 	return {
 		generate: async (params: AiGenerateParams): Promise<AiGenerateResult> => {
 			const cancellationSource = new CancellationTokenSource();
@@ -229,6 +235,7 @@ export function createAiModelPort(container: Container, source: Source): AiModel
 					source,
 					{
 						cancellation: cancellationSource.token,
+						conversationId: conversationId,
 						modelOptions: {
 							outputTokens: params.maxTokens,
 							temperature: params.temperature,
@@ -303,12 +310,13 @@ function buildLargePromptGate(initiallySuppressed: boolean): OnBeforePrompt {
 }
 
 async function showInteriorRefsWarning(violations: InteriorRefViolation[]): Promise<boolean> {
-	const confirm = { title: 'Continue' };
-	const cancel = { title: 'Cancel', isCloseAffordance: true };
+	const confirm = { title: l10n.t('Continue') };
+	const cancel = { title: l10n.t('Cancel'), isCloseAffordance: true };
 	const result = await window.showWarningMessage(
-		`Some commits being recomposed are also pointed to by other branches or tags:\n\n${formatInteriorRefList(
-			violations,
-		)}\n\nThese references won't be updated — they'll keep pointing at their current commits (which remain in the repository), so the recomposed history will diverge from them rather than being followed by them.\n\nDo you want to continue?`,
+		l10n.t(
+			"Some commits being recomposed are also pointed to by other branches or tags:\n\n{0}\n\nThese references won't be updated — they'll keep pointing at their current commits (which remain in the repository), so the recomposed history will diverge from them rather than being followed by them.\n\nDo you want to continue?",
+			formatInteriorRefList(violations),
+		),
 		{ modal: true },
 		confirm,
 		cancel,
@@ -318,14 +326,17 @@ async function showInteriorRefsWarning(violations: InteriorRefViolation[]): Prom
 
 function formatInteriorRefList(violations: InteriorRefViolation[]): string {
 	const max = 10;
-	const labels = violations.map(v => {
-		if (v.refname.startsWith('refs/tags/')) return `tag ${v.refname.slice('refs/tags/'.length)}`;
-		if (v.refname.startsWith('refs/heads/')) return v.refname.slice('refs/heads/'.length);
-		return v.refname;
+	const shown = violations.slice(0, max).map(v => {
+		if (v.refname.startsWith('refs/tags/')) {
+			return l10n.t('  • tag {0}', v.refname.slice('refs/tags/'.length));
+		}
+
+		if (v.refname.startsWith('refs/heads/')) return `  • ${v.refname.slice('refs/heads/'.length)}`;
+		return `  • ${v.refname}`;
 	});
-	const shown = labels.slice(0, max).map(l => `  • ${l}`);
-	if (labels.length > max) {
-		shown.push(`  • …and ${labels.length - max} more`);
+	const remaining = violations.length - max;
+	if (remaining > 0) {
+		shown.push(formatPlural(l10n.t('{0, plural, one{  • …and {0} more} other{  • …and {0} more}}'), [remaining]));
 	}
 	return shown.join('\n');
 }

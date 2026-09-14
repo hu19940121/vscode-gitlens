@@ -19,14 +19,18 @@ import type {
 } from '../authentication/integrationAuthenticationProvider.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
+import { RejectedTokenTracker } from '../authentication/rejectedTokenTracker.js';
 import type { IntegrationIds, IssuesCloudHostIntegrationId } from '../constants.js';
 import { GitCloudHostIntegrationId } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
-import { AuthenticationError, RequestClientError } from '../errors.js';
+import { AuthenticationError, RequestClientError, toError } from '../errors.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
 import type { ProvidersApi } from '../providers/providersApi.js';
 import type { Sources } from '../telemetry.js';
+import { areDomainsOnSameHost } from '../utils/domain.utils.js';
+import { isGitSelfManagedHostIntegrationId } from '../utils/integration.utils.js';
 import type { GitHostIntegration } from './gitHostIntegration.js';
+import type { AccountWideIssuesResult, SearchMyIssuesOptions } from './issueReads.js';
 import type { IssuesIntegration } from './issuesIntegration.js';
 
 export type Integration = GitHostIntegration | IssuesIntegration;
@@ -34,6 +38,11 @@ export type IntegrationById<T extends IntegrationIds> = T extends IssuesCloudHos
 	? IssuesIntegration
 	: GitHostIntegration;
 export type IntegrationType = 'git' | 'issues';
+
+// The issue-read contracts live in their own module (pure data, and their relationship to each other is the
+// point of reading them together); re-exported here so the providers that implement these reads keep one import.
+export type { AccountWideIssuesResult, ProviderIssueSearchPage, SearchMyIssuesOptions } from './issueReads.js';
+export type { ProviderPullRequestSearchPage } from './pullRequestReads.js';
 
 export type IntegrationKey<T extends IntegrationIds = IntegrationIds> = T extends
 	| GitCloudHostIntegrationId
@@ -57,16 +66,25 @@ type SyncReqUsecase = Exclude<
 	| 'getIssue'
 	| 'getIssueOrPullRequest'
 	| 'getIssuesForProject'
+	| 'getIssuesForRepos'
+	| 'getMyPullRequestsForUser'
 	| 'getOrganizationsForUser'
+	| 'getProjectsForOrg'
 	| 'getProjectsForResources'
 	| 'getPullRequest'
 	| 'getRepositoriesForOrg'
+	| 'getRepositoriesForUser'
 	| 'getPullRequestForBranch'
 	| 'getPullRequestForCommit'
+	| 'getPullRequestsForRepos'
 	| 'getRepositoryMetadata'
 	| 'getResourcesForUser'
 	| 'getSshSigningKeysForEmails'
+	| 'countIssues'
+	| 'countPullRequests'
 	| 'mergePullRequest'
+	| 'searchIssuesPage'
+	| 'searchPullRequestsPage'
 	| 'searchMyIssues'
 	| 'searchMyPullRequests'
 	| 'searchPullRequests',
@@ -134,9 +152,13 @@ export abstract class IntegrationBase<
 		if (this._session == null) return undefined;
 
 		if (this._sessionFingerprint?.session !== this._session) {
-			this._sessionFingerprint = { session: this._session, hash: fnv1aHash64(this._session.accessToken) };
+			this._sessionFingerprint = { session: this._session, hash: this.getSessionFingerprint(this._session) };
 		}
 		return this._sessionFingerprint.hash;
+	}
+
+	protected getSessionFingerprint(session: ProviderAuthenticationSession): string {
+		return fnv1aHash64(session.accessToken);
 	}
 
 	get connectionExpired(): boolean | undefined {
@@ -151,7 +173,13 @@ export abstract class IntegrationBase<
 		if (this._session === undefined) {
 			return this.ensureSession({ createIfNeeded: false, source: source });
 		}
-		return this._session ?? undefined;
+		return this._session != null && this.isSessionForIntegrationHost(this._session) ? this._session : undefined;
+	}
+
+	private isSessionForIntegrationHost(session: ProviderAuthenticationSession): boolean {
+		if (!isGitSelfManagedHostIntegrationId(this.id)) return true;
+
+		return areDomainsOnSameHost(this.domain, session.domain);
 	}
 
 	/**
@@ -177,15 +205,20 @@ export abstract class IntegrationBase<
 		// A truthy connectionId targets a specific account; an empty string is not a real target, so it falls
 		// through to the primary path below.
 		if (connectionId) {
+			// A read of this connection previously failed with an AuthenticationError, so the token in
+			// storage is known-refused. Ask for a refresh through the GK cloud before reading again, which
+			// is this branch's equivalent of the primary path's `refreshSessionIfExpired`. Claimed here so
+			// the forced refresh runs at most once per rejection.
+			const refreshRejectedToken = this._rejectedTokens.claimRefresh(connectionId);
 			// Degrade to "no results" on failure, matching the primary path (whose ensureSession/
 			// refreshSessionIfExpired swallow errors) so read methods keep their never-throws contract.
 			try {
 				const authProvider = await this.authenticationService.get(this.authProvider.id);
 				const session = await authProvider.getSession(
 					{ ...this.authProviderDescriptor, connectionId: connectionId, cloud: true },
-					{ source: source },
+					{ source: source, refreshRejectedToken: refreshRejectedToken },
 				);
-				return session ?? undefined;
+				return session != null && this.isSessionForIntegrationHost(session) ? session : undefined;
 			} catch (ex) {
 				scope?.error(ex);
 				return undefined;
@@ -196,7 +229,7 @@ export abstract class IntegrationBase<
 		if (!connected) return undefined;
 
 		await this.refreshSessionIfExpired(scope);
-		return this._session ?? undefined;
+		return this._session != null && this.isSessionForIntegrationHost(this._session) ? this._session : undefined;
 	}
 
 	@debug()
@@ -237,7 +270,13 @@ export abstract class IntegrationBase<
 			// id, so an unscoped clear would sign the user out of unrelated hosts. deleteAllSessions derives an
 			// undefined domain for cloud providers, so they still clear every account as intended.
 			const authProvider = await this.authenticationService.get(this.authProvider.id);
-			void authProvider.deleteAllSessions(this.authProviderDescriptor);
+			// Awaited, not fire-and-forget: a caller that awaits `disconnect()` has to be able to rely on the
+			// secrets and descriptors actually being gone when it resumes. Left floating, the only thing that
+			// ever made this land in time was incidental scheduling slack — `syncCloudIntegrations` used to
+			// await each provider in turn, so a later iteration's suspension let the previous provider's delete
+			// finish. Syncing providers concurrently removes that slack and the clear was observably still
+			// pending when the sync returned.
+			await authProvider.deleteAllSessions(this.authProviderDescriptor);
 		}
 
 		this.resetRequestExceptionCount('all');
@@ -263,6 +302,10 @@ export abstract class IntegrationBase<
 
 	@debug()
 	async reauthenticate(): Promise<void> {
+		// `forceNewSession` below deletes the stored secrets to reconnect. Ahead of the guard — see
+		// `onStoredTokensReplaced`.
+		this.onStoredTokensReplaced();
+
 		if (this._session === undefined) return;
 
 		this._session = undefined;
@@ -280,6 +323,30 @@ export abstract class IntegrationBase<
 	requestSessionSyncForUsecase(syncReqUsecase: SyncReqUsecase): void {
 		this._syncRequestsPerFailedUsecase.add(syncReqUsecase);
 	}
+
+	/**
+	 * The per-connection counterpart of the primary session's expire-and-resync recovery: a token the
+	 * provider refused is refreshed once through the GK cloud, which exchanges the refresh token server-side
+	 * (the client never holds one). Armed by {@link handleProviderException} and consumed by
+	 * {@link resolveReadSession}; a rejection it declines belongs to {@link trackRequestException} instead.
+	 */
+	private readonly _rejectedTokens = new RejectedTokenTracker();
+
+	/**
+	 * Called by every path that replaces or removes the stored tokens — a disconnect, a forced re-sync, a
+	 * reauthentication, or the connection set changing. A rejection names a specific credential, so once that
+	 * credential is gone the rejection describes nothing and must not force a refresh (or, for a deleted
+	 * connection, outlive it).
+	 *
+	 * Deliberately NOT conditioned on `_session`. A per-connection read resolves through the auth provider and
+	 * never populates the cached primary session, so the connections this recovery exists for are exactly the
+	 * ones with no `_session` to inspect — the same blind spot the recovery itself was added to fix. Callers
+	 * that guard on `_session` therefore invoke this ahead of that guard.
+	 */
+	protected onStoredTokensReplaced(): void {
+		this._rejectedTokens.clear();
+	}
+
 	private static readonly requestExceptionLimit = 5;
 	private requestExceptionCount = 0;
 
@@ -287,6 +354,8 @@ export abstract class IntegrationBase<
 		this.requestExceptionCount = 0;
 		if (syncReqUsecase === 'all') {
 			this._syncRequestsPerFailedUsecase.clear();
+			// 'all' is the whole-integration reset: a disconnect, or a re-sync that produced a new access token.
+			this.onStoredTokensReplaced();
 		} else {
 			this._syncRequestsPerFailedUsecase.delete(syncReqUsecase);
 		}
@@ -311,6 +380,10 @@ export abstract class IntegrationBase<
 	 * `deleteConnection`). Unlike {@link reset}/{@link disconnect}, it deletes nothing from storage.
 	 */
 	switchConnection(): void {
+		// A connection was deleted, or a different one became primary. Ahead of the guard — see
+		// `onStoredTokensReplaced`.
+		this.onStoredTokensReplaced();
+
 		if (this._session === undefined) return;
 
 		const wasConnected = this._session != null;
@@ -356,6 +429,9 @@ export abstract class IntegrationBase<
 					// Reset our stored session so that we get a new one from the cloud
 					const authProvider = await this.authenticationService.get(this.authProvider.id);
 					await authProvider.deleteSession(this.authProviderDescriptor);
+					// The stored token was just deleted. Not left to the token-changed check below, which needs
+					// an `oldSession` — see `onStoredTokensReplaced`.
+					this.onStoredTokensReplaced();
 					// Reset the session and clear our "stay disconnected" flag
 					this._session = undefined;
 					await this.ctx.storage.deleteWorkspace(this.connectedKey);
@@ -411,11 +487,28 @@ export abstract class IntegrationBase<
 	protected handleProviderException(
 		syncReqUsecase: SyncReqUsecase,
 		ex: Error,
-		options?: { scope?: ScopedLogger | undefined; silent?: boolean },
+		options?: { scope?: ScopedLogger | undefined; silent?: boolean; connectionId?: string },
 	): void {
 		if (isCancellationError(ex)) return;
 
 		options?.scope?.error(ex);
+
+		// A per-connection (multi-account) read resolved its session through `resolveReadSession`'s
+		// `connectionId` branch, which deliberately never touches the cached primary `_session`. So the
+		// primary-session recovery below cannot apply to it: expiring `_session` would mark a session this
+		// read never used, while the rejected connection kept its stored token and re-sent it on every
+		// later read — a token the provider has already refused (expired scopes, a revoked grant, an
+		// uninstalled app) is not self-healing, so the read failed identically until the user reconnected
+		// by hand. Record the rejection against the connection instead; `resolveReadSession` consumes it
+		// and forces the cloud `/refresh` on the next read of that connection. When there is nothing to
+		// recover, fall through to the shared failure budget, which disconnects after
+		// `requestExceptionLimit` and surfaces the reconnect prompt.
+		if (ex instanceof AuthenticationError && options?.connectionId) {
+			if (!this._rejectedTokens.recordRejection(options.connectionId)) {
+				this.trackRequestException(options);
+			}
+			return;
+		}
 
 		if (ex instanceof AuthenticationError && this._session?.cloud) {
 			if (!this.hasSessionSyncRequests()) {
@@ -490,8 +583,14 @@ export abstract class IntegrationBase<
 					source?: Sources;
 			  },
 	): Promise<ProviderAuthenticationSession | undefined> {
+		const scope = getScopedLogger();
+
 		const { createIfNeeded, forceNewSession, source, sync } = options;
-		if (this._session != null) return this._session;
+		if (this._session != null) {
+			if (this.isSessionForIntegrationHost(this._session)) return this._session;
+
+			this._session = null;
+		}
 		if (this.ctx.config.isIntegrationsEnabled?.() === false) return undefined;
 
 		if (createIfNeeded || sync) {
@@ -516,6 +615,9 @@ export abstract class IntegrationBase<
 
 			if (session?.expiresAt != null && session.expiresAt < new Date()) {
 				session = null;
+			}
+			if (session != null && !this.isSessionForIntegrationHost(session)) {
+				session = undefined;
 			}
 		} catch (ex) {
 			await this.ctx.storage.deleteWorkspace(this.connectedKey);
@@ -549,7 +651,18 @@ export abstract class IntegrationBase<
 			queueMicrotask(() => {
 				this._onDidChange.fire();
 				this.didChangeConnection?.fire({ integration: this, key: this.key, reason: 'connected' });
-				void this.providerOnConnect?.();
+				// Fired detached, so there is no caller left to catch anything: every implementor is async, and
+				// a rejection would surface as a process-level unhandled rejection in the host. It is a
+				// best-effort warm-up, so swallow the failure with a warning instead.
+				void (async () => {
+					try {
+						await this.providerOnConnect?.();
+					} catch (ex) {
+						scope?.warn(
+							`Failed to run providerOnConnect for ${this.key}: ${ex instanceof Error ? ex.message : String(ex)}`,
+						);
+					}
+				})();
 			});
 		}
 
@@ -564,14 +677,27 @@ export abstract class IntegrationBase<
 		resource?: ResourceDescriptor,
 		cancellation?: AbortSignal,
 		connectionId?: string,
-	): Promise<IntegrationResult<IssueShape[] | undefined>>;
+	): Promise<IssueShape[] | undefined>;
 	async searchMyIssues(
 		resources?: ResourceDescriptor[],
 		cancellation?: AbortSignal,
 		connectionId?: string,
-	): Promise<IntegrationResult<IssueShape[] | undefined>>;
+	): Promise<IssueShape[] | undefined>;
 	@trace()
 	async searchMyIssues(
+		resources?: ResourceDescriptor | ResourceDescriptor[],
+		cancellation?: AbortSignal,
+		connectionId?: string,
+	): Promise<IssueShape[] | undefined> {
+		return (await this.searchMyIssuesResult(resources, cancellation, connectionId))?.value;
+	}
+
+	/**
+	 * Result-returning core of {@link searchMyIssues}. Recovers thrown errors into `{ error }` so callers
+	 * (e.g. the ProviderBackend account-wide issues read) can surface a per-provider warning instead of a
+	 * silent empty result. Returns the normalized {@link IssueShape} (there is no raw account-wide issue read).
+	 */
+	async searchMyIssuesResult(
 		resources?: ResourceDescriptor | ResourceDescriptor[],
 		cancellation?: AbortSignal,
 		connectionId?: string,
@@ -591,8 +717,8 @@ export abstract class IntegrationBase<
 			this.resetRequestExceptionCount('searchMyIssues');
 			return { value: issues, duration: performance.now() - start };
 		} catch (ex) {
-			this.handleProviderException('searchMyIssues', ex, { scope: scope });
-			return { error: ex, duration: performance.now() - start };
+			this.handleProviderException('searchMyIssues', ex, { scope: scope, connectionId: connectionId });
+			return { error: toError(ex), duration: performance.now() - start };
 		}
 	}
 
@@ -601,6 +727,52 @@ export abstract class IntegrationBase<
 		resources?: ResourceDescriptor[],
 		cancellation?: AbortSignal,
 	): Promise<IssueShape[] | undefined>;
+
+	/**
+	 * Paging/truncation-aware variant of {@link searchProviderMyIssues}. The default wraps the normalized read
+	 * as a complete single page; providers with native cursors or fan-out metadata override it.
+	 */
+	protected async searchProviderMyIssuesWithTruncation(
+		session: ProviderAuthenticationSession,
+		resources?: ResourceDescriptor[],
+		cancellation?: AbortSignal,
+		_options?: SearchMyIssuesOptions,
+	): Promise<AccountWideIssuesResult | undefined> {
+		// The default read has no assignee scoping to broaden, so `_options` is inert here; a provider whose
+		// account-wide read is user-scoped (GitHub/GitLab/Azure) overrides this and honors `includeAllAssignees`.
+		const values = await this.searchProviderMyIssues(session, resources, cancellation);
+		if (values == null) return undefined;
+		return { values: values, truncated: false };
+	}
+
+	/**
+	 * Result-returning, truncation-aware account-wide issue read. Recovers thrown errors into `{ error }` and
+	 * carries the `truncated` flag so the ProviderBackend facade can report an incomplete read honestly.
+	 */
+	async searchMyIssuesWithTruncationResult(
+		resources?: ResourceDescriptor | ResourceDescriptor[],
+		cancellation?: AbortSignal,
+		connectionId?: string,
+		options?: SearchMyIssuesOptions,
+	): Promise<IntegrationResult<AccountWideIssuesResult | undefined>> {
+		const scope = getScopedLogger();
+		const session = await this.resolveReadSession(connectionId, scope);
+		if (session == null) return undefined;
+
+		try {
+			const result = await this.searchProviderMyIssuesWithTruncation(
+				session,
+				resources != null ? (Array.isArray(resources) ? resources : [resources]) : undefined,
+				cancellation,
+				options,
+			);
+			this.resetRequestExceptionCount('searchMyIssues');
+			return { value: result };
+		} catch (ex) {
+			this.handleProviderException('searchMyIssues', ex, { scope: scope, connectionId: connectionId });
+			return { error: toError(ex) };
+		}
+	}
 
 	@trace()
 	async getLinkedIssueOrPullRequest(
@@ -691,16 +863,16 @@ export abstract class IntegrationBase<
 
 	async getCurrentAccount(options?: {
 		avatarSize?: number;
+		connectionId?: string;
 		expiryOverride?: boolean | number;
 	}): Promise<Account | undefined> {
 		const scope = getScopedLogger();
+		const { connectionId: requestedConnectionId, expiryOverride, ...opts } = options ?? {};
+		const connectionId = requestedConnectionId || undefined;
+		const session = await this.resolveReadSession(connectionId, scope);
+		if (session == null) return undefined;
 
-		const connected = this.maybeConnected ?? (await this.isConnected());
-		if (!connected) return undefined;
-
-		await this.refreshSessionIfExpired(scope);
-
-		const { expiryOverride, ...opts } = options ?? {};
+		const sessionFingerprint = this.getSessionFingerprint(session);
 
 		const currentAccount = await this.ctx.cache.getCurrentAccount(
 			this,
@@ -708,7 +880,7 @@ export abstract class IntegrationBase<
 			(cacheable: any) => ({
 				value: (async () => {
 					try {
-						const account = await this.getProviderCurrentAccount?.(this._session!, opts);
+						const account = await this.getProviderCurrentAccount?.(session, opts);
 						this.resetRequestExceptionCount('getCurrentAccount');
 						return account;
 					} catch (ex) {
@@ -717,7 +889,10 @@ export abstract class IntegrationBase<
 							return undefined;
 						}
 
-						this.handleProviderException('getCurrentAccount', ex, { scope: scope });
+						this.handleProviderException('getCurrentAccount', ex, {
+							scope: scope,
+							connectionId: connectionId,
+						});
 
 						// Invalidate the cache on error, except for auth errors
 						if (!(ex instanceof AuthenticationError)) {
@@ -729,7 +904,12 @@ export abstract class IntegrationBase<
 					}
 				})(),
 			}),
-			{ expiryOverride: expiryOverride, expireOnError: false },
+			{
+				connectionId: connectionId,
+				expiryOverride: expiryOverride,
+				expireOnError: false,
+				etag: `${this.id}:${this.maybeConnected ?? false}:${sessionFingerprint}`,
+			},
 		);
 		return currentAccount;
 	}
@@ -752,7 +932,7 @@ export abstract class IntegrationBase<
 	async getPullRequest(
 		resource: T,
 		id: string,
-		options?: { expiryOverride?: boolean | number },
+		options?: { expiryOverride?: boolean | number; throwOnError?: boolean },
 	): Promise<PullRequest | undefined> {
 		const scope = getScopedLogger();
 
@@ -765,14 +945,18 @@ export abstract class IntegrationBase<
 			id,
 			resource,
 			this,
-			() => ({
+			cacheable => ({
 				value: (async () => {
 					try {
 						const result = await this.getProviderPullRequest?.(this._session!, resource, id);
 						this.resetRequestExceptionCount('getPullRequest');
 						return result;
 					} catch (ex) {
+						// A failed lookup is not an answer — and the by-id bucket never expires a miss.
+						cacheable.invalidate();
 						this.handleProviderException('getPullRequest', ex, { scope: scope });
+						if (options?.throwOnError) throw ex;
+
 						return undefined;
 					}
 				})(),

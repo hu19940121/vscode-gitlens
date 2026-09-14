@@ -9,7 +9,6 @@ import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import CircularDependencyPlugin from 'circular-dependency-plugin';
 import CopyPlugin from 'copy-webpack-plugin';
-import CspHtmlPlugin from 'csp-html-webpack-plugin';
 import CssMinimizerPlugin from 'css-minimizer-webpack-plugin';
 import esbuild from 'esbuild';
 import { generateFonts } from 'fantasticon';
@@ -57,6 +56,9 @@ class WebviewPublicPathPlugin extends WebpackRequireFromPlugin {
 
 function getLibraryAliases() {
 	return {
+		'@gitkraken/commit-graph': path.resolve(__dirname, 'packages', 'plus', 'commit-graph', 'src'),
+		'@gitkraken/commit-graph-ui': path.resolve(__dirname, 'packages', 'plus', 'commit-graph-ui', 'src'),
+		'@gitlens/components': path.resolve(__dirname, 'packages', 'components', 'src'),
 		'@gitlens/utils': path.resolve(__dirname, 'packages', 'utils', 'src'),
 		'@gitlens/ipc': path.resolve(__dirname, 'packages', 'ipc', 'src'),
 		'@gitlens/git': path.resolve(__dirname, 'packages', 'git', 'src'),
@@ -87,7 +89,7 @@ function getUtilsEnvAliases(target) {
 		'#env/platform.js': path.resolve(base, 'platform.ts'),
 	};
 }
-/** @typedef {{ analyzeBundle?: boolean; analyzeDeps?: boolean; quick?: boolean; trace?: boolean; webviews?: string }} GlEnv */
+/** @typedef {{ analyzeBundle?: boolean; analyzeDeps?: boolean; quick?: boolean; stats?: boolean; trace?: boolean; webviews?: string }} GlEnv */
 /** @typedef {{ [key: string]: { entry: string; plus?: boolean; alias?: { [key: string]: string } } }} GlWebviews */
 
 /**
@@ -102,6 +104,7 @@ export default function (env, argv) {
 		analyzeBundle: false,
 		analyzeDeps: false,
 		quick: false,
+		stats: false,
 		trace: false,
 		...env,
 	};
@@ -306,8 +309,11 @@ function getExtensionConfig(target, mode, env) {
 		// `sequence.editor` for the Commit Graph's headless squash/drop/reword (no git in webworker).
 		entry:
 			target === 'webworker'
-				? { extension: './src/extension.ts' }
-				: { extension: './src/extension.ts', rebaseTodoEditor: './src/git/utils/rebaseTodoEditor.ts' },
+				? { extension: ['./src/system/-webview/localization.ts', './src/extension.ts'] }
+				: {
+						extension: ['./src/system/-webview/localization.ts', './src/extension.ts'],
+						rebaseTodoEditor: './src/git/utils/rebaseTodoEditor.ts',
+					},
 		mode: mode,
 		target: target,
 		devtool: mode === 'production' && !env.analyzeBundle ? false : 'cheap-module-source-map',
@@ -369,21 +375,8 @@ function getExtensionConfig(target, mode, env) {
 								// `defaultVendors` (minChunks 1) extracts every async dep into numeric vendor chunks.
 								default: false,
 								defaultVendors: false,
-								// zod + compose-tools (+ all first-party compose code: the webview compose
-								// integrations, the coretools compose backend, and the env-node composer
-								// factory) are the AI/compose feature family, lazily imported by both the
-								// composer and graph controllers. Emit one shared chunk instead of duplicating
-								// it (and a per-controller wrapper) across them.
-								compose: {
-									test: /([\\/]node_modules[\\/](zod|@gitkraken[\\/](compose-tools|shared-tools))[\\/]|[\\/]src[\\/](webviews[\\/].*[\\/]compose[\\/]|plus[\\/]coretools[\\/]compose[\\/]|env[\\/]node[\\/]coretools[\\/]composer))/,
-									name: 'compose',
-									minChunks: 2,
-									priority: 20,
-									reuseExistingChunk: true,
-									enforce: true,
-								},
 								// The webview RPC service layer + shared webview infra are copied into every
-								// webview controller (commitDetails, timeline, graph, home, …); emit them once.
+								// webview controller (commitDetails, timeline, graph, …); emit them once.
 								webviewShared: {
 									test: /[\\/]src[\\/]webviews[\\/](rpc|shared)[\\/]/,
 									name: 'webview-shared',
@@ -498,7 +491,6 @@ function getWebviewsConfigs(mode, env) {
 		allowedSigners: { entry: './allowedSigners/allowedSigners.ts' },
 		commitDetails: { entry: './commitDetails/commitDetails.ts' },
 		graph: { entry: './plus/graph/graph.ts', plus: true },
-		home: { entry: './home/home.ts' },
 		rebase: { entry: './rebase/rebase.ts' },
 		settings: { entry: './settings/settings.ts' },
 		timeline: { entry: './plus/timeline/timeline.ts', plus: true },
@@ -601,7 +593,7 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 		new WebviewPublicPathPlugin({ variableName: 'webpackResourceBasePath' }),
 		new MiniCssExtractPlugin({ filename: '[name].css' }),
 		...Object.entries(webviews).map(([name, config]) => getHtmlPlugin(name, Boolean(config.plus), mode, env)),
-		getCspHtmlPlugin(mode, env),
+		new WebviewCspPlugin(mode, env),
 	];
 
 	// Keep `custom-elements.json` fresh during dev/watch builds (skipped in production and quick modes)
@@ -649,12 +641,22 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 				statsFilename: path.join(out, `${filePrefix}-stats.json`),
 			}),
 		);
+	} else if (env.stats) {
+		// Same stats file as `analyzeBundle` above (so `checkGraphBundle.mjs`'s default path resolves
+		// either way), but written from the actual production compilation — no analyzer instrumentation,
+		// no forced source maps — so the graph bundle budget measures the bundle GitLens ships.
+		const out = path.join(__dirname, 'out');
+		fs.mkdirSync(out, { recursive: true });
+
+		plugins.push(new WebviewStatsPlugin(path.join(out, `${filePrefix}-stats.json`)));
 	}
 
 	return {
 		name: name,
 		context: basePath,
-		entry: Object.fromEntries(Object.entries(webviews).map(([n, { entry }]) => [n, entry])),
+		entry: Object.fromEntries(
+			Object.entries(webviews).map(([n, { entry }]) => [n, ['./shared/localization.ts', entry]]),
+		),
 		mode: mode,
 		target: 'web',
 		devtool: mode === 'production' && !env.analyzeBundle ? false : 'cheap-module-source-map',
@@ -709,7 +711,26 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 			splitChunks: {
 				// Disable all non-async code splitting
 				// chunks: () => false,
-				cacheGroups: { default: false, vendors: false },
+				cacheGroups: {
+					default: false,
+					vendors: false,
+					// Every app statically ships the same runtime floor (lit, supertalk RPC + signals,
+					// fflate IPC inflate, floating-ui, webawesome baseline, shared components/appBase).
+					// Extract whatever ≥2 apps share into one sibling chunk so it exists (and is cached)
+					// once instead of 9 copies. HtmlPlugin injects it as a plain <script> tag per surface,
+					// so this stays build-time-only code splitting — no runtime import() (unsupported for
+					// webviews on VS Code Web). Keep this a single fat chunk: each extra file is an extra
+					// service-worker round-trip, and high request fan-out trips Chromium's concurrent
+					// FetchEvent cap (microsoft/vscode#326500).
+					shared: {
+						test: /[\\/](node_modules|src|packages)[\\/]/,
+						chunks: 'initial',
+						name: 'shared',
+						minChunks: 2,
+						reuseExistingChunk: true,
+						enforce: true,
+					},
+				},
 			},
 		},
 		module: {
@@ -759,6 +780,10 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 		},
 
 		resolve: {
+			// GitLens consumes @gitkraken/commit-graph-ui from `src/` through the alias above; the package's
+			// `dist/` also carries compiled copies of @gitlens/utils and @gitlens/components for external
+			// consumers. Refuse to resolve into it so those copies can never be bundled a second time.
+			restrictions: [/^(?!.*[\\/]packages[\\/]plus[\\/]commit-graph-ui[\\/]dist[\\/])/],
 			alias: {
 				'@env': path.resolve(__dirname, 'src', 'env', 'browser'),
 				// Deduplicate signal-polyfill: linked @supertalk/* packages resolve to their
@@ -781,36 +806,78 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 	};
 }
 
-/**
- * @param { GlMode } mode
- * @param {GlEnv} env
- * @returns { CspHtmlPlugin }
- */
-function getCspHtmlPlugin(mode, env) {
-	const cspPlugin = new CspHtmlPlugin(
-		{
-			'default-src': "'none'",
-			'img-src': ['#{cspSource}', 'https:', 'data:'],
-			'script-src':
-				mode !== 'production'
-					? ['#{cspSource}', "'nonce-#{cspNonce}'", "'unsafe-eval'"]
-					: ['#{cspSource}', "'nonce-#{cspNonce}'"],
-			'style-src': ['#{cspSource}', "'nonce-#{cspNonce}'", "'unsafe-hashes'"],
-			'font-src': ['#{cspSource}'],
-			'connect-src': mode !== 'production' ? ['#{cspSource}'] : "'none'",
-		},
-		{
-			enabled: true,
-			hashingMethod: 'sha256',
-			hashEnabled: { 'script-src': true, 'style-src': mode === 'production' },
-			nonceEnabled: { 'script-src': true, 'style-src': true },
-		},
-	);
-	// Override the nonce creation so we can dynamically generate them at runtime
-	// @ts-ignore
-	cspPlugin.createNonce = () => '#{cspNonce}';
+class WebviewCspPlugin {
+	/**
+	 * @param {GlMode} mode
+	 * @param {GlEnv} env
+	 */
+	constructor(mode, env) {
+		this.mode = mode;
+		this.env = env;
+	}
 
-	return cspPlugin;
+	/**
+	 * @param {import('webpack').Compiler} compiler
+	 */
+	apply(compiler) {
+		compiler.hooks.compilation.tap('WebviewCspPlugin', compilation => {
+			HtmlPlugin.getHooks(compilation).alterAssetTagGroups.tap('WebviewCspPlugin', data => {
+				for (const tag of [...data.headTags, ...data.bodyTags]) {
+					if (tag.tagName === 'script' || (tag.tagName === 'link' && tag.attributes?.rel === 'stylesheet')) {
+						tag.attributes = { ...tag.attributes, nonce: '#{cspNonce}' };
+					}
+				}
+
+				const scriptHashes = [];
+				if (data.plugin?.options?.template) {
+					try {
+						const rawTemplate = (data.plugin.options.template ?? '').split('!').pop().split('?')[0];
+						const templatePath = path.resolve(compiler.context, rawTemplate);
+						const templateContent = fs.readFileSync(templatePath, 'utf8');
+						const scriptRegex = /<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
+						let match;
+						while ((match = scriptRegex.exec(templateContent)) !== null) {
+							const content = match[1];
+							if (content.trim()) {
+								const hash = createHash('sha256').update(content, 'utf8').digest('base64');
+								scriptHashes.push(`'sha256-${hash}'`);
+							}
+						}
+					} catch {}
+				}
+
+				const scriptSrc = [
+					'#{cspSource}',
+					"'nonce-#{cspNonce}'",
+					...(this.mode !== 'production' ? ["'unsafe-eval'"] : []),
+					...scriptHashes,
+				];
+
+				const policy = [
+					`base-uri 'self'`,
+					`object-src 'none'`,
+					`script-src ${scriptSrc.join(' ')}`,
+					`style-src #{cspSource} 'nonce-#{cspNonce}' 'unsafe-hashes'`,
+					`default-src 'none'`,
+					`img-src #{cspSource} https: data:`,
+					`font-src #{cspSource}`,
+					`connect-src ${this.mode !== 'production' ? '#{cspSource}' : "'none'"}`,
+				].join('; ');
+
+				data.headTags.unshift({
+					tagName: 'meta',
+					voidTag: true,
+					attributes: {
+						'http-equiv': 'Content-Security-Policy',
+						content: policy,
+					},
+					meta: { plugin: 'html-webpack-plugin' },
+				});
+
+				return data;
+			});
+		});
+	}
 }
 
 /**
@@ -1046,18 +1113,28 @@ class FileGeneratorPlugin {
 
 				pendingGeneration = true;
 
-				try {
-					const logger = compiler.getInfrastructureLogger(this.pluginName);
-					logger.log(`${this.strings.starting} ${this.command.name}...`);
-					const start = Date.now();
+				const logger = compiler.getInfrastructureLogger(this.pluginName);
+				logger.log(`${this.strings.starting} ${this.command.name}...`);
+				const start = Date.now();
 
-					const result = spawnSync(`${this.command.command} ${this.command.args.join(' ')}`, {
-						cwd: __dirname,
-						encoding: 'utf8',
-						shell: true,
-					});
+				const child = spawn(`${this.command.command} ${this.command.args.join(' ')}`, {
+					cwd: __dirname,
+					shell: true,
+					stdio: ['ignore', 'pipe', 'pipe'],
+				});
 
-					if (result.status === 0) {
+				let stdout = '';
+				let stderr = '';
+				child.stdout?.on('data', d => {
+					stdout += d;
+				});
+				child.stderr?.on('data', d => {
+					stderr += d;
+				});
+
+				child.on('close', code => {
+					pendingGeneration = false;
+					if (code === 0) {
 						const missingOutputs = this.outputs.filter(output => !fs.existsSync(output));
 						if (missingOutputs.length !== 0) {
 							callback(
@@ -1073,26 +1150,29 @@ class FileGeneratorPlugin {
 						logger.log(
 							`${this.strings.completed} ${this.command.name} in \x1b[32m${Date.now() - start}ms\x1b[0m`,
 						);
+						callback();
 					} else {
-						const detail = (result.stderr || result.stdout || result.error?.message || '').trim();
+						const detail = (stderr || stdout).trim();
 						callback(
 							new WebpackError(
 								`[${this.pluginName}] Failed to run ${this.command.name}${
-									detail ? `: ${detail}` : ` (exit ${result.status})`
+									detail ? `: ${detail}` : ` (exit ${code})`
 								}`,
 							),
 						);
-						return;
 					}
-				} finally {
-					pendingGeneration = false;
-				}
-			} catch (ex) {
-				callback(new WebpackError(`[${this.pluginName}] Error checking source file: ${ex}`));
-				return;
-			}
+				});
 
-			callback();
+				child.on('error', err => {
+					pendingGeneration = false;
+					callback(
+						new WebpackError(`[${this.pluginName}] Failed to start ${this.command.name}: ${err.message}`),
+					);
+				});
+			} catch (ex) {
+				pendingGeneration = false;
+				callback(new WebpackError(`[${this.pluginName}] Error checking source file: ${ex}`));
+			}
 		});
 	}
 }
@@ -1117,7 +1197,7 @@ class GenerateContributionsPlugin extends FileGeneratorPlugin {
 		super({
 			pluginName: 'contributions',
 			pathsToWatch: [path.join(__dirname, 'contributions.json')],
-			outputs: [path.join(__dirname, 'package.json')],
+			outputs: [path.join(__dirname, 'package.json'), path.join(__dirname, 'package.nls.json')],
 			command: {
 				name: "'package.json' contributions",
 				command: pkgMgr,
@@ -1158,13 +1238,11 @@ class DocsPlugin extends FileGeneratorPlugin {
 				path.join(__dirname, 'pnpm-lock.yaml'),
 			],
 			outputs: [path.join(__dirname, 'docs', 'telemetry-events.md')],
-			// The TypeScript program follows transitive type imports, so an exhaustive static input list
-			// would be brittle. Always regenerate on a one-shot build; the paths above drive watch rebuilds.
 			cache: false,
 			command: {
 				name: 'docs',
-				command: pkgMgr,
-				args: ['run', 'generate:docs:telemetry'],
+				command: 'node',
+				args: ['./scripts/generateTelemetryDocs.mjs'],
 			},
 		});
 	}
@@ -1193,6 +1271,7 @@ class LicensesPlugin extends FileGeneratorPlugin {
 
 class FantasticonPlugin {
 	alreadyRun = false;
+	#cacheFile = path.join(__dirname, '.codegen-cache', 'fantasticon.json');
 
 	/**
 	 * @param {{config?: { [key:string]: any }; configPath?: string; onBefore?: Function; onComplete?: Function }} options
@@ -1210,6 +1289,68 @@ class FantasticonPlugin {
 				baseDataPath: 'options',
 			},
 		);
+	}
+
+	/**
+	 * @private
+	 * @param {string} inputDir
+	 * @param {string | undefined} configPath
+	 */
+	#getInputsHash(inputDir, configPath) {
+		const hash = createHash('sha1');
+		try {
+			for (const entry of fs.readdirSync(inputDir, { recursive: true, withFileTypes: true })) {
+				if (!entry.isFile()) continue;
+				const fullPath = path.join(entry.parentPath, entry.name);
+				hash.update(fullPath);
+				hash.update('\0');
+				try {
+					hash.update(fs.readFileSync(fullPath));
+				} catch {}
+				hash.update('\0');
+			}
+		} catch {}
+
+		const extraFiles = ['scripts/applyIconsContribution.mjs'];
+		if (configPath) extraFiles.push(configPath);
+		for (const file of extraFiles) {
+			try {
+				hash.update(fs.readFileSync(path.resolve(__dirname, file)));
+			} catch {}
+		}
+
+		return hash.digest('hex');
+	}
+
+	/**
+	 * @private
+	 * @param {string[]} outputs
+	 * @param {string} inputDir
+	 * @param {string | undefined} configPath
+	 */
+	#persistedSkip(outputs, inputDir, configPath) {
+		if (outputs.some(o => !fs.existsSync(o))) return false;
+		try {
+			const cached = JSON.parse(fs.readFileSync(this.#cacheFile, 'utf8'));
+			return cached.inputsHash === this.#getInputsHash(inputDir, configPath);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * @private
+	 * @param {string} inputDir
+	 * @param {string | undefined} configPath
+	 */
+	#recordRun(inputDir, configPath) {
+		try {
+			fs.mkdirSync(path.dirname(this.#cacheFile), { recursive: true });
+			fs.writeFileSync(
+				this.#cacheFile,
+				JSON.stringify({ inputsHash: this.#getInputsHash(inputDir, configPath) }),
+			);
+		} catch {}
 	}
 
 	/**
@@ -1238,9 +1379,18 @@ class FantasticonPlugin {
 		}
 
 		const fontConfig = { ...loadedConfig, ...config };
+		const inputDir = path.resolve(__dirname, fontConfig.inputDir ?? 'images/icons');
+		const outputs = [
+			path.resolve(__dirname, fontConfig.pathOptions?.woff2 ?? 'dist/glicons.woff2'),
+			path.resolve(__dirname, 'src/webviews/apps/shared/glicons.scss'),
+			path.resolve(__dirname, 'packages/components/src/components/icons/gliconsMap.ts'),
+		];
 
-		// TODO@eamodio: Figure out how to add watching for the fontConfig.inputDir
-		// Maybe something like: https://github.com/Fridus/webpack-watch-files-plugin
+		compiler.hooks.thisCompilation.tap(this.pluginName, compilation => {
+			compilation.contextDependencies.add(inputDir);
+			if (configPath) compilation.fileDependencies.add(path.resolve(__dirname, configPath));
+			compilation.fileDependencies.add(path.resolve(__dirname, 'scripts', 'applyIconsContribution.mjs'));
+		});
 
 		/**
 		 * @this {FantasticonPlugin}
@@ -1250,6 +1400,10 @@ class FantasticonPlugin {
 			if (compiler.watchMode) {
 				if (this.alreadyRun) return;
 				this.alreadyRun = true;
+			}
+
+			if (this.#persistedSkip(outputs, inputDir, configPath)) {
+				return;
 			}
 
 			const logger = compiler.getInfrastructureLogger(this.pluginName);
@@ -1283,6 +1437,7 @@ class FantasticonPlugin {
 			}
 
 			logger.log(`Generated icon font in \x1b[32m${Date.now() - start}ms\x1b[0m${suffix}`);
+			this.#recordRun(inputDir, configPath);
 		}
 
 		const generateFn = generate.bind(this);
@@ -1360,6 +1515,45 @@ class BuildCompletePlugin {
 					}
 				}, 100);
 			}
+		});
+	}
+}
+
+/**
+ * Writes a plain webpack stats JSON (assets + entrypoints only — no analyzer instrumentation) so the
+ * graph bundle budget check (`checkGraphBundle.mjs`) can measure the real production compilation
+ * instead of the source-mapped, analyzer-only build `analyzeBundle`/`BundleAnalyzerPlugin` produces.
+ */
+class WebviewStatsPlugin {
+	/** @param {string} statsFilename */
+	constructor(statsFilename) {
+		this.statsFilename = statsFilename;
+	}
+
+	/** @param {import('webpack').Compiler} compiler */
+	apply(compiler) {
+		const pluginName = 'WebviewStatsPlugin';
+
+		compiler.hooks.done.tap(pluginName, stats => {
+			const json = stats.toJson({
+				assets: true,
+				entrypoints: true,
+				errors: true,
+				errorsCount: true,
+				warnings: false,
+				chunks: false,
+				// Module identifiers (no source, no reasons) so `checkGraphBundle.mjs` can prove every workspace
+				// package was bundled from its aliased `src/`, never from a built `dist/`.
+				modules: true,
+				modulesSpace: Infinity,
+				nestedModules: true,
+				nestedModulesSpace: Infinity,
+				reasons: false,
+				hash: false,
+				builtAt: false,
+				source: false,
+			});
+			fs.writeFileSync(this.statsFilename, JSON.stringify(json));
 		});
 	}
 }

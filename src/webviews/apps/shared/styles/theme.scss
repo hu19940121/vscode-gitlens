@@ -47,6 +47,10 @@
 
 	--color-foreground: var(--vscode-editor-foreground, var(--vscode-foreground));
 
+	// VS Code's general UI foreground (chrome), NOT the editor's — they differ in Light+/Dark+.
+	--color-ui-foreground: var(--vscode-foreground);
+	--color-description-foreground: var(--vscode-descriptionForeground);
+
 	// Computed variants in code
 	--color-foreground--85: color-mix(in srgb, transparent 15%, var(--color-foreground));
 	--color-foreground--75: color-mix(in srgb, transparent 25%, var(--color-foreground));
@@ -79,6 +83,22 @@
 	--color-focus-border: var(--vscode-focusBorder);
 
 	--color-link-foreground: var(--vscode-textLink-foreground);
+	--color-code-background: var(--vscode-textCodeBlock-background, var(--color-background));
+	--color-contrast-border: var(--vscode-contrastBorder);
+	--color-elevated-background: var(--vscode-editorWidget-background, var(--color-background));
+	--color-menu-background: var(--vscode-menu-background, var(--color-elevated-background));
+	--color-sash-hover-border: var(--vscode-sash-hoverBorder, var(--color-focus-border));
+	--color-scrollbar-background: var(--vscode-scrollbarSlider-background, transparent);
+	--color-scrollbar-hover-background: var(
+		--vscode-scrollbarSlider-hoverBackground,
+		var(--color-scrollbar-background)
+	);
+	--color-scrollbar-active-background: var(
+		--vscode-scrollbarSlider-activeBackground,
+		var(--color-scrollbar-hover-background)
+	);
+	--color-view-header-background: var(--vscode-sideBarSectionHeader-background, var(--color-background));
+	--color-view-header-border: var(--vscode-sideBarSectionHeader-border, var(--color-foreground--25));
 
 	// Computed variants in code
 	--color-link-foreground--darken-20: color-mix(in srgb, #000 20%, var(--color-link-foreground));
@@ -128,14 +148,35 @@
 	/* Agent phase colors — own palette (NOT SCM/gitDecoration tokens, which semantically belong
 	   to file change states). Phase names match the AgentSessionPhase enum so every agent surface
 	   (sidebar leaf, tooltip, pill, details panel card, WIP file decoration) dereferences one set
-	   of variables. `working` uses a hand-picked slate-purple — reads as "AI / in motion" on both
-	   light and dark backgrounds without colliding with chip-filtered blue (`#0099ff`) or the
-	   waiting yellow. Avoids `--vscode-progressBar-background` (often chrome-grey/white per
-	   theme) and `--vscode-button-background` (varies dramatically across themes — some are
-	   near-foreground, defeating the "this stands out" signal). */
-	--gl-agent-working-color: #7b68ee;
+	   of variables. `working` is blue — the calm in-progress signal; green would read as
+	   passing/done (CI-green) and purple as merged, and both over-claim an agent that is still
+	   running. Per-theme values (see the light block below); the previous hand-picked hex was
+	   identical in every theme, so it couldn't answer a light or high-contrast background.
+	   Avoids `--vscode-progressBar-background` (often chrome-grey/white per theme) and
+	   `--vscode-button-background` (varies dramatically across themes — some are near-foreground,
+	   defeating the "this stands out" signal). */
+	--gl-agent-working-color: #4dabf7;
 	--gl-agent-waiting-color: var(--vscode-editorWarning-foreground, var(--vscode-charts-yellow, #bf8700));
 	--gl-agent-idle-color: var(--vscode-descriptionForeground);
+	--gl-agent-ended-color: var(--vscode-descriptionForeground);
+	--commit-stats-pill-background: color-mix(
+		in srgb,
+		var(--color-view-header-background, transparent) 90%,
+		var(--color-foreground, currentColor) 10%
+	);
+	--wip-stats-operation-background: var(
+		--vscode-gitlens-decorations\.statusMergingOrRebasingForegroundColor,
+		#d29922
+	);
+	--wip-stats-operation-conflict-background: var(
+		--vscode-gitlens-decorations\.statusMergingOrRebasingConflictForegroundColor,
+		#f85149
+	);
+	--wip-stats-operation-ready-background: var(
+		--vscode-gitlens-decorations\.statusPausedOperationReadyForegroundColor,
+		#3fb950
+	);
+	--wip-stats-operation-ready-foreground: #06150a;
 
 	/* Unified scope/filter chip indicator colors — bg/border use the *-color (translucent via
 	   color-mix); text uses *-text-color so light themes can pair a vibrant tint with much
@@ -150,6 +191,14 @@
 	--gl-chip-tint-bg: 22%;
 	--gl-chip-tint-border: 50%;
 	--gl-chip-tint-hover: 32%;
+
+	/* Derived "scoped" chip surface colors, computed once from the color + tint tokens above so
+	   every consumer (titlebar row bands, the scope chip, the branch pill) renders the identical
+	   tint by construction — and picks up the dark/light overrides below automatically, since the
+	   cascade re-resolves these `var()`s per theme. */
+	--gl-chip-scoped-bg: color-mix(in srgb, var(--gl-chip-scoped-color) var(--gl-chip-tint-bg), transparent);
+	--gl-chip-scoped-border: color-mix(in srgb, var(--gl-chip-scoped-color) var(--gl-chip-tint-border), transparent);
+	--gl-chip-scoped-hover: color-mix(in srgb, var(--gl-chip-scoped-color) var(--gl-chip-tint-hover), transparent);
 
 	--gitlens-gutter-width: 20px;
 }
@@ -185,6 +234,12 @@ body[data-placement='panel'] {
 }
 
 @include utils.light-theme($selectorPrefix: ':root:has(', $selectorPostfix: ')') {
+	--commit-stats-pill-background: color-mix(
+		in srgb,
+		var(--color-view-header-background, transparent) 98%,
+		var(--color-foreground, currentColor) 2%
+	);
+	--wip-stats-operation-ready-foreground: #fff;
 	--color-alert-infoHoverBackground: color-mix(in srgb, #000 5%, var(--color-alert-infoBackground));
 	--color-alert-warningHoverBackground: color-mix(in srgb, #000 5%, var(--color-alert-warningBackground));
 	--color-alert-errorHoverBackground: color-mix(in srgb, #000 5%, var(--color-alert-errorBackground));
@@ -208,6 +263,10 @@ body[data-placement='panel'] {
 	--gl-chip-filtered-text-color: #0550ae;
 	--gl-chip-scoped-color: #e89500;
 	--gl-chip-scoped-text-color: #4d3300;
+
+	/* Darker working-blue so the agent glyph reads against white surfaces — the dark-theme value
+	   washes out there, the same way the stat colors above do. */
+	--gl-agent-working-color: #1971c2;
 
 	--gl-chip-tint-bg: 22%;
 	--gl-chip-tint-border: 55%;

@@ -1,10 +1,11 @@
+import * as l10n from '@vscode/l10n';
 import type { TemplateResult } from 'lit';
 import { html, nothing } from 'lit';
+import { GlElement } from '@gitlens/components/components/element.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { HierarchicalItem } from '@gitlens/utils/array.js';
 import { makeHierarchical } from '@gitlens/utils/array.js';
 import { joinPaths, trimTrailingSlash } from '@gitlens/utils/path.js';
-import { GlElement } from '../../../shared/components/element.js';
 import type {
 	TreeItemAction,
 	TreeItemActionDetail,
@@ -42,22 +43,22 @@ export class GlTreeBase extends GlElement {
 
 		let value = 'tree';
 		let icon = 'list-tree';
-		let label = 'View as Tree';
+		let label = l10n.t('View as Tree');
 		switch (layout) {
 			case 'auto':
 				value = 'list';
 				icon = 'gl-list-auto';
-				label = 'View as List';
+				label = l10n.t('View as List');
 				break;
 			case 'list':
 				value = 'tree';
 				icon = 'list-flat';
-				label = 'View as Tree';
+				label = l10n.t('View as Tree');
 				break;
 			case 'tree':
 				value = 'auto';
 				icon = 'list-tree';
-				label = 'View as Auto';
+				label = l10n.t('View as Auto');
 				break;
 		}
 
@@ -151,6 +152,7 @@ export class GlTreeBase extends GlElement {
 			icon: 'folder',
 			label: name,
 			tooltip: relativePath,
+			tooltipWrap: 'break-all',
 			...options,
 		};
 	}
@@ -220,6 +222,7 @@ export class GlTreeBase extends GlElement {
 			label: fileName,
 			description: flat === true ? filePath : undefined,
 			tooltip: buildFileTooltip(file),
+			tooltipWrap: 'break-all',
 			context: [file],
 			actions: this.getFileActions(file, options),
 			decorations: [{ type: 'text', label: file.status }],

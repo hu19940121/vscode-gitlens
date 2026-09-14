@@ -1,9 +1,10 @@
+import * as l10n from '@vscode/l10n';
 import type { TemplateResult } from 'lit';
 import { css, html, nothing } from 'lit';
 import { formatDate } from '@gitlens/utils/date.js';
 import type { CommitSignatureShape } from '../../../../commitDetails/protocol.js';
 import { messageHeadlineSplitterToken } from '../../../../commitDetails/protocol.js';
-import '../code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import './signature-details.js';
 
 export interface CompactCommitAuthor {
@@ -184,7 +185,9 @@ export function renderCommitPopoverContent(
 							<div class="commit-popover-content__details">
 								<span class="commit-popover-content__name"
 									>${committer.name || committer.email}
-									<span class="commit-popover-content__committer-label">(committer)</span></span
+									<span class="commit-popover-content__committer-label"
+										>${l10n.t('(committer)')}</span
+									></span
 								>
 								${
 									committer.email

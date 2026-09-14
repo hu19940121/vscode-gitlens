@@ -258,4 +258,14 @@ export const commitBoxStyles = css`
 		--button-foreground: #000;
 		--button-hover-background: color-mix(in srgb, #fff 10%, var(--vscode-inputValidation-warningBorder, #b89500));
 	}
+
+	/* The pair spans the same full width the single commit button occupies (the shared module
+	   defaults to inline-flex/flex:none, sized to content). */
+	.split-btn {
+		display: flex;
+	}
+
+	.split-btn__menu {
+		--button-padding-inline: var(--gl-space-6);
+	}
 `;

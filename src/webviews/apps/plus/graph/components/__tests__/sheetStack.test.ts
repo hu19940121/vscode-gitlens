@@ -1,14 +1,18 @@
 import * as assert from 'assert';
+import type { PastAgentSessionState } from '../../../../../../agents/models/agentSessionState.js';
+import type { GraphSidebarPullRequest } from '../../../../../plus/graph/protocol.js';
 import type { FileChangeListItemDetail } from '../../../../commitDetails/components/gl-details-base.js';
 import type { BranchSheetRef } from '../gl-graph-branch-sheet-pane.js';
-import type { SheetDescriptor } from '../sheetStack.js';
+import type { PullRequestSheetPayload, PullRequestSheetTarget, SheetDescriptor } from '../sheetStack.js';
 import {
 	popSheet,
 	projectCompareSignal,
 	pushSheet,
 	reduceOnSelectionChange,
 	removeKind,
+	removePendingPullRequestSheet,
 	replaceStack,
+	resolvePullRequestSheet,
 	sheetKey,
 } from '../sheetStack.js';
 
@@ -38,6 +42,44 @@ function rebaseSummaryDescriptor(repoPath: string = '/repo'): SheetDescriptor {
 
 function compareDescriptor(): SheetDescriptor {
 	return { kind: 'compare' };
+}
+
+function agentSessionDescriptor(sessionId: string = 'session-1', providerId: string = 'claudeCode'): SheetDescriptor {
+	return { kind: 'agentSession', sessionId: sessionId, providerId: providerId };
+}
+
+function pastAgentSessionDescriptor(
+	sessionId: string = 'session-1',
+	providerId: string = 'claudeCode',
+): SheetDescriptor {
+	const session: PastAgentSessionState = {
+		id: sessionId,
+		providerId: providerId,
+		disposition: 'ended',
+		actions: {},
+		worktreePath: '/repo',
+		displayName: 'Past Session',
+		lastActivity: 0,
+	};
+	return { kind: 'pastAgentSession', session: session };
+}
+
+function pullRequestFixture(number: string = '123'): GraphSidebarPullRequest {
+	const pr: GraphSidebarPullRequest = {
+		number: number,
+		id: `id-${number}`,
+		title: 'Some pull request',
+		state: 'opened',
+		url: `https://example.com/pr/${number}`,
+	};
+	return pr;
+}
+
+function pullRequestDescriptor(
+	target: PullRequestSheetTarget = { number: '123' },
+	pr?: GraphSidebarPullRequest,
+): SheetDescriptor {
+	return { kind: 'pullRequest', target: target, pr: pr };
 }
 
 suite('pushSheet', () => {
@@ -324,5 +366,124 @@ suite('sheetKey', () => {
 		const b = conflictDescriptor({ repoPath: '/r', path: 'a|b' });
 
 		assert.notStrictEqual(sheetKey(a), sheetKey(b));
+	});
+
+	test('two agent session descriptors for the same provider and session id produce equal keys', () => {
+		assert.strictEqual(
+			sheetKey(agentSessionDescriptor('session-1', 'claudeCode')),
+			sheetKey(agentSessionDescriptor('session-1', 'claudeCode')),
+		);
+	});
+
+	test('keys differ for the same session id under different providers', () => {
+		assert.notStrictEqual(
+			sheetKey(agentSessionDescriptor('session-1', 'claudeCode')),
+			sheetKey(agentSessionDescriptor('session-1', 'copilot')),
+		);
+	});
+
+	test('keys differ for different session ids under the same provider', () => {
+		assert.notStrictEqual(
+			sheetKey(agentSessionDescriptor('session-1', 'claudeCode')),
+			sheetKey(agentSessionDescriptor('session-2', 'claudeCode')),
+		);
+	});
+
+	test('two past agent session descriptors for the same provider and session id produce equal keys', () => {
+		assert.strictEqual(
+			sheetKey(pastAgentSessionDescriptor('session-1', 'claudeCode')),
+			sheetKey(pastAgentSessionDescriptor('session-1', 'claudeCode')),
+		);
+	});
+
+	test('past agent session keys differ for the same session id under different providers', () => {
+		assert.notStrictEqual(
+			sheetKey(pastAgentSessionDescriptor('session-1', 'claudeCode')),
+			sheetKey(pastAgentSessionDescriptor('session-1', 'copilot')),
+		);
+	});
+
+	test('past agent session keys differ for different session ids under the same provider', () => {
+		assert.notStrictEqual(
+			sheetKey(pastAgentSessionDescriptor('session-1', 'claudeCode')),
+			sheetKey(pastAgentSessionDescriptor('session-2', 'claudeCode')),
+		);
+	});
+
+	test('a pending pull request sheet and its resolved form produce equal keys', () => {
+		const target: PullRequestSheetTarget = { number: '123' };
+
+		assert.strictEqual(
+			sheetKey(pullRequestDescriptor(target)),
+			sheetKey(pullRequestDescriptor(target, pullRequestFixture('123'))),
+		);
+	});
+
+	test('keys differ between a {number} target and a {stackNumber} target', () => {
+		assert.notStrictEqual(
+			sheetKey(pullRequestDescriptor({ number: '123' })),
+			sheetKey(pullRequestDescriptor({ stackNumber: 123 })),
+		);
+	});
+});
+
+suite('resolvePullRequestSheet', () => {
+	test('fills in the matching pending sheet, leaving the rest of the stack untouched', () => {
+		const target: PullRequestSheetTarget = { number: '123' };
+		const payload: PullRequestSheetPayload = { pr: pullRequestFixture('123') };
+		const stack = [branchDescriptor(), pullRequestDescriptor(target)];
+
+		const result = resolvePullRequestSheet(stack, target, payload);
+
+		assert.deepStrictEqual(result, [branchDescriptor(), { kind: 'pullRequest', target: target, ...payload }]);
+	});
+
+	test('is a no-op (same reference) when the matching sheet already resolved', () => {
+		const target: PullRequestSheetTarget = { number: '123' };
+		const stack = [pullRequestDescriptor(target, pullRequestFixture('123'))];
+
+		const result = resolvePullRequestSheet(stack, target, { pr: pullRequestFixture('123') });
+
+		assert.strictEqual(result, stack);
+	});
+
+	test('is a no-op (same reference) when no pending sheet matches the target', () => {
+		const stack = [pullRequestDescriptor({ number: '123' })];
+
+		const result = resolvePullRequestSheet(stack, { number: '456' }, { pr: pullRequestFixture('456') });
+
+		assert.strictEqual(result, stack);
+	});
+});
+
+suite('removePendingPullRequestSheet', () => {
+	test('drops the matching pending sheet, marking its index removed', () => {
+		const target: PullRequestSheetTarget = { number: '123' };
+		const other = branchDescriptor();
+		const stack = [other, pullRequestDescriptor(target)];
+
+		const result = removePendingPullRequestSheet(stack, target);
+
+		assert.deepStrictEqual(result.stack, [other]);
+		assert.deepStrictEqual(result.removed, [false, true]);
+	});
+
+	test('leaves a resolved sheet with the same key alone — same reference, all-false removed', () => {
+		const target: PullRequestSheetTarget = { number: '123' };
+		const stack = [pullRequestDescriptor(target, pullRequestFixture('123'))];
+
+		const result = removePendingPullRequestSheet(stack, target);
+
+		assert.strictEqual(result.stack, stack);
+		assert.deepStrictEqual(result.removed, [false]);
+	});
+
+	test('same reference and all-false removed when no sheet matches the target', () => {
+		const stack = [pullRequestDescriptor({ number: '123' })];
+
+		const result = removePendingPullRequestSheet(stack, { number: '456' });
+
+		assert.strictEqual(result.stack, stack);
+		assert.deepStrictEqual(result.removed, [false]);
 	});
 });

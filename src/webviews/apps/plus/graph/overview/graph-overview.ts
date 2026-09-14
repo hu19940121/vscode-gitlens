@@ -1,44 +1,44 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import { when } from 'lit/directives/when.js';
+import { linkBase, scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { RovingTabindexController } from '@gitlens/components/controllers/rovingTabindex.js';
 import type { Deferrable } from '@gitlens/utils/debounce.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
+import { createCommandLink } from '../../../../../system/commands.js';
 import type {
 	GetOverviewEnrichmentResponse,
+	GetOverviewParams,
 	GetOverviewWipResponse,
 	GraphOverviewData,
 	OverviewRecentThreshold,
 } from '../../../../plus/graph/protocol.js';
-import {
-	GetOverviewEnrichmentRequest,
-	GetOverviewRequest,
-	GetOverviewWipDetailedRequest,
-	GetOverviewWipRequest,
-	TrackGraphOverviewShownCommand,
-} from '../../../../plus/graph/protocol.js';
-import { indexAgentSessionsByRepoAndWorktree, matchAgentSessionsForWorktree } from '../../../shared/agentUtils.js';
-import { scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
-import { RovingTabindexController } from '../../../shared/controllers/roving-tabindex.js';
-import type { HostIpc } from '../../../shared/ipc.js';
+import { isConnectionClosedError, notifyService } from '../../../shared/actions/rpc.js';
+import { matchAgentSessionsForWorktree } from '../../../shared/agentUtils.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import type { AppState } from '../context.js';
-import { graphStateContext } from '../context.js';
+import { graphServicesContext, graphStateContext } from '../context.js';
 import './graph-overview-card.js';
-import '../../../shared/components/code-icon.js';
+import '../../../shared/components/button.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/menu/menu-popover.js';
 
 /** Labels for the Overview "Recent" timeframe filter, in display order. */
 const recentThresholdLabels: Record<OverviewRecentThreshold, string> = {
-	OneDay: '1 day',
-	OneWeek: '1 week',
-	OneMonth: '1 month',
+	OneDay: l10n.t('1 day'),
+	OneWeek: l10n.t('1 week'),
+	OneMonth: l10n.t('1 month'),
 };
+
+/** Page size for the Overview panel's "Load More" older-branches paging — how many additional older
+ *  branches one click reveals. */
+const olderBranchesPageSize = 25;
 
 @customElement('gl-graph-overview')
 export class GlGraphOverview extends SignalWatcher(LitElement) {
@@ -47,6 +47,7 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		// in via the .scrollable border-color trick on hover/focus). Replaces the bespoke
 		// hover-to-show webkit-scrollbar rules that diverged from the rest of the graph.
 		scrollableBase,
+		linkBase,
 		css`
 			:host {
 				display: flex;
@@ -92,7 +93,15 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 			}
 
 			.group__header .group__label {
+				min-width: 0;
 				margin-block: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+
+			.group__header .threshold-filter {
+				flex: none;
 			}
 
 			.group__count {
@@ -125,6 +134,30 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 				font-size: var(--gl-font-micro);
 			}
 
+			.show-more {
+				display: block;
+				width: 100%;
+				padding: var(--gl-space-6) var(--gl-space-8);
+				margin-top: var(--gl-space-2);
+				font-family: inherit;
+				font-size: var(--gl-font-sm);
+				color: var(--color-foreground--50);
+				text-align: center;
+				cursor: pointer;
+				background: none;
+				border: none;
+				border-radius: var(--gl-radius-sm);
+			}
+
+			.show-more:hover {
+				color: var(--vscode-foreground);
+				background: var(--vscode-list-hoverBackground);
+			}
+
+			.show-more:focus-visible {
+				outline: var(--gl-border-width) solid var(--color-focus-border);
+			}
+
 			.section {
 				margin-bottom: var(--gl-space-6);
 			}
@@ -155,14 +188,86 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 				font-style: italic;
 				color: var(--vscode-descriptionForeground);
 			}
+
+			.skeleton-cards {
+				display: flex;
+				flex-direction: column;
+				gap: var(--gl-space-6);
+				padding: var(--gl-space-2) 0 var(--gl-space-16);
+			}
+
+			.skeleton-card {
+				display: flex;
+				gap: var(--gl-space-6);
+				align-items: center;
+				padding: var(--gl-space-8) var(--gl-space-6);
+				background: color-mix(in lab, var(--color-graph-background, var(--color-background)) 100%, #fff 8%);
+				border-radius: var(--gl-radius-sm);
+			}
+
+			:host-context(.vscode-light) .skeleton-card,
+			:host-context(.vscode-high-contrast-light) .skeleton-card {
+				background: color-mix(in lab, var(--color-graph-background, var(--color-background)) 100%, #000 6%);
+			}
+
+			.skeleton-card__icon {
+				flex: none;
+				width: 1.6rem;
+				height: 1.6rem;
+				background: var(--vscode-foreground);
+				border-radius: var(--gl-radius-sm);
+				opacity: 0.07;
+			}
+
+			.skeleton-card__lines {
+				display: flex;
+				flex: 1 1 auto;
+				flex-direction: column;
+				gap: var(--gl-space-4);
+				min-width: 0;
+			}
+
+			.skeleton-card__line {
+				height: 1rem;
+				background: var(--vscode-foreground);
+				border-radius: var(--gl-radius-sm);
+				opacity: 0.07;
+			}
+
+			.skeleton-card__line--title {
+				width: 55%;
+			}
+
+			.skeleton-card__line--subtitle {
+				width: 35%;
+			}
+
+			.skeleton-card:nth-child(2) .skeleton-card__line--title {
+				width: 40%;
+			}
+
+			.skeleton-card:nth-child(3) .skeleton-card__line--title {
+				width: 65%;
+			}
+
+			.actions {
+				display: flex;
+				gap: var(--gl-space-8);
+				margin-bottom: var(--gl-space-16);
+			}
+
+			.actions gl-button {
+				flex: 1 1 0;
+				min-width: 0;
+			}
 		`,
 	];
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private readonly _state!: AppState;
 
-	@consume({ context: ipcContext })
-	private _ipc!: HostIpc;
+	@consume({ context: graphServicesContext, subscribe: true })
+	private services?: typeof graphServicesContext.__context__;
 
 	@state()
 	private _wipData: GetOverviewWipResponse = {};
@@ -197,11 +302,22 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 	 *  (e.g. switching away from the overview panel and back) emits a fresh shown event. */
 	private _shownEmitted = false;
 
-	/** Whether the initial `GetOverviewRequest` has been issued this mount (once the panel is
+	/** Whether the initial `getOverview` call has been issued this mount (once the panel is
 	 *  visible). Guards `updated()` from re-firing it every render while `overview` is still null. */
 	private _overviewRequested = false;
 	/** Last-seen sidebar visibility, for detecting the hidden→visible transition in `updated()`. */
 	private _wasVisible = false;
+
+	/** Count of in-flight `getOverview` calls, tracked as a counter rather than a boolean — the
+	 *  mount fetch and a visibility-restore refetch (`connectedCallback`/`updated`) can overlap, and the
+	 *  header's progress bar should stay lit until every one of them settles, not just the first. */
+	private _overviewLoadingCount = 0;
+
+	/** How many older-than-threshold branches are currently requested via "Load More" paging — sent as
+	 *  `olderLimit` on every `getOverview` call. Reset to 0 on threshold change and on `refresh()`
+	 *  (both start the Recent list over), and never restored from persisted state — paging is
+	 *  session-local. */
+	private _olderLimit = 0;
 
 	// Each card list (Current work / Recent) is its own vertical roving toolbar: one Tab stop per
 	// list, ArrowUp/Down (+ Home/End) rove between cards, keyed by branch id so the active stop
@@ -235,17 +351,27 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		// transition (connectedCallback won't refire when the sidebar reopens).
 		this._wasVisible = this._state.sidebar?.visible === true;
 		if (this._wasVisible) {
+			// Also gated on `services` — if RPC hasn't connected yet, leave `_overviewRequested`
+			// unlatched so the `updated()` pass that fires when the services context arrives issues
+			// the fetch instead of dropping it.
 			if (this._state.overview == null) {
-				this._overviewRequested = true;
-				void this._ipc.sendRequest(GetOverviewRequest, {
-					recentThreshold: this._state.overviewRecentThreshold,
-				});
+				if (this.services != null) {
+					this._overviewRequested = true;
+					// Apply the reply directly — a failed first load must land `error` in state, or the
+					// skeleton renders forever (the host push only follows successful graph reloads).
+					void this.requestOverview({
+						recentThreshold: this._state.overviewRecentThreshold,
+						olderLimit: this._olderLimit,
+					}).then(overview => {
+						this._state.overview = overview;
+					});
+				}
 			} else {
 				// Force a re-fetch on remount/visibility-restore — the bulk push path is gone, so any
 				// drift accumulated while the overview panel was hidden (e.g. file edits in opened
 				// worktrees whose graph WIP rows are off-screen) is caught here. Reset the fingerprint
-				// dedup so `maybeRefetchOverviewData` actually fires. The host's `GetOverviewWipRequest`
-				// handler is cache-backed (`_wipStatusCache`), so entries kept warm by per-event pushes
+				// dedup so `maybeRefetchOverviewData` actually fires. The host's `getWip` handler is
+				// cache-backed (`_wipStatusCache`), so entries kept warm by per-event pushes
 				// resolve without any extra `git status` — only genuinely stale entries cost a fetch.
 				this._lastOverviewFingerprint = undefined;
 				this.maybeRefetchOverviewData(this._state.overview);
@@ -269,8 +395,45 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		this._wipData = {};
 		this._enrichmentData = {};
 		this._pendingWipDetails.clear();
+		this._olderLimit = 0;
 		this._state.resetOverviewEnrichment();
-		void this._ipc.sendRequest(GetOverviewRequest, { recentThreshold: this._state.overviewRecentThreshold });
+		void this.requestOverview({
+			recentThreshold: this._state.overviewRecentThreshold,
+			olderLimit: this._olderLimit,
+		}).then(overview => {
+			this._state.overview = overview;
+		});
+	}
+
+	/** Adjusts the in-flight `getOverview` counter and, on a 0↔1 crossing, bubbles the loading
+	 *  edge up to the sidebar panel so it can mirror it into the header's `progress-indicator` — this
+	 *  panel fetches its own data outside the sidebar's resource fetch loop, so nothing else surfaces
+	 *  the in-flight state for it. */
+	private adjustOverviewLoading(delta: 1 | -1): void {
+		const wasLoading = this._overviewLoadingCount > 0;
+		this._overviewLoadingCount = Math.max(0, this._overviewLoadingCount + delta);
+		const isLoading = this._overviewLoadingCount > 0;
+		if (wasLoading === isLoading) return;
+
+		this.dispatchEvent(
+			new CustomEvent<{ loading: boolean }>('gl-graph-overview-loading-change', {
+				detail: { loading: isLoading },
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	}
+
+	/** Every caller gates on `this.services` (mount/visibility fetches skip until RPC connects;
+	 *  the rest are user-triggered post-render), so the non-null assertion here is safe. */
+	private async requestOverview(params: GetOverviewParams): Promise<GraphOverviewData> {
+		this.adjustOverviewLoading(1);
+		try {
+			const overviewService = await this.services!.overview;
+			return await overviewService.getOverview(params);
+		} finally {
+			this.adjustOverviewLoading(-1);
+		}
 	}
 
 	private readonly onWipDetailsRequested = (e: Event) => {
@@ -284,7 +447,11 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 	private async fetchWipDetailsForBranch(branchId: string): Promise<void> {
 		this._pendingWipDetails.add(branchId);
 		try {
-			const result = await this._ipc.sendRequest(GetOverviewWipDetailedRequest, { branchIds: [branchId] });
+			const services = this.services;
+			if (services == null) return;
+
+			const overviewService = await services.overview;
+			const result = await overviewService.getWipDetailed([branchId]);
 			const detailed = result?.[branchId];
 			if (detailed == null) return;
 
@@ -293,7 +460,9 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 			const overview = this._state.overview;
 			const stillPresent =
 				overview != null &&
-				(overview.active.some(b => b.id === branchId) || overview.recent.some(b => b.id === branchId));
+				(overview.active.some(b => b.id === branchId) ||
+					overview.recent.some(b => b.id === branchId) ||
+					(overview.older ?? []).some(b => b.id === branchId));
 			if (!stillPresent) return;
 
 			// Merge into the existing entry (preserving any fields the basic load set, e.g.
@@ -322,10 +491,15 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 			if (overview == null) {
 				// Deferred initial fetch: the panel became visible before any data arrived. Fire once
 				// (guarded) so repeated `updated()` passes don't spam the request while `overview` is null.
-				if (!this._overviewRequested) {
+				if (!this._overviewRequested && this.services != null) {
 					this._overviewRequested = true;
-					void this._ipc.sendRequest(GetOverviewRequest, {
+					// Apply directly for the same reason as `connectedCallback` — a failed load must
+					// surface `error` rather than leaving the skeleton up.
+					void this.requestOverview({
 						recentThreshold: this._state.overviewRecentThreshold,
+						olderLimit: this._olderLimit,
+					}).then(overview => {
+						this._state.overview = overview;
 					});
 				}
 			} else {
@@ -355,10 +529,14 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 
 		// Fire the shown event once overview data is available AND the sidebar is visible so the
 		// walkthrough step only completes when the user actually sees the overview.
-		if (!this._shownEmitted && overview != null && this._state.sidebar?.visible) {
+		// Also gated on `services` so a render before RPC connects doesn't latch the guard and drop
+		// the walkthrough-step completion for the whole mount.
+		if (!this._shownEmitted && overview != null && this._state.sidebar?.visible && this.services != null) {
 			this._shownEmitted = true;
-			this._ipc.sendCommand(TrackGraphOverviewShownCommand, undefined);
-			emitTelemetrySentEvent<'graph/overview/shown'>(this, {
+			notifyService(this.services.telemetry, 'track usage', svc =>
+				svc.trackUsage('action:gitlens.graph.overview.shown:happened'),
+			);
+			emitTelemetrySentEvent(this, {
 				name: 'graph/overview/shown',
 				data: {
 					'branches.active.count': overview.active.length,
@@ -392,7 +570,11 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		const repoPaths =
 			overview != null
 				? [
-						...new Set([...overview.active.map(b => b.repoPath), ...overview.recent.map(b => b.repoPath)]),
+						...new Set([
+							...overview.active.map(b => b.repoPath),
+							...overview.recent.map(b => b.repoPath),
+							...(overview.older ?? []).map(b => b.repoPath),
+						]),
 					].sort()
 				: [];
 
@@ -479,6 +661,11 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		if (fingerprint !== this._lastOverviewFingerprint) {
 			this._lastOverviewFingerprint = fingerprint;
 			void this.fetchOverviewData(overview, fingerprint).catch((ex: unknown) => {
+				if (isConnectionClosedError(ex)) {
+					Logger.debug('GraphOverview: overview data fetch dropped by deliberate connection teardown');
+					return;
+				}
+
 				Logger.error(ex, 'GraphOverview: Failed to fetch overview data');
 			});
 		}
@@ -486,20 +673,30 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 	}
 
 	private getOverviewFingerprint(overview: GraphOverviewData): string {
-		const ids = [...overview.active.map(b => b.id), ...overview.recent.map(b => b.id)];
+		const ids = [
+			...overview.active.map(b => b.id),
+			...overview.recent.map(b => b.id),
+			...(overview.older ?? []).map(b => b.id),
+		];
 		return ids.sort().join(',');
 	}
 
 	private async fetchOverviewData(overview: GraphOverviewData, fingerprint: string) {
-		const allBranches = [...overview.active, ...overview.recent];
+		const older = overview.older ?? [];
+		const allBranches = [...overview.active, ...overview.recent, ...older];
 		if (allBranches.length === 0) return;
+
+		const services = this.services;
+		if (services == null) return;
+
+		const overviewService = await services.overview;
 
 		const allIds = allBranches.map(b => b.id);
 		const wipIds = overview.active.map(b => b.id);
-		// Recent worktree-backed branches get a cheap clean/dirty probe so their cards can show the
-		// same pill as Current Work. Recent branches without a worktree have no working tree of their
-		// own and are skipped — the empty default `{ hasChanges: false }` would lie there.
-		const recentWipIds = overview.recent.filter(b => b.worktree != null).map(b => b.id);
+		// Recent (and paged-in older) worktree-backed branches get a cheap clean/dirty probe so their
+		// cards can show the same pill as Current Work. Branches without a worktree have no working
+		// tree of their own and are skipped — the empty default `{ hasChanges: false }` would lie there.
+		const recentWipIds = [...overview.recent, ...older].filter(b => b.worktree != null).map(b => b.id);
 		const keep = new Set(allIds);
 
 		// Enrichment is fetched lazily — by this panel on mount, or by the scope popover on open.
@@ -511,15 +708,9 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		// allSettled so a single transient IPC failure doesn't tank the other two — wip-only,
 		// cheap-only, or enrichment-only outages still update the rest of the overview.
 		const [wipSettled, recentWipSettled, enrichmentSettled] = await Promise.allSettled([
-			wipIds.length > 0
-				? this._ipc.sendRequest(GetOverviewWipRequest, { branchIds: wipIds })
-				: Promise.resolve(undefined),
-			recentWipIds.length > 0
-				? this._ipc.sendRequest(GetOverviewWipRequest, { branchIds: recentWipIds, cheap: true })
-				: Promise.resolve(undefined),
-			sharedCoversAll
-				? Promise.resolve(sharedEnrichment)
-				: this._ipc.sendRequest(GetOverviewEnrichmentRequest, { branchIds: allIds }),
+			wipIds.length > 0 ? overviewService.getWip(wipIds) : Promise.resolve(undefined),
+			recentWipIds.length > 0 ? overviewService.getWip(recentWipIds, true) : Promise.resolve(undefined),
+			sharedCoversAll ? Promise.resolve(sharedEnrichment) : overviewService.getEnrichment(allIds),
 		]);
 		if (this._lastOverviewFingerprint !== fingerprint) return;
 
@@ -574,15 +765,26 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		// stale at the partial/empty reachability captured before the page arrived.
 		void this._state.rows;
 		if (overview == null) {
+			return html` <div class="content scrollable">${this.renderSkeleton()}</div> `;
+		}
+
+		if (overview.error != null) {
 			return html`
 				<div class="content scrollable">
-					<div class="empty">Loading...</div>
+					${this.renderStartActions()}
+					<div class="empty">
+						${l10n.t('Unable to load branch data.')}
+						<a href="#" @click=${this.onRetryClick}>${l10n.t('Retry')}</a>
+					</div>
 				</div>
 			`;
 		}
 
 		const hasActive = overview.active.length > 0;
-		const hasRecent = overview.recent.length > 0;
+		const olderCount = overview.older?.length ?? 0;
+		// True once older branches have been paged in even if the within-threshold `recent` bucket is
+		// empty — otherwise the Recent group (and the older cards it now holds) would never render.
+		const hasRecent = overview.recent.length > 0 || olderCount > 0;
 
 		return html`
 			<div class="content scrollable">
@@ -590,25 +792,114 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 					hasActive,
 					() => html`
 						<div class="group">
-							<div class="group__label">Current work</div>
+							<div class="group__label">${l10n.t('Current work')}</div>
 							${this.renderCards(overview.active, 'active')}
 						</div>
 					`,
 				)}
+				${this.renderStartActions()}
 				${when(
 					hasRecent,
 					() => html`
 						<div class="group">
 							<div class="group__header">
 								<div class="group__label">
-									Recent <span class="group__count">(${overview.recent.length})</span>
+									${l10n.t('Recent')}
+									<span class="group__count">(${overview.recent.length + olderCount})</span>
 								</div>
 								${this.renderRecentThresholdFilter()}
 							</div>
-							${this.renderCards(overview.recent, 'recent')}
+							${this.renderCards([...overview.recent, ...(overview.older ?? [])], 'recent')}
+							${when(
+								(overview.olderTotal ?? 0) > olderCount,
+								() => html`
+									<button class="show-more" type="button" @click=${this.onShowMoreOlderClick}>
+										${l10n.t('Load More')}
+									</button>
+								`,
+							)}
 						</div>
 					`,
 				)}
+				${when(!hasActive && !hasRecent, () => this.renderEmptyOverview(overview))}
+			</div>
+		`;
+	}
+
+	private renderEmptyOverview(overview: GraphOverviewData) {
+		return html`
+			<div class="empty">${l10n.t('No recent branch activity')}</div>
+			${when(
+				(overview.olderTotal ?? 0) > 0,
+				() =>
+					html`<div class="empty">
+						<a href="#" @click=${this.onShowMoreOlderClick}>${l10n.t('Show older branches')}</a>
+					</div>`,
+			)}
+		`;
+	}
+
+	private readonly onRetryClick = (e: Event): void => {
+		e.preventDefault();
+		void this.requestOverview({
+			recentThreshold: this._state.overviewRecentThreshold,
+			olderLimit: this._olderLimit,
+		}).then(overview => {
+			this._state.overview = overview;
+		});
+	};
+
+	private readonly onShowMoreOlderClick = (e: Event): void => {
+		e.preventDefault();
+		this._olderLimit += olderBranchesPageSize;
+		void this.requestOverview({
+			recentThreshold: this._state.overviewRecentThreshold,
+			olderLimit: this._olderLimit,
+		}).then(overview => {
+			this._state.overview = overview;
+		});
+	};
+
+	/** 3 card-shaped shimmer placeholders, matching the sidebar's `renderSkeleton()` pattern (static
+	 *  low-opacity blocks, no tree rows) but sized like `<gl-graph-overview-card>` rather than a tree
+	 *  row — the overview renders cards, not a list. */
+	private renderSkeleton() {
+		return html`
+			<div class="skeleton-cards" aria-hidden="true">
+				${Array.from(
+					{ length: 3 },
+					() => html`
+						<div class="skeleton-card">
+							<div class="skeleton-card__icon"></div>
+							<div class="skeleton-card__lines">
+								<div class="skeleton-card__line skeleton-card__line--title"></div>
+								<div class="skeleton-card__line skeleton-card__line--subtitle"></div>
+							</div>
+						</div>
+					`,
+				)}
+			</div>
+		`;
+	}
+
+	/** Start Work button between the Current work and Recent groups. `showOpenInAgent` makes the
+	 *  wizard end with its manual-vs-agent hand-off step, so this one entry point covers both routes
+	 *  — no separate Start Agent affordance. Sourced so it reads apart from the agents panel header's
+	 *  action in telemetry. */
+	private renderStartActions() {
+		return html`
+			<div class="actions">
+				<gl-button
+					full
+					appearance="secondary"
+					density="tight"
+					href=${createCommandLink('gitlens.startWork', {
+						source: { source: 'graph-sidebar' as const, detail: 'overview' },
+						showOpenInAgent: 'agent',
+					})}
+				>
+					${l10n.t('Start Work...')}
+				</gl-button>
 			</div>
 		`;
 	}
@@ -620,7 +911,12 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 		);
 		return html`
 			<gl-menu-popover placement="bottom-end" .items=${items} @gl-menu-select=${this.onRecentThresholdSelect}>
-				<button slot="anchor" class="threshold-filter" type="button" aria-label="Change Recent Timeframe">
+				<button
+					slot="anchor"
+					class="threshold-filter"
+					type="button"
+					aria-label=${l10n.t('Change Recent Timeframe')}
+				>
 					${recentThresholdLabels[threshold]}<code-icon icon="chevron-down"></code-icon>
 				</button>
 			</gl-menu-popover>
@@ -634,7 +930,7 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 	private onRecentThresholdSelected(threshold: OverviewRecentThreshold): void {
 		if ((this._state.overviewRecentThreshold ?? 'OneWeek') === threshold) return;
 
-		emitTelemetrySentEvent<'graph/overview/recentThresholdChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/overview/recentThresholdChanged',
 			data: { threshold: threshold },
 		});
@@ -648,10 +944,13 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 				composed: true,
 			}),
 		);
-		// Apply the re-partitioned response — unlike the host-pushed `DidChangeOverviewNotification`
-		// path (graph load, branch changes), a `GetOverviewRequest` reply isn't routed into state
-		// for us, so a threshold change would otherwise never re-render the Recent list.
-		void this._ipc.sendRequest(GetOverviewRequest, { recentThreshold: threshold }).then(overview => {
+		// A new threshold restarts the Recent list — any older branches paged in under the old
+		// threshold no longer apply.
+		this._olderLimit = 0;
+		// Apply the re-partitioned response — unlike the host-pushed `onOverviewChanged` RPC event
+		// (graph load, branch changes), a `getOverview` reply isn't routed into state for us, so a
+		// threshold change would otherwise never re-render the Recent list.
+		void this.requestOverview({ recentThreshold: threshold, olderLimit: this._olderLimit }).then(overview => {
 			this._state.overview = overview;
 		});
 	}
@@ -659,7 +958,9 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 	private renderCards(branches: GraphOverviewData['active'], group: 'active' | 'recent') {
 		if (!branches.length) return nothing;
 
-		const sessionsByRepoAndWorktree = indexAgentSessionsByRepoAndWorktree(this._state.agentSessions);
+		// Memoized on `agentSessions` by the state provider — every rows splice re-renders this panel,
+		// and rebuilding the index here would pay for it each time.
+		const sessionsByRepoAndWorktree = this._state.agentSessionIndex;
 		const containsByRepo = this._selectionContainsByRepo;
 		const scopedBranchId = this._state.scope?.branchRef;
 		const roving = group === 'active' ? this._rovingActive : this._rovingRecent;
@@ -670,7 +971,7 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 				data-group=${group}
 				role="toolbar"
 				aria-orientation="vertical"
-				aria-label=${group === 'active' ? 'Current work branches' : 'Recent branches'}
+				aria-label=${group === 'active' ? l10n.t('Current work branches') : l10n.t('Recent branches')}
 				@keydown=${roving.onKeydown}
 				@focusin=${roving.onFocusin}
 			>
@@ -685,12 +986,14 @@ export class GlGraphOverview extends SignalWatcher(LitElement) {
 						// the match so the matcher's `worktreePath ?? repoPath` fallback doesn't
 						// false-match it to the default-worktree session).
 						const matchWorktreePath = b.worktree?.path ?? (b.opened ? b.repoPath : undefined);
+						// Ended sessions are history — the card surfaces live presence only,
+						// matching the hover's filter (`gl-branch-hover`).
 						const agentSessions =
 							matchWorktreePath != null
 								? matchAgentSessionsForWorktree(sessionsByRepoAndWorktree, {
 										repoPath: b.repoPath,
 										worktreePath: matchWorktreePath,
-									})
+									})?.filter(s => s.phase !== 'ended')
 								: undefined;
 						return html`
 							<gl-graph-overview-card
@@ -727,5 +1030,6 @@ declare global {
 
 	interface GlobalEventHandlersEventMap {
 		'gl-graph-overview-recent-threshold-change': CustomEvent<{ threshold: OverviewRecentThreshold }>;
+		'gl-graph-overview-loading-change': CustomEvent<{ loading: boolean }>;
 	}
 }

@@ -1,15 +1,17 @@
 import { dirname, resolve } from 'path';
 import { workspace } from 'vscode';
-import { ClaudeCodeProvider } from '@gitlens/agents/providers/claudeCodeProvider.js';
+import { GkAgentProvider } from '@gitlens/agents/providers/gkAgentProvider.js';
 import { Git } from '@gitlens/git-cli/exec/git.js';
 import { findGitPath } from '@gitlens/git-cli/exec/locator.js';
 import type { Cache } from '@gitlens/git/cache.js';
 import type { GitProvider } from '@gitlens/git/providers/provider.js';
 import type { GitResult, GitRunOptions } from '@gitlens/git/run.types.js';
 import type { UnifiedDisposable } from '@gitlens/utils/disposable.js';
+import { Logger } from '@gitlens/utils/logger.js';
 import { normalizePath } from '@gitlens/utils/path.js';
 import type { AgentSessionProvider } from '../../agents/provider.js';
-import { tryOpenClaudeSession } from '../../agents/utils/-webview/claudeExtension.js';
+import { getAgentExtension } from '../../agents/utils/-webview/agentExtensions.js';
+import { resumeAgentSessionInTerminal } from '../../agents/utils/-webview/agentResume.js';
 import type { Container } from '../../container.js';
 import type { GlGitProvider } from '../../git/gitProvider.js';
 import type { RepositoryLocationProvider } from '../../git/location/repositorylocationProvider.js';
@@ -107,7 +109,7 @@ export function getGkMcpService(container: Container, gkCli: GkCliService): GkMc
 
 export function getAgentSessionProviders(container: Container): AgentSessionProvider[] {
 	return [
-		new ClaudeCodeProvider({
+		new GkAgentProvider({
 			ipc: container.ipc,
 			getActivityDecayMs: () =>
 				activityDecayToMs(configuration.get('graph.experimental.visualizations.activityDecay') ?? '5m'),
@@ -136,14 +138,34 @@ export function getAgentSessionProviders(container: Container): AgentSessionProv
 				}
 			},
 			runCLICommand: (args, opts) => runCLICommand(args, opts),
-			openSessionInClaudeExtension: async sessionId => {
-				// Shared editor → primaryEditor → sidebar fallback chain so the peer-side open
-				// honors a specific session through the same rungs the local-window path uses.
-				// Throws when all three rungs fail so the IPC handler can report
-				// `{ opened: false }` to the initiating window.
-				if (!(await tryOpenClaudeSession(sessionId))) {
-					throw new Error('Claude Code extension did not respond to any open command');
+			getLiveAgentSessions: async () => {
+				// The CLI's durable session store never revives a resumed session, and its active
+				// record can freeze on a missed hook event. Reconcile both against Claude's current
+				// `agents --json` listing. Dynamic import mirrors `agentStatusService`'s use of this
+				// module and keeps the spawn logic out of the main bundle.
+				const { getLiveClaudeSessions } = await import(
+					/* webpackChunkName: "agents" */ '@env/agents/claudeSessionFile.js'
+				);
+				return getLiveClaudeSessions();
+			},
+			revealSession: sessionId => container.agentStatus?.revealSession(sessionId) ?? Promise.resolve(false),
+			getResumeTargets: (providerId, cwd) =>
+				container.agentStatus?.getResumeTargets(providerId, cwd) ?? ['terminal'],
+			resumeSession: async (providerId, sessionId, cwd, target, name) => {
+				if (target === 'extension') {
+					const extension = getAgentExtension(providerId);
+					if (extension != null && (await extension.openSession(sessionId))) return 'extension';
+
+					Logger.warn(
+						`getAgentSessionProviders.resumeSession: extension open failed for ${providerId} session ${sessionId}; falling back to terminal`,
+					);
 				}
+
+				const resumed = await resumeAgentSessionInTerminal(
+					{ providerId: providerId, id: sessionId, cwd: cwd, name: name },
+					container,
+				);
+				return resumed ? 'terminal' : false;
 			},
 			resolveGitInfo: async cwd => {
 				// Fast path: cwd is in an already-loaded repo — fully synchronous, no shell calls.

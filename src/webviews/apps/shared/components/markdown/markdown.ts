@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
@@ -7,9 +8,12 @@ import { Marked } from 'marked';
 import type { ThemeIcon } from 'vscode';
 import { ruleStyles } from '../../../plus/shared/components/vscode.css.js';
 import { applyCspSafeStyles, rewriteInlineStylesToData } from './css-inline-styles.js';
+import '@gitlens/components/components/overlays/tooltip.js';
+
+type BlockRenderMode = 'plain' | 'image-chips' | 'avatar-column';
 
 let inlineMarked: Marked | undefined;
-let blockMarked: Marked | undefined;
+const blockMarkedByMode = new Map<BlockRenderMode, Marked>();
 
 @customElement('gl-markdown')
 export class GlMarkdown extends LitElement {
@@ -25,8 +29,8 @@ export class GlMarkdown extends LitElement {
 
 			a,
 			a code {
-				text-decoration: none;
 				color: var(--vscode-textLink-foreground);
+				text-decoration: none;
 			}
 
 			a:hover,
@@ -36,6 +40,23 @@ export class GlMarkdown extends LitElement {
 
 			a:hover:not(.disabled) {
 				cursor: pointer;
+			}
+
+			.image {
+				display: inline-flex;
+				gap: var(--gl-space-4);
+				align-items: center;
+				padding: var(--gl-space-2) var(--gl-space-6) var(--gl-space-2) var(--gl-space-4);
+				line-height: 1.4;
+				vertical-align: middle;
+				background: color-mix(in srgb, transparent 88%, var(--color-foreground));
+				border-radius: var(--gl-radius-sm);
+			}
+
+			/* The chip's own padding and gap place the icon; the general icon nudge below would double it.
+			   The :not() matches that rule's specificity so this earlier rule can win. */
+			.image > code-icon:not(.leading) {
+				margin-left: 0;
 			}
 
 			p,
@@ -48,6 +69,22 @@ export class GlMarkdown extends LitElement {
 			h5,
 			h6 {
 				margin-inline: 0;
+			}
+
+			/* In avatar-column mode a paragraph that LEADS with an image (the hover formats' avatar) lays
+			   out as a card: the image in one column, everything after it in the other, so the
+			   author/date/sha lines wrap against a single left edge beside the avatar rather than under
+			   a baseline-aligned picture. The block renderer wraps everything after the image in one
+			   span — otherwise each inline run would become its own flex item and squeeze into columns —
+			   and strips the format's spacing after the image; the gap replaces it. */
+			:host([avatar-column]) p:has(> img:first-child + .lead-image-body) {
+				display: flex;
+				gap: var(--gl-space-4);
+				align-items: flex-start;
+			}
+
+			.lead-image-body {
+				min-width: 0;
 			}
 
 			:where(:host([density='compact'])) p,
@@ -72,31 +109,31 @@ export class GlMarkdown extends LitElement {
 			}
 
 			code {
+				padding: 0 4px 2px;
+				font-family: var(--vscode-editor-font-family);
 				background: var(--vscode-textCodeBlock-background);
 				border-radius: var(--gl-radius-sm);
-				padding: 0px 4px 2px 4px;
-				font-family: var(--vscode-editor-font-family);
 			}
 
 			code code-icon {
-				color: inherit;
 				font-size: inherit;
 				vertical-align: middle;
+				color: inherit;
 			}
 
 			/* An icon labels the ref that follows it, but the literal space plus code's own left
-			   padding put more room on that side than on the side of the word before it, so it read as
-			   attached to the wrong neighbour. Pull it toward its ref and give the preceding text room. */
+  padding put more room on that side than on the side of the word before it, so it read as
+  attached to the wrong neighbour. Pull it toward its ref and give the preceding text room. */
 			/* The child combinator keeps this off icons nested inside a code span. The graph's row
-			   hovercard wraps icon and sha in one span (CommitFormatter.link), where the icon can't be
-			   row-leading and an indent would just push it off the chip's own padding. */
+  hovercard wraps icon and sha in one span (CommitFormatter.link), where the icon can't be
+  row-leading and an indent would just push it off the chip's own padding. */
 			:not(code) > code-icon:not(.leading) {
 				margin-left: 0.3em;
 			}
 
 			/* An icon that starts a row is an emblem for the whole line, not a word in it, so it keeps
-			   the full size a caller's --code-icon-size would otherwise shrink, and needs no leading
-			   space. Tagged during rendering rather than selected here — see renderThemeIconsWithinText. */
+  the full size a caller's --code-icon-size would otherwise shrink, and needs no leading
+  space. Tagged during rendering rather than selected here — see renderThemeIconsWithinText. */
 			code-icon.leading {
 				--code-icon-size: 1.6rem;
 
@@ -104,10 +141,10 @@ export class GlMarkdown extends LitElement {
 			}
 
 			/* Fully absorbs the literal space, so the only separation left is the chip's own padding —
-			   which is also trimmed here, since the icon already reads as attached. */
+  which is also trimmed here, since the icon already reads as attached. */
 			code-icon + code {
-				margin-left: -0.3em;
 				padding-left: 3px;
+				margin-left: -0.3em;
 			}
 
 			p:first-child,
@@ -126,6 +163,7 @@ export class GlMarkdown extends LitElement {
 			ul {
 				padding-left: var(--markdown-list-spacing);
 			}
+
 			ol {
 				padding-left: var(--markdown-list-spacing);
 			}
@@ -148,6 +186,19 @@ export class GlMarkdown extends LitElement {
 
 	@property({ type: Boolean, reflect: true })
 	inline = false;
+
+	/** Renders every image (markdown `![]()` and raw `<img>`) as a chip that opens the image in the
+	 *  browser rather than an `<img>` — for content like PR descriptions whose images can't load in
+	 *  the webview (no cookies for private repos, GitHub's pasted-image URLs). Off by default so
+	 *  GitLens's own generated images (e.g. hover avatars) still render inline. */
+	@property({ type: Boolean, reflect: true, attribute: 'image-chips' })
+	imageChips = false;
+
+	/** Lays out a paragraph that leads with an image as an avatar column beside the rest of its text —
+	 *  for the host's hover formats, which open with `${avatar}`. Off by default so a commit message
+	 *  that happens to start with an image keeps its ordinary inline flow. */
+	@property({ type: Boolean, reflect: true, attribute: 'avatar-column' })
+	avatarColumn = false;
 
 	override render(): unknown {
 		return html`${this.markdown ? this.renderMarkdown(this.markdown) : ''}`;
@@ -179,8 +230,14 @@ export class GlMarkdown extends LitElement {
 			return html`<span>${unsafeHTML(rewriteInlineStylesToData(rendered))}</span>`;
 		}
 
-		blockMarked ??= new Marked({ breaks: true, gfm: true, renderer: getMarkdownRenderer() });
-		rendered = blockMarked.parse(markdownEscapeEscapedIcons(markdown), { async: false });
+		const mode: BlockRenderMode = this.imageChips ? 'image-chips' : this.avatarColumn ? 'avatar-column' : 'plain';
+		let marked = blockMarkedByMode.get(mode);
+		if (marked == null) {
+			marked = new Marked({ breaks: true, gfm: true, renderer: getMarkdownRenderer(mode) });
+			blockMarkedByMode.set(mode, marked);
+		}
+
+		rendered = marked.parse(markdownEscapeEscapedIcons(markdown), { async: false });
 		rendered = renderThemeIconsWithinText(rendered);
 		return unsafeHTML(rewriteInlineStylesToData(rendered));
 	}
@@ -207,9 +264,16 @@ export function escape(html: string, encode?: boolean) {
 	return html;
 }
 
-function getMarkdownRenderer(): RendererObject {
+const leadingImageRegex = /^(<img\b[^>]*>)(?:\s|&nbsp;)*(.*)$/is;
+
+function getMarkdownRenderer(mode: BlockRenderMode): RendererObject {
+	const imageChips = mode === 'image-chips';
 	return {
 		image: function (this: RendererThis, { href, title, text }: Tokens.Image): string {
+			if (imageChips) {
+				return renderImagePlaceholder(href ? parseHrefAndDimensions(href).href : href, text);
+			}
+
 			let dimensions: string[] = [];
 			let attributes: string[] = [];
 			if (href) {
@@ -231,14 +295,63 @@ function getMarkdownRenderer(): RendererObject {
 			return `<code>${escape(text)}</code>`;
 		},
 		paragraph: function (this: RendererThis, { tokens }: Tokens.Paragraph): string {
-			const text = this.parser.parseInline(tokens);
+			let text = this.parser.parseInline(tokens);
+			if (mode === 'avatar-column') {
+				// A leading image lays out as a card column (see the `.lead-image-body` rule): the rest of
+				// the paragraph becomes the single second column, and the gap supplies the spacing — so
+				// drop the format's own spaces/`&nbsp;` or the first line starts indented relative to the
+				// lines that wrap beneath it.
+				const match = leadingImageRegex.exec(text);
+				if (match?.[2]) {
+					text = `${match[1]}<span class="lead-image-body">${match[2]}</span>`;
+				}
+			}
+
 			return `<p>${text}</p>`;
 		},
 		html: function (this: RendererThis, { text }: Tokens.HTML | Tokens.Tag): string {
+			if (imageChips) {
+				const images = renderImagePlaceholdersFromHtml(text);
+				if (images) return images;
+			}
+
 			const match = text.match(/^(<span[^>]+>)|(<\/\s*span>)$/);
 			return match ? text : '';
 		},
 	};
+}
+
+/** GitHub-flavored pasted images and private-repo images can't render in the webview — no cookies, and
+ *  the `html` renderer otherwise drops raw `<img>` tags entirely (see `getMarkdownRenderer`'s `html`
+ *  case). This renders a clickable chip in their place instead of the image itself. */
+function renderImagePlaceholder(src: string | undefined, alt: string | undefined): string {
+	const label = escape(alt || l10n.t('Image'));
+	const icon = renderThemeIcon({ id: 'file-media' });
+	if (src && /^https?:\/\//i.test(src)) {
+		return `<gl-tooltip content="${escapeDoubleQuotes(l10n.t('Open image in browser'))}"><a class="image" href="${escapeDoubleQuotes(src)}">${icon}${label}</a></gl-tooltip>`;
+	}
+
+	return `<span class="image">${icon}${label}</span>`;
+}
+
+const htmlImageTagRegex = /<img\b[^>]*>/gis;
+const htmlImageSrcRegex = /\bsrc=(?:"([^"]*)"|'([^']*)')/i;
+const htmlImageAltRegex = /\balt=(?:"([^"]*)"|'([^']*)')/i;
+
+/** Extracts every `<img …>` tag out of a raw HTML block (e.g. a `<picture>` wrapper) and renders each as
+ *  a placeholder chip — see `renderImagePlaceholder`. */
+function renderImagePlaceholdersFromHtml(text: string): string {
+	const tags = text.match(htmlImageTagRegex);
+	if (!tags?.length) return '';
+
+	let result = '';
+	for (const tag of tags) {
+		const srcMatch = htmlImageSrcRegex.exec(tag);
+		const altMatch = htmlImageAltRegex.exec(tag);
+		result += renderImagePlaceholder(srcMatch?.[1] ?? srcMatch?.[2], altMatch?.[1] ?? altMatch?.[2]);
+	}
+
+	return result;
 }
 
 function getInlineMarkdownRenderer(): RendererObject {

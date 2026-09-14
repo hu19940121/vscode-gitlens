@@ -86,12 +86,17 @@ export class IntegrationAuthenticationService implements Disposable {
 	}
 
 	supports(providerId: string): boolean {
+		// Linear and Trello are cloud-backed issue integrations (same as Jira): `ensureProvider` registers a
+		// cloud auth provider for them, so a disconnect must offer to sign out of the cloud token too —
+		// otherwise the backend token and configured connection survive the disable.
 		switch (providerId) {
 			case GitCloudHostIntegrationId.AzureDevOps:
 			case GitSelfManagedHostIntegrationId.AzureDevOpsServer:
 			case GitCloudHostIntegrationId.Bitbucket:
 			case GitCloudHostIntegrationId.GitLab:
 			case IssuesCloudHostIntegrationId.Jira:
+			case IssuesCloudHostIntegrationId.Linear:
+			case IssuesCloudHostIntegrationId.Trello:
 			case GitCloudHostIntegrationId.GitHub:
 				return true;
 			default:
@@ -108,8 +113,6 @@ export class IntegrationAuthenticationService implements Disposable {
 		// the package constructs its own cloud providers below (so GitLens's cloud auth needs no host hook).
 		const hostProvider = await this.ctx.hooks?.createAuthenticationProvider?.({
 			id: providerId,
-			auth: this,
-			configured: this.configuredIntegrationService,
 		});
 		if (hostProvider != null) {
 			this.providers.set(providerId, hostProvider);
@@ -128,6 +131,7 @@ export class IntegrationAuthenticationService implements Disposable {
 			case GitSelfManagedHostIntegrationId.BitbucketServer:
 			case IssuesCloudHostIntegrationId.Jira:
 			case IssuesCloudHostIntegrationId.Linear:
+			case IssuesCloudHostIntegrationId.Trello:
 				provider = new CloudIntegrationAuthenticationProvider(
 					this,
 					this.configuredIntegrationService,
@@ -135,7 +139,7 @@ export class IntegrationAuthenticationService implements Disposable {
 				);
 				break;
 			default:
-				throw new Error(`No authentication provider registered for integration '${providerId}'`);
+				throw new Error(`No authentication provider registered for integration '${String(providerId)}'`);
 		}
 
 		this.providers.set(providerId, provider);

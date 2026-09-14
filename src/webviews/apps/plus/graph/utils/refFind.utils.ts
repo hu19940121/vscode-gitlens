@@ -1,3 +1,7 @@
+import { getExcludedRemotes, refPillKey } from '@gitkraken/commit-graph-ui/extensions/refs/pills.js';
+import { emptySetMarker } from '@gitkraken/commit-graph-ui/scope/filtering.js';
+import { createWipRowId } from '@gitkraken/commit-graph/wip/identity.js';
+import * as l10n from '@vscode/l10n';
 import type { GraphBranchesVisibility } from '../../../../../config.js';
 import type {
 	GraphExcludeRefs,
@@ -10,11 +14,8 @@ import type {
 	GraphSidebarTag,
 	GraphWipRowsById,
 } from '../../../../plus/graph/protocol.js';
-import { createWipRowId, emptySetMarker } from '../../../../plus/graph/protocol.js';
 import { parseFilterTerms } from '../../../shared/utils/filter-match.js';
-import { getExcludedRemotes } from '../hiddenRefs.utils.js';
-import { refPillKey } from './refKey.utils.js';
-import { filterSecondariesForScopeAndVisibility, shouldShowPrimaryWipRow } from './wip.utils.js';
+import { filterSecondariesForScopeAndVisibility, shouldShowPrimaryWipRow, wipBranchName } from './wip.utils.js';
 
 /**
  * Ref find ("jump to a ref by name") vocabulary, shared by the header trigger and the find widget.
@@ -119,19 +120,6 @@ function isTypeExcluded(kind: RefFindKind, excludeTypes: GraphExcludeTypes | und
 	}
 }
 
-/** The worktree's branch name for a WIP row, or `undefined` for a detached worktree. Prefers the
- *  synced `branch` projection; falls back to parsing `branchRef` (`{repoPath}|heads/{name}`). */
-function wipBranchName(meta: { branch?: { name?: string }; branchRef?: string }): string | undefined {
-	if (meta.branch?.name != null) return meta.branch.name;
-
-	const ref = meta.branchRef;
-	if (ref == null) return undefined;
-
-	const marker = '|heads/';
-	const index = ref.indexOf(marker);
-	return index === -1 ? undefined : ref.slice(index + marker.length);
-}
-
 /** De-dupes candidate names, dropping empties and anything equal to the label (redundant with it). */
 function wipAliases(names: readonly (string | undefined)[], label: string): string[] | undefined {
 	const aliases = new Set<string>();
@@ -142,6 +130,9 @@ function wipAliases(names: readonly (string | undefined)[], label: string): stri
 	}
 	return aliases.size > 0 ? [...aliases] : undefined;
 }
+
+/** Stable English alias retained so localizing the visible WIP label doesn't remove existing searches. */
+const workingChangesSearchAlias = 'Working Changes';
 
 /**
  * Assembles the jump candidates from the branches/remotes/tags sidebar payloads, dropping anything
@@ -296,7 +287,7 @@ export function buildRefFindCandidates(sources: RefFindSources, filters?: RefFin
 				const key = refPillKey({ kind: 'wip', name: primaryMeta.repoPath });
 				if (!seen.has(key)) {
 					seen.add(key);
-					const label = 'Working Changes';
+					const label = l10n.t('Working Changes');
 					candidates.push({
 						kind: 'wip',
 						name: primaryMeta.repoPath,
@@ -304,7 +295,7 @@ export function buildRefFindCandidates(sources: RefFindSources, filters?: RefFin
 						sha: primaryWipRowId,
 						date: primaryMeta.parentDate,
 						current: true,
-						aliases: wipAliases([wipBranchName(primaryMeta), 'wip'], label),
+						aliases: wipAliases([wipBranchName(primaryMeta), 'wip', workingChangesSearchAlias], label),
 					});
 				}
 			}
@@ -330,14 +321,15 @@ export function buildRefFindCandidates(sources: RefFindSources, filters?: RefFin
 			if (seen.has(key)) continue;
 
 			seen.add(key);
-			const label = `Working Changes (${meta.label})`;
+			const searchAlias = `Working Changes (${meta.label})`;
+			const label = l10n.t('Working Changes ({worktree})', { worktree: meta.label });
 			candidates.push({
 				kind: 'wip',
 				name: meta.repoPath,
 				label: label,
 				sha: id,
 				date: meta.parentDate,
-				aliases: wipAliases([wipBranchName(meta), meta.label, 'wip'], label),
+				aliases: wipAliases([wipBranchName(meta), meta.label, 'wip', searchAlias], label),
 			});
 		}
 	}

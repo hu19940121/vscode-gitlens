@@ -11,7 +11,7 @@
 import * as process from 'node:process';
 import type { FrameLocator } from '@playwright/test';
 import { test as base, createTmpDir, expect, GitFixture, MaxTimeout } from '../baseTest.js';
-import { waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
+import { graphDetailsRegion, waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
 
 const test = base.extend({
 	vscodeOptions: [
@@ -103,9 +103,9 @@ test.describe('Review & Compose Sub-Panels', () => {
 			state: 6 /* SubscriptionState.Paid */,
 			planId: 'pro',
 		});
-		dispose = () => {
-			sim[Symbol.dispose]();
-			return Promise.resolve();
+		// Awaits the real teardown — see the note in the other graph specs' helpers.
+		dispose = async () => {
+			await sim[Symbol.asyncDispose]();
 		};
 
 		await vscode.gitlens.showCommitGraphView();
@@ -173,9 +173,14 @@ test.describe('Review & Compose Sub-Panels', () => {
 			graphWebview.locator('gl-details-wip-header gl-details-header gl-action-chip[icon="checklist"]'),
 		).not.toBeVisible();
 
-		// WIP details and commit bottom should be hidden
-		const wipDetails = graphWebview.locator('gl-details-wip-panel');
-		await expect(wipDetails).not.toBeVisible();
+		// WIP details and commit bottom should be hidden. Asserted on the WIP panel element rather than
+		// on the details REGION: entering a mode locks the panel to the context it was entered from
+		// (`resolveContent` returns `resolveByContext(activeModeContext)`), so a mode entered from the
+		// WIP header keeps the region's `Working changes details` name and the region stays visible by
+		// design — it is the container the mode's own panel renders into. What has to be gone is the WIP
+		// BODY, and `renderWip` renders `gl-details-wip-panel` only while no mode is active, so counting
+		// it is both exact and free of the layout-box caveat on `graphDetailsRegion`.
+		await expect(graphWebview.locator('gl-details-wip-panel')).toHaveCount(0);
 		const commitBottom = graphWebview.locator('.commit-panel__bottom');
 		await expect(commitBottom).not.toBeVisible();
 	});
@@ -201,8 +206,7 @@ test.describe('Review & Compose Sub-Panels', () => {
 		await expect(graphWebview.locator('.review-panel')).not.toBeVisible({ timeout: MaxTimeout });
 
 		// WIP details should be back
-		const wipDetails = graphWebview.locator('gl-details-wip-panel');
-		await expect(wipDetails).toBeVisible({ timeout: MaxTimeout });
+		await expect(graphDetailsRegion(graphWebview, 'wip')).toBeVisible({ timeout: MaxTimeout });
 
 		// Header tint should be gone
 		await expect(

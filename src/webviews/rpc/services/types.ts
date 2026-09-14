@@ -68,15 +68,6 @@ export interface SerializedRepository {
 }
 
 /**
- * Serialized commit reference for RPC.
- */
-export interface SerializedCommitRef {
-	readonly repoPath: string;
-	readonly sha: string;
-	readonly message?: string;
-}
-
-/**
  * Repository change event data.
  *
  * `changes` contains numeric values matching the `RepositoryChange` const enum.
@@ -152,7 +143,10 @@ export interface AgentInfo {
 	readonly kind: 'ide-chat' | 'claude-extension' | 'cli' | 'editor';
 	readonly detected?: boolean;
 	readonly mcp?: { readonly supported: boolean; readonly installed: boolean };
-	readonly hooks?: { readonly supported: boolean; readonly installed: boolean };
+	/** `manualActivation` mirrors `AgentCapabilities.manualActivation` (see
+	 *  `packages/plus/agents/src/agentCapabilities.ts`) — an extra step the agent's host requires
+	 *  before installed hooks actually fire, surfaced unconditionally whenever `installed` is true. */
+	readonly hooks?: { readonly supported: boolean; readonly installed: boolean; readonly manualActivation?: string };
 	/** For an IDE-host row that supports hooks, the gkcli agent name to target for hooks install/uninstall
 	 *  (e.g. `cursor`) — this row's own `id` may be `ide-chat`. Absent when `id` is already the hooks target. */
 	readonly hooksAgentId?: string;
@@ -217,6 +211,28 @@ export interface AIState {
 	 * Undefined when no default is set or the persisted agent is not currently available.
 	 */
 	readonly defaultAgent: { readonly id: string; readonly label: string } | undefined;
+}
+
+/**
+ * GitKraken AI weekly usage standing (allowance, consumption, reset). `limit === -1` means unlimited,
+ * `limit === 0` means no allowance — never conflate the two.
+ */
+export interface AiUsageInfo {
+	readonly limit: number;
+	readonly used: number;
+	readonly resetsOn: string;
+	/**
+	 * The organization's shared pool rollup, when the backend reports a usable one — 20% of every seat's
+	 * weekly allowance funds it, which is why `limit` above reads below the plan's stated per-week figure.
+	 * Same sentinels as `limit`.
+	 */
+	readonly organization?: { readonly used: number; readonly limit: number };
+	/**
+	 * This user's own consumption drawn from the shared organization pool — the slice of
+	 * `organization.used` attributable to the current account, NOT a separate allowance and NOT part of
+	 * `used` above. Lets the pool's bar separate this user's draw from the rest of the organization's.
+	 */
+	readonly sharedUsed?: number;
 }
 
 // ============================================================

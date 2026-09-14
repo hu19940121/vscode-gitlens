@@ -1,8 +1,9 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import type { CommitSignatureShape } from '../../../../commitDetails/protocol.js';
 import { getSignatureState, getSignatureStatusInfo } from './signature.utils.js';
-import '../code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../copy-container.js';
 import './signature-badge.js';
 
@@ -84,8 +85,8 @@ export class GlSignatureDetails extends LitElement {
 
 		.signature-action {
 			display: inline-flex;
-			align-items: center;
 			gap: 0.3rem;
+			align-items: center;
 			width: fit-content;
 			margin-top: 0.15rem;
 			color: var(--vscode-textLink-foreground);
@@ -134,14 +135,23 @@ export class GlSignatureDetails extends LitElement {
 		const hasFingerprint = Boolean(fingerprint);
 		const keyValue = fingerprint ?? keyId;
 		const formatLabel = this.getFormatLabel(format);
-		const keyTypeLabel = hasFingerprint ? 'Fingerprint' : 'Key ID';
-		const label = formatLabel ? `${formatLabel} ${keyTypeLabel}:` : `${keyTypeLabel}:`;
+		const label = formatLabel
+			? hasFingerprint
+				? l10n.t('{format} Fingerprint:', { format: formatLabel })
+				: l10n.t('{format} Key ID:', { format: formatLabel })
+			: hasFingerprint
+				? l10n.t('Fingerprint:')
+				: l10n.t('Key ID:');
 
 		return html`
 			<div class="signature-key">
 				<span class="signature-key-label">${label}</span>
 				<span class="signature-key-value">${keyValue}</span>
-				<gl-copy-container tabindex="0" .content=${keyValue} copyLabel="Copy ${keyTypeLabel}">
+				<gl-copy-container
+					tabindex="0"
+					.content=${keyValue}
+					copyLabel=${hasFingerprint ? l10n.t('Copy Fingerprint') : l10n.t('Copy Key ID')}
+				>
 					<code-icon icon="copy"></code-icon>
 				</gl-copy-container>
 			</div>
@@ -160,9 +170,10 @@ export class GlSignatureDetails extends LitElement {
 			<a
 				class="signature-action"
 				href="command:gitlens.git.editAllowedSigners?${args}"
-				title="Open the SSH Allowed Signers editor"
+				title=${l10n.t('Open the SSH Allowed Signers editor')}
 			>
-				<code-icon icon="key"></code-icon><span class="signature-action-label">Add to allowed signers…</span>
+				<code-icon icon="key"></code-icon
+				><span class="signature-action-label">${l10n.t('Add to allowed signers…')}</span>
 			</a>
 		`;
 	}

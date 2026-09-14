@@ -1,0 +1,1027 @@
+import { SignalWatcher } from '@lit-labs/signals';
+import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
+import { css, html, LitElement, nothing } from 'lit';
+import { customElement, property, query } from 'lit/decorators.js';
+import { ifDefined } from 'lit/directives/if-defined.js';
+import { when } from 'lit/directives/when.js';
+import type { GlPopover } from '@gitlens/components/components/overlays/popover.js';
+import { focusableBaseStyles } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase, linkBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { urls } from '../../../../../../constants.js';
+import { proTrialLengthInDays, SubscriptionState } from '../../../../../../constants.subscription.js';
+import type { Source } from '../../../../../../constants.telemetry.js';
+import type { PlansContent } from '../../../../../../plus/gk/models/plans.js';
+import { defaultPlansContent } from '../../../../../../plus/gk/models/plans.js';
+import type { PromoPlans } from '../../../../../../plus/gk/models/promo.js';
+import type { SubscriptionUpgradeCommandArgs } from '../../../../../../plus/gk/models/subscription.js';
+import {
+	compareSubscriptionPlans,
+	getSubscriptionEntitlement,
+	getSubscriptionNextPaidPlanId,
+	getSubscriptionPlanAiCredits,
+	getSubscriptionPlanName,
+	getSubscriptionPlanUpgradeFeatures,
+	getSubscriptionProductPlanName,
+	getSubscriptionProductPlanNameFromState,
+	getSubscriptionTimeRemaining,
+	isSubscriptionPaid,
+	isSubscriptionTrial,
+} from '../../../../../../plus/gk/utils/subscription.utils.js';
+import { createCommandLink } from '../../../../../../system/commands.js';
+import type { GlPromo } from '../../../../shared/components/promo.js';
+import type { PromosContext } from '../../../../shared/contexts/promos.js';
+import { promosContext } from '../../../../shared/contexts/promos.js';
+import type { SubscriptionContextState } from '../../../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../../../shared/contexts/subscription.js';
+import { accountRingStyles } from '../../../shared/components/accountRing.css.js';
+import { chipStyles } from '../../../shared/components/chipStyles.js';
+import { rollupSurfaceStyles, skeletonStyles } from '../../../shared/components/rollupSurface.css.js';
+import { ruleStyles } from '../../../shared/components/vscode.css.js';
+import '../../../../shared/components/badges/badge.js';
+import '../../../../shared/components/button.js';
+import '../../../../shared/components/button-container.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/popover.js';
+
+declare global {
+	interface GlobalEventHandlersEventMap {
+		/** The panel's "Send Feedback" toolbar action — only rendered when `feedback` is set. Bubbles
+		 *  so a host (e.g. the Graph header's account rollup) can route it to its own feedback dialog. */
+		'gl-account-chip-feedback': CustomEvent<void>;
+	}
+}
+
+@customElement('gl-account-chip')
+export class GlAccountChip extends SignalWatcher(LitElement) {
+	@consume({ context: subscriptionContext, subscribe: true })
+	private _subscription!: SubscriptionContextState;
+
+	static override shadowRootOptions: ShadowRootInit = {
+		...LitElement.shadowRootOptions,
+		delegatesFocus: true,
+	};
+
+	static override styles = [
+		boxSizingBase,
+		linkBase,
+		focusableBaseStyles,
+		accountRingStyles,
+		chipStyles,
+		rollupSurfaceStyles,
+		skeletonStyles,
+		ruleStyles,
+		css`
+			:host {
+				display: inline-flex;
+				gap: var(--gl-space-8);
+				align-items: center;
+			}
+
+			/* No trailing padding in the panel: the rollup owns the space below this chip, and the shared
+  .content padding stacked on top of it made the identity-to-setup boundary the largest gap in
+  the popover by a wide margin. The collapsed chip still wants it, and so does the merge-target
+  popover, so this is scoped rather than removed from chipStyles. */
+			:host([display='panel']) .content {
+				width: 100%;
+				padding-bottom: 0;
+			}
+
+			:host-context(.vscode-dark),
+			:host-context(.vscode-high-contrast) {
+				--gl-account-chip-media-color: color-mix(in lab, var(--vscode-sideBar-background), #fff 25%);
+				--gl-account-account-media-color: color-mix(in lab, var(--vscode-sideBar-background), #fff 20%);
+			}
+
+			:host-context(.vscode-light),
+			:host-context(.vscode-high-contrast-light) {
+				--gl-account-chip-media-color: color-mix(in lab, var(--vscode-sideBar-background), #000 18%);
+				--gl-account-account-media-color: color-mix(in lab, var(--vscode-sideBar-background), #000 15%);
+			}
+
+			/* Element selector, not button.chip: the class rules below (and .chip--outlined) intentionally
+  set a background, a border and a type scale, and a button.chip reset would out-specify all
+  three. At (0,0,1) this still beats the UA's buttonface/buttontext/13px-Arial defaults — same
+  origin, and author wins — while losing to every class rule, so the reset can stay complete
+  without fighting the chip's own paint. */
+			button {
+				margin: 0;
+				font: inherit;
+				color: inherit;
+				text-align: start;
+				appearance: none;
+				background: none;
+				border: none;
+			}
+
+			.chip {
+				padding-right: var(--gl-space-6);
+				font-size: var(--gl-font-sm);
+				font-weight: 400;
+				line-height: 2rem;
+				text-transform: uppercase;
+				background-color: var(--gl-rollup-raised);
+			}
+
+			.chip--outlined {
+				background-color: transparent;
+				border: var(--gl-border-width) solid var(--gl-rollup-raised);
+			}
+
+			.chip__media {
+				display: flex;
+				flex: 0 0 auto;
+				align-items: center;
+				justify-content: center;
+				padding: var(--gl-space-2);
+			}
+
+			img.chip__media {
+				/* Outer size, not image size: the 0.2rem chip__media padding paints the tinted ring
+				   inside it, leaving a 1.6rem image to match the size=16 code-icon fallback. */
+				width: 2rem;
+				aspect-ratio: 1 / 1;
+				background-color: var(--gl-account-chip-media-color);
+				border-radius: 50%;
+			}
+
+			.chip-group {
+				display: inline-flex;
+				flex-direction: row;
+				gap: var(--gl-space-8);
+				cursor: pointer;
+			}
+
+			.account-info {
+				display: flex;
+				flex-direction: column;
+				gap: var(--gl-space-4);
+			}
+
+			.row {
+				position: relative;
+				display: flex;
+				flex-direction: row;
+				gap: 0 var(--gl-space-6);
+				align-items: center;
+			}
+
+			.row:last-of-type {
+				margin-bottom: var(--gl-space-6);
+			}
+
+			/* Top alignment works better with a wrapping title */
+			.header {
+				align-items: flex-start;
+			}
+
+			/* The headline is a name plus badges, so it lays out as a wrapping row rather than one line of
+  text. flex-wrap is all this needs now — the shared .header__title no longer imposes the
+  single-line truncation this used to have to undo. */
+			.header__title {
+				display: flex;
+				flex-wrap: wrap;
+				gap: var(--gl-space-2) var(--gl-space-6);
+				align-items: center;
+			}
+
+			/* gl-badge's host sets no display of its own, so as a flex item it blockifies to a box whose height
+  comes from the INHERITED strut — the title's own tall line — and the badge inside was then placed by
+  that strut's baseline, riding well below the title's text. Giving the host a display makes its box
+  the badge itself, so the row's align-items can actually center it. */
+			.header__title gl-badge {
+				display: inline-flex;
+				align-items: center;
+			}
+
+			/* Accents the TIER badge; the status badges keep gl-badge's neutral default (see renderPlanTitle). */
+			.plan-tier {
+				--gl-badge-color: var(--vscode-textLink-foreground);
+			}
+
+			/* Recessed grey sub-chip carved into the tier pill. Styled here rather than with gl-badge's
+  appearance="muted" because that variant's palette is tuned to sit inside a FILLED badge
+  (--vscode-badge-foreground on its own tint), and overriding it through ::part would need
+  !important to outrank the component's internal .badge class. Inherits the pill's small-caps. */
+			.plan-trial {
+				display: flex;
+				flex: 0 0 auto;
+				align-items: center;
+
+				/* Bleeds to the pill's inner edges rather than floating in its padding: stretch fills the
+   content box vertically, and the negative right/bottom margins reach back across the
+   padding the tier text needs, so the grey ends flush against the border. Only the trailing
+   corners are rounded — the leading edge butts up against the tier text. */
+				align-self: stretch;
+
+				/* Mirrors the pill's own vertical padding so the sub-chip's text centers in the same optical
+   box as the tier text. Without it the chip centers over the full bled height while the tier
+   text centers above the bottom padding, and the two labels sit a pixel apart. */
+				padding: 0 var(--gl-space-4) var(--gl-space-2);
+				margin: 0 calc(var(--gl-space-4) * -1) calc(var(--gl-space-2) * -1) var(--gl-space-4);
+				font-weight: 500;
+				color: var(--color-foreground--65);
+				background-color: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+				border-radius: 0 var(--gl-radius-xs) var(--gl-radius-xs) 0;
+			}
+
+			/* Trial countdown, alongside the pills rather than inside one — see renderPlanTitle. Sits a step
+  below the badges in the foreground ladder: it's supporting detail, and the body restates it. */
+			.plan-remaining {
+				font-size: var(--gl-font-sm);
+				color: var(--color-foreground--50);
+				white-space: nowrap;
+			}
+
+			/* The upgrade CTA rides the account row's right edge, and wraps under the name/email when they
+  leave it no room — better than squeezing either side in a narrow panel. */
+			.row--account {
+				flex-wrap: wrap;
+				row-gap: var(--gl-space-6);
+			}
+
+			.row--account .details {
+				min-width: 14rem;
+			}
+
+			.row--account .details__button {
+				margin-inline-start: auto;
+			}
+
+			.row__media {
+				display: flex;
+				flex: 0 0 auto;
+				align-items: center;
+				justify-content: center;
+				width: 3.4rem;
+			}
+
+			.row__media code-icon {
+				color: var(--color-foreground--65);
+			}
+
+			/* Ring matches the Graph header's account pill (accountRing.css.ts) so the same entitlement reads
+  the same in the toolbar and in the panel it opens. Only the photo gets it — the no-avatar
+  fallback is a square-ish glyph, and a circular ring around it would read as a mistake.
+
+  Never gate the ring color on --vscode-contrastBorder: any theme can set it, and setting it to the
+  theme's own background is the standard way to suppress VS Code's default hairlines, which would
+  paint the ring in the background color and erase the state. */
+			.row__media img {
+				width: 2rem;
+				aspect-ratio: 1 / 1;
+				background-color: var(--gl-account-account-media-color);
+				border-radius: 50%;
+				box-shadow: 0 0 0 var(--gl-account-ring-width) var(--gl-account-ring-color);
+			}
+
+			/* Forced-colors mode drops box-shadow; repaint the ring as an outline, which survives and is
+  equally layout-free. */
+			@media (forced-colors: active) {
+				.row__media img {
+					outline: 0.1rem solid ButtonBorder;
+					outline-offset: 0.1rem;
+				}
+			}
+
+			.details {
+				display: flex;
+				flex: 1;
+				flex-direction: column;
+				justify-content: center;
+			}
+
+			.details__title {
+				margin: 0;
+				font-size: var(--gl-font-base);
+				font-weight: 600;
+			}
+
+			.details__subtitle {
+				margin: 0;
+				font-size: var(--gl-font-sm);
+				font-weight: 400;
+				color: var(--color-foreground--65);
+			}
+
+			.details__button {
+				display: flex;
+				flex: none;
+				flex-direction: row;
+				gap: var(--gl-space-2);
+				align-items: center;
+				justify-content: center;
+			}
+
+			.org__badge {
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+				width: 2.4rem;
+				height: 2.4rem;
+				margin-right: var(--gl-space-6);
+				font-size: var(--gl-font-micro);
+				font-weight: 600;
+				line-height: 2.4rem;
+				color: var(--color-foreground--65);
+				background-color: var(--vscode-toolbar-hoverBackground);
+				border-radius: 50%;
+			}
+
+			.account-status > p {
+				margin-block: var(--gl-space-6);
+			}
+
+			.account-status > :first-child {
+				margin-block-start: 0;
+			}
+
+			.account-status > :last-child {
+				margin-block-end: 0;
+			}
+
+			button-container {
+				margin-bottom: 1.3rem;
+			}
+
+			button-container .button-suffix {
+				display: inline-flex;
+				gap: 0.2em;
+				align-items: center;
+				margin-left: var(--gl-space-4);
+				white-space: nowrap;
+			}
+
+			.upgrade > * {
+				margin-block: var(--gl-space-8) 0;
+			}
+
+			.upgrade ul {
+				padding-inline-start: var(--gl-space-20);
+			}
+
+			.upgrade li {
+				text-wrap: pretty;
+			}
+
+			.upgrade gl-promo::part(text) {
+				margin-block-start: 0;
+
+				/* border-radius: 0.3rem;
+padding: var(--gl-space-2) var(--gl-space-4);
+background-color: var(--gl-rollup-raised); */
+			}
+
+			.upgrade gl-promo:not([has-promo]) {
+				display: none;
+			}
+
+			.upgrade-button {
+				font-size: var(--gl-font-micro);
+				text-transform: uppercase;
+			}
+
+			/* Rides .chip for its padding/radius; only the fixed pill box is local. The shimmer that sweeps
+  it is shared (skeletonStyles), which is why position/overflow stay here — they are what the
+  shared ::before positions against. */
+			.skeleton {
+				position: relative;
+				width: 8rem;
+				height: 2.4rem;
+				overflow: hidden;
+				cursor: default;
+				background-color: var(--gl-rollup-raised);
+			}
+		`,
+	];
+
+	/** Controls whether this renders as the compact popover-triggering chip, or just the account panel content. */
+	@property({ reflect: true }) display: 'chip' | 'panel' = 'chip';
+
+	/** When set, the panel's account-management cog deep-links to the in-editor Settings → Account
+	 *  view instead of the external gk.dev account page. Set by surfaces that want the cog to lead
+	 *  inward (e.g. the Graph header account rollup) rather than out to gk.dev.
+	 *
+	 *  It says nothing about whether Settings is *reachable* — every surface can open it — so it must
+	 *  not be used to gate other links into Settings. */
+	@property({ type: Boolean, reflect: true, attribute: 'settings-nav' })
+	settingsNav = false;
+
+	/** Shows a "Send Feedback" toolbar action alongside the panel's other header actions. Set by
+	 *  surfaces that have somewhere to route it (e.g. the Graph header wires it to its feedback
+	 *  dialog) — off by default since most hosts of this panel have no such dialog. */
+	@property({ type: Boolean, reflect: true })
+	feedback = false;
+
+	private _showUpgrade = false;
+	@property({ type: Boolean, reflect: true, attribute: 'show-upgrade' })
+	get showUpgrade() {
+		return this._showUpgrade;
+	}
+	private set showUpgrade(value: boolean) {
+		this._showUpgrade = value;
+	}
+
+	@query('#chip')
+	private _chip!: HTMLElement;
+
+	@query('gl-popover')
+	private _popover!: GlPopover;
+
+	private get accountAvatar() {
+		return this.hasAccount && this._subscription.avatar.get();
+	}
+
+	private get accountName() {
+		return this.subscription?.account?.name ?? '';
+	}
+
+	private get accountEmail() {
+		return this.subscription?.account?.email ?? '';
+	}
+
+	private get hasAccount() {
+		return this.subscription?.account != null;
+	}
+
+	get isReactivatedTrial(): boolean {
+		return (
+			this.subscriptionState === SubscriptionState.Trial &&
+			(this.subscription?.plan.effective.trialReactivationCount ?? 0) > 0
+		);
+	}
+	/** Drives the account avatar's entitlement ring — matches the Graph header's account pill. */
+	private get entitlement() {
+		return getSubscriptionEntitlement(this._subscription.subscription.get()?.state);
+	}
+
+	private get planId() {
+		return this._subscription.subscription.get()?.plan.actual.id ?? 'pro';
+	}
+	private get effectivePlanId() {
+		return this._subscription.subscription.get()?.plan.effective.id ?? 'pro';
+	}
+
+	private get planName() {
+		return getSubscriptionProductPlanNameFromState(
+			this.subscriptionState ?? SubscriptionState.Community,
+			this.planId,
+			this.effectivePlanId,
+		);
+	}
+
+	private get planTier() {
+		const sub = this.subscription;
+		if (sub != null && isSubscriptionTrial(sub)) {
+			return sub.plan.effective.id === 'student' ? 'Student' : 'Pro Trial';
+		}
+
+		return getSubscriptionPlanName(this.planId);
+	}
+
+	@consume({ context: promosContext })
+	private promos!: PromosContext;
+
+	/**
+	 * Plan marketing copy (AI credit figures, feature bullets) — the `@consume` field can still be unset
+	 * on the very first render, and the signal read here is what makes this `SignalWatcher` element
+	 * re-render when the host's copy lands.
+	 */
+	private get plans(): PlansContent {
+		return this.promos?.plans.get() ?? defaultPlansContent;
+	}
+
+	private get subscription() {
+		return this._subscription.subscription.get();
+	}
+
+	private get subscriptionState() {
+		return this.subscription?.state;
+	}
+
+	private get trialDaysRemaining() {
+		if (this.subscription == null) return 0;
+
+		return getSubscriptionTimeRemaining(this.subscription, 'days') ?? 0;
+	}
+
+	override focus(): void {
+		this._chip.focus();
+	}
+
+	override render(): unknown {
+		// Don't show account state until subscription data has loaded.
+		// subscription starts as undefined; even Community users have a Subscription object.
+		if (this.subscription === undefined) {
+			return html`<span
+				id="chip"
+				class="chip skeleton"
+				tabindex="-1"
+				aria-label=${l10n.t('Loading account status')}
+				role="status"
+			></span>`;
+		}
+
+		if (this.display === 'panel') {
+			return html`<div class="content">${this.renderPanelContent()}</div>`;
+		}
+
+		return html`<gl-popover placement="bottom" trigger="hover focus click">
+				<button id="chip" type="button" slot="anchor" class="chip" aria-label="Account — ${this.planTier}">
+					${
+						this.accountAvatar
+							? html`<img class="chip__media" src=${this.accountAvatar} />`
+							: html`<code-icon class="chip__media" icon="gl-gitlens" size="16"></code-icon>`
+					}
+					<span>${this.planTier}</span>
+				</button>
+				<div slot="content" class="content" tabindex="-1">${this.renderPanelContent()}</div>
+			</gl-popover>
+			${this.renderUpgradeContent()}`;
+	}
+
+	show(): void {
+		void this._popover.show();
+		this.focus();
+	}
+
+	/** Re-dispatched by the host — this panel has no feedback dialog of its own to open. */
+	private onFeedbackClick = (): void => {
+		this.dispatchEvent(new CustomEvent('gl-account-chip-feedback', { bubbles: true, composed: true }));
+	};
+
+	/** The account panel body: header (plan name + toolbar actions) + account info + subscription-state CTAs. */
+	private renderPanelContent(): unknown {
+		return html`<div class="header">
+				${this.renderPlanTitle()}
+				<span class="header__actions">
+					${when(
+						this.feedback,
+						() => html`<gl-button
+							appearance="toolbar"
+							tooltip=${l10n.t('Send Feedback')}
+							aria-label=${l10n.t('Send Feedback')}
+							@click=${this.onFeedbackClick}
+							><code-icon icon="feedback"></code-icon
+						></gl-button>`,
+					)}
+					${
+						this.hasAccount
+							? html`<gl-button
+										appearance="toolbar"
+										href="${createCommandLink<Source>('gitlens.plus.validate', {
+											source: 'account',
+										})}"
+										tooltip=${l10n.t('Synchronize Status')}
+										aria-label=${l10n.t('Synchronize Status')}
+										><code-icon icon="sync"></code-icon
+									></gl-button>
+									${
+										this.settingsNav
+											? html`<gl-button
+													appearance="toolbar"
+													href="${createCommandLink('gitlens.showSettingsPage!account')}"
+													tooltip=${l10n.t('Account Settings')}
+													aria-label=${l10n.t('Account Settings')}
+													><code-icon icon="gear"></code-icon
+												></gl-button>`
+											: html`<gl-button
+													appearance="toolbar"
+													href="${createCommandLink<Source>('gitlens.plus.manage', {
+														source: 'account',
+													})}"
+													tooltip=${l10n.t('Manage Account')}
+													aria-label=${l10n.t('Manage Account')}
+													><code-icon icon="gear"></code-icon
+												></gl-button>`
+									}
+									<gl-button
+										appearance="toolbar"
+										href="${createCommandLink<Source>('gitlens.plus.logout', {
+											source: 'account',
+										})}"
+										tooltip=${l10n.t('Sign Out')}
+										aria-label=${l10n.t('Sign Out')}
+										><code-icon icon="sign-out"></code-icon
+									></gl-button>`
+							: nothing
+					}
+				</span>
+			</div>
+			${this.renderAccountInfo()} ${this.renderAccountState()}`;
+	}
+
+	/**
+	 * The panel's plan headline. Everything paid or trialling reads as one product — GitLens Pro — with what
+	 * varies split into two DELIBERATELY distinct badges: the TIER (Advanced / Business / Enterprise /
+	 * Student, what was bought) takes the accent, while STATUS (trialling, unverified) stays neutral. Sharing
+	 * a treatment would make an upgrade and a countdown read as the same kind of claim.
+	 *
+	 * Community and the post-trial states aren't Pro, so they keep the name they already had and take no
+	 * badge. Only the panel changes — the collapsed chip still leads with the tier.
+	 */
+	private renderPlanTitle(): unknown {
+		const state = this.subscriptionState ?? SubscriptionState.Community;
+		if (
+			state === SubscriptionState.Community ||
+			state === SubscriptionState.TrialExpired ||
+			state === SubscriptionState.TrialReactivationEligible
+		) {
+			return html`<span class="header__title">${this.planName}</span>`;
+		}
+
+		const trial = state === SubscriptionState.Trial;
+		// A trial's tier rides on the EFFECTIVE plan (what the trial grants); a paid plan's on the actual one.
+		const tier = getSubscriptionPlanName(trial ? this.effectivePlanId : this.planId);
+		const days = trial ? this.trialDaysRemaining : 0;
+		const hasTier = tier !== 'Pro' && tier !== 'Community';
+		const daysRemaining =
+			days < 1
+				? l10n.t('<1d left')
+				: formatPlural(l10n.t('{0, plural, one{{0}d left} other{{0}d left}}'), [days]);
+
+		return html`<span class="header__title"
+			>${getSubscriptionProductPlanName('pro')}${when(
+				hasTier,
+				// Trialling a named tier reads as one claim, not two competing pills: the status rides inside
+				// the tier pill as a recessed grey sub-chip.
+				() =>
+					html`<gl-badge appearance="squared" class="plan-tier"
+						>${tier}${when(trial, () => html`<span class="plan-trial">${l10n.t('Trial')}</span>`)}</gl-badge
+					>`,
+			)}${when(
+				trial && !hasTier,
+				// A Pro trial has no tier pill to nest into — the headline already names Pro, so a PRO badge
+				// beside it would only restate it — so the status stands as its own neutral badge.
+				() => html`<gl-badge appearance="squared">${l10n.t('Trial')}</gl-badge>`,
+			)}${when(
+				state === SubscriptionState.VerificationRequired,
+				() => html`<gl-badge appearance="squared">${l10n.t('Unverified')}</gl-badge>`,
+			)}${when(
+				trial && days !== 0,
+				// The countdown is a measurement, not a label — it changes daily and would resize a badge as it
+				// counts down, so it rides alongside as text. The panel body states it in full below.
+				() => html`<span class="plan-remaining">${daysRemaining}</span>`,
+			)}</span
+		>`;
+	}
+
+	private renderAccountInfo() {
+		const sub = this._subscription.subscription.get();
+		const avatar = this._subscription.avatar.get();
+		const orgCount = this._subscription.organizationsCount.get();
+		const organization = sub?.activeOrganization?.name ?? '';
+		// Only the account itself is required — a solo account has no active organization, and gating on one
+		// hid the avatar, name, and email from every user who isn't in an org. The organization row below
+		// carries its own guard.
+		if (!this.hasAccount) return nothing;
+
+		return html`<div class="account-info">
+			<span class="row row--account">
+				<span class="row__media" data-entitlement=${this.entitlement ?? 'loading'}
+					>${
+						avatar ? html`<img src=${avatar} />` : html`<code-icon icon="gl-gitlens" size="20"></code-icon>`
+					}</span
+				>
+				<span class="details"
+					><p class="details__title">${this.accountName}</p>
+					<p class="details__subtitle">${this.accountEmail}</p></span
+				>
+				${this.renderUpgradeButton(sub?.activeOrganization?.id)}
+			</span>
+			${when(
+				orgCount > 1 && organization.length > 0,
+				() =>
+					html`<span class="row">
+						<span class="row__media"><code-icon icon="organization" size="20"></code-icon></span>
+						<span class="details"><p class="details__title">${organization}</p></span>
+						<div class="details__button">
+							<gl-button
+								appearance="toolbar"
+								href="${createCommandLink<Source>('gitlens.gk.switchOrganization', {
+									source: 'account',
+									detail: {
+										organization: sub?.activeOrganization?.id,
+									},
+								})}"
+								aria-label=${l10n.t('Switch Active Organization')}
+								><span class="org__badge">+${orgCount - 1}</span
+								><code-icon icon="arrow-swap"></code-icon
+								><span slot="tooltip"
+									>${l10n.t('Switch Active Organization')}
+									<hr />
+									${formatPlural(
+										l10n.t(
+											'{0, plural, one{You are in {0} other organization} other{You are in {0} other organizations}}',
+										),
+										[orgCount - 1],
+									)}</span
+								></gl-button
+							>
+						</div>
+					</span>`,
+			)}
+		</div>`;
+	}
+
+	/** The next-tier upsell, shown to paid plans below Advanced. It rides the account row rather than a plan
+	 *  row of its own — the plan is already named in the panel's header, so a row restating it was redundant.
+	 *  The target is the NEXT paid tier up, not Advanced flat: Student sits below Pro, so pitching Advanced
+	 *  there would skip a tier. Matches the plan `gitlens.plus.upgrade` resolves to on its own. */
+	private renderUpgradeButton(organizationId: string | undefined) {
+		const sub = this.subscription;
+		if (sub == null || !isSubscriptionPaid(sub) || compareSubscriptionPlans(this.planId, 'advanced') >= 0) {
+			return nothing;
+		}
+
+		const plan = getSubscriptionNextPaidPlanId(sub);
+		const pitch =
+			plan === 'advanced'
+				? l10n.t(
+						'Upgrade to the Advanced plan for access to self-hosted integrations, advanced AI features @ {0} credits/week, and more',
+						getSubscriptionPlanAiCredits(this.plans, 'advanced', false),
+					)
+				: l10n.t(
+						'Upgrade to the Pro plan for AI features @ {0} credits/week, and more',
+						getSubscriptionPlanAiCredits(this.plans, 'pro', false),
+					);
+
+		return html`<div class="details__button">
+			<gl-button
+				appearance="secondary"
+				href="${createCommandLink<SubscriptionUpgradeCommandArgs>('gitlens.plus.upgrade', {
+					plan: plan,
+					source: 'account',
+					detail: {
+						location: 'plan-section:upgrade-button',
+						organization: organizationId,
+						plan: plan,
+					},
+				})}"
+				aria-label=${l10n.t('Upgrade to {0}', getSubscriptionPlanName(plan))}
+				><span class="upgrade-button">${l10n.t('Upgrade')}</span>${this.renderPromo(plan, 'icon', 'suffix')}
+				<span slot="tooltip">${pitch} ${this.renderPromo(plan, 'info')}</span>
+			</gl-button>
+		</div>`;
+	}
+
+	/**
+	 * The panel's attention zone — whatever the account needs from the user right now, and nothing else. Zero
+	 * or one occupant: a verification prompt, a trial countdown, an expiry, a reactivation offer, or the
+	 * Community pitch, each with its own CTA cluster.
+	 *
+	 * A healthy paid account needs nothing, so this renders NOTHING rather than an empty `.account-status` —
+	 * the wrapper is a flex item of `.content`, so an empty one would still spend a gap and leave a phantom
+	 * band between the account row and the rule below it. The blank zone is the intended outcome, not a hole
+	 * waiting to be filled: refer-a-friend used to live here and now sits in the rollup's footer, out of the
+	 * path a reader has to walk from "who am I" to "what is set up".
+	 */
+	private renderAccountState() {
+		const sub = this._subscription.subscription.get();
+
+		switch (this.subscriptionState) {
+			case SubscriptionState.Paid:
+				return nothing;
+
+			case SubscriptionState.VerificationRequired:
+				return html`<div class="account-status">
+					<p>${l10n.t('You must verify your email before you can access Pro features.')}</p>
+					<button-container layout="editor">
+						<gl-button
+							full
+							href="${createCommandLink<Source>('gitlens.plus.resendVerification', {
+								source: 'account',
+							})}"
+							>${l10n.t('Resend Email')}</gl-button
+						>
+						<gl-button
+							appearance="secondary"
+							href="${createCommandLink<Source>('gitlens.plus.validate', {
+								source: 'account',
+							})}"
+							tooltip=${l10n.t('Refresh Account Status')}
+							aria-label=${l10n.t('Refresh Account Status')}
+							><code-icon size="20" icon="refresh"></code-icon>
+						</gl-button>
+					</button-container>
+				</div>`;
+
+			case SubscriptionState.Trial: {
+				const days = this.trialDaysRemaining;
+				const studentTrial = this.effectivePlanId === 'student';
+				let message: unknown[];
+				if (days < 1) {
+					const lessThanOneDayRemaining = html`<strong>${l10n.t('<1 day left')}</strong>`;
+					message = studentTrial
+						? localizedContent(
+								l10n.t(
+									'You have {lessThanOneDayRemaining} in your Student trial. Once your trial ends, you will only be able to use Pro features on publicly-hosted repos.',
+								),
+								{ lessThanOneDayRemaining: lessThanOneDayRemaining },
+							)
+						: localizedContent(
+								l10n.t(
+									'You have {lessThanOneDayRemaining} in your Pro trial. Once your trial ends, you will only be able to use Pro features on publicly-hosted repos.',
+								),
+								{ lessThanOneDayRemaining: lessThanOneDayRemaining },
+							);
+				} else {
+					const daysRemainingText = formatPlural(
+						l10n.t('{0, plural, one{{0} more day left} other{{0} more days left}}'),
+						[days],
+					);
+					const daysRemaining = html`<strong>${daysRemainingText}</strong>`;
+					message = studentTrial
+						? localizedContent(
+								l10n.t(
+									'You have {daysRemaining} in your Student trial. Once your trial ends, you will only be able to use Pro features on publicly-hosted repos.',
+								),
+								{ daysRemaining: daysRemaining },
+							)
+						: localizedContent(
+								l10n.t(
+									'You have {daysRemaining} in your Pro trial. Once your trial ends, you will only be able to use Pro features on publicly-hosted repos.',
+								),
+								{ daysRemaining: daysRemaining },
+							);
+				}
+
+				return html`<div class="account-status">
+					<p>${message}</p>
+					<button-container layout="editor">
+						<gl-button
+							full
+							href="${createCommandLink<SubscriptionUpgradeCommandArgs>('gitlens.plus.upgrade', {
+								plan: 'pro',
+								source: 'account',
+								detail: {
+									location: 'upgrade-button',
+									organization: sub?.activeOrganization?.id,
+									plan: 'pro',
+								},
+							})}"
+							>${l10n.t('Upgrade to Pro')}</gl-button
+						>
+					</button-container>
+					${this.renderPromo('pro')}
+				</div>`;
+			}
+
+			case SubscriptionState.TrialExpired:
+				return html`<div class="account-status">
+					<p>
+						${localizedContent(l10n.t('Thank you for trying {product}.'), { product: html`<a href="${urls.communityVsPro}">GitLens Pro</a>` })}
+					</p>
+					<p>
+						${l10n.t('Continue leveraging Pro features and workflows for privately hosted repos by upgrading today.')}
+					</p>
+					<button-container layout="editor">
+						<gl-button
+							full
+							href="${createCommandLink<SubscriptionUpgradeCommandArgs>('gitlens.plus.upgrade', {
+								plan: 'pro',
+								source: 'account',
+								detail: {
+									location: 'upgrade-button',
+									organization: sub?.activeOrganization?.id,
+									plan: 'pro',
+								},
+							})}"
+							>${l10n.t('Upgrade to Pro')}</gl-button
+						>
+					</button-container>
+					${this.renderPromo('pro')}
+				</div>`;
+
+			case SubscriptionState.TrialReactivationEligible: {
+				const trialLength = getNumericFormat()(proTrialLengthInDays);
+				return html`<div class="account-status">
+					<p>
+						${l10n.t(
+							'Reactivate your GitLens Pro trial and experience all the new Pro features — free for another {0} days.',
+							trialLength,
+						)}
+					</p>
+					<button-container layout="editor">
+						<gl-button
+							full
+							href="${createCommandLink<Source>('gitlens.plus.reactivateProTrial', {
+								source: 'account',
+							})}"
+							tooltip=${l10n.t('Reactivate your Pro trial for another {0} days', trialLength)}
+							>${l10n.t('Reactivate GitLens Pro Trial')}</gl-button
+						>
+					</button-container>
+				</div>`;
+			}
+
+			default:
+				return html`<div class="account-status">
+					<p>
+						${localizedContent(l10n.t('Unlock advanced features and workflows for private repos, accelerate reviews, and streamline collaboration with {product}.'), { product: html`<a href="${urls.communityVsPro}">GitLens Pro</a>` })}
+					</p>
+					<button-container layout="editor">
+						<gl-button
+							full
+							href="${createCommandLink<Source>('gitlens.plus.signUp', {
+								source: 'account',
+							})}"
+							>${l10n.t('Try GitLens Pro')}</gl-button
+						>
+						<span class="button-suffix"
+							>${l10n.t('or')}
+							<a
+								href="${createCommandLink<Source>('gitlens.plus.login', {
+									source: 'account',
+								})}"
+								>${l10n.t('sign in')}</a
+							></span
+						>
+					</button-container>
+					<p>
+						${l10n.t('Get {0} days of GitLens Pro for free — no credit card required.', proTrialLengthInDays)}
+					</p>
+				</div>`;
+		}
+	}
+
+	private renderUpgradeContent() {
+		const sub = this._subscription.subscription.get();
+
+		if (sub != null && isSubscriptionPaid(sub)) {
+			this.showUpgrade = false;
+			return nothing;
+		}
+
+		this.showUpgrade = true;
+
+		return html`<gl-popover placement="bottom" trigger="hover focus click">
+			<button type="button" slot="anchor" class="chip chip--outlined">
+				<span>${l10n.t('Upgrade')}</span>
+			</button>
+			<div slot="content" class="content" tabindex="-1">
+				<div class="header">
+					<span class="header__title">${l10n.t('Advantages of GitLens Pro')}</span>
+				</div>
+				<div class="upgrade">
+					<button-container layout="editor">
+						<gl-button
+							full
+							href="${createCommandLink<SubscriptionUpgradeCommandArgs>('gitlens.plus.upgrade', {
+								plan: 'pro',
+								source: 'account',
+								detail: {
+									location: 'upgrade-chip:upgrade-button',
+									organization: sub?.activeOrganization?.id,
+									plan: 'pro',
+								},
+							})}"
+							>${l10n.t('Upgrade to Pro')}</gl-button
+						>
+					</button-container>
+					${this.renderPromo('pro')}
+
+					<ul>
+						${getSubscriptionPlanUpgradeFeatures(this.plans, 'pro').map(feature => html`<li>${feature}</li>`)}
+					</ul>
+
+					<br />
+					<button-container>
+						<gl-button
+							full
+							href="${createCommandLink<SubscriptionUpgradeCommandArgs>('gitlens.plus.upgrade', {
+								plan: 'advanced',
+								source: 'account',
+								detail: {
+									location: 'upgrade-chip:upgrade-button',
+									organization: sub?.activeOrganization?.id,
+									plan: 'advanced',
+								},
+							})}"
+							>${l10n.t('Upgrade to Advanced')}</gl-button
+						>
+					</button-container>
+					${this.renderPromo('advanced')}
+
+					<ul>
+						${getSubscriptionPlanUpgradeFeatures(this.plans, 'advanced').map(
+							feature => html`<li>${feature}</li>`,
+						)}
+					</ul>
+				</div>
+			</div>
+		</gl-popover>`;
+	}
+
+	private renderPromo(plan: PromoPlans, type: GlPromo['type'] = 'info', slot?: string): unknown {
+		return html`<gl-promo
+			slot=${ifDefined(slot)}
+			.promoPromise=${this.promos.getApplicablePromo(plan, 'account')}
+			.type=${type}
+			.source="${{ source: 'account' } as const}"
+		></gl-promo>`;
+	}
+}

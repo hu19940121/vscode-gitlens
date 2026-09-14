@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
+import { mkdir, open, readdir, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import * as process from 'node:process';
+import * as l10n from '@vscode/l10n';
 import type { Cache } from '@gitlens/git/cache.js';
 import type { GitServiceContext } from '@gitlens/git/context.js';
 import type { GitFeatures } from '@gitlens/git/features.js';
 import { gitFeaturesByVersion } from '@gitlens/git/features.js';
+import { looseRefsThreshold } from '@gitlens/git/gitHealth.js';
 import type { GkConfigKeys } from '@gitlens/git/providers/config.js';
 import type {
 	GitHealthDetails,
@@ -33,6 +36,14 @@ const looseObjectSampleDirs: readonly string[] = Array.from({ length: 16 }, (_, 
 	(i * 16).toString(16).padStart(2, '0'),
 );
 
+/** Stops the ref probe at four times the recommendation threshold: bounded, but still useful for telemetry. */
+const looseRefProbeLimit = looseRefsThreshold * 4;
+
+/** Worktree-local ownership journal for the sparse-index command lever. */
+const sparseIndexAppliedMarker = 'sparse-index.applied';
+const sparseIndexLockFile = 'sparse-index.lock';
+const sparseIndexPendingMarker = 'sparse-index.pending';
+
 /** How long the global `maintenance.repo` registration list is served from cache (mirrors the config caches). */
 const registeredMaintenanceReposTtlMs = 30 * 1000;
 
@@ -41,6 +52,13 @@ const worktreePathsTtlMs = 30 * 1000;
 
 /** Demand cadence for the commit-graph write: refreshed at most this often per object database. */
 const commitGraphRefreshIntervalMs = 5 * 60 * 1000;
+
+/** Git's default `maintenance.incremental-repack.auto` threshold. */
+const defaultIncrementalRepackAutoThreshold = 10;
+
+/** Bounds defensive reads of repository-controlled MIDX metadata. */
+const maxMultiPackIndexChunkBytes = 16 * 1024 * 1024;
+const maxMultiPackIndexChainBytes = 1024 * 1024;
 
 /** Sentinel recorded in a `gk.applied.*` marker when the lever's prior LOCAL value was absent (→ undo unsets it). */
 const unsetConfigSentinel = 'unset';
@@ -83,15 +101,92 @@ type GkMarkers = Pick<GitHealthSnapshot, 'fsmonitorNotApplicable' | 'untrackedCa
 const emptyGkMarkers: GkMarkers = {
 	fsmonitorNotApplicable: false,
 	untrackedCacheNotApplicable: false,
-	applied: { untrackedCache: false, fsmonitor: false, manyFiles: false, backgroundMaintenance: false },
+	applied: {
+		untrackedCache: false,
+		fsmonitor: false,
+		manyFiles: false,
+		backgroundMaintenance: false,
+		sparseIndex: false,
+	},
 	commitGraphDisabled: false,
 };
+
+type ConfigLeverChange = {
+	readonly configKey: string;
+	readonly markerKey: GkConfigKeys;
+	readonly pendingKey: GkConfigKeys;
+	readonly value: string;
+};
+
+type PendingConfigChange = {
+	readonly prior: string;
+	readonly value: string;
+};
+
+class MarkerLockContentionError extends Error {}
+
+const untrackedCacheChange: ConfigLeverChange = {
+	configKey: 'core.untrackedCache',
+	markerKey: 'gk.applied.untrackedCache',
+	pendingKey: 'gk.pending.untrackedCache',
+	value: 'true',
+};
+const fsmonitorChange: ConfigLeverChange = {
+	configKey: 'core.fsmonitor',
+	markerKey: 'gk.applied.fsmonitor',
+	pendingKey: 'gk.pending.fsmonitor',
+	value: 'true',
+};
+const manyFilesChange: ConfigLeverChange = {
+	configKey: 'feature.manyFiles',
+	markerKey: 'gk.applied.manyFiles',
+	pendingKey: 'gk.pending.manyFiles',
+	value: 'true',
+};
+const skipHashChange: ConfigLeverChange = {
+	configKey: 'index.skipHash',
+	markerKey: 'gk.applied.skipHash',
+	pendingKey: 'gk.pending.skipHash',
+	value: 'true',
+};
+const configLeverChanges: readonly ConfigLeverChange[] = [
+	untrackedCacheChange,
+	fsmonitorChange,
+	manyFilesChange,
+	skipHashChange,
+];
+
+function encodePendingConfigChange(change: PendingConfigChange): string {
+	return JSON.stringify(change);
+}
+
+function decodePendingConfigChange(value: string): PendingConfigChange | undefined {
+	try {
+		const parsed = JSON.parse(value) as Partial<PendingConfigChange>;
+		return typeof parsed.prior === 'string' && typeof parsed.value === 'string'
+			? { prior: parsed.prior, value: parsed.value }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 /** `core.fsmonitor` is enabled when set to a truthy bool OR a hook path — unset or any false spelling is "off". */
 function isFsmonitorEnabled(value: string | undefined): boolean {
 	if (value == null) return false;
 
 	return !isGitBooleanFalse(value);
+}
+
+/** Parses Git's integer syntax, including the case-insensitive binary `k`, `m`, and `g` suffixes. */
+function parseGitInteger(value: string | undefined): number | undefined {
+	const match = /^([+-]?\d+)([kmg])?$/i.exec(value?.trim() ?? '');
+	if (match == null) return undefined;
+
+	const multiplier =
+		match[2]?.toLowerCase() === 'k' ? 1024 : match[2]?.toLowerCase() === 'm' ? 1024 ** 2 : match[2] ? 1024 ** 3 : 1;
+	const parsed = Number.parseInt(match[1], 10) * multiplier;
+	return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
 /**
@@ -162,17 +257,17 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	// worktrees racing the same interval boundary) never stack concurrent writes on one object database.
 	private readonly commitGraphWriteInflight = new Set<string>();
 
-	request(repoPath: string, task: GitMaintenanceTask): void {
+	request(repoPath: string, task: GitMaintenanceTask): Promise<boolean> | undefined {
 		// Only the commit-graph has a demand cadence — its cache is most valuable immediately after a history
-		// walk, so graph-load and repo-open hint it and the throttle decides. loose-objects/incremental-repack
-		// are owned by the daily pass (a demand write buys nothing there), so they no-op here.
+		// walk, so graph-load and repo-open hint it and the throttle decides. Other maintenance tasks are owned
+		// by the daily pass (a demand write buys nothing there), so they no-op here.
 		switch (task) {
 			case 'commit-graph':
-				void this.ensureCommitGraph(repoPath);
-				break;
+				return this.ensureCommitGraph(repoPath);
 			case 'loose-objects':
 			case 'incremental-repack':
-				break;
+			case 'pack-refs':
+				return undefined;
 		}
 	}
 
@@ -185,32 +280,32 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	 * write it routinely) and is always safe to delete. Fire-and-forget: refreshed at most every few minutes
 	 * per object database (a current chain makes the write a near-no-op), at background queue priority,
 	 * failures swallowed. Cross-WINDOW writes aren't coordinated here — git's own `commit-graph-chain.lock`
-	 * serializes them; a loser errors and is swallowed. Returns the background write's promise (or `undefined`
-	 * when gated) purely so tests can await the fire-and-forget work — production callers `void` it.
+	 * serializes them; a loser errors and is swallowed. Resolves `true` only when the write completes; the
+	 * health service uses that signal for one post-write freshness probe, while graph consumers ignore it.
 	 */
-	private ensureCommitGraph(repoPath: string): Promise<void> | undefined {
+	private ensureCommitGraph(repoPath: string): Promise<boolean> {
 		// Governed by the auto-tier master switch (`gitlens.gitOptimizations.enabled`), fed into both
 		// mapped config slots below.
-		if (this.context.config?.maintenance?.enabled === false) return undefined;
-		if (this.context.config?.graph?.writeCommitGraph === false) return undefined;
+		if (this.context.config?.maintenance?.enabled === false) return Promise.resolve(false);
+		if (this.context.config?.graph?.writeCommitGraph === false) return Promise.resolve(false);
 
 		const lastWrittenAt = this.commitGraphWrittenAt.get(repoPath);
 		if (lastWrittenAt != null && Date.now() - lastWrittenAt < commitGraphRefreshIntervalMs) {
-			return undefined;
+			return Promise.resolve(false);
 		}
 
 		this.commitGraphWrittenAt.set(repoPath, Date.now());
 
 		return (async () => {
 			try {
-				if (!(await this.git.supports('git:commit-graph'))) return;
+				if (!(await this.git.supports('git:commit-graph'))) return false;
 
 				// Re-throttle + single-flight on the COMMON git dir so this worktree's write coalesces with
 				// its siblings' (they all share the one object database the commit-graph lives in). Resolved
 				// via the config sub-provider's cached git-dir, so repeat hints don't re-spawn `rev-parse`.
 				const gitDir = await this.provider.config.getGitDir(repoPath).catch(() => undefined);
 				const commonKey = gitDir != null ? (gitDir.commonUri ?? gitDir.uri).fsPath : repoPath;
-				if (this.commitGraphWriteInflight.has(commonKey)) return;
+				if (this.commitGraphWriteInflight.has(commonKey)) return false;
 
 				// Skip the common-dir re-throttle when resolution fell back to repoPath itself — the sync
 				// gate above JUST stamped that key, so re-checking it here would early-return forever and
@@ -218,39 +313,46 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 				if (commonKey !== repoPath) {
 					const lastCommonWriteAt = this.commitGraphWrittenAt.get(commonKey);
 					if (lastCommonWriteAt != null && Date.now() - lastCommonWriteAt < commitGraphRefreshIntervalMs) {
-						return;
+						return false;
 					}
 
 					this.commitGraphWrittenAt.set(commonKey, Date.now());
 				}
 				this.commitGraphWriteInflight.add(commonKey);
 				try {
-					// Respect an explicit read opt-out — writing a cache this git will never read is pure waste.
-					// `--type=bool` so every falsy spelling git accepts (`false`/`no`/`off`/`0`) normalizes to
-					// `false`; unset (the overwhelmingly common case) means git reads it, and a malformed value
-					// errors out (errors swallowed → empty stdout) → proceed, matching git's own read behavior.
-					const optOut = await this.runQuietly(
-						repoPath,
-						undefined,
-						'config',
-						'--type=bool',
-						'--get',
-						'core.commitGraph',
-					);
-					if (optOut.stdout.trim() === 'false') return;
+					if (await this.isCommitGraphWriteDisabled(repoPath)) return false;
 
-					// The per-repository off switch (Git Health), independent of the two settings-level gates above.
-					if ((await this.provider.config.getGkConfig(repoPath, 'gk.commitGraphDisabled')) === 'true') return;
-
-					await this.writeCommitGraph(repoPath);
+					await this.writeCommitGraph(repoPath, true);
+					return true;
 				} finally {
 					this.commitGraphWriteInflight.delete(commonKey);
 				}
 			} catch {
 				// Best-effort acceleration only — never surface failures (shallow/partial clones,
 				// read-only repos, ancient gits behind the feature gate, etc.).
+				return false;
 			}
 		})();
+	}
+
+	/** Shared opt-out gate for automatic and explicit writes. */
+	private async isCommitGraphWriteDisabled(repoPath: string, cancellation?: AbortSignal): Promise<boolean> {
+		// Respect an explicit read opt-out — writing a cache this git will never read is pure waste.
+		// `--type=bool` normalizes every falsy spelling Git accepts (`false`/`no`/`off`/`0`). Unset means
+		// Git reads the cache; a malformed value isn't false, matching Git's own read behavior.
+		const optOut = await this.runQuietly(
+			repoPath,
+			cancellation,
+			'config',
+			'--type=bool',
+			'--get',
+			'core.commitGraph',
+		);
+		this.throwIfDidNotComplete(optOut, cancellation);
+		if (optOut.stdout.trim() === 'false') return true;
+
+		// The per-repository off switch (Git Health), independent of the settings-level auto-tier gates.
+		return (await this.provider.config.getGkConfig(repoPath, 'gk.commitGraphDisabled')) === 'true';
 	}
 
 	/**
@@ -260,28 +362,87 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	 * geometric policy. Background priority: a first write on a huge repo can run for a while and must never
 	 * hold a queue slot ahead of interactive work. Throws on failure — callers decide whether to swallow.
 	 */
-	private async writeCommitGraph(repoPath: string, cancellation?: AbortSignal): Promise<void> {
-		const args = ['commit-graph', 'write', '--reachable', '--split'];
+	private async writeCommitGraph(repoPath: string, bounded: boolean, cancellation?: AbortSignal): Promise<void> {
+		const partialClone = await this.isPartialClone(repoPath, cancellation);
+		const args = ['commit-graph', 'write', '--reachable', bounded || partialClone ? '--split' : '--split=replace'];
 
 		// Changed-path Bloom filters make `git log -- <path>` fast, but computing them for the WHOLE history
-		// on a big repo is expensive — `--max-new-filters` bounds a single background write to stay cheap.
-		// Coverage still grows to completion: each incremental `--split` write computes filters for the NEXT
-		// batch of newest-first uncovered commits, so the cache fills in over successive background passes.
-		if (await this.git.supports('git:commit-graph:changed-paths')) {
-			args.push('--changed-paths', '--max-new-filters=512');
+		// on a big repo is expensive, so automatic writes seed at most 512 filters. A bounded split write does
+		// NOT backfill older layers on later passes; only the explicit task uses an unbounded replace write to
+		// provide complete reachable-history coverage. Partial/promisor clones omit filters entirely because
+		// computing them needs missing trees and would otherwise lazy-fetch from the network.
+		if (!partialClone && (await this.git.supports('git:commit-graph:changed-paths'))) {
+			args.push('--changed-paths');
+			if (bounded) {
+				args.push('--max-new-filters=512');
+			}
 		}
 
 		await this.git.run(
-			{ cwd: repoPath, priority: 'background', cancellation: cancellation, selfMaintenance: true },
+			{
+				cwd: repoPath,
+				priority: 'background',
+				cancellation: cancellation,
+				env: { GIT_NO_LAZY_FETCH: '1' },
+				selfMaintenance: true,
+			},
 			...args,
 		);
 	}
 
+	/** Config-only partial/promisor detection; never examines an object and therefore cannot itself lazy-fetch. */
+	private async isPartialClone(repoPath: string, cancellation?: AbortSignal): Promise<boolean> {
+		const result = await this.runQuietly(
+			repoPath,
+			cancellation,
+			'config',
+			'--local',
+			'--get-regex',
+			'^(extensions\\.partialclone|remote\\..*\\.promisor)$',
+		);
+		this.throwIfDidNotComplete(result, cancellation);
+		if (result.exitCode !== 0 && result.exitCode !== gitConfigGetMissingExitCode) {
+			throw new Error(l10n.t('Unable to detect a partial clone (git exited {0})', String(result.exitCode)));
+		}
+		if (result.exitCode !== 0) return false;
+
+		const config = parseConfigRegexOutput(result.stdout, { includeValueless: true });
+		for (const [key, value] of config) {
+			if (key === 'extensions.partialclone' || (key.endsWith('.promisor') && parseGitBoolean(value))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Honors an explicit MIDX opt-out on both automatic and user-invoked incremental repacks. */
+	private async isMultiPackIndexEnabled(repoPath: string, cancellation?: AbortSignal): Promise<boolean> {
+		const result = await this.runQuietly(
+			repoPath,
+			cancellation,
+			'config',
+			'--bool',
+			'--get',
+			'core.multiPackIndex',
+		);
+		this.throwIfDidNotComplete(result, cancellation);
+		if (result.exitCode === gitConfigGetMissingExitCode) return true;
+		if (result.exitCode !== 0) {
+			throw new Error(l10n.t('Unable to read core.multiPackIndex (git exited {0})', String(result.exitCode)));
+		}
+
+		return parseGitBoolean(result.stdout.trim());
+	}
+
 	@debug()
 	async getHealthSnapshot(repoPath: string, cancellation?: AbortSignal): Promise<GitHealthSnapshot> {
+		await this.reconcilePendingConfigChanges(repoPath, cancellation);
+
 		const gitDir = await this.provider.config.getGitDir(repoPath);
 		// Object store lives in the COMMON git dir (shared across worktrees); the index is per-worktree.
-		const objectsDir = joinPaths((gitDir.commonUri ?? gitDir.uri).fsPath, 'objects');
+		const commonGitDir = (gitDir.commonUri ?? gitDir.uri).fsPath;
+		const objectsDir = joinPaths(commonGitDir, 'objects');
+		const packDir = joinPaths(objectsDir, 'pack');
 		const indexPath = joinPaths(gitDir.uri.fsPath, 'index');
 
 		const [
@@ -291,44 +452,111 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			looseObjects,
 			indexBytes,
 			indexEntryCount,
+			sharedIndex,
+			conflictOperation,
 			config,
 			maintenanceRegistered,
 			gkMarkers,
 			supportsMaintenanceRun,
 			changedPaths,
-			changedPathsSupported,
+			changedPathsFeatureSupported,
+			shallowRepository,
+			partialClone,
+			looseRefs,
+			supportsPackRefsMaintenance,
 		] = await Promise.allSettled([
 			this.probeCommitGraph(objectsDir),
-			fsExists(joinPaths(objectsDir, 'pack', 'multi-pack-index')),
+			this.probeMultiPackIndex(packDir),
 			this.probePacks(objectsDir),
 			this.sampleLooseObjects(objectsDir),
 			this.fileBytes(indexPath),
 			this.probeIndexEntryCount(indexPath),
+			this.probeSharedIndex(gitDir.uri.fsPath),
+			this.probeConflictOperation(gitDir.uri.fsPath),
 			this.probeConfig(repoPath, cancellation),
 			this.isMaintenanceRegistered(repoPath, cancellation),
 			this.probeGkMarkers(repoPath),
 			this.git.supports('git:maintenance'),
 			this.probeChangedPathFilters(objectsDir),
 			this.git.supports('git:commit-graph:changed-paths'),
+			this.probePathPresence(joinPaths(commonGitDir, 'shallow')),
+			this.isPartialClone(repoPath, cancellation),
+			this.probeLooseRefs(joinPaths(commonGitDir, 'refs')),
+			this.git.supports('git:maintenance:pack-refs'),
 		]);
 
 		const markers = getSettledValue(gkMarkers) ?? emptyGkMarkers;
+		const configValue = getSettledValue(config);
+		const sparseIndexState = await this.reconcileSparseIndexMarkers(
+			repoPath,
+			gitDir.uri.fsPath,
+			configValue?.sparseIndex,
+			cancellation,
+		).catch(() => ({ enabled: configValue?.sparseIndex, applied: false }));
+		const rawIndexBytes = getSettledValue(indexBytes) ?? 0;
+		const rawIndexEntryCount = getSettledValue(indexEntryCount);
+		const sharedIndexValue = getSettledValue(sharedIndex);
+		const conflictOperationValue = getSettledValue(conflictOperation);
+		const packsValue = getSettledValue(packs);
+		const multiPackIndexValue = getSettledValue(multiPackIndex);
+		const indexedPackNames = multiPackIndexValue?.packNames;
+		const packsOutsideMultiPackIndex =
+			configValue?.multiPackIndexEnabled === true && packsValue != null && indexedPackNames != null
+				? packsValue.names.filter(name => !indexedPackNames.has(name)).length
+				: undefined;
+		const splitIndex =
+			configValue?.splitIndex === true || sharedIndexValue?.present === true
+				? true
+				: configValue != null && sharedIndexValue != null
+					? false
+					: undefined;
+		const indexEntryCountType: GitHealthSnapshot['indexEntryCountType'] =
+			configValue == null ||
+			rawIndexEntryCount == null ||
+			sharedIndexValue == null ||
+			conflictOperationValue == null
+				? 'unavailable'
+				: splitIndex
+					? 'split'
+					: conflictOperationValue
+						? 'conflicted'
+						: sparseIndexState.enabled
+							? 'sparse'
+							: 'full';
 		return {
+			repository: {
+				shallow: getSettledValue(shallowRepository),
+				partial: getSettledValue(partialClone),
+				sparseCheckout: configValue?.sparseCheckout,
+				sparseCheckoutCone: configValue?.sparseCheckoutCone,
+				sparseIndex: sparseIndexState.enabled,
+				splitIndex: splitIndex,
+				refFormat: configValue?.refFormat ?? 'unknown',
+			},
+			looseRefs: getSettledValue(looseRefs) ?? { count: 0, exact: false },
 			commitGraph: {
 				...(getSettledValue(commitGraphStat) ?? { present: false, mtime: undefined }),
 				changedPaths: getSettledValue(changedPaths) ?? false,
-				changedPathsSupported: getSettledValue(changedPathsSupported) ?? false,
+				changedPathsSupported:
+					getSettledValue(changedPathsFeatureSupported) === true && getSettledValue(partialClone) === false,
 				disabled: markers.commitGraphDisabled,
-				readDisabled: getSettledValue(config)?.commitGraphReadDisabled ?? false,
+				readDisabled: configValue?.commitGraphReadDisabled ?? false,
 			},
-			multiPackIndex: getSettledValue(multiPackIndex) ?? false,
-			packCount: getSettledValue(packs)?.count ?? 0,
-			packBytes: getSettledValue(packs)?.bytes ?? 0,
+			multiPackIndex: multiPackIndexValue?.present ?? false,
+			multiPackIndexEnabled: configValue?.multiPackIndexEnabled,
+			packCount: packsValue?.names.length ?? 0,
+			packsOutsideMultiPackIndex: packsOutsideMultiPackIndex,
+			incrementalRepackAutoThreshold: configValue?.incrementalRepackAutoThreshold,
+			packBytes: packsValue?.bytes ?? 0,
 			looseObjects: getSettledValue(looseObjects) ?? { objectsInSampledDirs: 0, dirsSampled: 0 },
-			indexBytes: getSettledValue(indexBytes) ?? 0,
-			indexEntryCount: getSettledValue(indexEntryCount),
+			// The main file is only the mutable layer of a split index. Include its largest shared base so the
+			// byte-size fallback remains a useful working-tree signal instead of classifying it from a tiny delta.
+			indexBytes: rawIndexBytes + (indexEntryCountType === 'split' ? (sharedIndexValue?.bytes ?? 0) : 0),
+			indexEntryCount:
+				indexEntryCountType === 'full' || indexEntryCountType === 'sparse' ? rawIndexEntryCount : undefined,
+			indexEntryCountType: indexEntryCountType,
 			// `untrackedCacheConfigured: true` on failure — see `probeConfig`, the auto tier must not guess.
-			config: getSettledValue(config) ?? {
+			config: configValue ?? {
 				fsmonitor: false,
 				untrackedCache: false,
 				untrackedCacheConfigured: true,
@@ -339,8 +567,9 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			maintenanceRegistered: getSettledValue(maintenanceRegistered),
 			fsmonitorNotApplicable: markers.fsmonitorNotApplicable,
 			untrackedCacheNotApplicable: markers.untrackedCacheNotApplicable,
-			applied: markers.applied,
+			applied: { ...markers.applied, sparseIndex: sparseIndexState.applied },
 			supportsMaintenanceRun: getSettledValue(supportsMaintenanceRun) ?? false,
+			supportsPackRefsMaintenance: getSettledValue(supportsPackRefsMaintenance) ?? false,
 		};
 	}
 
@@ -362,6 +591,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 				fsmonitor: map.has('gk.applied.fsmonitor'),
 				manyFiles: map.has('gk.applied.manyfiles'),
 				backgroundMaintenance: map.has('gk.applied.backgroundmaintenance'),
+				sparseIndex: false,
 			},
 			commitGraphDisabled: map.get('gk.commitgraphdisabled') === 'true',
 		};
@@ -393,8 +623,12 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	}
 
 	private async getCapabilitiesCore(): Promise<GitOptimizationCapability[]> {
-		const requiresGit = (feature: GitFeatures, suffix?: string): string =>
-			`Requires Git ${gitFeaturesByVersion.get(feature)} or later${suffix ?? ''}`;
+		const requiresGit = (feature: GitFeatures, systemd = false): string =>
+			systemd
+				? l10n.t('Requires Git {version} or later (for systemd timer scheduling)', {
+						version: String(gitFeaturesByVersion.get(feature)),
+					})
+				: l10n.t('Requires Git {version} or later', { version: String(gitFeaturesByVersion.get(feature)) });
 
 		// The scheduler gate differs by platform: launchctl/schtasks (win/mac) vs systemd timer (Linux,
 		// since 2.31–2.33 is cron-only and modern distros often ship without cron).
@@ -403,20 +637,28 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// backend at all has no floor to check.
 		const fsmonitorFeature = fsmonitorFeatureForPlatform();
 
-		const [untrackedCacheResult, fsmonitorResult, backgroundMaintenanceResult, manyFilesResult, skipHashResult] =
-			await Promise.allSettled([
-				this.git.supports('git:untrackedCache'),
-				fsmonitorFeature != null ? this.git.supports(fsmonitorFeature) : false,
-				this.git.supports(maintenanceStartFeature),
-				this.git.supports('git:manyFiles'),
-				this.git.supports('git:index:skipHash'),
-			]);
+		const [
+			untrackedCacheResult,
+			fsmonitorResult,
+			backgroundMaintenanceResult,
+			manyFilesResult,
+			skipHashResult,
+			sparseIndexResult,
+		] = await Promise.allSettled([
+			this.git.supports('git:untrackedCache'),
+			fsmonitorFeature != null ? this.git.supports(fsmonitorFeature) : false,
+			this.git.supports(maintenanceStartFeature),
+			this.git.supports('git:manyFiles'),
+			this.git.supports('git:index:skipHash'),
+			this.git.supports('git:sparse-index'),
+		]);
 
 		const untrackedCache = getSettledValue(untrackedCacheResult) ?? false;
 		const fsmonitor = getSettledValue(fsmonitorResult) ?? false;
 		const backgroundMaintenance = getSettledValue(backgroundMaintenanceResult) ?? false;
 		const manyFiles = getSettledValue(manyFilesResult) ?? false;
 		const skipHash = getSettledValue(skipHashResult) ?? false;
+		const sparseIndex = getSettledValue(sparseIndexResult) ?? false;
 
 		return [
 			{
@@ -429,7 +671,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 				supported: fsmonitor,
 				reason:
 					fsmonitorFeature == null
-						? 'Only available on Windows, macOS, and Linux'
+						? l10n.t('Only available on Windows, macOS, and Linux')
 						: !fsmonitor
 							? requiresGit(fsmonitorFeature)
 							: undefined,
@@ -439,40 +681,58 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 				supported: backgroundMaintenance,
 				reason: backgroundMaintenance
 					? undefined
-					: requiresGit(
-							maintenanceStartFeature,
-							maintenanceStartFeature === 'git:maintenance:start:systemd'
-								? ' (for systemd timer scheduling)'
-								: undefined,
-						),
+					: requiresGit(maintenanceStartFeature, maintenanceStartFeature === 'git:maintenance:start:systemd'),
 			},
 			{
 				id: 'manyFiles',
 				supported: manyFiles,
 				reason: manyFiles ? undefined : requiresGit('git:manyFiles'),
-				// On Git 2.40+, feature.manyFiles also enables index.skipHash, whose index older tools can't read.
+				// On Git 2.40+, feature.manyFiles also enables index.skipHash. Its zeroed trailing hash may not
+				// be understood by older Git versions or common third-party index readers.
 				note:
 					manyFiles && skipHash
-						? 'Also enables index.skipHash — the resulting index cannot be read by Git older than 2.40, libgit2, or JGit'
+						? l10n.t(
+								'Also enables index.skipHash — Git before 2.40 reports the zeroed hash as corrupt, and some libgit2- and JGit-based tools may reject or misdiagnose the index',
+							)
 						: undefined,
+			},
+			{
+				id: 'sparseIndex',
+				supported: sparseIndex,
+				reason: sparseIndex ? undefined : requiresGit('git:sparse-index'),
+				note: sparseIndex
+					? l10n.t(
+							'Older Git versions and some tools that read the index directly do not understand sparse-directory entries',
+						)
+					: undefined,
 			},
 		];
 	}
 
 	@debug()
-	async runMaintenanceTask(repoPath: string, task: GitMaintenanceTask, cancellation?: AbortSignal): Promise<boolean> {
+	async runMaintenanceTask(
+		repoPath: string,
+		task: GitMaintenanceTask,
+		options?: { readonly auto?: boolean; readonly cancellation?: AbortSignal },
+	): Promise<boolean> {
+		const cancellation = options?.cancellation;
 		// Not-applicable (the installed git can't run this task) short-circuits to `false`; a genuine command
 		// failure throws (the git error propagates so the ask-tier "Run Maintenance Now" UI can surface it).
 		if (task === 'commit-graph') {
 			// Direct write, gated at 2.24 — routing through `maintenance run --task=commit-graph` (2.30) would
 			// drop 2.24–2.29 users on the highest-value lever. The explicit path skips the demand throttle.
 			if (!(await this.git.supports('git:commit-graph'))) return false;
+			if (await this.isCommitGraphWriteDisabled(repoPath, cancellation)) return false;
 
-			await this.writeCommitGraph(repoPath, cancellation);
+			await this.writeCommitGraph(repoPath, false, cancellation);
 			return true;
 		}
 
-		if (!(await this.git.supports('git:maintenance'))) return false;
+		const maintenanceFeature = task === 'pack-refs' ? 'git:maintenance:pack-refs' : 'git:maintenance';
+		if (!(await this.git.supports(maintenanceFeature))) return false;
+		if (task === 'incremental-repack' && !(await this.isMultiPackIndexEnabled(repoPath, cancellation))) {
+			return false;
+		}
 
 		await this.git.run(
 			{
@@ -484,6 +744,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			},
 			'maintenance',
 			'run',
+			...(options?.auto ? ['--auto'] : []),
 			`--task=${task}`,
 		);
 		return true;
@@ -491,6 +752,8 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 
 	@debug()
 	async applyOptimization(repoPath: string, id: GitOptimizationId, cancellation?: AbortSignal): Promise<boolean> {
+		await this.reconcilePendingConfigChanges(repoPath, cancellation);
+
 		switch (id) {
 			case 'untrackedCache':
 				return this.applyUntrackedCache(repoPath, cancellation);
@@ -500,11 +763,15 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 				return this.startBackgroundMaintenance(repoPath, cancellation);
 			case 'manyFiles':
 				return this.applyManyFiles(repoPath, cancellation);
+			case 'sparseIndex':
+				return this.applySparseIndex(repoPath, cancellation);
 		}
 	}
 
 	@debug()
 	async revertOptimization(repoPath: string, id: GitOptimizationId, cancellation?: AbortSignal): Promise<void> {
+		await this.reconcilePendingConfigChanges(repoPath, cancellation);
+
 		switch (id) {
 			case 'untrackedCache':
 				await this.revertConfigLever(
@@ -535,6 +802,9 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 					await this.revertConfigLever(repoPath, 'index.skipHash', 'gk.applied.skipHash', cancellation);
 					await this.revertConfigLever(repoPath, 'feature.manyFiles', 'gk.applied.manyFiles', cancellation);
 				}
+				break;
+			case 'sparseIndex':
+				await this.revertSparseIndex(repoPath, cancellation);
 				break;
 		}
 	}
@@ -587,9 +857,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		return this.withMarkerLock(repoPath, async () => {
 			if ((await this.probeConfig(repoPath, cancellation)).untrackedCacheConfigured) return false;
 
-			await this.recordPriorUnlocked(repoPath, 'core.untrackedCache', 'gk.applied.untrackedCache', cancellation);
-			await this.setLocalConfig(repoPath, 'core.untrackedCache', 'true', cancellation);
-			return true;
+			return this.applyConfigChangesUnlocked(repoPath, [untrackedCacheChange], cancellation);
 		});
 	}
 
@@ -605,13 +873,15 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// error — and the caller turns `false` into a PERMANENT not-applicable marker. Throw instead, so a
 		// one-off hiccup during a background pass just retries on the next pass.
 		if (result.exitCode !== 0 && result.exitCode !== untrackedCacheUnsupportedExitCode) {
-			throw new Error(`Untracked-cache probe did not complete (git exited ${String(result.exitCode)})`);
+			throw new Error(l10n.t('Untracked-cache probe did not complete (git exited {0})', String(result.exitCode)));
 		}
 		return result.exitCode === 0;
 	}
 
 	private async applyFsmonitor(repoPath: string, cancellation?: AbortSignal): Promise<boolean> {
 		const scope = getScopedLogger();
+
+		if ((await this.probeConfig(repoPath, cancellation)).fsmonitor) return false;
 
 		const fsmonitorFeature = fsmonitorFeatureForPlatform();
 		if (fsmonitorFeature == null) return false;
@@ -629,8 +899,13 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			return false;
 		}
 
-		await this.recordPriorAndMark(repoPath, 'core.fsmonitor', 'gk.applied.fsmonitor', cancellation);
-		await this.setLocalConfig(repoPath, 'core.fsmonitor', 'true', cancellation);
+		const applied = await this.withMarkerLock(repoPath, async () => {
+			await this.reconcilePendingConfigChangesUnlocked(repoPath, cancellation);
+			if ((await this.probeConfig(repoPath, cancellation)).fsmonitor) return false;
+
+			return this.applyConfigChangesUnlocked(repoPath, [fsmonitorChange], cancellation);
+		});
+		if (!applied) return false;
 
 		// A `status` with `core.fsmonitor=true` spins up the built-in daemon; if it can't start, the command
 		// errors. Run it quietly so the EXIT CODE stays visible — the distinction between "git ran and
@@ -654,7 +929,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// Neither does a failure to run git at all, which surfaces as a non-numeric error code (→ NaN). Only a
 		// real git exit is evidence about THIS repo, so only that earns the permanent marker.
 		if (!Number.isInteger(result.exitCode)) {
-			throw new Error(`FSMonitor warm-up did not complete (git exited ${String(result.exitCode)})`);
+			throw new Error(l10n.t('FSMonitor warm-up did not complete (git exited {0})', String(result.exitCode)));
 		}
 
 		// Before blaming FSMonitor, re-run the same command now that the rollback has restored the prior
@@ -665,7 +940,10 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		this.throwIfDidNotComplete(baseline, cancellation);
 		if (baseline.exitCode !== 0) {
 			throw new Error(
-				`Repository status fails independently of FSMonitor (git exited ${String(baseline.exitCode)})`,
+				l10n.t(
+					'Repository status fails independently of FSMonitor (git exited {0})',
+					String(baseline.exitCode),
+				),
 			);
 		}
 
@@ -680,16 +958,164 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// capability filtering doesn't protect callers that reach `applyOptimization` some other way.
 		if (!(await this.git.supports('git:manyFiles'))) return false;
 
-		await this.recordPriorAndMark(repoPath, 'feature.manyFiles', 'gk.applied.manyFiles', cancellation);
-		await this.setLocalConfig(repoPath, 'feature.manyFiles', 'true', cancellation);
-
 		// `feature.manyFiles` implies index v4 + untracked cache; add `index.skipHash` explicitly where
-		// the installed git supports it (2.40+) for the extra index-write speedup.
+		// the installed git supports it (2.40+) for the extra index-write speedup. Both writes and both
+		// ownership markers share one transaction so any failed write/marker restores the whole new state.
+		const changes: ConfigLeverChange[] = [manyFilesChange];
 		if (await this.git.supports('git:index:skipHash')) {
-			await this.recordPriorAndMark(repoPath, 'index.skipHash', 'gk.applied.skipHash', cancellation);
-			await this.setLocalConfig(repoPath, 'index.skipHash', 'true', cancellation);
+			changes.push(skipHashChange);
 		}
-		return true;
+
+		// feature.manyFiles only DEFAULTS the untracked cache on. Respect an explicit true/false/keep (and
+		// avoid probing a bareword, which makes update-index fatal); only an unset key needs the same
+		// filesystem-correctness probe as the standalone lever. Re-check under the marker lock so a config
+		// change during the potentially slow probe cannot make this decision stale.
+		const initialConfig = await this.probeConfig(repoPath, cancellation);
+
+		// A repo already marked not-applicable must not re-run the multi-second filesystem probe on every
+		// attempt — an explicit `core.untrackedCache` still overrides the marker, same as below.
+		if (
+			!initialConfig.untrackedCacheConfigured &&
+			(await this.provider.config.getGkConfig(repoPath, 'gk.untrackedCacheNotApplicable')) === 'true'
+		) {
+			return false;
+		}
+
+		const initialSupport = initialConfig.untrackedCacheConfigured
+			? undefined
+			: await this.testUntrackedCacheSupport(repoPath, cancellation);
+		return this.withMarkerLock(repoPath, async () => {
+			await this.reconcilePendingConfigChangesUnlocked(repoPath, cancellation);
+			const localManyFiles = await this.getLocalConfig(repoPath, manyFilesChange.configKey, cancellation);
+			const manyFilesMarker = await this.readGkMarkerUncached(repoPath, manyFilesChange.markerKey, cancellation);
+			if (parseGitBoolean(localManyFiles) && manyFilesMarker == null) return false;
+
+			const currentConfig = await this.probeConfig(repoPath, cancellation);
+			if (!currentConfig.untrackedCacheConfigured) {
+				const supported = initialSupport ?? (await this.testUntrackedCacheSupport(repoPath, cancellation));
+				if (!supported) {
+					await this.markGkConfigSafe(repoPath, 'gk.untrackedCacheNotApplicable', 'true');
+					return false;
+				}
+			}
+
+			return this.applyConfigChangesUnlocked(repoPath, changes, cancellation);
+		});
+	}
+
+	/** Enables sparse-directory index entries for an existing cone-mode sparse checkout. */
+	private async applySparseIndex(repoPath: string, cancellation?: AbortSignal): Promise<boolean> {
+		if (!(await this.git.supports('git:sparse-index'))) return false;
+
+		const gitDir = await this.provider.config.getGitDir(repoPath);
+		const markerPaths = this.getSparseIndexMarkerPaths(gitDir.uri.fsPath);
+		return this.withMarkerLock(
+			repoPath,
+			async () => {
+				const config = await this.probeConfig(repoPath, cancellation);
+				const current = await this.reconcileSparseIndexMarkersUnlocked(markerPaths, config.sparseIndex);
+				if (current.enabled) return current.applied;
+				if (!config.sparseCheckout || !config.sparseCheckoutCone) return false;
+
+				const [sharedIndex, conflictOperation] = await Promise.all([
+					this.probeSharedIndex(gitDir.uri.fsPath),
+					this.probeConflictOperation(gitDir.uri.fsPath),
+				]);
+				if (sharedIndex?.present === true || conflictOperation) return false;
+
+				await mkdir(markerPaths.dir, { recursive: true });
+				const pending = await open(markerPaths.pending, 'wx');
+				await pending.close();
+
+				try {
+					await this.runSparseCheckoutReapply(repoPath, true, cancellation);
+					const completed = await this.reconcileSparseIndexMarkersUnlocked(markerPaths, true);
+					return completed.enabled && completed.applied;
+				} catch (ex) {
+					try {
+						// The command can fail after replacing its config/index locks. Repair ownership from the
+						// resulting state without the cancelled signal so a successful mutation never loses Undo.
+						const repaired = await this.reconcileSparseIndexMarkersUnlocked(
+							markerPaths,
+							await this.probeSparseIndexEnabled(repoPath),
+						);
+						if (repaired.enabled && repaired.applied) return true;
+					} catch (repairEx) {
+						const error = new Error(
+							l10n.t('Unable to enable the sparse index or reconcile its ownership record'),
+							{
+								cause: ex,
+							},
+						) as Error & { errors: unknown[] };
+						error.errors = [repairEx];
+						throw error;
+					}
+					throw ex;
+				}
+			},
+			undefined,
+			markerPaths,
+		);
+	}
+
+	/** Expands a sparse index only when this worktree's marker proves GitLens enabled it. */
+	private async revertSparseIndex(repoPath: string, cancellation?: AbortSignal): Promise<void> {
+		const gitDir = await this.provider.config.getGitDir(repoPath);
+		const markerPaths = this.getSparseIndexMarkerPaths(gitDir.uri.fsPath);
+		await this.withMarkerLock(
+			repoPath,
+			async () => {
+				const current = await this.reconcileSparseIndexMarkersUnlocked(
+					markerPaths,
+					await this.probeSparseIndexEnabled(repoPath, cancellation),
+				);
+				if (!current.applied) return;
+
+				try {
+					await this.runSparseCheckoutReapply(repoPath, false, cancellation);
+					await rm(markerPaths.applied, { force: true });
+				} catch (ex) {
+					try {
+						const repaired = await this.reconcileSparseIndexMarkersUnlocked(
+							markerPaths,
+							await this.probeSparseIndexEnabled(repoPath),
+						);
+						if (!repaired.enabled && !repaired.applied) return;
+					} catch (repairEx) {
+						const error = new Error(
+							l10n.t('Unable to disable the sparse index or reconcile its ownership record'),
+							{
+								cause: ex,
+							},
+						) as Error & { errors: unknown[] };
+						error.errors = [repairEx];
+						throw error;
+					}
+					throw ex;
+				}
+			},
+			undefined,
+			markerPaths,
+		);
+	}
+
+	private async runSparseCheckoutReapply(
+		repoPath: string,
+		enabled: boolean,
+		cancellation?: AbortSignal,
+	): Promise<void> {
+		await this.git.run(
+			{
+				cwd: repoPath,
+				errors: 'throw',
+				priority: 'background',
+				cancellation: cancellation,
+				selfMaintenance: true,
+			},
+			'sparse-checkout',
+			'reapply',
+			enabled ? '--sparse-index' : '--no-sparse-index',
+		);
 	}
 
 	/**
@@ -816,7 +1242,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			this._registeredMaintenanceRepos = undefined;
 
 			if (await this.isPathRegistered(repoPath, registeredPath, cancellation)) {
-				throw new Error('Unable to unregister background maintenance');
+				throw new Error(l10n.t('Unable to unregister background maintenance'));
 			}
 
 			scope?.warn(`Removed the global maintenance.repo entry for '${registeredPath}' directly`);
@@ -895,6 +1321,164 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		);
 	}
 
+	/**
+	 * Reconciles write-ahead records left by an interrupted direct config mutation. The cached namespace read
+	 * keeps the normal probe free of extra subprocesses; an actual pending record is re-read under the marker
+	 * lock before it is finalized or cleared.
+	 */
+	private async reconcilePendingConfigChanges(repoPath: string, cancellation?: AbortSignal): Promise<void> {
+		const markers = await this.provider.config.getGkConfigRegex(repoPath, '^gk\\.pending\\.');
+		if (!configLeverChanges.some(change => markers.has(canonicalizeGitConfigKey(change.pendingKey)))) return;
+
+		await this.withMarkerLock(repoPath, () => this.reconcilePendingConfigChangesUnlocked(repoPath, cancellation));
+	}
+
+	/** Body of {@link reconcilePendingConfigChanges} for a caller already holding the marker lock. */
+	private async reconcilePendingConfigChangesUnlocked(repoPath: string, cancellation?: AbortSignal): Promise<void> {
+		for (const change of configLeverChanges) {
+			const raw = await this.readGkMarkerUncached(repoPath, change.pendingKey, cancellation);
+			if (raw == null) continue;
+
+			const pending = decodePendingConfigChange(raw);
+			if (pending == null || pending.value !== change.value) {
+				// A malformed record can't be reconciled into an ownership marker — drop it rather than throw,
+				// which would otherwise wedge every future health snapshot/apply/revert on this repo. Failing
+				// toward "not GitLens's" is the safe direction: the user keeps whatever config exists, GitLens
+				// just never offers Undo for it.
+				await this.provider.config.setGkConfig(repoPath, change.pendingKey, undefined);
+				continue;
+			}
+
+			const applied = await this.readGkMarkerUncached(repoPath, change.markerKey, cancellation);
+			if (applied == null) {
+				const current = await this.getLocalConfig(repoPath, change.configKey, cancellation);
+				if (current === pending.value) {
+					await this.provider.config.setGkConfig(repoPath, change.markerKey, pending.prior);
+				}
+			}
+
+			// If the intended value never landed (or a user changed it afterward), leave the config untouched and
+			// drop only the uncommitted journal record. If it did land, ownership was finalized above first.
+			await this.provider.config.setGkConfig(repoPath, change.pendingKey, undefined);
+		}
+	}
+
+	/**
+	 * Applies direct config levers for a caller holding the ownership-marker lock. A write-ahead record closes
+	 * the crash gap between the local config and ownership files; an ordinary failure restores every config
+	 * value and marker without cancellation.
+	 */
+	private async applyConfigChangesUnlocked(
+		repoPath: string,
+		changes: readonly ConfigLeverChange[],
+		cancellation?: AbortSignal,
+	): Promise<boolean> {
+		await this.reconcilePendingConfigChangesUnlocked(repoPath, cancellation);
+
+		const states: {
+			readonly change: ConfigLeverChange;
+			readonly prior: string;
+			readonly rollbackPrior: string;
+			readonly alreadyOwned: boolean;
+		}[] = [];
+		let alreadyApplied = false;
+		for (const change of changes) {
+			const marker = await this.readGkMarkerUncached(repoPath, change.markerKey, cancellation);
+			const current = await this.getLocalConfig(repoPath, change.configKey, cancellation);
+			if (current === change.value) {
+				alreadyApplied ||= marker != null;
+				continue;
+			}
+
+			const rollbackPrior =
+				current == null ? unsetConfigSentinel : current === '' ? emptyConfigSentinel : current;
+			if (marker != null) {
+				states.push({
+					change: change,
+					prior: marker,
+					rollbackPrior: rollbackPrior,
+					alreadyOwned: true,
+				});
+				continue;
+			}
+
+			states.push({
+				change: change,
+				prior: rollbackPrior,
+				rollbackPrior: rollbackPrior,
+				alreadyOwned: false,
+			});
+		}
+		if (states.length === 0) return alreadyApplied;
+
+		const written: typeof states = [];
+		const marked: typeof states = [];
+		const pending = new Set<(typeof states)[number]>();
+		try {
+			for (const state of states) {
+				if (state.alreadyOwned) continue;
+
+				await this.provider.config.setGkConfig(
+					repoPath,
+					state.change.pendingKey,
+					encodePendingConfigChange({ prior: state.prior, value: state.change.value }),
+				);
+				pending.add(state);
+			}
+
+			for (const state of states) {
+				await this.setLocalConfig(repoPath, state.change.configKey, state.change.value, cancellation);
+				written.push(state);
+			}
+
+			for (const state of states) {
+				if (state.alreadyOwned) continue;
+
+				await this.provider.config.setGkConfig(repoPath, state.change.markerKey, state.prior);
+				marked.push(state);
+			}
+
+			for (const state of pending) {
+				await this.provider.config.setGkConfig(repoPath, state.change.pendingKey, undefined);
+				pending.delete(state);
+			}
+			return true;
+		} catch (ex) {
+			const rollbackErrors: unknown[] = [];
+			for (const state of written.toReversed()) {
+				try {
+					await this.restoreLocalConfig(repoPath, state.change.configKey, state.rollbackPrior);
+				} catch (rollbackEx) {
+					rollbackErrors.push(rollbackEx);
+				}
+			}
+			for (const state of marked.toReversed()) {
+				try {
+					await this.provider.config.setGkConfig(repoPath, state.change.markerKey, undefined);
+				} catch (rollbackEx) {
+					rollbackErrors.push(rollbackEx);
+				}
+			}
+			for (const state of pending) {
+				try {
+					await this.provider.config.setGkConfig(repoPath, state.change.pendingKey, undefined);
+				} catch (rollbackEx) {
+					rollbackErrors.push(rollbackEx);
+				}
+			}
+
+			if (rollbackErrors.length) {
+				const error = new Error(
+					l10n.t('Unable to apply Git maintenance settings and completely restore their prior values'),
+					{ cause: ex },
+				) as Error & { errors: unknown[] };
+				error.errors = rollbackErrors;
+				throw error;
+			}
+			throw ex;
+		}
+	}
+
 	@debug()
 	async claimMaintenancePass(repoPath: string, intervalMs: number): Promise<boolean> {
 		// The stamp is the CROSS-WINDOW throttle, so reading it and writing it must be one transaction —
@@ -920,6 +1504,105 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		return joinPaths((gitDir.commonUri ?? gitDir.uri).fsPath, 'gk');
 	}
 
+	private getSparseIndexMarkerPaths(gitDirPath: string): {
+		readonly dir: string;
+		readonly applied: string;
+		readonly contention: 'sparseIndex';
+		readonly lock: string;
+		readonly pending: string;
+	} {
+		const dir = joinPaths(gitDirPath, 'gk');
+		return {
+			dir: dir,
+			applied: joinPaths(dir, sparseIndexAppliedMarker),
+			contention: 'sparseIndex',
+			lock: joinPaths(dir, sparseIndexLockFile),
+			pending: joinPaths(dir, sparseIndexPendingMarker),
+		};
+	}
+
+	/**
+	 * Reconciles the sparse-index command's worktree-local write-ahead marker. The fast path is filesystem
+	 * only; a pending or stale-applied marker takes the worktree's sparse-index operation lock and re-reads
+	 * Git config before mutating anything, so it cannot act on a snapshot that raced another window's
+	 * apply/undo. A live operation keeps that lock across the index rewrite, but snapshots never wait for it:
+	 * they return the last committed marker state until the operation publishes its result.
+	 */
+	private async reconcileSparseIndexMarkers(
+		repoPath: string,
+		gitDirPath: string,
+		knownEnabled: boolean | undefined,
+		cancellation?: AbortSignal,
+	): Promise<{ enabled: boolean | undefined; applied: boolean }> {
+		const markerPaths = this.getSparseIndexMarkerPaths(gitDirPath);
+		const [pending, applied] = await Promise.all([fsExists(markerPaths.pending), fsExists(markerPaths.applied)]);
+		if (knownEnabled == null) return { enabled: undefined, applied: false };
+		if (!pending && (!applied || knownEnabled)) {
+			return { enabled: knownEnabled, applied: applied && knownEnabled };
+		}
+
+		try {
+			return await this.withMarkerLock(
+				repoPath,
+				async () =>
+					this.reconcileSparseIndexMarkersUnlocked(
+						markerPaths,
+						await this.probeSparseIndexEnabled(repoPath, cancellation),
+					),
+				{ retryMs: 0, maxAttempts: 0 },
+				markerPaths,
+			);
+		} catch (ex) {
+			if (!(ex instanceof MarkerLockContentionError)) throw ex;
+
+			// The config probe is the truthful state even if the lock holder crashed after changing it. Marker
+			// presence only proves ownership while that config is still enabled; reconciliation can resume after
+			// the live operation finishes or a positively dead owner's lock is removed manually.
+			return { enabled: knownEnabled, applied: applied && knownEnabled };
+		}
+	}
+
+	/** Body of {@link reconcileSparseIndexMarkers} for a caller already holding the ownership lock. */
+	private async reconcileSparseIndexMarkersUnlocked(
+		markerPaths: { readonly dir: string; readonly applied: string; readonly pending: string },
+		enabled: boolean,
+	): Promise<{ enabled: boolean; applied: boolean }> {
+		const pending = await fsExists(markerPaths.pending);
+		let applied = await fsExists(markerPaths.applied);
+		if (pending) {
+			if (enabled) {
+				await mkdir(markerPaths.dir, { recursive: true });
+				if (applied) {
+					await rm(markerPaths.pending, { force: true });
+				} else {
+					await rename(markerPaths.pending, markerPaths.applied);
+					applied = true;
+				}
+			} else {
+				await rm(markerPaths.pending, { force: true });
+			}
+		}
+
+		if (applied && !enabled) {
+			await rm(markerPaths.applied, { force: true });
+			applied = false;
+		}
+
+		return { enabled: enabled, applied: applied };
+	}
+
+	/** Reads the effective worktree-scoped sparse-index switch without relying on a cached config map. */
+	private async probeSparseIndexEnabled(repoPath: string, cancellation?: AbortSignal): Promise<boolean> {
+		const result = await this.runQuietly(repoPath, cancellation, 'config', '--bool', '--get', 'index.sparse');
+		this.throwIfDidNotComplete(result, cancellation);
+		if (result.exitCode === gitConfigGetMissingExitCode) return false;
+		if (result.exitCode !== 0) {
+			throw new Error(l10n.t("Unable to read 'index.sparse' (git exited {0})", String(result.exitCode)));
+		}
+
+		return parseGitBoolean(result.stdout);
+	}
+
 	/** Reads an ownership marker straight from `.git/gk/config`, bypassing every cache. */
 	private async readGkMarkerUncached(
 		repoPath: string,
@@ -937,14 +1620,17 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		);
 		this.throwIfDidNotComplete(result, cancellation);
 		if (result.exitCode !== 0 && result.exitCode !== gitConfigGetMissingExitCode) {
-			throw new Error(`Unable to read the '${markerKey}' marker (git exited ${String(result.exitCode)})`);
+			throw new Error(
+				l10n.t("Unable to read the '{0}' marker (git exited {1})", markerKey, String(result.exitCode)),
+			);
 		}
 		return result.stdout.trim() || undefined;
 	}
 
 	/**
-	 * Runs `fn` holding an exclusive on-disk lock over this repo family's ownership markers. Two layers make
-	 * this safe across processes:
+	 * Runs `fn` holding an exclusive on-disk lock over one ownership-marker scope. By default that is the
+	 * repository family's config-marker scope; callers can provide a worktree-local lock location for an
+	 * operation whose state is isolated per worktree. Two layers make this safe across processes:
 	 *
 	 * - **Exclusive-create ownership, with an identity record.** `open(lockPath, 'wx')` — the same `O_EXCL`
 	 *   primitive git uses for its own `*.lock` files — is the only atomic step; a contender that loses the
@@ -969,10 +1655,11 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	 * holder that was never dead. Kernel-managed advisory locking (`flock`) would close that gap, but Node
 	 * exposes no portable interface to it and a native, platform-sensitive dependency is disproportionate
 	 * here. Therefore a contender NEVER mutates an existing lock — only the creator removes one, and no stale
-	 * observation can authorize mutation. Recovery is a guided MANUAL step instead: a give-up runs the same PID probe ONCE, purely to choose the error's
-	 * wording — a confirmed-dead ('dead' verdict) owner gets an error naming the lock file to delete;
-	 * anything else (live, unverifiable, or on another host) gets the generic "another window" error. Either
-	 * way the fix is the same: delete the named lock file and retry.
+	 * observation can authorize mutation. Recovery is a guided MANUAL step instead: a give-up runs the same PID
+	 * probe ONCE, purely to choose the error's wording. For the sparse-operation lock, a confirmed-live owner gets
+	 * wait-only guidance, a confirmed-dead owner gets crash-recovery guidance, and an unverifiable owner gets the
+	 * lock path plus guarded manual-recovery guidance. The shared marker lock retains its generic non-dead error.
+	 * No verdict authorizes an automatic steal.
 	 *
 	 * Because a live holder can't lose its lock, `fn` needs no cancellation coupling to the lock itself — the
 	 * critical section only ever ends on its own terms.
@@ -990,12 +1677,9 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	private async withMarkerLock<T>(
 		repoPath: string,
 		fn: () => Promise<T>,
-		// Test seam only — production call sites rely on the module defaults below. `probeOwner` REPLACES the
-		// real `process.kill(pid, 0)` liveness probe used for the give-up error's wording, so a test can stage
-		// a dead (or unverifiable) owner deterministically. `writeRecord` REPLACES the real ownership-record
-		// write, so a test can force the post-open setup to fail. `openLock` REPLACES the real
-		// `open(lockPath, 'wx')` acquisition, so a test can force it to fail deterministically (POSIX mode
-		// bits don't reliably block child creation on Windows).
+		// `retryMs`/`maxAttempts` define the acquisition policy; health snapshots deliberately use zero retries
+		// for the sparse operation lock. The remaining callbacks are test seams: `probeOwner` replaces the real
+		// PID probe, `writeRecord` forces post-open setup failures, and `openLock` forces acquisition failures.
 		timings?: {
 			retryMs?: number;
 			maxAttempts?: number;
@@ -1003,20 +1687,23 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			writeRecord?: (handle: FileHandle) => Promise<void>;
 			openLock?: (lockPath: string) => Promise<FileHandle>;
 		},
+		lockLocation?: { readonly dir: string; readonly contention?: 'sparseIndex'; readonly lock: string },
 	): Promise<T> {
 		const retryMs = timings?.retryMs ?? markerLockRetryMs;
 		const maxAttempts = timings?.maxAttempts ?? markerLockMaxAttempts;
 
-		const dir = await this.getGkDir(repoPath);
-		const lockPath = joinPaths(dir, 'applied.lock');
+		const dir = lockLocation?.dir ?? (await this.getGkDir(repoPath));
+		const lockPath = lockLocation?.lock ?? joinPaths(dir, 'applied.lock');
 		try {
 			await mkdir(dir, { recursive: true });
 		} catch (ex) {
 			// Never proceed unlocked: a lock that can't even be set up must not let the guarded transaction
 			// run without one. Recoverable by the same manual fix as any other acquisition failure.
 			throw new Error(
-				`Could not acquire the Git maintenance settings lock at '${lockPath}'. If this persists and no ` +
-					`other VS Code window is using this repository, delete that file and try again.`,
+				l10n.t(
+					"Could not acquire the Git maintenance settings lock at '{0}'. If this persists and no other VS Code window is using this repository, delete that file and try again.",
+					lockPath,
+				),
 				{ cause: ex },
 			);
 		}
@@ -1031,8 +1718,10 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 					// stale "marker absent" and record the wrong prior. Failing loudly is recoverable; racing
 					// is not.
 					throw new Error(
-						`Could not acquire the Git maintenance settings lock at '${lockPath}'. If this persists ` +
-							`and no other VS Code window is using this repository, delete that file and try again.`,
+						l10n.t(
+							"Could not acquire the Git maintenance settings lock at '{0}'. If this persists and no other VS Code window is using this repository, delete that file and try again.",
+							lockPath,
+						),
 						{ cause: ex },
 					);
 				}
@@ -1046,16 +1735,36 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 						() => 'unverifiable' as const,
 					);
 					if (verdict === 'dead') {
-						throw new Error(
-							`A previous VS Code window appears to have crashed while updating Git maintenance ` +
-								`settings. Delete '${lockPath}' to recover.`,
+						throw new MarkerLockContentionError(
+							lockLocation?.contention === 'sparseIndex'
+								? l10n.t(
+										"A previous VS Code window appears to have crashed while updating the sparse index. Delete '{0}' to recover.",
+										lockPath,
+									)
+								: l10n.t(
+										"A previous VS Code window appears to have crashed while updating Git maintenance settings. Delete '{0}' to recover.",
+										lockPath,
+									),
+							{ cause: ex },
+						);
+					}
+					if (lockLocation?.contention === 'sparseIndex' && verdict === 'alive') {
+						throw new MarkerLockContentionError(
+							l10n.t('A sparse-index update is still in progress. Wait for it to finish and try again.'),
 							{ cause: ex },
 						);
 					}
 
-					throw new Error(
-						`Another window is currently updating Git maintenance settings. If no other VS Code ` +
-							`window is using this repository, delete '${lockPath}' and try again.`,
+					throw new MarkerLockContentionError(
+						lockLocation?.contention === 'sparseIndex'
+							? l10n.t(
+									"Could not verify whether another window is still updating the sparse index. If no update is in progress, delete '{0}' and try again.",
+									lockPath,
+								)
+							: l10n.t(
+									"Another window is currently updating Git maintenance settings. If no other VS Code window is using this repository, delete '{0}' and try again.",
+									lockPath,
+								),
 						{ cause: ex },
 					);
 				}
@@ -1094,8 +1803,10 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 				await rm(lockPath, { force: true }).catch(() => {});
 			}
 			throw new Error(
-				`Could not acquire the Git maintenance settings lock at '${lockPath}'. If this persists and no ` +
-					`other VS Code window is using this repository, delete that file and try again.`,
+				l10n.t(
+					"Could not acquire the Git maintenance settings lock at '{0}'. If this persists and no other VS Code window is using this repository, delete that file and try again.",
+					lockPath,
+				),
 				{ cause: ex },
 			);
 		}
@@ -1119,9 +1830,9 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 
 	/**
 	 * Diagnoses the process recorded in `lockPath` for the give-up error's wording ONLY — see
-	 * `withMarkerLock`'s doc comment for why a verdict never causes an automatic steal. 'dead' only when the
-	 * OS kill-probe returns `ESRCH`; every other outcome (unreadable/malformed content, a lock recorded on
-	 * another host, a probe that succeeds, or fails with anything but `ESRCH`) is 'unverifiable'.
+	 * `withMarkerLock`'s doc comment for why a verdict never causes an automatic steal. Returns 'dead' only when
+	 * the OS kill-probe returns `ESRCH`, 'alive' when it succeeds, and 'unverifiable' for unreadable/malformed
+	 * content, a lock recorded on another host, or a probe that fails with anything but `ESRCH`.
 	 */
 	private async probeLockOwner(
 		lockPath: string,
@@ -1229,7 +1940,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		}
 		// `failed` covers both a queue rejection/spawn failure (`unstarted`) and a signal kill, neither of
 		// which produced a trustworthy result — for a maintenance probe both must read as "did not run".
-		if (result.completion.status === 'failed') throw new Error('Git command did not run');
+		if (result.completion.status === 'failed') throw new Error(l10n.t('Git command did not run'));
 	}
 
 	/**
@@ -1266,7 +1977,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// so a later undo would DELETE a setting the user had all along instead of restoring it. Exit 1 is
 		// git's "no match" — genuinely unset, the same discipline as `--get`.
 		if (result.exitCode !== 0 && result.exitCode !== gitConfigGetMissingExitCode) {
-			throw new Error(`Unable to read '${key}' (git exited ${result.exitCode})`);
+			throw new Error(l10n.t("Unable to read '{0}' (git exited {1})", key, String(result.exitCode)));
 		}
 		if (result.exitCode !== 0) return undefined;
 
@@ -1325,7 +2036,7 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// Undo ever offered again — while the config is in fact still set.
 		this.throwIfDidNotComplete(result, cancellation);
 		if (result.exitCode !== 0 && result.exitCode !== gitConfigUnsetMissingExitCode) {
-			throw new Error(`Unable to unset '${key}' (git exited ${result.exitCode})`);
+			throw new Error(l10n.t("Unable to unset '{0}' (git exited {1})", key, String(result.exitCode)));
 		}
 
 		this.cache.deleteConfig(repoPath, key);
@@ -1352,10 +2063,21 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	private async probeConfig(
 		repoPath: string,
 		cancellation?: AbortSignal,
-	): Promise<GitHealthSnapshot['config'] & { commitGraphReadDisabled: boolean }> {
-		// One `git config --get-regex` for the three levers plus the commit-graph read switch, reading MERGED
-		// config — so a key's presence means the user set it somewhere (local, global, or system). Git
-		// lowercases the section + variable in the output.
+	): Promise<
+		GitHealthSnapshot['config'] & {
+			commitGraphReadDisabled: boolean;
+			multiPackIndexEnabled: boolean | undefined;
+			incrementalRepackAutoThreshold: number | undefined;
+			refFormat: GitHealthSnapshot['repository']['refFormat'];
+			sparseCheckout: boolean;
+			sparseCheckoutCone: boolean;
+			sparseIndex: boolean;
+			splitIndex: boolean;
+		}
+	> {
+		// One `git config --get-regex` for the levers, commit-graph read switch, and index shape, reading
+		// MERGED config — so a key's presence means the user set it somewhere (local, worktree, global, or
+		// system). Git lowercases the section + variable in the output.
 		//
 		// Deliberately NOT routed through the config sub-provider's cached helper: that one swallows git
 		// errors and resolves an EMPTY map, which is indistinguishable from "none of these keys are set" —
@@ -1366,13 +2088,13 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			cancellation,
 			'config',
 			'--get-regex',
-			'^(core\\.fsmonitor|core\\.untrackedcache|core\\.commitgraph|feature\\.manyfiles)$',
+			'^(core\\.fsmonitor|core\\.untrackedcache|core\\.commitgraph|core\\.multipackindex|core\\.sparsecheckout|core\\.sparsecheckoutcone|core\\.splitindex|extensions\\.refstorage|feature\\.manyfiles|index\\.sparse|maintenance\\.incremental-repack\\.auto)$',
 		);
 		this.throwIfDidNotComplete(result, cancellation);
 		// Exit 1 is git's "no matches" — genuinely unset. Anything else means we couldn't read the
 		// config; `getHealthSnapshot` turns the throw into a fail-closed snapshot.
 		if (result.exitCode !== 0 && result.exitCode !== gitConfigGetMissingExitCode) {
-			throw new Error(`Unable to read git config (git exited ${String(result.exitCode)})`);
+			throw new Error(l10n.t('Unable to read git config (git exited {0})', String(result.exitCode)));
 		}
 
 		// `includeValueless`: a BAREWORD entry (`core.untrackedCache` with no `=value`) is git's own
@@ -1385,6 +2107,21 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// (possibly multi-line) stdout strips that meaningful trailing space and it misreads as a bareword.
 		// `parseConfigRegexOutput` already skips the blank line a trailing newline produces.
 		const map = parseConfigRegexOutput(result.stdout, { includeValueless: true });
+		const incrementalRepackAuto = map.get('maintenance.incremental-repack.auto');
+		const incrementalRepackAutoThreshold =
+			incrementalRepackAuto == null
+				? defaultIncrementalRepackAutoThreshold
+				: parseGitInteger(incrementalRepackAuto);
+
+		const multiPackIndex = map.get('core.multipackindex');
+		const multiPackIndexEnabled =
+			multiPackIndex == null
+				? true
+				: isGitBooleanFalse(multiPackIndex)
+					? false
+					: parseGitBoolean(multiPackIndex)
+						? true
+						: undefined;
 
 		return {
 			fsmonitor: isFsmonitorEnabled(map.get('core.fsmonitor')),
@@ -1396,6 +2133,18 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 			// honors this same setting as a write opt-out.
 			commitGraphReadDisabled:
 				map.has('core.commitgraph') && isGitBooleanFalse(map.get('core.commitgraph') ?? ''),
+			multiPackIndexEnabled: multiPackIndexEnabled,
+			incrementalRepackAutoThreshold: incrementalRepackAutoThreshold,
+			refFormat:
+				map.get('extensions.refstorage') == null
+					? 'files'
+					: map.get('extensions.refstorage') === 'reftable'
+						? 'reftable'
+						: 'unknown',
+			sparseCheckout: parseGitBoolean(map.get('core.sparsecheckout')),
+			sparseCheckoutCone: parseGitBoolean(map.get('core.sparsecheckoutcone')),
+			sparseIndex: parseGitBoolean(map.get('index.sparse')),
+			splitIndex: parseGitBoolean(map.get('core.splitindex')),
 		};
 	}
 
@@ -1421,7 +2170,9 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		// Exit 1 is git's "key not set" — a genuinely empty list.
 		this.throwIfDidNotComplete(result, cancellation);
 		if (result.exitCode !== 0 && result.exitCode !== gitConfigGetMissingExitCode) {
-			throw new Error(`Unable to read registered maintenance repos (git exited ${String(result.exitCode)})`);
+			throw new Error(
+				l10n.t('Unable to read registered maintenance repos (git exited {0})', String(result.exitCode)),
+			);
 		}
 
 		const paths = result.stdout
@@ -1603,20 +2354,136 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		}
 	}
 
-	private async probePacks(objectsDir: string): Promise<{ count: number; bytes: number }> {
+	/**
+	 * Reads the pack names represented by the active classic or incremental MIDX. A classic MIDX wins when
+	 * both layouts exist, matching Git's own lookup order. Malformed metadata is reported as unknown instead
+	 * of treating every pack as uncovered and silently launching repair work.
+	 */
+	private async probeMultiPackIndex(
+		packDir: string,
+	): Promise<{ present: boolean; packNames: ReadonlySet<string> | undefined }> {
+		const classicPath = joinPaths(packDir, 'multi-pack-index');
+		try {
+			const packNames = await this.readMultiPackIndexPackNames(classicPath);
+			return { present: true, packNames: packNames };
+		} catch (ex) {
+			if ((ex as { code?: unknown }).code !== 'ENOENT') return { present: true, packNames: undefined };
+		}
+
+		const chainDir = joinPaths(packDir, 'multi-pack-index.d');
+		const chainPath = joinPaths(chainDir, 'multi-pack-index-chain');
+		let chain: string;
+		try {
+			if ((await stat(chainPath)).size > maxMultiPackIndexChainBytes) {
+				return { present: true, packNames: undefined };
+			}
+
+			chain = await readFile(chainPath, 'utf8');
+		} catch (ex) {
+			return (ex as { code?: unknown }).code === 'ENOENT'
+				? { present: false, packNames: new Set() }
+				: { present: true, packNames: undefined };
+		}
+
+		const hashes = chain
+			.split('\n')
+			.map(line => line.trim())
+			.filter(Boolean);
+		if (hashes.length === 0 || hashes.some(hash => !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash))) {
+			return { present: true, packNames: undefined };
+		}
+
+		const layers = await Promise.allSettled(
+			hashes.map(hash => this.readMultiPackIndexPackNames(joinPaths(chainDir, `multi-pack-index-${hash}.midx`))),
+		);
+		if (layers.some(layer => layer.status === 'rejected')) return { present: true, packNames: undefined };
+
+		const packNames = new Set<string>();
+		for (const layer of layers) {
+			if (layer.status !== 'fulfilled') continue;
+
+			for (const name of layer.value) {
+				packNames.add(name);
+			}
+		}
+		return { present: true, packNames: packNames };
+	}
+
+	/** Reads and validates the `PNAM` chunk of one MIDX file. */
+	private async readMultiPackIndexPackNames(path: string): Promise<ReadonlySet<string>> {
+		let handle: FileHandle | undefined;
+		try {
+			handle = await open(path, 'r');
+			const header = Buffer.alloc(12);
+			const { bytesRead } = await handle.read(header, 0, header.length, 0);
+			if (bytesRead < header.length || header.toString('ascii', 0, 4) !== 'MIDX') {
+				throw new Error(l10n.t('Invalid multi-pack-index header'));
+			}
+
+			const chunkCount = header.readUInt8(6);
+			const expectedPackCount = header.readUInt32BE(8);
+			const tableLength = (chunkCount + 1) * 12;
+			const table = Buffer.alloc(tableLength);
+			const { bytesRead: tableBytesRead } = await handle.read(table, 0, tableLength, header.length);
+			if (tableBytesRead < tableLength) throw new Error(l10n.t('Invalid multi-pack-index chunk table'));
+
+			let namesStart: number | undefined;
+			const chunkOffsets: number[] = [];
+			for (let i = 0; i <= chunkCount; i++) {
+				const offset = i * 12;
+				const chunkOffset = Number(table.readBigUInt64BE(offset + 4));
+				if (!Number.isSafeInteger(chunkOffset)) {
+					throw new Error(l10n.t('Invalid multi-pack-index chunk offset'));
+				}
+
+				chunkOffsets.push(chunkOffset);
+				if (table.toString('ascii', offset, offset + 4) === 'PNAM') {
+					namesStart = chunkOffset;
+				}
+			}
+			if (namesStart == null) throw new Error(l10n.t('Multi-pack-index is missing its pack-name chunk'));
+
+			const namesEnd = Math.min(...chunkOffsets.filter(offset => offset > namesStart));
+			const namesLength = namesEnd - namesStart;
+			if (!Number.isSafeInteger(namesEnd) || namesLength < 0 || namesLength > maxMultiPackIndexChunkBytes) {
+				throw new Error(l10n.t('Invalid multi-pack-index pack-name chunk'));
+			}
+
+			const namesChunk = Buffer.alloc(namesLength);
+			const { bytesRead: namesBytesRead } = await handle.read(namesChunk, 0, namesLength, namesStart);
+			if (namesBytesRead < namesLength) throw new Error(l10n.t('Short multi-pack-index pack-name chunk'));
+
+			const names = namesChunk
+				.toString('utf8')
+				.split('\0')
+				.filter(name => /^pack-(?:[0-9a-f]{40}|[0-9a-f]{64})\.idx$/.test(name))
+				.map(name => `${name.slice(0, -4)}.pack`);
+			if (names.length !== expectedPackCount || new Set(names).size !== names.length) {
+				throw new Error(l10n.t('Multi-pack-index pack-name count does not match its header'));
+			}
+
+			return new Set(names);
+		} finally {
+			await handle?.close().catch(() => {});
+		}
+	}
+
+	private async probePacks(objectsDir: string): Promise<{ names: string[]; bytes: number }> {
 		const packDir = joinPaths(objectsDir, 'pack');
 		let entries: string[];
 		try {
 			entries = await readdir(packDir);
-		} catch {
-			return { count: 0, bytes: 0 };
+		} catch (ex) {
+			if ((ex as { code?: unknown }).code === 'ENOENT') return { names: [], bytes: 0 };
+
+			throw ex;
 		}
 
 		const packFiles = entries.filter(name => name.endsWith('.pack'));
 		const sizes = await Promise.allSettled(packFiles.map(name => this.fileBytes(joinPaths(packDir, name))));
 		const bytes = sizes.reduce((sum, r) => sum + (getSettledValue(r) ?? 0), 0);
 
-		return { count: packFiles.length, bytes: bytes };
+		return { names: packFiles, bytes: bytes };
 	}
 
 	private async sampleLooseObjects(
@@ -1637,11 +2504,67 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		return { objectsInSampledDirs: objectsInSampledDirs, dirsSampled: looseObjectSampleDirs.length };
 	}
 
+	/**
+	 * Counts loose refs without traversing past the point where the recommendation decision is already made.
+	 * `readDirectory` is a test seam for deterministic ref-layout races between parent and child reads.
+	 */
+	private async probeLooseRefs(
+		refsDir: string,
+		readDirectory: (dir: string) => Promise<Dirent[]> = dir => readdir(dir, { withFileTypes: true }),
+	): Promise<{ count: number; exact: boolean }> {
+		const pending = [refsDir];
+		let count = 0;
+		while (pending.length !== 0) {
+			const dir = pending.pop()!;
+			let entries: Dirent[];
+			try {
+				entries = await readDirectory(dir);
+			} catch (ex) {
+				const code = (ex as { code?: unknown }).code;
+				if (code === 'ENOENT' || (dir !== refsDir && code === 'ENOTDIR')) {
+					if (dir === refsDir) return { count: 0, exact: true };
+
+					// Ref updates can remove a child directory or replace it with a same-named ref after its
+					// parent was listed. It contributes no child refs now, so continue the bounded walk.
+					continue;
+				}
+
+				throw ex;
+			}
+
+			for (const entry of entries) {
+				if (entry.isDirectory()) {
+					pending.push(joinPaths(dir, entry.name));
+					continue;
+				}
+				// Lock files are transient coordination state, not refs `pack-refs` can optimize.
+				if (entry.name.endsWith('.lock')) continue;
+
+				count++;
+				if (count >= looseRefProbeLimit) return { count: count, exact: false };
+			}
+		}
+
+		return { count: count, exact: true };
+	}
+
 	private async statMtime(path: string): Promise<number | undefined> {
 		try {
 			return (await stat(path)).mtimeMs;
 		} catch {
 			return undefined;
+		}
+	}
+
+	/** Presence probe that distinguishes a missing path from an unreadable one. */
+	private async probePathPresence(path: string): Promise<boolean> {
+		try {
+			await stat(path);
+			return true;
+		} catch (ex) {
+			if ((ex as { code?: unknown }).code === 'ENOENT') return false;
+
+			throw ex;
 		}
 	}
 
@@ -1654,8 +2577,8 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 	}
 
 	/**
-	 * Reads the exact tracked-file count straight from the index header — `DIRC` signature, version, entry
-	 * count, all big-endian, the first 12 bytes of `.git/index` — for free, no `git` invocation needed.
+	 * Reads the index entry count straight from the index header — `DIRC` signature, version, entry count,
+	 * all big-endian, the first 12 bytes of `.git/index` — for free, no `git` invocation needed.
 	 * `undefined` on any failure (missing index, short read, wrong signature): never a guess, never a throw.
 	 */
 	private async probeIndexEntryCount(indexPath: string): Promise<number | undefined> {
@@ -1672,5 +2595,35 @@ export class MaintenanceGitSubProvider implements GitMaintenanceSubProvider {
 		} finally {
 			await handle?.close().catch(() => {});
 		}
+	}
+
+	/**
+	 * Conservative split-index detection without spawning git or scanning index bodies. A shared-index file
+	 * proves this worktree uses split indexes; its largest base file is included in the byte-size proxy. Stale
+	 * bases can only make that explicitly-approximate signal larger.
+	 */
+	private async probeSharedIndex(gitDir: string): Promise<{ present: boolean; bytes: number } | undefined> {
+		try {
+			const names = (await readdir(gitDir)).filter(name => name.startsWith('sharedindex.'));
+			const sizes = await Promise.all(names.map(name => this.fileBytes(joinPaths(gitDir, name))));
+			return { present: names.length > 0, bytes: Math.max(0, ...sizes) };
+		} catch {
+			return undefined;
+		}
+	}
+
+	/**
+	 * Conflict stages duplicate paths in the header count. Operation-state files conservatively suppress the
+	 * exact claim without an unconditional `ls-files --unmerged` index scan on every staging event.
+	 */
+	private async probeConflictOperation(gitDir: string): Promise<boolean> {
+		const states = await Promise.all([
+			fsExists(joinPaths(gitDir, 'MERGE_HEAD')),
+			fsExists(joinPaths(gitDir, 'CHERRY_PICK_HEAD')),
+			fsExists(joinPaths(gitDir, 'REVERT_HEAD')),
+			fsExists(joinPaths(gitDir, 'rebase-merge')),
+			fsExists(joinPaths(gitDir, 'rebase-apply')),
+		]);
+		return states.some(Boolean);
 	}
 }

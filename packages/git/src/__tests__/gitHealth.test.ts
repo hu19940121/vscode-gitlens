@@ -10,7 +10,8 @@ import {
 	getAutoOptimizations,
 	isBannerEligible,
 	looseObjectsThreshold,
-	packCountThreshold,
+	looseRefsThreshold,
+	packsOutsideMultiPackIndexThreshold,
 	trackedFilesThreshold,
 } from '../gitHealth.js';
 import type { GitHealthSnapshot, GitOptimizationCapability, GitOptimizationId } from '../providers/maintenance.js';
@@ -23,10 +24,14 @@ const manyLooseSampled = Math.ceil((looseObjectsThreshold * 16) / 256) + 1;
 function makeSnapshot(
 	o: {
 		packCount?: number;
+		packsOutsideMultiPackIndex?: number;
+		multiPackIndexEnabled?: boolean;
+		incrementalRepackAutoThreshold?: number;
 		packBytes?: number;
 		looseSampled?: number;
 		indexBytes?: number;
 		indexEntryCount?: number;
+		indexEntryCountType?: GitHealthSnapshot['indexEntryCountType'];
 		fsmonitor?: boolean;
 		untrackedCache?: boolean;
 		untrackedCacheConfigured?: boolean;
@@ -40,9 +45,28 @@ function makeSnapshot(
 		supportsMaintenanceRun?: boolean;
 		commitGraphPresent?: boolean;
 		multiPackIndex?: boolean;
+		looseRefs?: number;
+		looseRefsExact?: boolean;
+		refFormat?: GitHealthSnapshot['repository']['refFormat'];
+		supportsPackRefsMaintenance?: boolean;
+		sparseCheckout?: boolean;
+		sparseCheckoutCone?: boolean;
+		sparseIndex?: boolean;
+		splitIndex?: boolean;
+		repositoryShapeUnreadable?: boolean;
 	} = {},
 ): GitHealthSnapshot {
 	return {
+		repository: {
+			shallow: false,
+			partial: false,
+			sparseCheckout: o.repositoryShapeUnreadable ? undefined : (o.sparseCheckout ?? false),
+			sparseCheckoutCone: o.repositoryShapeUnreadable ? undefined : (o.sparseCheckoutCone ?? false),
+			sparseIndex: o.repositoryShapeUnreadable ? undefined : (o.sparseIndex ?? false),
+			splitIndex: o.repositoryShapeUnreadable ? undefined : (o.splitIndex ?? false),
+			refFormat: o.refFormat ?? 'files',
+		},
+		looseRefs: { count: o.looseRefs ?? 0, exact: o.looseRefsExact ?? true },
 		commitGraph: {
 			present: o.commitGraphPresent ?? true,
 			mtime: o.commitGraphPresent === false ? undefined : 1000,
@@ -52,13 +76,17 @@ function makeSnapshot(
 			readDisabled: false,
 		},
 		multiPackIndex: o.multiPackIndex ?? false,
+		multiPackIndexEnabled: o.multiPackIndexEnabled ?? true,
 		packCount: o.packCount ?? 1,
+		packsOutsideMultiPackIndex: o.packsOutsideMultiPackIndex ?? 0,
+		incrementalRepackAutoThreshold: o.incrementalRepackAutoThreshold ?? packsOutsideMultiPackIndexThreshold,
 		packBytes: o.packBytes ?? 1000,
 		looseObjects: { objectsInSampledDirs: o.looseSampled ?? 0, dirsSampled: 16 },
 		indexBytes: o.indexBytes ?? 1000,
 		// `undefined` unless a test opts in — keeps every existing proxy-based expectation exercising the
 		// fallback path exactly as before.
 		indexEntryCount: o.indexEntryCount,
+		indexEntryCountType: o.indexEntryCountType ?? (o.indexEntryCount == null ? 'unavailable' : 'full'),
 		config: {
 			fsmonitor: o.fsmonitor ?? false,
 			untrackedCache: o.untrackedCache ?? false,
@@ -74,9 +102,11 @@ function makeSnapshot(
 			fsmonitor: false,
 			manyFiles: false,
 			backgroundMaintenance: false,
+			sparseIndex: false,
 			...o.applied,
 		},
 		supportsMaintenanceRun: o.supportsMaintenanceRun ?? true,
+		supportsPackRefsMaintenance: o.supportsPackRefsMaintenance ?? true,
 	};
 }
 
@@ -86,6 +116,7 @@ function makeCapabilities(overrides?: Partial<Record<GitOptimizationId, boolean>
 		fsmonitor: true,
 		backgroundMaintenance: true,
 		manyFiles: true,
+		sparseIndex: true,
 		...overrides,
 	};
 	return (Object.keys(supported) as GitOptimizationId[]).map(id => ({ id: id, supported: supported[id] }));
@@ -95,6 +126,10 @@ function optimizationIds(findings: readonly GitHealthFinding[]): GitOptimization
 	return findings
 		.map(f => (f.action.kind === 'optimization' ? f.action.id : undefined))
 		.filter((id): id is GitOptimizationId => id != null);
+}
+
+function makeSlowness(category: keyof GitHealthSlowness, maxDurationMs = 3000, count = 1): GitHealthSlowness {
+	return { [category]: { count: count, lastAt: Date.now(), maxDurationMs: maxDurationMs } };
 }
 
 suite('gitHealth.estimateLooseObjects', () => {
@@ -141,7 +176,7 @@ suite('gitHealth.computeHealthReport — auto tier', () => {
 		const report = computeHealthReport(
 			makeSnapshot({
 				looseSampled: manyLooseSampled,
-				packCount: packCountThreshold,
+				packCount: packsOutsideMultiPackIndexThreshold,
 				supportsMaintenanceRun: false,
 			}),
 			undefined,
@@ -150,18 +185,95 @@ suite('gitHealth.computeHealthReport — auto tier', () => {
 		assert.deepStrictEqual(getAutoMaintenanceTasks(report), []);
 	});
 
-	test('recommends incremental-repack when the pack count exceeds the threshold', () => {
+	test("recommends incremental-repack when uncovered packs reach Git's auto threshold", () => {
 		const report = computeHealthReport(
-			makeSnapshot({ packCount: packCountThreshold }),
+			makeSnapshot({
+				packCount: 50,
+				packsOutsideMultiPackIndex: packsOutsideMultiPackIndexThreshold,
+			}),
 			undefined,
 			makeCapabilities(),
 		);
 		assert.deepStrictEqual(getAutoMaintenanceTasks(report), ['incremental-repack']);
 	});
 
+	test('does not recommend incremental-repack for packs already covered by the MIDX', () => {
+		const report = computeHealthReport(
+			makeSnapshot({ packCount: 50, multiPackIndex: true, packsOutsideMultiPackIndex: 0 }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(report), []);
+	});
+
+	test('honors MIDX opt-out and a custom incremental-repack auto threshold', () => {
+		const disabled = computeHealthReport(
+			makeSnapshot({
+				packCount: 50,
+				packsOutsideMultiPackIndex: 50,
+				multiPackIndexEnabled: false,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(disabled), []);
+
+		const belowCustomThreshold = computeHealthReport(
+			makeSnapshot({
+				packCount: 50,
+				packsOutsideMultiPackIndex: 20,
+				incrementalRepackAutoThreshold: 25,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(belowCustomThreshold), []);
+
+		const disabledAutoCondition = computeHealthReport(
+			makeSnapshot({
+				packCount: 50,
+				packsOutsideMultiPackIndex: 50,
+				incrementalRepackAutoThreshold: 0,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(disabledAutoCondition), []);
+	});
+
+	test('recommends pack-refs when the files backend has many loose refs', () => {
+		const report = computeHealthReport(
+			makeSnapshot({ looseRefs: looseRefsThreshold }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(report), ['pack-refs']);
+	});
+
+	test('does not recommend pack-refs for reftable or an unsupported maintenance task', () => {
+		const reftable = computeHealthReport(
+			makeSnapshot({ looseRefs: looseRefsThreshold, refFormat: 'reftable' }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(reftable), []);
+
+		const unsupported = computeHealthReport(
+			makeSnapshot({ looseRefs: looseRefsThreshold, supportsPackRefsMaintenance: false }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.deepStrictEqual(getAutoMaintenanceTasks(unsupported), []);
+	});
+
 	test('the auto tier never applies config levers, even on a large repo with every threshold crossed', () => {
 		const report = computeHealthReport(
-			makeSnapshot({ indexBytes: largeIndexBytes, packCount: packCountThreshold, packBytes: 2 * 1024 ** 3 }),
+			makeSnapshot({
+				indexBytes: largeIndexBytes,
+				packCount: packsOutsideMultiPackIndexThreshold,
+				packsOutsideMultiPackIndex: packsOutsideMultiPackIndexThreshold,
+				packBytes: 2 * 1024 ** 3,
+			}),
 			undefined,
 			makeCapabilities(),
 		);
@@ -181,6 +293,44 @@ suite('gitHealth.computeHealthReport — ask tier', () => {
 		assert.ok(ask.includes('fsmonitor'));
 		assert.ok(ask.includes('manyFiles'));
 		assert.ok(ask.includes('backgroundMaintenance'));
+	});
+
+	test('suggests sparse index only for a large cone-mode sparse checkout with a full index', () => {
+		const eligible = computeHealthReport(
+			makeSnapshot({
+				indexEntryCount: trackedFilesThreshold,
+				indexEntryCountType: 'full',
+				sparseCheckout: true,
+				sparseCheckoutCone: true,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.ok(optimizationIds(eligible.findings).includes('sparseIndex'));
+
+		const nonCone = computeHealthReport(
+			makeSnapshot({
+				indexEntryCount: trackedFilesThreshold,
+				indexEntryCountType: 'full',
+				sparseCheckout: true,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.strictEqual(optimizationIds(nonCone.findings).includes('sparseIndex'), false);
+
+		const alreadySparse = computeHealthReport(
+			makeSnapshot({
+				indexEntryCount: trackedFilesThreshold,
+				indexEntryCountType: 'sparse',
+				sparseCheckout: true,
+				sparseCheckoutCone: true,
+				sparseIndex: true,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.strictEqual(optimizationIds(alreadySparse.findings).includes('sparseIndex'), false);
 	});
 
 	test('does NOT suggest untracked cache when already enabled', () => {
@@ -219,6 +369,32 @@ suite('gitHealth.computeHealthReport — ask tier', () => {
 			makeCapabilities(),
 		);
 		assert.strictEqual(optimizationIds(report.findings).includes('untrackedCache'), false);
+	});
+
+	test('does NOT suggest manyFiles when the untracked cache previously failed the filesystem probe', () => {
+		// manyFiles defaults the untracked cache on, so a repo whose filesystem already failed that probe
+		// must not be offered manyFiles either.
+		const report = computeHealthReport(
+			makeSnapshot({ indexBytes: largeIndexBytes, untrackedCacheNotApplicable: true }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.strictEqual(optimizationIds(report.findings).includes('manyFiles'), false);
+	});
+
+	test('still suggests manyFiles when the user explicitly configured core.untrackedCache', () => {
+		// An explicit config value overrides the feature default, so the not-applicable probe result is moot.
+		const report = computeHealthReport(
+			makeSnapshot({
+				indexBytes: largeIndexBytes,
+				untrackedCache: false,
+				untrackedCacheConfigured: true,
+				untrackedCacheNotApplicable: true,
+			}),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.strictEqual(optimizationIds(report.findings).includes('manyFiles'), true);
 	});
 
 	test('does NOT suggest fsmonitor when previously marked not-applicable', () => {
@@ -269,15 +445,25 @@ suite('gitHealth.computeHealthReport — ask tier', () => {
 		assert.strictEqual(optimizationIds(report.findings).includes('backgroundMaintenance'), false);
 	});
 
-	test('slowness alone (on a small repo) suggests backgroundMaintenance with a slowness reason', () => {
-		const slowness: GitHealthSlowness = { count: 3, lastAt: Date.now(), maxDurationMs: 4200 };
+	test('worktree slowness targets worktree levers instead of background maintenance', () => {
+		const slowness = makeSlowness('worktree', 4200, 3);
 		const report = computeHealthReport(makeSnapshot(), slowness, makeCapabilities());
-		const bg = report.findings.find(
-			f => f.action.kind === 'optimization' && f.action.id === 'backgroundMaintenance',
-		);
-		assert.ok(bg != null);
-		assert.strictEqual(bg.reason, 'slowness');
-		assert.strictEqual(bg.value, 4200);
+		const worktree = report.findings.find(f => f.action.kind === 'optimization' && f.action.id === 'fsmonitor');
+		assert.ok(worktree != null);
+		assert.strictEqual(worktree.reason, 'worktreeSlowness');
+		assert.strictEqual(worktree.value, 4200);
+		assert.strictEqual(optimizationIds(report.findings).includes('backgroundMaintenance'), false);
+	});
+
+	test('history, ref, and object slowness do not manufacture unrelated optimization findings', () => {
+		for (const category of ['history', 'refs', 'objects'] as const) {
+			const report = computeHealthReport(makeSnapshot(), makeSlowness(category), makeCapabilities());
+			assert.deepStrictEqual(
+				optimizationIds(report.findings),
+				[],
+				`${category} slowness should wait for its measured cache or maintenance condition`,
+			);
+		}
 	});
 });
 
@@ -291,10 +477,18 @@ suite('gitHealth.isBannerEligible', () => {
 		assert.strictEqual(isBannerEligible(report, undefined), true);
 	});
 
-	test('fires when an ask-tier fix exists and slowness was observed', () => {
-		const slowness: GitHealthSlowness = { count: 1, lastAt: Date.now(), maxDurationMs: 3000 };
+	test('fires when a worktree-targeted fix exists and worktree slowness was observed', () => {
+		const slowness = makeSlowness('worktree');
 		const report = computeHealthReport(makeSnapshot(), slowness, makeCapabilities());
 		assert.strictEqual(isBannerEligible(report, slowness), true);
+	});
+
+	test('does not fire for history, ref, object, or commit-file slowness alone', () => {
+		for (const category of ['history', 'refs', 'objects', 'commitFiles'] as const) {
+			const slowness = makeSlowness(category);
+			const report = computeHealthReport(makeSnapshot(), slowness, makeCapabilities());
+			assert.strictEqual(isBannerEligible(report, slowness), false);
+		}
 	});
 
 	test('does not fire when there are no ask-tier fixes', () => {
@@ -314,12 +508,16 @@ suite('gitHealth.isBannerEligible', () => {
 					action: { kind: 'optimization' as const, id: 'fsmonitor' as const },
 				},
 			],
+			repository: makeSnapshot().repository,
 			clearlyLarge: false,
 			estimatedLooseObjects: 0,
 			estimatedTrackedFiles: 0,
 			trackedFilesExact: false,
+			trackedFilesScope: 'estimate' as const,
 			packCount: 0,
+			packsOutsideMultiPackIndex: 0,
 			packBytes: 0,
+			looseRefs: { count: 0, exact: true },
 			commitGraph: {
 				present: false,
 				mtime: undefined,
@@ -364,6 +562,45 @@ suite('gitHealth.computeLevers', () => {
 		assert.strictEqual(theirs.get('untrackedCache')?.status, 'userEnabled');
 	});
 
+	test('sparse-index ownership is distinct from a user-enabled sparse index', () => {
+		const mine = leversFor({ sparseIndex: true, applied: { sparseIndex: true } });
+		assert.strictEqual(mine.get('sparseIndex')?.status, 'applied');
+
+		const theirs = leversFor({ sparseIndex: true });
+		assert.strictEqual(theirs.get('sparseIndex')?.status, 'userEnabled');
+	});
+
+	test('sparse index explains worktree-shape applicability instead of reporting not needed', () => {
+		const regular = leversFor({}).get('sparseIndex');
+		assert.strictEqual(regular?.status, 'notApplicable');
+		assert.ok(regular.reason?.includes('not using sparse checkout'));
+
+		const nonCone = leversFor({ sparseCheckout: true }).get('sparseIndex');
+		assert.strictEqual(nonCone?.status, 'notApplicable');
+		assert.ok(nonCone.reason?.includes('cone-mode'));
+
+		const split = leversFor({
+			sparseCheckout: true,
+			sparseCheckoutCone: true,
+			splitIndex: true,
+			indexEntryCountType: 'split',
+		}).get('sparseIndex');
+		assert.strictEqual(split?.status, 'notApplicable');
+		assert.ok(split.reason?.includes('split index'));
+
+		const conflicted = leversFor({
+			sparseCheckout: true,
+			sparseCheckoutCone: true,
+			indexEntryCountType: 'conflicted',
+		}).get('sparseIndex');
+		assert.strictEqual(conflicted?.status, 'notApplicable');
+		assert.ok(conflicted.reason?.includes('merge or rebase'));
+
+		const unknown = leversFor({ repositoryShapeUnreadable: true }).get('sparseIndex');
+		assert.strictEqual(unknown?.status, 'unavailable');
+		assert.strictEqual(unknown.checkFailed, true);
+	});
+
 	test('an eligible lever on a large repo is suggested', () => {
 		const levers = leversFor({ indexBytes: largeIndexBytes });
 		assert.strictEqual(levers.get('fsmonitor')?.status, 'suggested');
@@ -372,6 +609,13 @@ suite('gitHealth.computeLevers', () => {
 	test('a repo that previously failed the probe is notApplicable, not suggested', () => {
 		const levers = leversFor({ indexBytes: largeIndexBytes, fsmonitorNotApplicable: true });
 		assert.strictEqual(levers.get('fsmonitor')?.status, 'notApplicable');
+	});
+
+	test('manyFiles is notApplicable when the untracked cache previously failed the probe', () => {
+		const levers = leversFor({ indexBytes: largeIndexBytes, untrackedCacheNotApplicable: true });
+		const lever = levers.get('manyFiles');
+		assert.strictEqual(lever?.status, 'notApplicable');
+		assert.ok(lever.reason?.includes('untracked cache'), 'reason names the untracked cache');
 	});
 
 	test('scheduled maintenance carries its undo caveat before the choice, not after', () => {
@@ -384,11 +628,24 @@ suite('gitHealth.computeLevers', () => {
 		assert.ok(lever.note?.includes('scheduler'), 'note names the scheduler');
 	});
 
-	test('a healthy repo reports levers as available, never unavailable', () => {
+	test('a supported capability caveat reaches the lever shown before apply', () => {
+		const capabilities = makeCapabilities();
+		const manyFiles = capabilities.find(c => c.id === 'manyFiles');
+		assert.ok(manyFiles != null);
+		const note = 'Git before 2.40 reports the index as corrupt during git fsck';
+		const withNote = capabilities.map(c => (c === manyFiles ? { ...c, note: note } : c));
+		const lever = leversFor({ indexBytes: largeIndexBytes }, withNote).get('manyFiles');
+
+		assert.strictEqual(lever?.note, note);
+	});
+
+	test('a healthy repo reports generally applicable levers as available, never unavailable', () => {
 		// A small repo produces no findings. Reporting its levers as "unavailable" would tell the user
 		// something false — they are perfectly usable, just not worth recommending.
 		const levers = leversFor({});
 		for (const lever of levers.values()) {
+			if (lever.id === 'sparseIndex') continue;
+
 			assert.strictEqual(lever.status, 'available', `${lever.id} is available`);
 			assert.strictEqual(lever.reason, undefined, `${lever.id} needs no reason`);
 		}
@@ -418,7 +675,7 @@ suite('gitHealth.computeLevers', () => {
 });
 
 suite('gitHealth.computeHealthReport — tracked-file count source', () => {
-	test('prefers the exact index-header count over the byte-size proxy', () => {
+	test('prefers a normal index-header count over the byte-size proxy', () => {
 		const report = computeHealthReport(
 			makeSnapshot({ indexBytes: 1000, indexEntryCount: 12345 }),
 			undefined,
@@ -426,6 +683,29 @@ suite('gitHealth.computeHealthReport — tracked-file count source', () => {
 		);
 		assert.strictEqual(report.estimatedTrackedFiles, 12345);
 		assert.strictEqual(report.trackedFilesExact, true);
+		assert.strictEqual(report.trackedFilesScope, 'repository');
+	});
+
+	test('uses a sparse-index header as a working-set count, never an exact repository count', () => {
+		const report = computeHealthReport(
+			makeSnapshot({ indexBytes: 1000, indexEntryCount: 123, indexEntryCountType: 'sparse' }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.strictEqual(report.estimatedTrackedFiles, 123);
+		assert.strictEqual(report.trackedFilesExact, false);
+		assert.strictEqual(report.trackedFilesScope, 'sparseWorkingTree');
+	});
+
+	test('does not trust the mutable-layer header of a split index', () => {
+		const report = computeHealthReport(
+			makeSnapshot({ indexBytes: 8000, indexEntryCount: 999999, indexEntryCountType: 'split' }),
+			undefined,
+			makeCapabilities(),
+		);
+		assert.strictEqual(report.estimatedTrackedFiles, estimateTrackedFiles(8000));
+		assert.strictEqual(report.trackedFilesExact, false);
+		assert.strictEqual(report.trackedFilesScope, 'estimate');
 	});
 
 	test('falls back to the index-bytes proxy when the header count is unavailable', () => {
@@ -436,6 +716,7 @@ suite('gitHealth.computeHealthReport — tracked-file count source', () => {
 		);
 		assert.strictEqual(report.estimatedTrackedFiles, estimateTrackedFiles(largeIndexBytes));
 		assert.strictEqual(report.trackedFilesExact, false);
+		assert.strictEqual(report.trackedFilesScope, 'estimate');
 	});
 });
 
@@ -466,25 +747,26 @@ suite('gitHealth.computeHealthReport — backgroundMaintenance evidence priority
 		assert.strictEqual(bg.reason, 'trackedFiles');
 	});
 
-	test('slowness still wins over both when the repo is not clearly large', () => {
-		const slowness: GitHealthSlowness = { count: 1, lastAt: Date.now(), maxDurationMs: 3000 };
-		const report = computeHealthReport(makeSnapshot(), slowness, makeCapabilities());
-		const bg = report.findings.find(
-			f => f.action.kind === 'optimization' && f.action.id === 'backgroundMaintenance',
-		);
-		assert.ok(bg != null);
-		assert.strictEqual(bg.reason, 'slowness');
+	test('worktree slowness does not suggest scheduled maintenance for a small repository', () => {
+		const report = computeHealthReport(makeSnapshot(), makeSlowness('worktree'), makeCapabilities());
+		assert.strictEqual(optimizationIds(report.findings).includes('backgroundMaintenance'), false);
 	});
 });
 
 suite('gitHealth.computeHealthReport — snapshot pass-through', () => {
-	test('report passes through packCount, packBytes, and commitGraph from the snapshot', () => {
+	test('report passes through pack measurements and commitGraph from the snapshot', () => {
 		const report = computeHealthReport(
-			makeSnapshot({ packCount: 7, packBytes: 12345, commitGraphPresent: false }),
+			makeSnapshot({
+				packCount: 7,
+				packsOutsideMultiPackIndex: 3,
+				packBytes: 12345,
+				commitGraphPresent: false,
+			}),
 			undefined,
 			makeCapabilities(),
 		);
 		assert.strictEqual(report.packCount, 7);
+		assert.strictEqual(report.packsOutsideMultiPackIndex, 3);
 		assert.strictEqual(report.packBytes, 12345);
 		assert.deepStrictEqual(report.commitGraph, {
 			present: false,

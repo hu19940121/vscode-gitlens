@@ -16,38 +16,24 @@ jobs:
         timeout-minutes: 10
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
 
             - name: Calc tools versions
               id: tools-versions
               run: |
                   NODE_VERSION=$(jq -r '.engines.node | gsub("[^0-9.]"; "")' package.json)
-                  PNPM_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
                   echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
-                  echo "pnpm-version=$PNPM_VERSION" >> $GITHUB_OUTPUT
 
             - name: Setup Node.js
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v7
               with:
                   node-version: ${{ steps.tools-versions.outputs.node-version }}
 
-            - name: Install pnpm
-              uses: pnpm/action-setup@v4
+            - name: Setup pnpm
+              uses: pnpm/setup@v2
               with:
-                  version: ${{ steps.tools-versions.outputs.pnpm-version }}
-
-            - name: Get pnpm store directory
-              shell: bash
-              run: |
-                  echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-            - name: Setup pnpm cache
-              uses: actions/cache@v4
-              with:
-                  path: ${{ env.STORE_PATH }}
-                  key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-                  restore-keys: |
-                      ${{ runner.os }}-pnpm-store-
+                  install: false
+                  cache: true
 
             - name: Install dependencies
               run: pnpm install --frozen-lockfile
@@ -55,8 +41,29 @@ jobs:
             - name: Check formatting
               run: pnpm run fmt:check
 
+            # `--stats` writes out/webviews-stats.json from this same compilation (assets + entrypoints
+            # only, no analyzer instrumentation, no forced source maps), so the bundle budget below
+            # measures the exact bundle GitLens ships instead of a separate analyzer-only build.
             - name: Build (production)
-              run: pnpm run bundle
+              run: pnpm run bundle:stats
+
+            # The production build above emits the authoritative webpack stats. Reuse them here so the
+            # bundle budget doesn't compile the webviews a second time.
+            - name: Check graph production bundle size
+              run: pnpm run benchmark:graph:bundle:check
+
+            # Upload on both pass and fail (skip only on cancel) so the measurement is available to inspect
+            # even when the budget check fails on an over-budget bundle. `ignore` (not `error`) on a missing
+            # file so a check that fails before writing the file surfaces its own error, not an unrelated
+            # "no files found" from this step.
+            - name: Upload graph bundle measurements
+              if: ${{ !cancelled() }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: graph-bundle-performance
+                  path: out/perf/graph-bundle.json
+                  retention-days: 14
+                  if-no-files-found: ignore
 
             - name: Verify generated files are current
               run: git diff --exit-code -- ThirdPartyNotices.txt docs/telemetry-events.md
@@ -68,41 +75,39 @@ jobs:
         timeout-minutes: 15
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
 
             - name: Calc tools versions
               id: tools-versions
               run: |
                   NODE_VERSION=$(jq -r '.engines.node | gsub("[^0-9.]"; "")' package.json)
-                  PNPM_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
                   echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
-                  echo "pnpm-version=$PNPM_VERSION" >> $GITHUB_OUTPUT
 
             - name: Setup Node.js
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v7
               with:
                   node-version: ${{ steps.tools-versions.outputs.node-version }}
 
-            - name: Install pnpm
-              uses: pnpm/action-setup@v4
+            - name: Setup pnpm
+              uses: pnpm/setup@v2
               with:
-                  version: ${{ steps.tools-versions.outputs.pnpm-version }}
-
-            - name: Get pnpm store directory
-              shell: bash
-              run: |
-                  echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-            - name: Setup pnpm cache
-              uses: actions/cache@v4
-              with:
-                  path: ${{ env.STORE_PATH }}
-                  key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-                  restore-keys: |
-                      ${{ runner.os }}-pnpm-store-
+                  install: false
+                  cache: true
 
             - name: Install dependencies
               run: pnpm install --frozen-lockfile
+
+            - name: Build packages
+              run: pnpm run build:packages
+
+            - name: Lint graph package CSS
+              run: pnpm run lint:css:graph-packages
+
+            - name: Run package unit tests
+              run: pnpm run test:packages
+
+            - name: Build test files
+              run: pnpm run build:tests
 
             - name: Run unit tests
               run: xvfb-run -a pnpm run test
@@ -111,6 +116,25 @@ jobs:
             # here so the provider suites that exercise actual git behavior still gate CI.
             - name: Run integration tests
               run: pnpm --filter ./packages/git-cli run test:integration
+
+            # The package tests are bundled by esbuild, so they resolve CommonJS dependencies through a
+            # bundler's interop and never exercise Node's. Bundle and load the published tree the way an
+            # external Node ESM consumer does, so an import that only a bundler can link fails here rather
+            # than in a consumer.
+            - name: Bundle core package
+              run: pnpm --filter @gitkraken/core-gitlens run build
+
+            - name: Verify core package loads under Node ESM
+              run: pnpm --filter @gitkraken/core-gitlens run verify:esm
+
+            - name: Verify packed core package as an external consumer
+              run: pnpm --filter @gitkraken/core-gitlens run verify:package
+
+            - name: Build graph packages
+              run: pnpm run build:graph-packages
+
+            - name: Verify packed graph packages as external consumers
+              run: pnpm run verify:graph-packages
 
     derive-matrix:
         name: Derive editor matrix
@@ -121,7 +145,7 @@ jobs:
             editors: ${{ steps.gen.outputs.editors }}
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
 
             - name: Calc tools versions
               id: tools-versions
@@ -130,7 +154,7 @@ jobs:
                   echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
 
             - name: Setup Node.js
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v7
               with:
                   node-version: ${{ steps.tools-versions.outputs.node-version }}
 
@@ -165,38 +189,24 @@ jobs:
                 editor: ${{ fromJSON(needs.derive-matrix.outputs.editors) }}
         steps:
             - name: Checkout
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
 
             - name: Calc tools versions
               id: tools-versions
               run: |
                   NODE_VERSION=$(jq -r '.engines.node | gsub("[^0-9.]"; "")' package.json)
-                  PNPM_VERSION=$(jq -r '.packageManager | split("@")[1]' package.json)
                   echo "node-version=$NODE_VERSION" >> $GITHUB_OUTPUT
-                  echo "pnpm-version=$PNPM_VERSION" >> $GITHUB_OUTPUT
 
             - name: Setup Node.js
-              uses: actions/setup-node@v4
+              uses: actions/setup-node@v7
               with:
                   node-version: ${{ steps.tools-versions.outputs.node-version }}
 
-            - name: Install pnpm
-              uses: pnpm/action-setup@v4
+            - name: Setup pnpm
+              uses: pnpm/setup@v2
               with:
-                  version: ${{ steps.tools-versions.outputs.pnpm-version }}
-
-            - name: Get pnpm store directory
-              shell: bash
-              run: |
-                  echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
-
-            - name: Setup pnpm cache
-              uses: actions/cache@v4
-              with:
-                  path: ${{ env.STORE_PATH }}
-                  key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-                  restore-keys: |
-                      ${{ runner.os }}-pnpm-store-
+                  install: false
+                  cache: true
 
             - name: Install dependencies
               run: pnpm install --frozen-lockfile
@@ -282,12 +292,20 @@ jobs:
                   pnpm exec playwright test -c tests/e2e/playwright.config.ts
                   --project=${{ matrix.editor.id }} --workers=${{ matrix.editor.ciWorkers || 4 }}
 
+            # The frame/heap benchmark is deliberately excluded from the default functional suite. Run it
+            # serially and repeatedly in the canonical VS Code leg so its measurements remain comparable.
+            - name: Run graph browser performance benchmark
+              if: ${{ matrix.editor.id == 'vscode' }}
+              run: >
+                  xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x16"
+                  pnpm run benchmark:graph:browser
+
             # Upload on both pass and fail (skip only on cancel) so results/report are available to
             # inspect even when the job is green — flaky-retry traces (trace: on-first-retry) land in
             # out/test-results/ but would be dropped by an `if: failure()` gate on a passing run.
             - name: Upload test results
               if: ${{ !cancelled() }}
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: playwright-results-${{ matrix.editor.id }}
                   path: out/test-results/
@@ -296,9 +314,18 @@ jobs:
 
             - name: Upload Playwright report
               if: ${{ !cancelled() }}
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: playwright-report-${{ matrix.editor.id }}
                   path: playwright-report/
                   retention-days: 7
+                  if-no-files-found: ignore
+
+            - name: Upload graph performance measurements
+              if: ${{ !cancelled() && matrix.editor.id == 'vscode' }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: graph-browser-performance-${{ matrix.editor.id }}
+                  path: out/perf/commit-graph-browser-*.json
+                  retention-days: 14
                   if-no-files-found: ignore

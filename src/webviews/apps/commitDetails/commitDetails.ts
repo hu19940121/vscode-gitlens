@@ -1,7 +1,8 @@
 import './commitDetails.scss';
-import type { Remote } from '@eamodio/supertalk';
+import type { Remote, Subscription } from '@eamodio/supertalk';
+import * as l10n from '@vscode/l10n';
 import { html } from 'lit';
-import { customElement, property } from 'lit/decorators.js';
+import { customElement } from 'lit/decorators.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import type { StashApplyCommandArgs } from '../../../commands/stashApply.js';
 import type { ViewFilesLayout } from '../../../config.js';
@@ -42,9 +43,6 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 		return this;
 	}
 
-	@property({ type: String, noAccessor: true })
-	private context!: string;
-
 	// ── Host abstraction ──
 	private _host = getHost();
 
@@ -56,7 +54,7 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 	/**
 	 * RPC controller — manages connection lifecycle via Lit's ReactiveController pattern.
 	 */
-	private _rpc = new RpcController<CommitDetailsServices>(this, {
+	protected override readonly _rpc = new RpcController<CommitDetailsServices>(this, {
 		rpcOptions: { endpoint: () => this._host.createEndpoint() },
 		onReady: services => this._onRpcReady(services),
 		onError: error => this._state.error.set(error.message),
@@ -73,9 +71,10 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 	private _resources?: CommitDetailsResources;
 
 	/**
-	 * Unsubscribe function for event subscriptions.
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
 	 */
-	private _unsubscribeEvents?: () => void;
+	private _eventsSubscription?: Subscription;
 
 	/**
 	 * Stop auto-persistence — returned by startAutoPersist().
@@ -85,15 +84,16 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
-		this.context = undefined!;
-		this.initWebviewContext(context);
+		this.consumeContext();
 	}
 
 	override disconnectedCallback(): void {
-		// Unsubscribe RPC event callbacks (before RPC connection is disposed)
-		this._unsubscribeEvents?.();
-		this._unsubscribeEvents = undefined;
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 
 		// Stop auto-persistence
 		this._stopAutoPersist?.();
@@ -116,7 +116,7 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 		this._state.resetAll();
 
 		// GlWebviewApp: cleans up focus tracker, disposes ipc/promos/telemetry/DOM listeners
-		// Lit framework: calls RpcController.hostDisconnected() → disposes RPC connection
+		// Lit framework: calls RpcController.hostDisconnected() → ends the RPC session (the connection lives on)
 		super.disconnectedCallback?.();
 	}
 
@@ -161,6 +161,9 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 			services.telemetry,
 		]);
 
+		// Promo cache invalidation — the surface renders promos via `gl-feature-badge`.
+		this._promos.connect(this._rpc.connection!);
+
 		// Supertalk remote proxy properties are thenable at runtime (ProxyProperty with .then()),
 		// but Remote<T> types them as synchronous values. The lint rule correctly detects the
 		// thenable; the disable is required — this is how Supertalk property access works.
@@ -190,11 +193,11 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 				try {
 					const result = await inspect.explainCommit(commit.repoPath, commit.sha, prompt, signal);
 					if (result.error) {
-						return { error: { message: result.error.message ?? 'Error retrieving content' } };
+						return { error: { message: result.error.message ?? l10n.t('Error retrieving content') } };
 					}
 					return { result: result.result };
 				} catch (_ex) {
-					return { error: { message: 'Error retrieving content' } };
+					return { error: { message: l10n.t('Error retrieving content') } };
 				}
 			}),
 		};
@@ -226,12 +229,16 @@ export class GlCommitDetailsApp extends SignalWatcherWebviewApp {
 		// Set up DOM event listeners (needs actions to be initialized)
 		this.setupDomListeners();
 
-		// Set up event subscriptions FIRST (so we don't miss events during fetch)
-		this._unsubscribeEvents = await setupSubscriptions(
-			s,
-			{ inspect: inspect, repositories: repositories, config: config, integrations: integrations, ai: ai },
-			this._actions,
-		);
+		// Set up event subscriptions FIRST (so we don't miss events during fetch) — synchronous:
+		// `subscribe()` buffers the wire subscribe until the connection's handshake completes.
+		// Recreated per ready (not `??=`): the subscriber closes over this session's actions, and a
+		// reconnect recreates those — a kept first-session subscription would replay events into
+		// disposed objects. Unsubscribing also cancels the old subscription's own resubscription.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = setupSubscriptions(this._rpc.connection!, s, this._actions);
+		// Wait for the subscriptions to land before the initial fetch below, preserving the
+		// subscribe-before-fetch guarantee (`ready` settles once, so reconnects don't re-wait).
+		await this._eventsSubscription.ready;
 
 		// Fetch initial state via individual parallel calls (replaces legacy getState())
 		await this._actions.fetchInitialState();

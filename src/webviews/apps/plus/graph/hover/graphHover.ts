@@ -1,18 +1,19 @@
 import { css, html } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { until } from 'lit/directives/until.js';
+import { GlElement } from '@gitlens/components/components/element.js';
+import type { GlPopover } from '@gitlens/components/components/overlays/popover.js';
+import { ModifierKeysController } from '@gitlens/components/controllers/modifierKeys.js';
 import type { GitGraphRow } from '@gitlens/git/models/graph.js';
 import type { Deferrable } from '@gitlens/utils/debounce.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import type { Disposable } from '@gitlens/utils/disposable.js';
 import type { OverlayEntry } from '@gitlens/utils/keys/keybinding.js';
+import { LruMap } from '@gitlens/utils/lruMap.js';
 import { getSettledValue, isPromise } from '@gitlens/utils/promise.js';
 import type { DidGetRowHoverParams } from '../../../../plus/graph/protocol.js';
-import { GlElement } from '../../../shared/components/element.js';
-import type { GlPopover } from '../../../shared/components/overlays/popover.js';
-import { ModifierKeysController } from '../../../shared/controllers/modifier-keys.js';
 import '../../../shared/components/markdown/markdown.js';
-import '../../../shared/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/popover.js';
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -75,10 +76,12 @@ export class GlGraphHover extends GlElement {
 	@query('gl-popover')
 	popup!: GlPopover;
 
-	private hoverMarkdownCache = new Map<
+	// Bounded so a long session (paging across thousands of rows) can't grow it without limit; the
+	// 32-entry cap matches the graph's SHA-keyed commit-enrichment cache.
+	private readonly hoverMarkdownCache = new LruMap<
 		string,
 		Promise<PromiseSettledResult<string>> | PromiseSettledResult<string> | string
-	>();
+	>(32);
 	private shaHovering: string | undefined;
 	private unhoverTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -86,7 +89,7 @@ export class GlGraphHover extends GlElement {
 	// A card opened from the keyboard (`i` / `mod+I`) is PINNED: no pointer is inside it, so every
 	// pointer-driven close path (row exit, parent/popover mouseleave, the row under a scroll changing) must
 	// leave it alone. It closes on Esc (the overlay stack, pushed by `showCore` like any card), a second `i`,
-	// focus leaving the graph, or its anchor row being virtualized away — all driven by `gl-lit-graph`.
+	// focus leaving the graph, or its anchor row being virtualized away — all driven by `gl-commit-graph`.
 	// TODO: focus never moves INTO the card, so its links/actions stay keyboard-unreachable; reaching them
 	// needs a focus trap plus a way back out to the row (the card content is markdown, so also a tab order).
 	private _peeked = false;
@@ -96,7 +99,7 @@ export class GlGraphHover extends GlElement {
 	 *  the `gl-graph-hoverpeekclosed` event is only for closes the graph can't see (Esc's overlay pop). */
 	private _suppressPeekClosedEvent = false;
 
-	// Shared modifier-key tracker — the same source of Ctrl/Alt truth `gl-lit-graph` uses for the modifier-
+	// Shared modifier-key tracker — the same source of Ctrl/Alt truth `gl-commit-graph` uses for the modifier-
 	// hold lane dim. A bare window keydown/keyup pair wouldn't do: those only fire when the webview iframe
 	// has keyboard focus, and hovering the graph never grants it. The tracker also reads the modifiers off
 	// pointer events, so a hold registers even while the graph is unfocused.
@@ -146,42 +149,17 @@ export class GlGraphHover extends GlElement {
 			.skidding=${this.skidding}
 			.placement=${this.placement}
 			trigger="manual"
-			@sl-reposition=${this.onReposition}
 		>
 			<div slot="content">
-				<gl-markdown .markdown=${until(this.markdown ?? 'Loading...', 'Loading...')}></gl-markdown>
+				<gl-markdown
+					avatar-column
+					.markdown=${until(this.markdown ?? 'Loading...', 'Loading...')}
+				></gl-markdown>
 			</div>
 		</gl-popover>`;
 	}
 
-	private previousSkidding: number | undefined;
-	private recalculated = false;
-
-	private onReposition() {
-		if (this.skidding == null || (this.placement !== `bottom-start` && this.placement !== `top-start`)) {
-			return;
-		}
-
-		switch (this.popup?.currentPlacement) {
-			case 'bottom-end':
-			case 'top-end':
-				if (!this.recalculated && this.previousSkidding == null) {
-					this.previousSkidding = this.skidding;
-					this.skidding = -this.skidding * 5;
-					this.recalculated = true;
-				}
-				break;
-			default:
-				if (this.previousSkidding != null) {
-					this.skidding = this.previousSkidding;
-					this.previousSkidding = undefined;
-				}
-				break;
-		}
-	}
-
 	reset(): void {
-		this.recalculated = false;
 		this.hoverMarkdownCache.clear();
 	}
 
@@ -287,7 +265,7 @@ export class GlGraphHover extends GlElement {
 	}
 
 	/** Moves an open peek onto the newly focused row. No-op (returns `false`) unless a peek is showing —
-	 *  which is also how `gl-lit-graph` learns the card went away behind its back (Esc, pointer takeover). */
+	 *  which is also how `gl-commit-graph` learns the card went away behind its back (Esc, pointer takeover). */
 	repeek(row: GitGraphRow, anchor: Anchor): boolean {
 		if (!this._peeked || !this.open) return false;
 
@@ -350,7 +328,6 @@ export class GlGraphHover extends GlElement {
 		// Pinned: there was never a pointer in the card to leave it.
 		if (this._peeked) return;
 
-		this.recalculated = false;
 		this.resetUnhoverTimer();
 		this._showCoreDebounced?.cancel();
 

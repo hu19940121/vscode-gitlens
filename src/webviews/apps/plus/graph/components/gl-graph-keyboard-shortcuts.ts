@@ -1,12 +1,15 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { getAltKeySymbol, getCmdKeySymbol, getShiftKeySymbol, isMac } from '@env/platform.js';
+import { scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { Disposable } from '@gitlens/utils/disposable.js';
 import type { ChordSymbols } from '@gitlens/utils/keys/chord.js';
 import { formatChordParts, parseChord } from '@gitlens/utils/keys/chord.js';
-import { scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
-import type { KeymapDispatcher, KeymapSheetRow } from '../../../shared/keymap/keymapDispatcher.js';
-import '../../../shared/components/code-icon.js';
+import type { SheetDisplayText } from '@gitlens/utils/keys/keybinding.js';
+import type { KeymapDispatcher, KeymapSheetRow } from '@gitlens/utils/keys/keymapDispatcher.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/overlays/dialog.js';
 
 // Platform-aware modifier symbols, matching how `parseChord`/`formatChordParts` resolve `mod` (`meta`
@@ -28,12 +31,12 @@ type SheetGroup = 'navigation' | 'selection' | 'folding' | 'goto' | 'panels' | '
 const groupOrder: readonly SheetGroup[] = ['navigation', 'selection', 'folding', 'goto', 'panels', 'search'];
 
 const groupTitles: Record<SheetGroup, string> = {
-	navigation: 'Navigation',
-	selection: 'Selection',
-	folding: 'Folding',
-	goto: 'Go to',
-	panels: 'Panels',
-	search: 'Search',
+	navigation: l10n.t('Navigation'),
+	selection: l10n.t('Selection'),
+	folding: l10n.t('Folding'),
+	goto: l10n.t('Go to'),
+	panels: l10n.t('Panels'),
+	search: l10n.t('Search'),
 };
 
 // Bindings that live outside the keymap registry entirely — owned by chrome elements (the search box,
@@ -42,25 +45,31 @@ const groupTitles: Record<SheetGroup, string> = {
 // binding's `sheet` metadata, NOT here — only add a row here when there's truly no binding to attach
 // it to.
 const residualRows: readonly KeymapSheetRow[] = [
-	{ group: 'navigation', label: "Focus the commit's refs & actions", order: 7, keys: ['Tab'] },
+	{ group: 'navigation', label: l10n.t("Focus the commit's refs & actions"), order: 7, keys: ['Tab'] },
 	{
 		group: 'selection',
-		label: 'Extend the selection',
+		label: l10n.t('Extend the selection'),
 		order: 1,
 		// Not a chord: Shift is declared on each movement binding rather than bound on its own, so
 		// the rail spells "Shift + nav" out of literals.
-		keys: [`mod:${chordSymbols.shift}`, `sep:${chordSeparator}`, 'text:nav'],
+		keys: [`mod:${chordSymbols.shift}`, `sep:${chordSeparator}`, `text:${l10n.t('nav')}`],
 	},
-	{ group: 'search', label: 'Next match', order: 3, keys: isMac ? ['F3', 'mod+KeyG'] : ['F3'] },
-	{ group: 'search', label: 'Previous match', order: 4, keys: ['shift+F3'] },
-	{ group: 'footer', label: 'closes the topmost', order: 1, keys: ['Escape'] },
+	{ group: 'search', label: l10n.t('Next match'), order: 3, keys: isMac ? ['F3', 'mod+KeyG'] : ['F3'] },
+	{ group: 'search', label: l10n.t('Previous match'), order: 4, keys: ['shift+F3'] },
+	{ group: 'footer', label: l10n.t('{keys} closes the topmost'), order: 1, keys: ['Escape'] },
 	{
 		group: 'footer',
-		label: 'to highlight the lane',
+		label: l10n.t('Hold {ctrl} or {alt} to highlight the lane'),
 		order: 3,
-		keys: ['text:Hold ', 'raw:Ctrl', 'text: or ', 'raw:Alt'],
+		keys: ['raw:Ctrl', 'raw:Alt'],
 	},
 ];
+
+/** Builds a `command:` URI that opens VS Code's Settings UI. `@id:<id>` jumps straight to one setting;
+ *  a bare query (no `@id:` prefix) runs a search, which is what surfaces BOTH shortcut settings at once. */
+function settingsHref(query: string): string {
+	return `command:workbench.action.openSettings?${encodeURIComponent(JSON.stringify(query))}`;
+}
 
 @customElement('gl-graph-keyboard-shortcuts')
 export class GlGraphKeyboardShortcuts extends LitElement {
@@ -72,7 +81,7 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 			}
 
 			/* Scoped to [open]: an unconditional display on the part would override the UA's
-	   dialog:not([open]) { display: none } and paint the closed sheet inline under the graph. */
+dialog:not([open]) { display: none } and paint the closed sheet inline under the graph. */
 			.shortcuts-dialog[open]::part(base) {
 				display: flex;
 				flex-direction: column;
@@ -80,14 +89,17 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 
 			.shortcuts-dialog::part(base) {
 				/* gl-dialog's own styles don't set box-sizing, so without it here width/max-width
-		   size the CONTENT box only — the dialog's padding then pushes the actual box past
-		   the max-width at narrow widths. */
+ size the CONTENT box only — the dialog's padding then pushes the actual box past
+ the max-width at narrow widths. */
 				box-sizing: border-box;
 				width: 104rem;
+				/* gl-dialog floors its box at 40rem — wider than the graph's side bar view — so the floor
+ has to be lifted here or the sheet overflows off-canvas there. */
+				min-width: 0;
 				max-width: 96vw;
 				max-height: 92vh;
 				/* Sections own their own padding (the title bar and footer rules need to sit flush
-		   against the dialog edge), so the dialog contributes none. */
+ against the dialog edge), so the dialog contributes none. */
 				padding: 0;
 				overflow: hidden;
 			}
@@ -98,8 +110,8 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 				flex-direction: column;
 				min-height: 0;
 				/* The column count responds to the DIALOG's width, not the viewport's — the graph can
-		   be docked into a narrow panel while the window stays wide. Sized by the dialog above,
-		   so inline-size containment has nothing to circularly resolve. */
+ be docked into a narrow panel while the window stays wide. Sized by the dialog above,
+ so inline-size containment has nothing to circularly resolve. */
 				container-type: inline-size;
 			}
 
@@ -140,7 +152,7 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 			}
 
 			/* Caps how tall the sheet gets before it scrolls internally; flex + min-height let it give
-	   back below that cap when the dialog itself is height-capped by a short viewport. */
+back below that cap when the dialog itself is height-capped by a short viewport. */
 			.scrollwrap {
 				flex: 1;
 				min-height: 0;
@@ -149,9 +161,9 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 			}
 
 			.body {
+				columns: 3;
 				column-gap: 3.2rem;
 				padding: 1.8rem 2rem 1.4rem;
-				columns: 3;
 			}
 
 			@container (max-width: 88rem) {
@@ -201,7 +213,7 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 			}
 
 			/* Secondary key sequences get their own line under the label — inline text is for short
-	   qualifiers only. */
+qualifiers only. */
 			.subline {
 				display: block;
 				margin-top: 0.15rem;
@@ -234,12 +246,6 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 				border-radius: var(--gl-radius-sm);
 			}
 
-			/* Modifiers read as hollow so the eye lands on the key that actually names the shortcut. */
-			kbd.mod {
-				color: var(--color-foreground--65, var(--vscode-descriptionForeground));
-				background-color: transparent;
-			}
-
 			.sep {
 				margin: 0 0.12rem;
 				font-size: 1rem;
@@ -266,6 +272,24 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 
 			.footrow kbd {
 				font-size: 0.95rem;
+			}
+
+			/* Pushed to the far end of the (otherwise centered) footrow — the auto margin absorbs the
+			free space on its left, leaving the other footrow entries centered among themselves. */
+			.footrow .customize {
+				margin-left: auto;
+				color: inherit;
+				text-decoration: underline;
+				text-underline-offset: 0.15rem;
+			}
+
+			.footrow .customize:hover {
+				color: var(--vscode-textLink-foreground);
+			}
+
+			.footrow .customize:focus-visible {
+				outline: var(--gl-border-width) solid var(--color-focus-border);
+				outline-offset: 0.2rem;
 			}
 		`,
 	];
@@ -305,8 +329,17 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 	}
 
 	override render(): unknown {
+		// `sheetEntries()` reflects the effective (user-overridden) bindings. Fixed (id-less) rows are
+		// never dropped by an override, so there's always at least the fixed navigation rows to show —
+		// no "everything disabled" empty state is reachable.
+		const registryRows = this.keymap?.sheetEntries() ?? [];
+
+		// Every row — registry AND residual, footer included — goes into `grouped`; the body only
+		// renders the groups in `groupOrder` (which excludes `footer`), and the footer strip below
+		// pulls its own rows back out of the same map, so `?`'s registry row ends up alongside the
+		// residual footer rows instead of being dropped.
 		const grouped = new Map<string, KeymapSheetRow[]>();
-		for (const row of [...(this.keymap?.sheetEntries() ?? []), ...residualRows]) {
+		for (const row of [...registryRows, ...residualRows]) {
 			let list = grouped.get(row.group);
 			if (list == null) {
 				list = [];
@@ -320,18 +353,20 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 			list.sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
 		}
 
+		const footerRows = grouped.get('footer') ?? [];
+
 		return html`<gl-dialog
 			class="shortcuts-dialog"
 			modal
 			closedby="any"
-			label="Keyboard Shortcuts"
+			label=${l10n.t('Keyboard Shortcuts')}
 			?open=${this.open}
 			@gl-dialog-close=${this.close}
 		>
 			<div class="container">
 				<header class="titlebar">
-					<h2><code-icon icon="keyboard"></code-icon> Keyboard Shortcuts</h2>
-					<button class="close" type="button" aria-label="Close" @click=${this.close}>
+					<h2><code-icon icon="keyboard"></code-icon> ${l10n.t('Keyboard Shortcuts')}</h2>
+					<button class="close" type="button" aria-label=${l10n.t('Close')} @click=${this.close}>
 						<code-icon icon="close"></code-icon>
 					</button>
 				</header>
@@ -343,9 +378,17 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 					</div>
 				</div>
 				<div class="footrow">
-					${(grouped.get('footer') ?? []).map(
-						row => html`<span>${this.renderEntries(row.keys, false)} ${row.label}</span>`,
+					${footerRows.map(
+						row =>
+							html`<span
+								>${localizedContent(row.label, {
+									keys: this.renderEntries(row.keys, false),
+									ctrl: this.renderEntry('raw:Ctrl'),
+									alt: this.renderEntry('raw:Alt'),
+								})}</span
+							>`,
 					)}
+					<a class="customize" href=${settingsHref('gitlens.graph.shortcuts')}>${l10n.t('Customize…')}</a>
 				</div>
 			</div>
 		</gl-dialog>`;
@@ -355,18 +398,38 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 		return html`<section class="group">
 			<h3>${groupTitles[group]}</h3>
 			${rows.map(
-				row => html`<div class="row">
+				row => html`<div class="row" title=${this.rowTooltip(row.ids)}>
 					<span class="keys">${this.renderEntries(row.keys, true)}</span>
 					<span class="label"
 						>${row.label}${
-							row.subline != null
-								? html`<span class="subline">${this.renderEntries(row.subline, false)}</span>`
+							row.sublineText != null || row.subline != null
+								? html`<span class="subline"
+										>${row.sublineText != null ? this.renderSubline(row.sublineText) : this.renderEntries(row.subline!, false)}</span
+									>`
 								: nothing
 						}</span
 					>
 				</div>`,
 			)}
 		</section>`;
+	}
+
+	/** A row's tooltip names the binding id(s) a user overrides against — absent for fixed (id-less)
+	 *  rows and residual rows, which aren't customizable. */
+	private rowTooltip(ids: readonly string[] | undefined): string | typeof nothing {
+		if (ids == null || ids.length === 0) return nothing;
+		if (ids.length === 1) return l10n.t('Shortcut id: {id}', { id: ids[0] });
+
+		return l10n.t('Shortcut ids: {ids}', { ids: ids.join(', ') });
+	}
+
+	private renderSubline(subline: SheetDisplayText): unknown {
+		const keys = Object.fromEntries(
+			Object.entries(subline.keys).map(([name, entries]) => [name, this.renderEntries(entries, false)]),
+		);
+		return localizedContent(subline.message, keys).map(part =>
+			typeof part === 'string' ? html`<span class="text">${part}</span>` : part,
+		);
 	}
 
 	/** Renders a display-entry list. `spaced` puts a space between adjacent chips — what the keys rail
@@ -385,7 +448,7 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 	private renderEntry(entry: string): unknown {
 		if (entry.startsWith('raw:')) return html`<kbd>${entry.slice('raw:'.length)}</kbd>`;
 
-		if (entry.startsWith('mod:')) return html`<kbd class="mod">${entry.slice('mod:'.length)}</kbd>`;
+		if (entry.startsWith('mod:')) return html`<kbd>${entry.slice('mod:'.length)}</kbd>`;
 
 		if (entry.startsWith('text:')) return html`<span class="text">${entry.slice('text:'.length)}</span>`;
 
@@ -399,7 +462,6 @@ export class GlGraphKeyboardShortcuts extends LitElement {
 		return parts.map(
 			(part, i) =>
 				html`${i > 0 && chordSeparator ? html`<span class="sep">${chordSeparator}</span>` : nothing}<kbd
-						class=${part.kind === 'mod' ? 'mod' : nothing}
 						>${part.text}</kbd
 					>`,
 		);

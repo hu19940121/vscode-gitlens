@@ -1,15 +1,18 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import { classMap } from 'lit/directives/class-map.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { repeat } from 'lit/directives/repeat.js';
+import { focusOutlineButton } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { RovingTabindexController } from '@gitlens/components/controllers/rovingTabindex.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { OnboardingKeys } from '../../../../../constants.onboarding.js';
 import type { GraphDisplayMode, GraphSidebarPanel } from '../../../../plus/graph/protocol.js';
-import { focusOutlineButton } from '../../../shared/components/styles/lit/a11y.css.js';
-import { RovingTabindexController } from '../../../shared/controllers/roving-tabindex.js';
+import { filterAgentSessionsForFamily } from '../../../shared/agentUtils.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import { graphStateContext } from '../context.js';
 import { sidebarActionsContext } from './sidebarContext.js';
@@ -17,10 +20,10 @@ import type { SidebarRailEntry } from './sidebarPanels.js';
 import { visibleSidebarRailEntries } from './sidebarPanels.js';
 import type { SidebarActions } from './sidebarState.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/indicators/new-indicator.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 interface Icon {
 	type: IconTypes;
@@ -32,19 +35,19 @@ interface Icon {
 /** Aliased rather than re-listed, so a new panel can't be added to the union without the rail seeing it. */
 type IconTypes = GraphSidebarPanel;
 const icons: Icon[] = [
-	{ type: 'overview', icon: 'home', tooltip: 'Overview' },
-	{ type: 'agents', icon: 'robot', tooltip: 'Agents', onboardingKey: 'graph:sidebar:agents:callout' },
+	{ type: 'overview', icon: 'home', tooltip: l10n.t('Overview') },
+	{ type: 'agents', icon: 'robot', tooltip: l10n.t('Agents'), onboardingKey: 'graph:sidebar:agents:callout' },
 	{
 		type: 'pullRequests',
 		icon: 'git-pull-request',
-		tooltip: 'Pull Requests',
+		tooltip: l10n.t('Pull Requests'),
 		onboardingKey: 'graph:sidebar:pullRequests:callout',
 	},
-	{ type: 'worktrees', icon: 'gl-worktrees-view', tooltip: 'Worktrees' },
-	{ type: 'branches', icon: 'gl-branches-view', tooltip: 'Branches' },
-	{ type: 'remotes', icon: 'gl-remotes-view', tooltip: 'Remotes' },
-	{ type: 'stashes', icon: 'gl-stashes-view', tooltip: 'Stashes' },
-	{ type: 'tags', icon: 'gl-tags-view', tooltip: 'Tags' },
+	{ type: 'worktrees', icon: 'gl-worktrees-view', tooltip: l10n.t('Worktrees') },
+	{ type: 'branches', icon: 'gl-branches-view', tooltip: l10n.t('Branches') },
+	{ type: 'remotes', icon: 'gl-remotes-view', tooltip: l10n.t('Remotes') },
+	{ type: 'stashes', icon: 'gl-stashes-view', tooltip: l10n.t('Stashes') },
+	{ type: 'tags', icon: 'gl-tags-view', tooltip: l10n.t('Tags') },
 ];
 
 // Bottom-rail display-mode toggles — each button stays on the same icon; the checked state on
@@ -63,15 +66,15 @@ const displayModeToggleByMode: Record<Exclude<GraphDisplayMode, 'graph'>, Displa
 	kanban: {
 		mode: 'kanban',
 		icon: 'gl-kanban-view',
-		activeTooltip: 'Show Commit Graph',
-		inactiveTooltip: 'Show Agent Kanban',
+		activeTooltip: l10n.t('Show Commit Graph'),
+		inactiveTooltip: l10n.t('Show Agent Kanban'),
 		onboardingKey: 'graph:kanban:buttonCallout',
 	},
 	visualizations: {
 		mode: 'visualizations',
 		icon: 'pulse',
-		activeTooltip: 'Show Commit Graph',
-		inactiveTooltip: 'Show Visualizations',
+		activeTooltip: l10n.t('Show Commit Graph'),
+		inactiveTooltip: l10n.t('Show Visualizations & Health'),
 		onboardingKey: 'graph:visualizations:buttonCallout',
 	},
 };
@@ -88,22 +91,24 @@ export interface GraphSidebarDisplayModeChangeEventDetail {
 export class GlGraphSideBar extends SignalWatcher(LitElement) {
 	static override styles = css`
 		/* Keyboard focus ring matching the bottom-rail gl-buttons, which outline a 26px icon-cell host
-		   that carries a border-radius (an outline only rounds if its own element does). The raw .item
-		   buttons are full rail width with a count stacked below, so outlining the button box clips at
-		   the left edge, stays square, and would enclose the count. Instead outline the .icon wrapper:
-		   padding grows it into a 2.6rem rounded cell and an equal negative margin cancels the layout
-		   shift, so the icon doesn't move but the outline (offset 2px) rounds and sits exactly like the
-		   gl-button ring. pointer-events stay on the button, not this decorative cell. */
+   that carries a border-radius (an outline only rounds if its own element does). The raw .item
+   buttons are full rail width with a count stacked below, so outlining the button box clips at
+   the left edge, stays square, and would enclose the count. Instead outline the .icon wrapper:
+   padding grows it into a 2.6rem rounded cell and an equal negative margin cancels the layout
+   shift, so the icon doesn't move but the outline (offset 2px) rounds and sits exactly like the
+   gl-button ring. pointer-events stay on the button, not this decorative cell. */
 		.item .icon {
 			display: inline-flex;
 			padding: 0.5rem;
 			margin: -0.5rem;
-			border-radius: var(--gl-radius-sm);
 			pointer-events: none;
+			border-radius: var(--gl-radius-sm);
 		}
+
 		.item:focus-visible {
 			outline: none;
 		}
+
 		.item:focus-visible .icon {
 			${focusOutlineButton}
 			outline-offset: -1px;
@@ -113,7 +118,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 			position: relative;
 
 			/* Workspace-level pinned chrome — must stay below the feature gate's cover tier so the
-		   rail can't paint over (or take clicks through) the Pro gate's scrim */
+   rail can't paint over (or take clicks through) the Pro gate's scrim */
 			z-index: var(--gl-z-sticky);
 			box-sizing: border-box;
 			display: flex;
@@ -136,15 +141,15 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 		}
 
 		/* The gl-new-indicator wrapper is the rail's flex item — gl-tooltip's host is display: contents,
-   so the button used to be. It therefore carries the full-width sizing the button expects, plus the
-   group gap, which a margin on the button inside the wrapper's grid would no longer produce. */
+ so the button used to be. It therefore carries the full-width sizing the button expects, plus the
+ group gap, which a margin on the button inside the wrapper's grid would no longer produce. */
 		.item-indicator {
 			width: 100%;
 		}
 
 		/* Doubles the gap after the last group-1 icon (Pull Requests) so the rail reads as two groups:
-   Overview/Agents/Pull Requests, then the view icons. 1.4rem here + the parent's 1.4rem flex gap
-   = 2.8rem. */
+ Overview/Agents/Pull Requests, then the view icons. 1.4rem here + the parent's 1.4rem flex gap
+ = 2.8rem. */
 		.item-indicator.group-end {
 			margin-bottom: 1.4rem;
 		}
@@ -217,14 +222,15 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 		}
 
 		/* Visualization toggle — uses <gl-button> for the checked/unchecked styling. Sits at the
-   bottom of the rail; the parent's 1.4rem flex gap is enough to read it as its own group. */
+ bottom of the rail; the parent's 1.4rem flex gap is enough to read it as its own group. */
 		.display-mode-toggle {
 			margin: 0 auto;
 		}
 
 		/* Must target the button itself: gl-button's own :host([appearance='toolbar']) declaration of
-   --button-foreground beats a value merely inherited from the gl-new-indicator wrapper. */
+ --button-foreground beats a value merely inherited from the gl-new-indicator wrapper. */
 		.display-mode-toggle gl-button {
+			position: relative;
 			--button-foreground: var(--color-view-foreground--65);
 		}
 
@@ -232,18 +238,46 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 			--button-foreground: var(--color-view-foreground);
 		}
 
+		/* Evidence dot for the Git Health banner's indicator — armed only on the visualizations
+   toggle; see renderDisplayModeToggle. Suppresses the onboarding new-indicator dot while
+   shown, so the two never double up. */
+		.display-mode-toggle .health-dot {
+			position: absolute;
+			top: 0.1rem;
+			right: 0.1rem;
+			width: 0.6rem;
+			height: 0.6rem;
+			pointer-events: none;
+			background: var(--vscode-activityBarBadge-background);
+			border-radius: var(--gl-radius-circle);
+		}
+
+		/* Rich tooltip content for the evidence-dot path — the plain tooltip strings need no styling
+   of their own, only the appended "suggested" hint line. */
+		.toggle-tooltip__hint {
+			display: flex;
+			gap: var(--gl-space-4);
+			align-items: center;
+			margin-top: var(--gl-space-2);
+			color: var(--vscode-descriptionForeground);
+		}
+
+		.toggle-tooltip__hint code-icon {
+			color: var(--color-alert-infoBorder);
+		}
+
 		/* Tighten the spacing between consecutive display-mode toggles so they read as one
-   bottom-rail group (e.g., kanban + visualizations) rather than two unrelated buttons.
-   Parent .sidebar has flex gap 1.4rem; -1rem margin-top brings the effective gap to 0.4rem.
-   The first toggle keeps the parent's 1.4rem separation from the spacer above. */
+ bottom-rail group (e.g., kanban + visualizations) rather than two unrelated buttons.
+ Parent .sidebar has flex gap 1.4rem; -1rem margin-top brings the effective gap to 0.4rem.
+ The first toggle keeps the parent's 1.4rem separation from the spacer above. */
 		.display-mode-toggle + .display-mode-toggle {
 			margin-top: -1rem;
 		}
 
 		/* Keyboard-shortcuts action — shares the rail affordance with the display-mode toggles but
-   opens a dialog rather than switching modes, so it carries no checked/active state. It lives in
-   the always-visible bottom group (not a foldable icon), so compaction reserves space for it via
-   the measured bottom block and folds nav icons into the … menu instead. */
+ opens a dialog rather than switching modes, so it carries no checked/active state. It lives in
+ the always-visible bottom group (not a foldable icon), so compaction reserves space for it via
+ the measured bottom block and folds nav icons into the … menu instead. */
 		.rail-action {
 			margin: 0 auto;
 			--button-foreground: var(--color-view-foreground--65);
@@ -254,13 +288,13 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 		}
 
 		/* Sit the action tight against the display-mode toggles above it (same -1rem pull the
-   toggles use between themselves) so the bottom of the rail reads as one group. */
+ toggles use between themselves) so the bottom of the rail reads as one group. */
 		.display-mode-toggle + .rail-action {
 			margin-top: -1rem;
 		}
 
 		/* Responsive compaction (driven by recompute): hide counts and tighten spacing together. Scoped
-   to rail items so the counts shown inside the … overflow menu (.overflow-menu-item) stay visible. */
+ to rail items so the counts shown inside the … overflow menu (.overflow-menu-item) stay visible. */
 		:host([compact]) .item .count {
 			display: none;
 		}
@@ -332,8 +366,14 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 	 *  `graph-app.ts`. */
 	private get railEntries(): readonly SidebarRailEntry[] {
 		const repo = this._state.repositories?.find(item => item.id === this._state.selectedRepository);
-		const kanbanEnabled = this._state.config?.experimentalKanbanEnabled ?? false;
-		return visibleSidebarRailEntries(repo?.virtual ?? false, kanbanEnabled);
+		return visibleSidebarRailEntries(repo?.virtual ?? false);
+	}
+
+	/** The selected repo's family path (`commonPath ?? path`), for scoping the agents badge count
+	 *  to the same repo family the sidebar panel shows. `undefined` when no repo is resolved. */
+	private get family(): string | undefined {
+		const repo = this._state.repositories?.find(item => item.id === this._state.selectedRepository);
+		return repo?.commonPath ?? repo?.path;
 	}
 
 	/** Panels included for the current repo kind, in canonical rail order — see `sidebarPanels.ts`.
@@ -351,7 +391,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 		return icons.filter(i => included.has(i.type));
 	}
 
-	/** Display-mode toggles included for the current gate state, in rail order. */
+	/** Display-mode toggles in rail order. */
 	private get visibleDisplayModeToggles(): readonly DisplayModeToggle[] {
 		return this.railEntries
 			.filter((e): e is Extract<SidebarRailEntry, { kind: 'displayMode' }> => e.kind === 'displayMode')
@@ -367,7 +407,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 	@consume({ context: sidebarActionsContext, subscribe: true })
 	private _actions!: SidebarActions;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private readonly _state!: typeof graphStateContext.__context__;
 
 	private _suppressTransition = true;
@@ -412,7 +452,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 			class="sidebar"
 			role="toolbar"
 			aria-orientation="vertical"
-			aria-label="Graph side bar"
+			aria-label=${l10n.t('Graph side bar')}
 			@keydown=${this.roving.onKeydown}
 			@focusin=${this.roving.onFocusin}
 		>
@@ -464,8 +504,8 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 			class="rail-action"
 			appearance="toolbar"
 			data-roving-key="shortcuts"
-			aria-label="Keyboard Shortcuts"
-			tooltip="Keyboard Shortcuts"
+			aria-label=${l10n.t('Keyboard Shortcuts')}
+			tooltip=${l10n.t('Keyboard Shortcuts')}
 			tooltipPlacement="right"
 			@click=${this.handleShowShortcuts}
 		>
@@ -480,20 +520,64 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 	private renderDisplayModeToggle(toggle: DisplayModeToggle, current: GraphDisplayMode) {
 		const isActive = current === toggle.mode;
 		const tooltip = isActive ? toggle.activeTooltip : toggle.inactiveTooltip;
-		return html`<gl-new-indicator class="display-mode-toggle" key=${ifDefined(toggle.onboardingKey)}>
-			<gl-button
-				appearance="toolbar"
-				role="switch"
-				data-roving-key="displayMode:${toggle.mode}"
-				aria-checked=${isActive ? 'true' : 'false'}
-				aria-label=${tooltip}
-				tooltip=${tooltip}
-				tooltipPlacement="right"
-				@click=${() => this.handleDisplayModeToggle(toggle)}
-			>
-				<code-icon icon=${toggle.icon}></code-icon>
-			</gl-button>
+
+		// Health-banner state only applies to the visualizations toggle. The tooltip's suggestion line
+		// and the dot decouple deliberately: the hint is a current fact (suggestions outstanding), so it
+		// shows while any are; the dot means "you haven't seen this", so a health-view visit clears only it.
+		const banner = toggle.mode === 'visualizations' ? this._state.gitHealthBanner : undefined;
+		const suggestedCount = banner?.suggestedCount ?? 0;
+		const showHint = this._state.config?.gitHealthAvailable === true && suggestedCount > 0;
+		const showEvidenceDot = showHint && banner?.indicator === true;
+
+		return html`<gl-new-indicator
+			class="display-mode-toggle"
+			key=${ifDefined(showEvidenceDot ? undefined : toggle.onboardingKey)}
+		>
+			${
+				showHint
+					? html`<gl-tooltip placement="right">
+							${this.renderDisplayModeButton(toggle, isActive, tooltip, undefined, showEvidenceDot)}
+							<div slot="content" class="toggle-tooltip">
+								${tooltip}
+								<span class="toggle-tooltip__hint">
+									<code-icon icon="heart"></code-icon>
+									${formatPlural(
+										l10n.t(
+											'{0, plural, one{{0} optimization suggested} other{{0} optimizations suggested}}',
+										),
+										[suggestedCount],
+									)}
+								</span>
+							</div>
+						</gl-tooltip>`
+					: this.renderDisplayModeButton(toggle, isActive, tooltip, tooltip, false)
+			}
 		</gl-new-indicator>`;
+	}
+
+	/** Shared button markup for a display-mode toggle — `visibleTooltip` is omitted when the caller
+	 *  wraps the button in its own `<gl-tooltip>` instead (the evidence-dot path), since a set
+	 *  `tooltip` attribute on `<gl-button>` would otherwise render a second, plain tooltip of its own. */
+	private renderDisplayModeButton(
+		toggle: DisplayModeToggle,
+		isActive: boolean,
+		ariaLabel: string,
+		visibleTooltip: string | undefined,
+		showHealthDot: boolean,
+	) {
+		return html`<gl-button
+			appearance="toolbar"
+			role="switch"
+			data-roving-key="displayMode:${toggle.mode}"
+			aria-checked=${isActive ? 'true' : 'false'}
+			aria-label=${ariaLabel}
+			tooltip=${ifDefined(visibleTooltip)}
+			tooltipPlacement=${ifDefined(visibleTooltip != null ? 'right' : undefined)}
+			@click=${() => this.handleDisplayModeToggle(toggle)}
+		>
+			<code-icon icon=${toggle.icon}></code-icon>
+			${showHealthDot ? html`<span class="health-dot" aria-hidden="true"></span>` : nothing}
+		</gl-button>`;
 	}
 
 	private handleDisplayModeToggle(toggle: DisplayModeToggle): void {
@@ -511,7 +595,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 			}),
 		);
 
-		emitTelemetrySentEvent<'graph/action/sidebar'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/action/sidebar',
 			data: { action: `displayMode:${next}` },
 		});
@@ -756,11 +840,13 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 		if (icon.type === 'overview') return nothing;
 		// Agents flow through reactive state, not the host counts IPC — read directly so the
 		// badge updates without paying the round-trip and skips the loading/error states. Follows the
-		// same completed-sessions filter as the panel so the badge matches what's shown.
+		// same past-sessions filter as the panel so the badge matches what's shown.
 		if (icon.type === 'agents') {
-			const sessions = this._state.agentSessions ?? [];
-			const showCompleted = this._state.sidebar?.showCompletedAgentSessions ?? false;
-			const count = showCompleted ? sessions.length : sessions.filter(s => s.phase !== 'completed').length;
+			const familyWorktreePaths =
+				this._state.worktreePaths != null ? new Set(this._state.worktreePaths) : undefined;
+			const sessions = filterAgentSessionsForFamily(this._state.agentSessions, this.family, familyWorktreePaths);
+			const showPast = this._state.sidebar?.showPastAgentSessions ?? false;
+			const count = showPast ? sessions.length : sessions.filter(s => s.phase !== 'ended').length;
 			return renderCount(count || undefined);
 		}
 		// Pull requests are network-backed, so they're deliberately absent from the counts IPC — badging
@@ -803,7 +889,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 				slot="anchor"
 				class=${classMap({ item: true, 'overflow-toggle': true, active: containsActive })}
 				data-roving-key="overflow"
-				aria-label="More"
+				aria-label=${l10n.t('More')}
 			>
 				<span class="icon"><code-icon icon="ellipsis"></code-icon></span>
 			</button>
@@ -852,7 +938,7 @@ export class GlGraphSideBar extends SignalWatcher(LitElement) {
 			}),
 		);
 
-		emitTelemetrySentEvent<'graph/action/sidebar'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/action/sidebar',
 			data: { action: icon.type },
 		});

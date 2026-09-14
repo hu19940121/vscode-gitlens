@@ -2,11 +2,13 @@ import { exhaustiveArray } from '@gitlens/utils/array.js';
 import { raceWithSignal } from '@gitlens/utils/cancellation.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { invalidateMemoized } from '@gitlens/utils/decorators/memoize.js';
+import { getBranchId } from '@gitlens/utils/gitRefs.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import { normalizePath } from '@gitlens/utils/path.js';
 import type { PromiseOrValue } from '@gitlens/utils/promise.js';
 import type { CacheController } from '@gitlens/utils/promiseCache.js';
 import { PromiseCache, PromiseMap, RepoPromiseCacheMap } from '@gitlens/utils/promiseCache.js';
+import type { ResourceUsage } from '@gitlens/utils/resourceUsage.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import type { ProgressiveGitBlame } from './models/blame.js';
 import type { BranchMetadata, GitBranch } from './models/branch.js';
@@ -29,7 +31,6 @@ import type { GitCommitReachability, LeftRightCommitCountResult } from './provid
 import type { GitContributorsResult } from './providers/contributors.js';
 import type { ResolvedRevision } from './providers/revision.js';
 import type { GitResult } from './run.types.js';
-import { getBranchId } from './utils/branch.utils.js';
 import { createReference } from './utils/reference.utils.js';
 import { getCommonRepositoryPath, getRepositoryOrWorktreePath } from './utils/repository.utils.js';
 import type { GitIgnoreFilter } from './watching/gitIgnoreFilter.js';
@@ -81,6 +82,24 @@ export type ConflictDetectionCacheKey =
  * external delete-and-recreate of a branch that is never checked out) self-heals without a reload.
  */
 const baseBranchNameTTL = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Completed blame graphs retain several objects and substrings per line. Keep normal files hot, but let large
+ * documents be owned by their active tracked-document snapshot instead of retaining a second long-lived owner.
+ */
+const maxCachedBlameLines = 5000;
+
+export async function shouldEvictBlameCacheEntry(progressive: ProgressiveGitBlame | undefined): Promise<boolean> {
+	if (progressive == null) return false;
+
+	try {
+		const blame = await progressive.completed;
+		return blame.lines.length > maxCachedBlameLines;
+	} catch {
+		// The provider factory resolves as soon as streaming starts, so a later stream failure must also be retried.
+		return true;
+	}
+}
 
 /**
  * gkConfig keys that participate in the `branchOverviews` cache's mergeTarget/mergeBase lineage.
@@ -264,6 +283,23 @@ export class Cache implements Disposable {
 
 	dispose(): void {
 		this.reset();
+	}
+
+	/** Resource usage retained by instantiated sub-caches and their bookkeeping maps. */
+	getResourceUsage(): ResourceUsage {
+		const usage: ResourceUsage = {};
+		for (const [name, cache] of Object.entries(this._caches)) {
+			if (cache != null) {
+				usage[`cache.${name}.entries.count`] =
+					cache instanceof RepoPromiseCacheMap ? cache.entryCount : cache.size;
+			}
+		}
+		usage['cache.commonPathRegistry.entries.count'] = this._commonPathRegistry.size;
+		usage['cache.worktreesByCommonPath.entries.count'] = this._worktreesByCommonPath.size;
+		usage['cache.statusGenerations.entries.count'] = this._statusGenerations.size;
+		usage['cache.closeGenerations.entries.count'] = this._closeGenerations.size;
+		usage['cache.gkConfigMergeSnapshots.entries.count'] = this._gkConfigMergeSnapshots.size;
+		return usage;
 	}
 
 	get bestRemotes(): PromiseMap<RepoPath, GitRemote<RemoteProvider>[]> {

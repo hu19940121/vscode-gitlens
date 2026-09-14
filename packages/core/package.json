@@ -1,7 +1,7 @@
 {
 	"name": "@gitkraken/core-gitlens",
 	"description": "GitLens core — shared Git / AI / GitHub primitives for internal GitKraken consumption",
-	"version": "0.5.0",
+	"version": "0.5.113",
 	"license": "SEE LICENSE IN LICENSE",
 	"author": {
 		"name": "GitKraken",
@@ -17,7 +17,7 @@
 		"directory": "packages/core"
 	},
 	"engines": {
-		"node": ">= 22.12.0"
+		"node": ">= 24"
 	},
 	"type": "module",
 	"sideEffects": false,
@@ -26,11 +26,11 @@
 	},
 	"files": [
 		"dist",
-		"src",
 		"LICENSE",
 		"LICENSE.plus",
 		"README.md",
-		"CHANGELOG.md"
+		"CHANGELOG.md",
+		"docs"
 	],
 	"imports": {
 		"#env/*.js": {
@@ -82,6 +82,10 @@
 			"types": "./dist/git/features.d.ts",
 			"default": "./dist/git/features.js"
 		},
+		"./git/gitHealth.js": {
+			"types": "./dist/git/gitHealth.d.ts",
+			"default": "./dist/git/gitHealth.js"
+		},
 		"./git/models/*.js": {
 			"types": "./dist/git/models/*.d.ts",
 			"default": "./dist/git/models/*.js"
@@ -129,6 +133,10 @@
 		"./ipc/ipcServer.js": {
 			"types": "./dist/ipc/ipcServer.d.ts",
 			"default": "./dist/ipc/ipcServer.js"
+		},
+		"./plus/agents/agentCapabilities.js": {
+			"types": "./dist/plus/agents/agentCapabilities.d.ts",
+			"default": "./dist/plus/agents/agentCapabilities.js"
 		},
 		"./plus/agents/providers/*.js": {
 			"types": "./dist/plus/agents/providers/*.d.ts",
@@ -190,69 +198,13 @@
 			"types": "./dist/plus/git-github/providers/github/*.d.ts",
 			"default": "./dist/plus/git-github/providers/github/*.js"
 		},
-		"./plus/integrations/authentication/*.js": {
-			"types": "./dist/plus/integrations/authentication/*.d.ts",
-			"default": "./dist/plus/integrations/authentication/*.js"
-		},
-		"./plus/integrations/constants.js": {
-			"types": "./dist/plus/integrations/constants.d.ts",
-			"default": "./dist/plus/integrations/constants.js"
-		},
-		"./plus/integrations/context.js": {
-			"types": "./dist/plus/integrations/context.d.ts",
-			"default": "./dist/plus/integrations/context.js"
-		},
-		"./plus/integrations/errors.js": {
-			"types": "./dist/plus/integrations/errors.d.ts",
-			"default": "./dist/plus/integrations/errors.js"
-		},
 		"./plus/integrations/index.js": {
 			"types": "./dist/plus/integrations/index.d.ts",
 			"default": "./dist/plus/integrations/index.js"
 		},
-		"./plus/integrations/integrationService.js": {
-			"types": "./dist/plus/integrations/integrationService.d.ts",
-			"default": "./dist/plus/integrations/integrationService.js"
-		},
 		"./plus/integrations/lite.js": {
 			"types": "./dist/plus/integrations/lite.d.ts",
 			"default": "./dist/plus/integrations/lite.js"
-		},
-		"./plus/integrations/models/*.js": {
-			"types": "./dist/plus/integrations/models/*.d.ts",
-			"default": "./dist/plus/integrations/models/*.js"
-		},
-		"./plus/integrations/providers/*.js": {
-			"types": "./dist/plus/integrations/providers/*.d.ts",
-			"default": "./dist/plus/integrations/providers/*.js"
-		},
-		"./plus/integrations/providers/azure/*.js": {
-			"types": "./dist/plus/integrations/providers/azure/*.d.ts",
-			"default": "./dist/plus/integrations/providers/azure/*.js"
-		},
-		"./plus/integrations/providers/bitbucket-server/*.js": {
-			"types": "./dist/plus/integrations/providers/bitbucket-server/*.d.ts",
-			"default": "./dist/plus/integrations/providers/bitbucket-server/*.js"
-		},
-		"./plus/integrations/providers/bitbucket/*.js": {
-			"types": "./dist/plus/integrations/providers/bitbucket/*.d.ts",
-			"default": "./dist/plus/integrations/providers/bitbucket/*.js"
-		},
-		"./plus/integrations/providers/github/*.js": {
-			"types": "./dist/plus/integrations/providers/github/*.d.ts",
-			"default": "./dist/plus/integrations/providers/github/*.js"
-		},
-		"./plus/integrations/providers/gitlab/*.js": {
-			"types": "./dist/plus/integrations/providers/gitlab/*.d.ts",
-			"default": "./dist/plus/integrations/providers/gitlab/*.js"
-		},
-		"./plus/integrations/telemetry.js": {
-			"types": "./dist/plus/integrations/telemetry.d.ts",
-			"default": "./dist/plus/integrations/telemetry.js"
-		},
-		"./plus/integrations/utils/*.js": {
-			"types": "./dist/plus/integrations/utils/*.d.ts",
-			"default": "./dist/plus/integrations/utils/*.js"
 		},
 		"./utils/__tests__/*.js": null,
 		"./utils/*.js": {
@@ -272,6 +224,18 @@
 		"./utils/env/node/platform.js": {
 			"types": "./dist/utils/env/node/platform.d.ts",
 			"default": "./dist/utils/env/node/platform.js"
+		},
+		"./utils/keys/chord.js": {
+			"types": "./dist/utils/keys/chord.d.ts",
+			"default": "./dist/utils/keys/chord.js"
+		},
+		"./utils/keys/keybinding.js": {
+			"types": "./dist/utils/keys/keybinding.d.ts",
+			"default": "./dist/utils/keys/keybinding.js"
+		},
+		"./utils/keys/keymapDispatcher.js": {
+			"types": "./dist/utils/keys/keymapDispatcher.d.ts",
+			"default": "./dist/utils/keys/keymapDispatcher.js"
 		}
 	},
 	"dependencies": {
@@ -280,14 +244,23 @@
 		"@octokit/request": "catalog:",
 		"@octokit/request-error": "catalog:",
 		"@octokit/types": "catalog:",
+		"@vscode/l10n": "catalog:",
 		"fast-string-truncated-width": "catalog:",
 		"ignore": "catalog:",
 		"vscode-uri": "catalog:"
 	},
 	"scripts": {
-		"build": "node scripts/bundle.mjs",
-		"bundle": "node scripts/bundle.mjs",
-		"clean": "pnpx rimraf --glob dist src LICENSE LICENSE.plus *.tgz",
-		"prepack": "node scripts/bundle.mjs"
+		"build": "tsdown && node scripts/bundle.mjs",
+		"check": "tsc -p tsconfig.json && oxlint --type-aware --type-check -c ../../.oxlintrc.json .",
+		"clean": "pnpx rimraf --glob dist LICENSE LICENSE.plus *.tgz",
+		"prepack": "pnpm run build",
+		"verify:esm": "node scripts/verify-esm.mjs",
+		"verify:package": "node scripts/verify-package.mjs"
+	},
+	"devDependencies": {
+		"@arethetypeswrong/cli": "catalog:",
+		"publint": "catalog:",
+		"tsdown": "catalog:",
+		"typescript": "catalog:"
 	}
 }

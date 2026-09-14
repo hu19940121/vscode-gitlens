@@ -1,5 +1,5 @@
 import type { CancellationToken, Event, MessageItem, ProgressOptions } from 'vscode';
-import { CancellationTokenSource, Disposable, env, EventEmitter, window } from 'vscode';
+import { CancellationTokenSource, Disposable, env, EventEmitter, l10n, window } from 'vscode';
 import { fetch } from '@env/fetch.js';
 import { getIsOffline } from '@env/platform.js';
 import type { AIPrimaryProviders, AIProviderAndModel, AIProviders, SupportedAIModels } from '@gitlens/ai/constants.js';
@@ -54,6 +54,7 @@ import { map } from '@gitlens/utils/iterable.js';
 import type { Lazy } from '@gitlens/utils/lazy.js';
 import { lazy } from '@gitlens/utils/lazy.js';
 import { Logger } from '@gitlens/utils/logger.js';
+import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import type { Deferred } from '@gitlens/utils/promise.js';
 import { getSettledValue, getSettledValues } from '@gitlens/utils/promise.js';
@@ -66,6 +67,7 @@ import {
 	AINoRequestDataError,
 	AuthenticationRequiredError,
 	classifyNetworkError,
+	getPresentableErrorMessage,
 } from '../../errors.js';
 import type { AIFeatures } from '../../features.js';
 import { isAdvancedFeature } from '../../features.js';
@@ -81,6 +83,7 @@ import type { ServerConnection } from '../gk/serverConnection.js';
 import { ensureFeatureAccess } from '../gk/utils/-webview/acount.utils.js';
 import { isAiAllAccessPromotionActive } from '../gk/utils/-webview/promo.utils.js';
 import {
+	canPurchaseAiCredits,
 	compareSubscriptionPlans,
 	getSubscriptionPlanName,
 	isSubscriptionPaid,
@@ -95,6 +98,7 @@ import {
 	getOrgAIConfig,
 	getOrgAIProviderOfType,
 	getOrPromptApiKey,
+	hasAIRelevantSubscriptionChanges,
 	isProviderEnabledByOrg,
 } from './utils/-webview/ai.utils.js';
 import type { ResolvePromptOptions } from './utils/-webview/prompt.utils.js';
@@ -118,6 +122,15 @@ export interface AIResultContext extends Serialized<Omit<AIResponse<any>, 'conte
 export type AISourceContext<T> = Source & { context: T };
 
 /**
+ * The `GET v1/ai-tasks/usage` 200 body, per `api-docs` `v1/schemas/ai-tasks.yaml#AIUsageResponse`:
+ * the shared `ApiResponseEnvelope` (`{ data: object }`) carrying an `AIUsage` record. The spec
+ * declares no `error` member on 200s (application errors are non-200 `APIError`), but the live
+ * endpoint sends `error: null` alongside `data` — modeled here so a non-null value can be rejected
+ * defensively, mirroring gk.dev's own client.
+ */
+type AIUsageResponse = { data?: Record<string, unknown> | null; error?: { message?: string } | null };
+
+/**
  * Identifies an operation that maintains its own remembered AI model, independent of the
  * global default. Picking a model from a scoped surface (the composer chip, the graph
  * compose/review/resolve mode chip) writes only to that scope's storage — the global `ai.model`
@@ -133,6 +146,34 @@ export interface AIModelChangeEvent {
 	readonly model: AIModel | undefined;
 	/** Scope whose model changed, or `undefined` when the global default changed. */
 	readonly scope?: AIModelScope;
+}
+
+/**
+ * GitKraken AI weekly usage standing for the active account/org — the fields of the
+ * `GET v1/ai-tasks/usage` payload we consume.
+ *
+ * `limit === -1` means unlimited and `limit === 0` means no allowance; never conflate the two, or a
+ * trial user with no allowance reads as having infinite AI.
+ */
+export interface AIUsageLimits {
+	readonly limit: number;
+	readonly used: number;
+	readonly resetsOn: string;
+	/**
+	 * The organization's shared pool rollup, when the payload carries a usable one — 20% of every seat's
+	 * weekly allowance funds it, which is why `limit` above reads below the plan's stated per-week figure.
+	 * Same sentinels as `limit`. The payload's `remaining` is dropped: it's `limit - used`, and no
+	 * consumer needs it precomputed.
+	 */
+	readonly organization?: { readonly used: number; readonly limit: number };
+	/**
+	 * This user's own consumption drawn from the shared organization pool — i.e. the slice of
+	 * `organization.used` attributable to the current account, NOT a separate allowance and NOT part of
+	 * `used` above (which is the personal allowance). It's what lets the pool's bar separate this user's
+	 * draw from everyone else's. Supplementary like `organization`, so an absent or unusable value is
+	 * `undefined` rather than a rejected record.
+	 */
+	readonly sharedUsed?: number;
 }
 
 type AIModelUpdateOptions = {
@@ -440,6 +481,20 @@ export class AIProviderService implements AIService, Disposable {
 	// called at session end.
 	private readonly _pendingBYOKUsage = new Map<string, Map<string, BYOKUsage>>();
 
+	// Cached GitKraken AI weekly usage standing (`getUsage`), keyed by `${accountId}|${orgId}` (the org id
+	// is '' when there is none). The allowance is org-scoped, but the account id has to be in the key too:
+	// keyed on the org alone, account B signing in inside the TTL is served account A's allowance — and
+	// personal accounts all collide on ''. TTL 5 minutes, mirroring gk.dev's react-query `staleTime` —
+	// short enough to reflect a reset/plan change within a session, long enough that repeated panel renders
+	// don't hammer the backend. A cache hit returns the stored value even when it's `undefined`, so a
+	// failing or unreachable backend isn't retried on every render; `force` evicts and refills it.
+	// `PromiseCache` also single-flights concurrent reads, so a stale in-flight fetch can't re-stamp the
+	// entry with a fresh TTL after an eviction (its late settle is ownership-guarded).
+	private readonly _usage = new PromiseCache<string, AIUsageLimits | undefined>({
+		createTTL: 5 * 60 * 1000, // 5 minutes
+		expireOnError: false,
+	});
+
 	private _actions: AIActions | undefined;
 	get actions(): AIActions {
 		this._actions ??= new AIActions(this);
@@ -468,15 +523,18 @@ export class AIProviderService implements AIService, Disposable {
 		this._disposable = Disposable.from(
 			this.container.subscription.onDidChange(e => {
 				// Prompt templates are tied to account identity & subscription state — clear on every
-				// fire. Model caches are heavier and only affected by account identity or plan changes
-				// (which can shift available providers/entitlements); filter to avoid wiping the cache
-				// on no-op subscription ticks like session refresh.
+				// fire. Model caches are heavier, so filter to changes that can actually shift what
+				// resolves (see `hasAIRelevantSubscriptionChanges`) to avoid wiping them on no-op
+				// subscription ticks like session refresh.
 				this._promptTemplates.clear();
-				const accountChanged = e.current.account?.id !== e.previous.account?.id;
-				const planChanged = e.current.plan?.actual?.id !== e.previous.plan?.actual?.id;
-				if (accountChanged || planChanged) {
+
+				if (hasAIRelevantSubscriptionChanges(e.previous, e.current)) {
 					this._modelCache.clear();
 					this._providerModelsCache.clear();
+					// The account id is in the usage key, so an account change already misses — but a plan or
+					// verification change moves the allowance under an unchanged key, so the entry has to go
+					// either way.
+					this._usage.clear();
 					clearResponseFormatRejections();
 
 					// Re-resolve now rather than waiting for a consumer to ask — signing in is what makes
@@ -607,6 +665,7 @@ export class AIProviderService implements AIService, Disposable {
 					currentUrl: string | undefined;
 					title: string;
 					placeholder: string;
+					prompt?: string;
 					validator?: (url: string) => string | undefined | Promise<string | undefined>;
 				},
 				silent: boolean,
@@ -633,7 +692,7 @@ export class AIProviderService implements AIService, Disposable {
 									try {
 										new URL(value);
 									} catch {
-										input.validationMessage = 'Please enter a valid URL';
+										input.validationMessage = l10n.t('Please enter a valid URL');
 										return;
 									}
 								}
@@ -642,14 +701,14 @@ export class AIProviderService implements AIService, Disposable {
 							input.onDidAccept(async () => {
 								const value = input.value.trim();
 								if (!value) {
-									input.validationMessage = 'Please enter a valid URL';
+									input.validationMessage = l10n.t('Please enter a valid URL');
 									return;
 								}
 
 								try {
 									new URL(value);
 								} catch {
-									input.validationMessage = 'Please enter a valid URL';
+									input.validationMessage = l10n.t('Please enter a valid URL');
 									return;
 								}
 								const error = await options.validator?.(value);
@@ -664,7 +723,12 @@ export class AIProviderService implements AIService, Disposable {
 
 						input.title = options.title;
 						input.placeholder = options.placeholder;
-						input.prompt = `Enter your ${options.title} URL`;
+						input.prompt =
+							options.prompt ??
+							l10n.t(
+								'Enter your {0} URL',
+								supportedAIProviders.get(providerId as AIProviders)?.name ?? providerId,
+							);
 						input.show();
 					});
 				} finally {
@@ -751,6 +815,28 @@ export class AIProviderService implements AIService, Disposable {
 			this.container.telemetry.sendEvent('ai/enabled', undefined, source);
 		}
 		await configuration.updateEffective('ai.enabled', true);
+	}
+
+	/**
+	 * Opens the GitKraken AI credit add-on purchase page, measuring the click on the way out.
+	 *
+	 * Shared by the weekly usage-limit notification and the Settings account panel's AI usage card (via
+	 * `gitlens.ai.purchaseCredits`), which is the whole point: the destination resolves host-side against
+	 * the configured gk.dev environment, so a webview can't build it, and keeping the telemetry here stops
+	 * the two entry points from measuring the same purchase intent differently.
+	 *
+	 * Callers are expected to have already gated on `canPurchaseAiCredits` — this doesn't re-check, so the
+	 * affordance and the action stay one decision rather than two that can disagree.
+	 */
+	async openAiCreditAddOn(source?: Source): Promise<void> {
+		const sub = await this.container.subscription.getSubscription();
+		this.container.telemetry.sendEvent(
+			'ai/credits/addOnClicked',
+			{ 'organization.role': sub.activeOrganization?.role },
+			source,
+		);
+
+		await openUrl(await this.container.urls.getGkDevUrl('subscription/credit-add-on'));
 	}
 
 	/**
@@ -1097,6 +1183,59 @@ export class AIProviderService implements AIService, Disposable {
 		return new Map<AIProviders, AIProviderDescriptorWithConfiguration>(getSettledValues(promises));
 	}
 
+	/**
+	 * Gets the GitKraken AI weekly usage standing (allowance, consumption, reset) for the active
+	 * account/org, or `undefined` when there's no account or the fetch fails or returns something
+	 * unusable — including on-premise enterprise orgs, which have no usage data and which GitLens has
+	 * no way to detect up front; hiding the surface is the graceful-degradation path for that case.
+	 *
+	 * Cached for 5 minutes per account/org (see `_usage`); pass `force: true` to evict that entry and
+	 * refill it, e.g. after a subscription/org change.
+	 */
+	@debug()
+	async getUsage(options?: { force?: boolean }): Promise<AIUsageLimits | undefined> {
+		const scope = getScopedLogger();
+
+		const subscription = await this.container.subscription.getSubscription(true);
+		if (subscription.account == null) {
+			scope?.addExitInfo('skipped: no account');
+			return undefined;
+		}
+
+		const key = `${subscription.account.id}|${subscription.activeOrganization?.id ?? ''}`;
+		// A hard `delete` rather than `invalidate`: `force` means "this value is wrong now", so an in-flight
+		// fetch started before the change must not be shared with this caller. Installing a successor under
+		// the same key is safe — the evicted entry's late settle is ownership-guarded (see `PromiseCache`).
+		if (options?.force) {
+			this._usage.delete(key);
+		}
+
+		return this._usage.getOrCreate(key, () => this.fetchUsage(scope));
+	}
+
+	/**
+	 * Every failure here resolves to `undefined` so the caller can hide the surface — but it must never
+	 * fail SILENTLY. `handleGkUnsuccessfulResponse` returns without logging for any 4xx
+	 * (`serverConnection.ts`), which is exactly the band this endpoint fails in when the token is
+	 * rejected (401/403) or the path is wrong (404) — so without logging the status here, a broken
+	 * allowance is indistinguishable from a legitimately absent one, in an output channel that shows
+	 * nothing either way.
+	 */
+	private async fetchUsage(scope: ScopedLogger | undefined): Promise<AIUsageLimits | undefined> {
+		try {
+			const rsp = await this.connection.fetchGkApi('v1/ai-tasks/usage', { method: 'GET' });
+			if (!rsp.ok) {
+				scope?.error(undefined, `Unable to get AI usage: ${rsp.status} ${rsp.statusText}`);
+				return undefined;
+			}
+
+			return parseAiUsageResponse(await rsp.json(), scope);
+		} catch (ex) {
+			scope?.error(ex, 'Unable to get AI usage');
+			return undefined;
+		}
+	}
+
 	private async ensureProviderConfigured(provider: AIProviderDescriptorWithType, silent: boolean): Promise<boolean> {
 		if (provider.id === this._provider?.id) return this._provider.configured(silent);
 
@@ -1271,17 +1410,18 @@ export class AIProviderService implements AIService, Disposable {
 	private async ensureFeatureAccess(feature: AIFeatures, source: Source): Promise<boolean> {
 		if (!(await ensureAccess(this.container, undefined, source))) return false;
 
-		const suffix = isAdvancedFeature(feature)
-			? 'requires GitLens Advanced or a trial'
-			: 'requires GitLens Pro or a trial';
 		let label;
 		switch (feature) {
 			case 'generate-searchQuery':
-				label = `AI-powered search ${suffix}`;
+				label = isAdvancedFeature(feature)
+					? l10n.t('AI-powered search requires GitLens Advanced or a trial')
+					: l10n.t('AI-powered search requires GitLens Pro or a trial');
 				break;
 
 			default:
-				label = isAdvancedFeature(feature) ? `This AI preview feature ${suffix}` : `This AI feature ${suffix}`;
+				label = isAdvancedFeature(feature)
+					? l10n.t('This AI preview feature requires GitLens Advanced or a trial')
+					: l10n.t('This AI feature requires GitLens Pro or a trial');
 		}
 
 		if (!(await ensureFeatureAccess(this.container, label, feature, source))) {
@@ -1345,6 +1485,9 @@ export class AIProviderService implements AIService, Disposable {
 		}
 
 		const telementry = provider.getTelemetryInfo(model, 0);
+		// Stamped here, not in each caller's `getTelemetryInfo`, so it also lands on the failure paths
+		// below — where an unattributable request is most costly to investigate.
+		telementry.data.conversationId = options?.conversationId;
 
 		// Resolve the provider for the resolved model independent of `this._provider` — the
 		// singleton cache reflects whichever `getModel` ran most recently, which races with
@@ -1541,7 +1684,7 @@ export class AIProviderService implements AIService, Disposable {
 
 						if (error instanceof AIError) {
 							scope?.setFailed(
-								`failed: ${String(error)}${error.original ? ` (${String(error.original)})` : ''}`,
+								`failed: ${error.diagnosticString}${error.original ? ` (${String(error.original)})` : ''}`,
 							);
 
 							this.container.telemetry.sendEvent(
@@ -1550,19 +1693,19 @@ export class AIProviderService implements AIService, Disposable {
 									...telementry.data,
 									duration: performance.now() - start,
 									failed: true,
-									'failed.error': String(error),
+									'failed.error': error.diagnosticString,
 									'failed.error.detail': error.original ? String(error.original) : undefined,
 								},
 								source,
 							);
 
-							// Every arm below `await`s a notification, and a VS Code notification carrying
-							// buttons doesn't auto-dismiss — so an un-actioned one parks this request, and with
-							// it anything driving it. A multi-step run (automatic rebase) would sit mid-step
-							// behind a toast, reporting the last thing it did, with even its own Cancel inert
-							// until someone clicks. Driven callers therefore opt out of the whole interactive
-							// tier and surface the failure in their own UI; they pass `throwAIErrors` so the
-							// reason survives for them to classify.
+							// A VS Code notification carrying buttons doesn't auto-dismiss, so anything this
+							// request `await`s below parks it — and with it anything driving it. The terminal
+							// arms therefore detach their notification (`void (async () => …)()`) and end the
+							// request immediately, keeping their offer live for whenever it's clicked; only the
+							// retry arms still await, because the answer drives `continue`. Driven callers opt
+							// out of the whole interactive tier regardless and surface the failure in their own
+							// UI; they pass `throwAIErrors` so the reason survives for them to classify.
 							if (options?.silent) {
 								if (!fulfilled) {
 									options?.generating?.cancel();
@@ -1575,11 +1718,13 @@ export class AIProviderService implements AIService, Disposable {
 							switch (error.reason) {
 								case AIErrorReason.NoNetwork:
 								case AIErrorReason.Unreachable: {
-									const retry: MessageItem = { title: 'Retry' };
+									const retry: MessageItem = { title: l10n.t('Retry') };
 									const result = await window.showErrorMessage(
 										error.reason === AIErrorReason.NoNetwork
-											? 'Unable to reach the AI service. Please check your internet connection and try again.'
-											: 'The AI service is temporarily unreachable. Please try again.',
+											? l10n.t(
+													'Unable to reach the AI service. Please check your internet connection and try again.',
+												)
+											: l10n.t('The AI service is temporarily unreachable. Please try again.'),
 										retry,
 									);
 									if (cancellation.isCancellationRequested) {
@@ -1598,187 +1743,241 @@ export class AIProviderService implements AIService, Disposable {
 									return undefined;
 								}
 								case AIErrorReason.NoRequestData:
-									void window.showInformationMessage(error.message);
+									void window.showInformationMessage(getPresentableErrorMessage(error));
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 
 								case AIErrorReason.NoEntitlement: {
-									const sub = await this.container.subscription.getSubscription();
+									void (async () => {
+										const sub = await this.container.subscription.getSubscription();
 
-									if (isSubscriptionPaid(sub)) {
-										const plan =
-											compareSubscriptionPlans(sub.plan.actual.id, 'advanced') <= 0
-												? 'teams'
-												: 'advanced';
+										if (isSubscriptionPaid(sub)) {
+											const plan =
+												compareSubscriptionPlans(sub.plan.actual.id, 'advanced') <= 0
+													? 'teams'
+													: 'advanced';
 
-										const upgrade = { title: `Upgrade to ${getSubscriptionPlanName(plan)}` };
-										const result = await window.showErrorMessage(
-											"This AI feature isn't included in your current plan. Please upgrade and try again.",
-											upgrade,
-										);
+											const upgrade = {
+												title: l10n.t('Upgrade to {0}', getSubscriptionPlanName(plan)),
+											};
+											const result = await window.showErrorMessage(
+												l10n.t(
+													"This AI feature isn't included in your current plan. Please upgrade and try again.",
+												),
+												upgrade,
+											);
 
-										if (result === upgrade) {
-											void this.container.subscription.manageSubscription(source);
+											if (result === upgrade) {
+												void this.container.subscription.manageSubscription(source);
+											}
+										} else {
+											// Users without accounts would never get here since they would have been blocked by `ensureFeatureAccess`
+											const upgrade = { title: l10n.t('Upgrade to Pro') };
+											const result = await window.showErrorMessage(
+												l10n.t(
+													'Please upgrade to GitLens Pro to access this AI feature and try again.',
+												),
+												upgrade,
+											);
+
+											if (result === upgrade) {
+												void this.container.subscription.upgrade('pro', source);
+											}
 										}
-									} else {
-										// Users without accounts would never get here since they would have been blocked by `ensureFeatureAccess`
-										const upgrade = { title: 'Upgrade to Pro' };
-										const result = await window.showErrorMessage(
-											'Please upgrade to GitLens Pro to access this AI feature and try again.',
-											upgrade,
-										);
-
-										if (result === upgrade) {
-											void this.container.subscription.upgrade('pro', source);
-										}
-									}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
+									);
 
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.RequestTooLarge: {
-									const switchModel: MessageItem = { title: 'Switch Model' };
-									const result = await window.showErrorMessage(
-										'Your request is too large. Please reduce the size of your request or switch to a different model, and then try again.',
-										switchModel,
+									void (async () => {
+										const switchModel: MessageItem = { title: l10n.t('Switch Model') };
+										const result = await window.showErrorMessage(
+											l10n.t(
+												'Your request is too large. Please reduce the size of your request or switch to a different model, and then try again.',
+											),
+											switchModel,
+										);
+										if (result === switchModel) {
+											void this.switchModel(source);
+										}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
 									);
-									if (result === switchModel) {
-										void this.switchModel(source);
-									}
+
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.UserQuotaExceeded: {
-									const sub = await this.container.subscription.getSubscription();
-									const role = sub.activeOrganization?.role;
-									const canPurchase =
-										role == null || role === 'owner' || role === 'admin' || role === 'billing';
+									void (async () => {
+										const sub = await this.container.subscription.getSubscription();
+										// Kept for telemetry — the purchase gate itself is the shared predicate the
+										// Settings AI usage card also renders from, so the two can't disagree.
+										const role = sub.activeOrganization?.role;
 
-									if (canPurchase) {
-										const getMoreCredits: MessageItem = {
-											title: 'Get More Credits',
-										};
-										const dismiss: MessageItem = {
-											title: 'Dismiss',
-											isCloseAffordance: true,
-										};
-										const result = await window.showErrorMessage(
-											"Your request could not be completed because you've reached the weekly usage included in your plan. Purchase additional AI credits to keep using GitKraken AI.",
-											getMoreCredits,
-											dismiss,
-										);
+										if (canPurchaseAiCredits(sub)) {
+											const getMoreCredits: MessageItem = {
+												title: l10n.t('Get More Credits'),
+											};
+											const dismiss: MessageItem = {
+												title: l10n.t('Dismiss'),
+												isCloseAffordance: true,
+											};
+											const result = await window.showErrorMessage(
+												l10n.t(
+													"Your request could not be completed because you've reached the weekly usage included in your plan. Purchase additional AI credits to keep using GitKraken AI.",
+												),
+												getMoreCredits,
+												dismiss,
+											);
 
-										if (result === getMoreCredits) {
-											this.container.telemetry.sendEvent(
-												'ai/credits/addOnClicked',
-												{ 'organization.role': role },
-												source,
-											);
-											void openUrl(
-												await this.container.urls.getGkDevUrl('subscription/credit-add-on'),
-											);
+											if (result === getMoreCredits) {
+												void this.openAiCreditAddOn(source);
+											} else {
+												this.container.telemetry.sendEvent(
+													'ai/credits/addOnDismissed',
+													{ 'organization.role': role },
+													source,
+												);
+											}
 										} else {
+											const ok: MessageItem = {
+												title: l10n.t('OK'),
+												isCloseAffordance: true,
+											};
+											await window.showErrorMessage(
+												l10n.t(
+													"Your request could not be completed because you've reached the weekly usage included in your plan. Contact your organization admin or owner to request more AI credits.",
+												),
+												ok,
+											);
+
 											this.container.telemetry.sendEvent(
 												'ai/credits/addOnDismissed',
 												{ 'organization.role': role },
 												source,
 											);
 										}
-									} else {
-										const ok: MessageItem = {
-											title: 'OK',
-											isCloseAffordance: true,
-										};
-										await window.showErrorMessage(
-											"Your request could not be completed because you've reached the weekly usage included in your plan. Contact your organization admin or owner to request more AI credits.",
-											ok,
-										);
-
-										this.container.telemetry.sendEvent(
-											'ai/credits/addOnDismissed',
-											{ 'organization.role': role },
-											source,
-										);
-									}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
+									);
 
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.RateLimitExceeded: {
-									const switchModel: MessageItem = { title: 'Switch Model' };
-									const result = await window.showErrorMessage(
-										'Rate limit exceeded. Please wait a few moments or switch to a different model, and then try again.',
-										switchModel,
+									void (async () => {
+										const switchModel: MessageItem = { title: l10n.t('Switch Model') };
+										const result = await window.showErrorMessage(
+											l10n.t(
+												'Rate limit exceeded. Please wait a few moments or switch to a different model, and then try again.',
+											),
+											switchModel,
+										);
+										if (result === switchModel) {
+											void this.switchModel(source);
+										}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
 									);
-									if (result === switchModel) {
-										void this.switchModel(source);
-									}
 
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.RateLimitOrFundsExceeded: {
-									const switchModel: MessageItem = { title: 'Switch Model' };
-									const result = await window.showErrorMessage(
-										'Rate limit exceeded, or your account is out of funds. Please wait a few moments, check your account balance, or switch to a different model, and then try again.',
-										switchModel,
+									void (async () => {
+										const switchModel: MessageItem = { title: l10n.t('Switch Model') };
+										const result = await window.showErrorMessage(
+											l10n.t(
+												'Rate limit exceeded, or your account is out of funds. Please wait a few moments, check your account balance, or switch to a different model, and then try again.',
+											),
+											switchModel,
+										);
+										if (result === switchModel) {
+											void this.switchModel(source);
+										}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
 									);
-									if (result === switchModel) {
-										void this.switchModel(source);
-									}
+
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.ServiceCapacityExceeded: {
 									void window.showErrorMessage(
-										'GitKraken AI is temporarily unable to process your request due to high volume. Please wait a few moments and try again. If this issue persists, please contact support.',
-										'OK',
+										l10n.t(
+											'GitKraken AI is temporarily unable to process your request due to high volume. Please wait a few moments and try again. If this issue persists, please contact support.',
+										),
+										l10n.t('OK'),
 									);
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.ModelNotSupported: {
-									const switchModel: MessageItem = { title: 'Switch Model' };
-									const result = await window.showErrorMessage(
-										'The selected model is not supported for this request. Please select a different model and try again.',
-										switchModel,
+									void (async () => {
+										const switchModel: MessageItem = { title: l10n.t('Switch Model') };
+										const result = await window.showErrorMessage(
+											l10n.t(
+												'The selected model is not supported for this request. Please select a different model and try again.',
+											),
+											switchModel,
+										);
+										if (result === switchModel) {
+											void this.switchModel(source);
+										}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
 									);
-									if (result === switchModel) {
-										void this.switchModel(source);
-									}
+
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.Unauthorized: {
-									const switchModel: MessageItem = { title: 'Switch Model' };
-									const result = await window.showErrorMessage(
-										'You do not have access to the selected model. Please select a different model and try again.',
-										switchModel,
+									void (async () => {
+										const switchModel: MessageItem = { title: l10n.t('Switch Model') };
+										const result = await window.showErrorMessage(
+											l10n.t(
+												'You do not have access to the selected model. Please select a different model and try again.',
+											),
+											switchModel,
+										);
+										if (result === switchModel) {
+											void this.switchModel(source);
+										}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
 									);
-									if (result === switchModel) {
-										void this.switchModel(source);
-									}
+
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
 								}
 								case AIErrorReason.DeniedByUser: {
-									const switchModel: MessageItem = { title: 'Switch Model' };
-									const result = await window.showErrorMessage(
-										'You have denied access to the selected model. Please provide access or select a different model, and then try again.',
-										switchModel,
+									void (async () => {
+										const switchModel: MessageItem = { title: l10n.t('Switch Model') };
+										const result = await window.showErrorMessage(
+											l10n.t(
+												'You have denied access to the selected model. Please provide access or select a different model, and then try again.',
+											),
+											switchModel,
+										);
+										if (result === switchModel) {
+											void this.switchModel(source);
+										}
+									})().catch((ex: unknown) =>
+										scope?.error(ex, 'Failed to show AI error notification'),
 									);
-									if (result === switchModel) {
-										void this.switchModel(source);
-									}
+
 									if (options?.throwAIErrors) throw error;
 
 									return undefined;
@@ -1852,10 +2051,16 @@ export class AIProviderService implements AIService, Disposable {
 		const key = `${model.provider.id}/${model.id}`;
 		const bucket = buckets.get(key);
 		if (bucket == null) {
+			// A conversation is one piece of work, so it reports one action: whichever opened it. The
+			// aggregate takes its action from whichever bucket holds the most tokens, so without this a
+			// session that mixes actions — a compose whose user also regenerates a commit message — could
+			// be reported as the wrong one once a model switch put the bulk of the tokens in the later
+			// bucket.
+			const openedWith = buckets.values().next().value?.action;
 			buckets.set(key, {
 				provider: model.provider.id,
 				model: model.id,
-				action: action,
+				action: openedWith ?? action,
 				totalTokens: totalTokens,
 				inputTokens: promptTokens ?? 0,
 			});
@@ -2015,7 +2220,9 @@ export class AIProviderService implements AIService, Disposable {
 			let diff = await changesOrRepo.git.diff.getDiff?.(uncommittedStaged);
 			if (!diff?.contents) {
 				diff = await changesOrRepo.git.diff.getDiff?.(uncommitted);
-				if (!diff?.contents) throw new AINoRequestDataError('No changes to generate a commit message from.');
+				if (!diff?.contents) {
+					throw new AINoRequestDataError(l10n.t('No changes to generate a commit message from.'));
+				}
 			}
 			if (options?.cancellation?.isCancellationRequested) return undefined;
 
@@ -2169,23 +2376,26 @@ export class AIProviderService implements AIService, Disposable {
 			provider = this._provider;
 		}
 
-		const resetCurrent: MessageItem = { title: `Reset Current` };
-		const resetAll: MessageItem = { title: 'Reset All' };
-		const cancel: MessageItem = { title: 'Cancel', isCloseAffordance: true };
+		const resetCurrent: MessageItem = { title: l10n.t('Reset Current') };
+		const resetAll: MessageItem = { title: l10n.t('Reset All') };
+		const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
 
 		let result;
 		if (options?.all) {
 			result = resetAll;
 		} else if (provider == null) {
 			result = await window.showInformationMessage(
-				`Do you want to reset all of the stored AI keys?`,
+				l10n.t('Do you want to reset all of the stored AI keys?'),
 				{ modal: true },
 				resetAll,
 				cancel,
 			);
 		} else {
 			result = await window.showInformationMessage(
-				`Do you want to reset the stored key for the current provider (${provider.name}) or reset all of the stored AI keys?`,
+				l10n.t(
+					'Do you want to reset the stored key for the current provider ({0}) or reset all of the stored AI keys?',
+					provider.name,
+				),
 				{ modal: true },
 				resetCurrent,
 				resetAll,
@@ -2211,7 +2421,7 @@ export class AIProviderService implements AIService, Disposable {
 			if (!options?.silent && keys.length) {
 				void env.clipboard.writeText(keys.join('\n'));
 				void window.showInformationMessage(
-					`All stored AI keys have been reset. The configured keys were copied to your clipboard.`,
+					l10n.t('All stored AI keys have been reset. The configured keys were copied to your clipboard.'),
 				);
 			}
 		} else {
@@ -2255,7 +2465,7 @@ export class AIProviderService implements AIService, Disposable {
 			if (key) {
 				void env.clipboard.writeText(key);
 				void window.showInformationMessage(
-					`The stored AI key has been reset. The configured key was copied to your clipboard.`,
+					l10n.t('The stored AI key has been reset. The configured key was copied to your clipboard.'),
 				);
 			}
 		}
@@ -2288,19 +2498,25 @@ export class AIProviderService implements AIService, Disposable {
 			(compareSubscriptionPlans(subscription.plan.actual.id, 'advanced') >= 0 ||
 				compareSubscriptionPlans(subscription.plan.effective.id, 'advanced') >= 0);
 
-		let body = 'All Access Week - now until July 11th!';
+		const body = usingGkProvider
+			? l10n.t('All Access Week - now until July 11th!')
+			: hasAdvancedOrHigher
+				? l10n.t(
+						'All Access Week - now until July 11th! Opt in now to get unlimited GitKraken AI until July 11th!',
+					)
+				: l10n.t(
+						'All Access Week - now until July 11th! Opt in now to try all Advanced GitLens features with unlimited GitKraken AI for FREE until July 11th!',
+					);
 		const detail = hasAdvancedOrHigher
-			? 'Opt in now to get unlimited GitKraken AI until July 11th!'
-			: 'Opt in now to try all Advanced GitLens features with unlimited GitKraken AI for FREE until July 11th!';
-
-		if (!usingGkProvider) {
-			body += ` ${detail}`;
-		}
+			? l10n.t('Opt in now to get unlimited GitKraken AI until July 11th!')
+			: l10n.t(
+					'Opt in now to try all Advanced GitLens features with unlimited GitKraken AI for FREE until July 11th!',
+				);
 
 		const optInButton: MessageItem = usingGkProvider
-			? { title: 'Opt in for Unlimited AI' }
-			: { title: 'Opt in and Switch to GitKraken AI' };
-		const dismissButton: MessageItem = { title: 'No, Thanks', isCloseAffordance: true };
+			? { title: l10n.t('Opt in for Unlimited AI') }
+			: { title: l10n.t('Opt in and Switch to GitKraken AI') };
+		const dismissButton: MessageItem = { title: l10n.t('No, Thanks'), isCloseAffordance: true };
 
 		// Show the notification
 		const result = await window.showInformationMessage(
@@ -2360,13 +2576,13 @@ function getPickerTitlesForScope(scope: AIModelScope | undefined): {
 	if (scope === 'compose') {
 		return {
 			provider: {
-				title: 'Select AI Provider for Composing',
-				placeholder: 'Choose an AI provider for composing',
+				title: l10n.t('Select AI Provider for Composing'),
+				placeholder: l10n.t('Choose an AI provider for composing'),
 				scope: scope,
 			},
 			model: {
-				title: 'Select AI Model for Composing',
-				placeholder: 'Choose an AI model for composing',
+				title: l10n.t('Select AI Model for Composing'),
+				placeholder: l10n.t('Choose an AI model for composing'),
 				scope: scope,
 			},
 		};
@@ -2374,13 +2590,13 @@ function getPickerTitlesForScope(scope: AIModelScope | undefined): {
 	if (scope === 'review') {
 		return {
 			provider: {
-				title: 'Select AI Provider for Reviewing',
-				placeholder: 'Choose an AI provider for reviewing',
+				title: l10n.t('Select AI Provider for Reviewing'),
+				placeholder: l10n.t('Choose an AI provider for reviewing'),
 				scope: scope,
 			},
 			model: {
-				title: 'Select AI Model for Reviewing',
-				placeholder: 'Choose an AI model for reviewing',
+				title: l10n.t('Select AI Model for Reviewing'),
+				placeholder: l10n.t('Choose an AI model for reviewing'),
 				scope: scope,
 			},
 		};
@@ -2388,16 +2604,99 @@ function getPickerTitlesForScope(scope: AIModelScope | undefined): {
 	if (scope === 'resolve') {
 		return {
 			provider: {
-				title: 'Select AI Provider for Resolving Conflicts',
-				placeholder: 'Choose an AI provider for resolving conflicts',
+				title: l10n.t('Select AI Provider for Resolving Conflicts'),
+				placeholder: l10n.t('Choose an AI provider for resolving conflicts'),
 				scope: scope,
 			},
 			model: {
-				title: 'Select AI Model for Resolving Conflicts',
-				placeholder: 'Choose an AI model for resolving conflicts',
+				title: l10n.t('Select AI Model for Resolving Conflicts'),
+				placeholder: l10n.t('Choose an AI model for resolving conflicts'),
 				scope: scope,
 			},
 		};
 	}
 	return { provider: undefined, model: undefined };
+}
+
+/**
+ * Parses the `GET v1/ai-tasks/usage` response body into `AIUsageLimits`, or `undefined` when the body
+ * is unusable. The usage record is the envelope's `data`, never the body itself (see
+ * `AIUsageResponse`); gk.dev's own `getAiUsage` parses this same endpoint the same way — `error`
+ * checked first, then `data`. The spec marks every `AIUsage` field optional, but the three consumed
+ * here are required by gk.dev's schema too, so a record missing them is rejected rather than
+ * half-rendered. The `organization` pool and `sharedUsed` are the exceptions — supplementary, so each is
+ * validated on its own and neither takes the record down with it. Every reject logs why, distinctly per
+ * failure mode — see `fetchUsage` on why silence here is unacceptable.
+ */
+function parseAiUsageResponse(body: unknown, scope: ScopedLogger | undefined): AIUsageLimits | undefined {
+	const rsp = body as AIUsageResponse | null;
+	if (rsp?.error != null) {
+		scope?.error(undefined, `Unable to get AI usage: ${JSON.stringify(rsp.error)}`);
+		return undefined;
+	}
+
+	if (rsp?.data == null) {
+		scope?.error(
+			undefined,
+			rsp == null
+				? 'Unable to get AI usage: empty response'
+				: `Unable to get AI usage: unexpected response shape (keys: ${Object.keys(rsp).join(', ')})`,
+		);
+		return undefined;
+	}
+
+	const { limit, used, resetsOn } = rsp.data;
+	if (typeof limit !== 'number' || typeof used !== 'number' || typeof resetsOn !== 'string' || !resetsOn) {
+		scope?.error(
+			undefined,
+			`Unable to get AI usage: unexpected response shape (keys: ${Object.keys(rsp.data).join(', ')})`,
+		);
+		return undefined;
+	}
+
+	// `-1` (unlimited) and `0` (no allowance) are the only sentinels the API documents, so anything below
+	// `-1` is a shape we don't understand — and one that renders as nonsense ("63K of -2 credits").
+	if (limit < -1) {
+		scope?.error(undefined, `Unable to get AI usage: unexpected limit (${limit})`);
+		return undefined;
+	}
+
+	// The `organization` pool rollup is supplementary to the personal figures, so it's validated on its own:
+	// a malformed or absent member yields `undefined` for it and leaves the primary record intact.
+	let organization: AIUsageLimits['organization'];
+	const org = rsp.data.organization;
+	if (org != null) {
+		const { used: orgUsed, limit: orgLimit } = org as { used?: unknown; limit?: unknown };
+		if (typeof orgUsed === 'number' && typeof orgLimit === 'number' && orgLimit >= -1) {
+			organization = { used: orgUsed, limit: orgLimit };
+		} else {
+			scope?.error(undefined, `Unable to get AI usage organization pool: ${JSON.stringify(org)}`);
+		}
+	}
+
+	// This user's slice of the pool, validated independently of the pool itself — the two arrive as
+	// separate members, so one being malformed says nothing about the other, and losing this one only
+	// costs the pool bar its split.
+	let sharedUsed: number | undefined;
+	const shared = rsp.data.sharedUsed;
+	if (shared != null) {
+		if (typeof shared === 'number' && shared >= 0) {
+			sharedUsed = shared;
+		} else {
+			scope?.error(undefined, `Unable to get AI usage shared usage: ${JSON.stringify(shared)}`);
+		}
+	}
+
+	scope?.addExitInfo(
+		`limit=${limit}, used=${used}, resetsOn=${resetsOn}${
+			organization != null ? `, org.limit=${organization.limit}, org.used=${organization.used}` : ''
+		}${sharedUsed != null ? `, sharedUsed=${sharedUsed}` : ''}`,
+	);
+	return {
+		limit: limit,
+		used: used,
+		resetsOn: resetsOn,
+		organization: organization,
+		sharedUsed: sharedUsed,
+	};
 }

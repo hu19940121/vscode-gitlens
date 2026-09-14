@@ -1,9 +1,10 @@
 import type { TextEditor, Uri } from 'vscode';
+import { l10n } from 'vscode';
 import type { LineRange } from '@gitlens/git/models/lineRange.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
-import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/git/utils/branch.utils.js';
 import { isSha } from '@gitlens/git/utils/revision.utils.js';
+import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { pad, splitSingle } from '@gitlens/utils/string.js';
 import { areUrisEqual } from '@gitlens/utils/uri.js';
@@ -159,12 +160,15 @@ export class OpenFileOnRemoteCommand extends ActiveEditorCommand {
 				}
 
 				if (branch?.upstream == null) {
+					const titleSeparator = pad(GlyphChars.Dot, 2, 2);
 					const pick = await showReferencePicker(
 						gitUri.repoPath,
 						args.clipboard
-							? `Copy Remote File URL From${pad(GlyphChars.Dot, 2, 2)}${gitUri.relativePath}`
-							: `Open File on Remote From${pad(GlyphChars.Dot, 2, 2)}${gitUri.relativePath}`,
-						`Choose a branch or tag to ${args.clipboard ? 'copy' : 'open'} the file revision from`,
+							? l10n.t('Copy Remote File URL From{0}{1}', titleSeparator, gitUri.relativePath)
+							: l10n.t('Open File on Remote From{0}{1}', titleSeparator, gitUri.relativePath),
+						args.clipboard
+							? l10n.t('Choose a branch or tag to copy the file revision from')
+							: l10n.t('Choose a branch or tag to open the file revision from'),
 						{
 							allowedAdditionalInput: { rev: true },
 							autoPick: true,
@@ -221,7 +225,7 @@ export class OpenFileOnRemoteCommand extends ActiveEditorCommand {
 			}));
 		} catch (ex) {
 			Logger.error(ex, 'OpenFileOnRemoteCommand');
-			void showGenericErrorMessage('Unable to open file on remote provider');
+			void showGenericErrorMessage(l10n.t('Unable to open file on remote provider'));
 		}
 	}
 }

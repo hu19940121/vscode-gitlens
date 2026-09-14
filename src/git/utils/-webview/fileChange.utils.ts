@@ -1,6 +1,7 @@
 import type { Uri } from 'vscode';
+import { l10n } from 'vscode';
 import type { GitFileChange, GitFileChangeStats } from '@gitlens/git/models/fileChange.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { Container } from '../../../container.js';
 
 export function getFileChangeWorkingUri(file: GitFileChange): Promise<Uri | undefined> {
@@ -27,7 +28,10 @@ export function formatFileChangeStats(
 	const lineStats = [];
 
 	if (additions) {
-		const additionsText = style === 'expanded' ? `${pluralize('line', additions)} added` : `+${additions}`;
+		const additionsText =
+			style === 'expanded'
+				? formatPlural(l10n.t('{0, plural, one{{0} line added} other{{0} lines added}}'), [additions])
+				: `+${additions}`;
 		if (options?.color && style !== 'short') {
 			lineStats.push(
 				/*html*/ `<span style="color:var(--vscode-gitDecoration-addedResourceForeground);">${additionsText}</span>`,
@@ -46,7 +50,10 @@ export function formatFileChangeStats(
 	}
 
 	if (deletions) {
-		const deletionsText = style === 'expanded' ? `${pluralize('line', deletions)} deleted` : `-${deletions}`;
+		const deletionsText =
+			style === 'expanded'
+				? formatPlural(l10n.t('{0, plural, one{{0} line deleted} other{{0} lines deleted}}'), [deletions])
+				: `-${deletions}`;
 		if (options?.color && style !== 'short') {
 			lineStats.push(
 				/*html*/ `<span style="color:var(--vscode-gitDecoration-deletedResourceForeground);">${deletionsText}</span>`,

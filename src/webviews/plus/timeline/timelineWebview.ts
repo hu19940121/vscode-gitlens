@@ -1,5 +1,5 @@
 import type { TabChangeEvent, TabGroupChangeEvent, TextDocumentShowOptions } from 'vscode';
-import { Disposable, EventEmitter, Uri, ViewColumn, window } from 'vscode';
+import { Disposable, EventEmitter, l10n, Uri, ViewColumn, window } from 'vscode';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitFileChange } from '@gitlens/git/models/fileChange.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
@@ -61,7 +61,6 @@ import type {
 	TimelineScopeSerialized,
 	TimelineServices,
 } from './protocol.js';
-import { DidChangeNotification } from './protocol.js';
 import type { TimelineWebviewShowingArgs } from './registration.js';
 import { buildTimelineDataset, buildWipDatums } from './timelineDataset.js';
 import {
@@ -102,9 +101,6 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 		return getTabUri(window.tabGroups.activeTabGroup.activeTab);
 	}
 
-	/** Subscription listener — fires legacy IPC notification for PromosContext cache invalidation */
-	private readonly _subscriptionDisposable: Disposable;
-
 	constructor(
 		private readonly container: Container,
 		private readonly host: WebviewHost<'gitlens.views.timeline' | 'gitlens.timeline'>,
@@ -112,21 +108,9 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 		if (this.host.is('view')) {
 			this.host.description = proBadge;
 		}
-
-		// Bridge: fire legacy DidChangeNotification on subscription changes so
-		// PromosContext (which listens for IPC, not RPC) can clear its cache
-		this._subscriptionDisposable = this.container.subscription.onDidChange(() => {
-			const state: Partial<State> = {
-				webviewId: this.host.id,
-				webviewInstanceId: this.host.instanceId,
-				timestamp: Date.now(),
-			};
-			void this.host.notify(DidChangeNotification, { state: state as State });
-		});
 	}
 
 	dispose(): void {
-		this._subscriptionDisposable.dispose();
 		this._onScopeChanged.dispose();
 		this._disposable?.dispose();
 		this._repositorySubscription?.dispose();
@@ -278,15 +262,9 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 	}
 
 	getRpcServices(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): TimelineServices {
-		const base = createSharedServices(
-			this.container,
-			this.host,
-			context => {
-				this._telemetryContext = context as TimelineWebviewTelemetryContext;
-			},
-			buffer,
-			tracker,
-		);
+		const base = createSharedServices(this.container, this.host, buffer, tracker, context => {
+			this._telemetryContext = context as TimelineWebviewTelemetryContext;
+		});
 
 		return proxyServices({
 			...base,
@@ -464,10 +442,10 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 
 		const pick = await showReferencePicker2(
 			repo.path,
-			params.type === 'base' ? 'Choose a Base Reference' : 'Choose a Head Reference',
+			params.type === 'base' ? l10n.t('Choose a Base Reference') : l10n.t('Choose a Head Reference'),
 			params.type === 'base'
-				? 'Choose a reference (branch, tag, etc) as the base to view history from'
-				: 'Choose a reference (branch, tag, etc) as the head to view history for',
+				? l10n.t('Choose a reference (branch, tag, etc) as the base to view history from')
+				: l10n.t('Choose a reference (branch, tag, etc) as the head to view history for'),
 			{
 				allowedAdditionalInput: { rev: true /*, range: true */ },
 				picked: ref?.ref,
@@ -677,7 +655,7 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 		}
 
 		if (this.host.is('editor')) {
-			this.host.title = title || 'Visual History';
+			this.host.title = title || l10n.t('Visual History');
 		} else {
 			this.host.description = title || proBadge;
 		}
@@ -741,9 +719,10 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 						{
 							preserveFocus: true,
 							preview: true,
-							title: `Folder Changes in ${shortenRevision(commit.sha, {
-								strings: { working: 'Working Tree' },
-							})}`,
+							title: l10n.t(
+								'Folder Changes in {0}',
+								shortenRevision(commit.sha, { strings: { working: l10n.t('Working Tree') } }),
+							),
 							...this.getOpenEditorShowOptions(),
 						},
 						type === 'folder' ? getFilesFilter(uri, commit.sha) : undefined,
@@ -756,9 +735,11 @@ export class TimelineWebviewProvider implements WebviewProvider<State, State, Ti
 						{
 							preserveFocus: true,
 							preview: true,
-							title: `Folder Changes between ${shortenRevision(commit.sha, {
-								strings: { working: 'Working Tree' },
-							})} and Working Tree`,
+							title: l10n.t(
+								'Folder Changes between {0} and {1}',
+								shortenRevision(commit.sha, { strings: { working: l10n.t('Working Tree') } }),
+								l10n.t('Working Tree'),
+							),
 							...this.getOpenEditorShowOptions(),
 						},
 						type === 'folder' ? getFilesFilter(uri, commit.sha) : undefined,

@@ -1,10 +1,13 @@
 import type { ConfigurationChangeEvent, Disposable, Event } from 'vscode';
 import { EventEmitter } from 'vscode';
 import type {
+	GitHealthBannerState,
 	GitHealthDurationBucket,
 	GitHealthLever,
 	GitHealthReport,
 	GitHealthSlowness,
+	GitHealthSlownessCategory,
+	GitHealthSlownessSample,
 	GitOptimizationTier,
 } from '@gitlens/git/gitHealth.js';
 import {
@@ -12,6 +15,7 @@ import {
 	computeLevers,
 	getAutoMaintenanceTasks,
 	getAutoOptimizations,
+	isBannerEligible,
 } from '@gitlens/git/gitHealth.js';
 import type { RepositoryChangeEvent } from '@gitlens/git/models/repositoryChangeEvent.js';
 import type { GitHealthDetails, GitMaintenanceTask, GitOptimizationId } from '@gitlens/git/providers/maintenance.js';
@@ -19,6 +23,8 @@ import type { Deferrable } from '@gitlens/utils/debounce.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
+import type { ResourceUsage } from '@gitlens/utils/resourceUsage.js';
+import type { StoredGitHealthBannerSuppression } from '../constants.storage.js';
 import type { Container } from '../container.js';
 import { configuration } from '../system/-webview/configuration.js';
 import type { GlRepository } from './models/repository.js';
@@ -29,17 +35,34 @@ const dailyPassIntervalMs = 24 * 60 * 60 * 1000;
 const persistSlownessDebounceMs = 5000;
 /** Debounce for change-driven re-probes so a burst of index events collapses to one probe. */
 const probeDebounceMs = 2000;
-/**
- * Git subcommands GitLens itself issues for background maintenance (the auto-tier pass + the demand-cadence
- * commit-graph write). These are legitimately slow and don't block the user, so they must NOT count as passive
- * "slowness" — else our own optimization work would justify suggesting more of it.
- *
- * Name matching is a BACKSTOP only. The primary mechanism is the exec layer's `selfMaintenance` run option,
- * which the maintenance provider sets explicitly: a subcommand name can't tell our work from the user's,
- * since the same `update-index`/`status` also serve real staging and status calls.
- */
-const selfMaintenanceOperations = new Set(['maintenance', 'commit-graph', 'repack', 'gc', 'prune', 'pack-refs']);
-/** Slowness entries idle longer than this are dropped at hydrate time so removed repos don't accrue forever. */
+/** Local operations whose runtime maps to a Git Health optimization surface. */
+const localHealthSignalOperations = new Map<string, GitHealthSlownessCategory>([
+	['add', 'worktree'],
+	['checkout', 'worktree'],
+	['diff', 'worktree'],
+	['ls-files', 'worktree'],
+	['read-tree', 'worktree'],
+	['restore', 'worktree'],
+	['reset', 'worktree'],
+	['status', 'worktree'],
+	['switch', 'worktree'],
+	['update-index', 'worktree'],
+	['blame', 'history'],
+	['log', 'history'],
+	['merge-base', 'history'],
+	['rev-list', 'history'],
+	['show', 'history'],
+	['for-each-ref', 'refs'],
+	['cat-file', 'objects'],
+]);
+const healthSlownessCategories: readonly GitHealthSlownessCategory[] = [
+	'worktree',
+	'history',
+	'refs',
+	'objects',
+	'commitFiles',
+];
+/** Slowness categories idle longer than this are dropped at hydrate time so removed repos don't accrue forever. */
 const slownessMaxAgeMs = 30 * 24 * 60 * 60 * 1000;
 
 /** Coarsens a maintenance duration into a telemetry-friendly bucket. */
@@ -49,6 +72,34 @@ function bucketDuration(ms: number): GitHealthDurationBucket {
 	if (ms < 15000) return '5-15s';
 	if (ms < 60000) return '15-60s';
 	return '>60s';
+}
+
+function isSlownessSample(value: unknown): value is GitHealthSlownessSample {
+	if (value == null || typeof value !== 'object') return false;
+
+	const sample = value as Partial<GitHealthSlownessSample>;
+	return (
+		typeof sample.count === 'number' &&
+		Number.isFinite(sample.count) &&
+		sample.count >= 0 &&
+		typeof sample.lastAt === 'number' &&
+		Number.isFinite(sample.lastAt) &&
+		typeof sample.maxDurationMs === 'number' &&
+		Number.isFinite(sample.maxDurationMs) &&
+		sample.maxDurationMs >= 0
+	);
+}
+
+function isBannerSuppression(value: unknown): value is StoredGitHealthBannerSuppression {
+	if (value == null || typeof value !== 'object') return false;
+
+	const suppression = value as Partial<StoredGitHealthBannerSuppression>;
+	return (
+		(suppression.dismissedAt === undefined ||
+			(typeof suppression.dismissedAt === 'number' && Number.isFinite(suppression.dismissedAt))) &&
+		(suppression.visitedAt === undefined ||
+			(typeof suppression.visitedAt === 'number' && Number.isFinite(suppression.visitedAt)))
+	);
 }
 
 /**
@@ -73,8 +124,19 @@ export class GitHealthService implements Disposable {
 	// Per-lever view rows, computed at probe time from the same snapshot + capabilities the report used —
 	// so the view can never disagree with the report about what's enabled or who enabled it.
 	private readonly _levers = new Map<string, GitHealthLever[]>();
+	// Completed on-demand details. Index/config-only changes reuse these instead of repeating full-history walks.
+	private readonly _details = new Map<string, GitHealthDetails>();
+	// Serialized report + lever state, used to suppress notifications whose visible state is identical.
+	private readonly _reportStates = new Map<string, string>();
+	// History/object-store changes can invalidate details without changing the cheap report.
+	private readonly _detailsChanged = new Set<string>();
+	// Replaced by invalidateDetails so a walk that started in an older cache epoch can't cache its stale result.
+	// Tokens are explicit and unique: deleting/clearing an epoch must never make two missing entries compare equal.
+	private readonly _detailsEpochs = new Map<string, symbol>();
 	// Passive-slowness accumulator per repo path (hydrated lazily from workspace storage).
 	private _slowness: Map<string, GitHealthSlowness> | undefined;
+	// Banner dismiss/visit suppression timestamps per repo path (hydrated lazily from workspace storage).
+	private _bannerSuppression: Map<string, StoredGitHealthBannerSuppression> | undefined;
 	// Common-git-dir paths with an in-flight auto pass (per-common-path serialization).
 	private readonly _runningPasses = new Set<string>();
 	// In-memory last-pass times — the session-local throttle backstop when the gk-config stamp can't persist.
@@ -136,37 +198,81 @@ export class GitHealthService implements Disposable {
 		this._disposables.length = 0;
 	}
 
+	/** Resource usage retained by git-health probes and observations. */
+	getResourceUsage(): ResourceUsage {
+		return {
+			'slowness.entries.count': this._slowness?.size ?? 0,
+			'bannerSuppressions.entries.count': this._bannerSuppression?.size ?? 0,
+			'probes.inflight.count': this._inflightProbes.size,
+			'telemetrySnapshots.entries.count': this._lastProbeTelemetry.size,
+		};
+	}
+
 	/**
 	 * Records a slow git command against its repo. Called from the exec-layer `onSlowCommand` hook, so it
 	 * MUST stay synchronous and resolve the repo via the in-memory registry only — never invoke git (that
 	 * would recurse through the exec layer that just fired this hook).
+	 *
+	 * An explicit `slownessCategory` (the caller-declared operation family, e.g. a paged log carrying
+	 * per-commit file details) wins over the subcommand allowlist below — only the caller can distinguish
+	 * an eager file-details log from a plain history walk; the git subcommand alone can't.
 	 */
-	recordSlowCommand(cwd: string | undefined, duration: number, operation: string | undefined): void {
+	recordSlowCommand(
+		cwd: string | undefined,
+		duration: number,
+		operation: string | undefined,
+		slownessCategory?: GitHealthSlownessCategory,
+	): void {
 		if (cwd == null || cwd.length === 0) return;
 		if (!configuration.get('gitOptimizations.enabled')) return;
-		// Don't let GitLens's own background maintenance/commit-graph writes register as user slowness.
-		if (operation != null && selfMaintenanceOperations.has(operation)) return;
+
+		// An allowlist keeps fetch/push/clone, credential prompts, hooks, and editors from leaking through as
+		// repository slowness. The category then constrains which optimization can use the evidence.
+		const category =
+			slownessCategory ?? (operation == null ? undefined : localHealthSignalOperations.get(operation));
+		if (category == null) return;
 
 		const repo = this.container.git.getRepository(cwd);
 		if (repo == null) return;
 
 		const slowness = this.getSlowness();
 		const prev = slowness.get(repo.path);
-		slowness.set(repo.path, {
-			count: (prev?.count ?? 0) + 1,
+		const prevCategory = prev?.[category];
+		const nextCategory: GitHealthSlownessSample = {
+			count: (prevCategory?.count ?? 0) + 1,
 			lastAt: Date.now(),
-			maxDurationMs: Math.max(prev?.maxDurationMs ?? 0, Math.round(duration)),
+			maxDurationMs: Math.max(prevCategory?.maxDurationMs ?? 0, Math.round(duration)),
+		};
+		slowness.set(repo.path, {
+			...prev,
+			[category]: nextCategory,
 		});
 		this._persistSlownessDebounced();
 
 		// A cached report is computed from the slowness known at probe time, so newly observed slowness
 		// would otherwise not reach the UI until an unrelated repo change or the next session. Re-probe
-		// only on the FIRST slow command: `computeHealthReport` gates on `count > 0`, so that's the one
-		// transition that can change a recommendation — and re-probing per slow command would itself run
-		// git, re-arming this hook.
-		if (prev == null) {
+		// only on the FIRST slow command in each family: that's the transition that can change a targeted
+		// recommendation, and re-probing every slow command would itself run git and re-arm this hook.
+		if (prevCategory == null) {
 			this.scheduleProbe(repo);
 		}
+	}
+
+	/**
+	 * Whether commit and stash queries should defer per-commit file details for this repository. The
+	 * `advanced.commits.delayLoadingFileDetails` setting is a hard override in either direction; `null`
+	 * (the default) defers only where the eager paged log has been observed slow (`commitFiles`
+	 * slowness within the retention window), and only while Git optimizations are enabled. Evidence
+	 * expires with the slowness samples, so a repository drifts back to eager loading on its own —
+	 * there is nothing to undo.
+	 */
+	shouldDelayFileDetails(repoPath: string): boolean {
+		const setting = configuration.get('advanced.commits.delayLoadingFileDetails');
+		if (setting != null) return setting;
+		if (!configuration.get('gitOptimizations.enabled')) return false;
+
+		const resolvedPath = this.container.git.getRepository(repoPath)?.path ?? repoPath;
+		return (this.getSlowness().get(resolvedPath)?.commitFiles?.count ?? 0) > 0;
 	}
 
 	/** Returns the current report for a repo, probing on first request. */
@@ -191,22 +297,147 @@ export class GitHealthService implements Disposable {
 		return this._levers.get(repo.path) ?? [];
 	}
 
+	/**
+	 * Evidence-gated Git Health banner state for a repo — undefined when there's nothing to show. Combines
+	 * {@link isBannerEligible}'s report/slowness gate with the suggested-lever count and the dismiss/visit
+	 * suppression windows so the graph and the Visualizations toggle read the same verdict.
+	 */
+	async getBannerState(repoPath: string): Promise<GitHealthBannerState | undefined> {
+		const repo = this.container.git.getRepository(repoPath);
+		if (repo == null) return undefined;
+
+		const report = await this.getReport(repoPath);
+		if (report == null) return undefined;
+
+		const slowness = this.getSlowness().get(repo.path);
+		if (!isBannerEligible(report, slowness)) return undefined;
+
+		// The banner promises "N optimizations suggested" — zero means nothing to show even though the
+		// report/slowness gate passed.
+		const suggestedCount = (await this.getLevers(repoPath)).filter(l => l.status === 'suggested').length;
+		if (suggestedCount === 0) return undefined;
+
+		const worktree = slowness?.worktree;
+		const reason = (worktree?.count ?? 0) > 0 ? 'slowness' : 'large';
+
+		const suppression = this.getBannerSuppression().get(repo.path);
+		const now = Date.now();
+		const dismissSuppressed = suppression?.dismissedAt != null && now - suppression.dismissedAt < slownessMaxAgeMs;
+		const visitSuppressed = suppression?.visitedAt != null && now - suppression.visitedAt < slownessMaxAgeMs;
+
+		// Only an explicit ✕ quiets the strip — a visit is not a decision about the banner (applying the
+		// suggestions ends it via the eligibility gate instead). A visit does clear the indicator: the dot
+		// means "something here you haven't seen", and visiting resolves exactly that.
+		const banner = !dismissSuppressed;
+		const indicator = !visitSuppressed;
+		// Returned even when both flags are suppressed — the toggle tooltip's "N optimizations
+		// suggested" line is a current fact, not a notice, so it outlives the strip and the dot.
+		return {
+			banner: banner,
+			indicator: indicator,
+			reason: reason,
+			maxDurationMs: reason === 'slowness' ? worktree?.maxDurationMs : undefined,
+			trackedFiles: reason === 'large' ? report.estimatedTrackedFiles : undefined,
+			trackedFilesExact: reason === 'large' ? report.trackedFilesScope !== 'estimate' : undefined,
+			suggestedCount: suggestedCount,
+		};
+	}
+
+	/** Dismisses the Git Health banner strip for a repo; suppresses the banner (not the indicator) for 30 days. */
+	async dismissBanner(repoPath: string): Promise<void> {
+		const repo = this.container.git.getRepository(repoPath);
+		if (repo == null) return;
+
+		const suppression = this.getBannerSuppression();
+		suppression.set(repo.path, { ...suppression.get(repo.path), dismissedAt: Date.now() });
+		await this.persistBannerSuppression();
+		this._onDidChange.fire(repo.path);
+	}
+
+	/**
+	 * Quiets the banner strip once the user acts on one of the suggestions it advertised — applying a
+	 * suggested lever IS the decision the strip was asking for, and leaving it up to nag with whatever
+	 * they deliberately left alone reads as the banner ignoring them. The still-suggested levers remain
+	 * visible where they belong: the Repository Health view and the toggle's tooltip.
+	 *
+	 * Deliberately narrow. `suggested` is read from the CACHED levers (the same rows the view rendered,
+	 * so this matches the status the person actually clicked) and only that status counts: Undo, the
+	 * commit-graph toggle, maintenance runs, and re-applying an already-applied lever are not the
+	 * banner's ask, so they leave it to the explicit ✕. Undo in particular RE-suggests its lever — an
+	 * implicit dismiss there would quiet a strip that just regained something to say.
+	 *
+	 * Written BEFORE the apply's own work so the strip clears immediately rather than after a re-probe
+	 * that can spend seconds on a large repository, and unconditional on the apply's outcome: the click
+	 * is the engagement, and a genuine git failure is surfaced by the view the person is already looking
+	 * at, not by a banner still telling them to go there.
+	 */
+	private async quietBannerForAppliedSuggestion(repoPath: string, id: GitOptimizationId): Promise<void> {
+		const suggested = this._levers.get(repoPath)?.some(l => l.id === id && l.status === 'suggested');
+		if (suggested !== true) return;
+
+		try {
+			await this.dismissBanner(repoPath);
+		} catch (ex) {
+			// Best-effort — a failed suppression write must never block the apply the user actually asked
+			// for. The strip just stands until the next fetch, same as a failed explicit dismiss.
+			Logger.error(ex, 'GitHealthService.quietBannerForAppliedSuggestion');
+		}
+	}
+
+	/** Records a Repository Health view visit for a repo; quiets the indicator (not the strip) for 30 days. */
+	async markHealthViewVisited(repoPath: string): Promise<void> {
+		const repo = this.container.git.getRepository(repoPath);
+		if (repo == null) return;
+
+		const suppression = this.getBannerSuppression();
+		const prevVisitedAt = suppression.get(repo.path)?.visitedAt;
+		const now = Date.now();
+		suppression.set(repo.path, { ...suppression.get(repo.path), visitedAt: now });
+		await this.persistBannerSuppression();
+
+		// The health view is visited on every open — a repeat visit inside the window extends the quiet
+		// period (persisted above) but must not refire, or every visit would loop a refresh.
+		if (prevVisitedAt != null && now - prevVisitedAt < slownessMaxAgeMs) return;
+
+		this._onDidChange.fire(repo.path);
+	}
+
 	/** On-demand commit count + `count-objects` breakdown for the Git Health view. */
 	async getDetails(repoPath: string, cancellation?: AbortSignal): Promise<GitHealthDetails> {
-		const maintenance = this.getMaintenance(repoPath);
-		if (maintenance == null) return { commitCount: undefined, countObjects: undefined };
+		const resolved = this.resolveMaintenance(repoPath);
+		if (resolved == null) return { commitCount: undefined, countObjects: undefined };
 
-		return maintenance.getHealthDetails(cancellation);
+		const cached = this._details.get(resolved.repo.path);
+		if (cached != null) return cached;
+
+		let epoch = this._detailsEpochs.get(resolved.repo.path);
+		if (epoch == null) {
+			epoch = Symbol();
+			this._detailsEpochs.set(resolved.repo.path, epoch);
+		}
+
+		const details = await resolved.maintenance.getHealthDetails(cancellation);
+		// A superseded webview refresh aborts its walks; never cache that degraded result for the next refresh.
+		// Nor a walk that STARTED before an invalidation, eviction, or disable but completed after it — the
+		// unique epoch catches that even though this call's own cancellation never fired.
+		if (cancellation?.aborted !== true && this._detailsEpochs.get(resolved.repo.path) === epoch) {
+			this._details.set(resolved.repo.path, details);
+		}
+		return details;
 	}
 
 	/**
 	 * Applies an optimization lever, then re-probes. Returns whether it took effect. This is the ask-tier
 	 * (user-clicked) path, so a genuine failure PROPAGATES to the caller (the view surfaces it); the re-probe
 	 * runs in a `finally` so the view's state stays fresh even when the apply threw.
+	 *
+	 * Acting on a suggestion also quiets the banner strip — see {@link quietBannerForAppliedSuggestion}.
 	 */
 	async applyFix(repoPath: string, id: GitOptimizationId, cancellation?: AbortSignal): Promise<boolean> {
 		const resolved = this.resolveMaintenance(repoPath);
 		if (resolved == null) return false;
+
+		await this.quietBannerForAppliedSuggestion(resolved.repo.path, id);
 
 		try {
 			return await this.applyOptimizationWithTelemetry(repoPath, id, 'ask', cancellation);
@@ -256,7 +487,7 @@ export class GitHealthService implements Disposable {
 		const resolved = this.resolveMaintenance(repoPath);
 		if (resolved == null) return [];
 
-		const tasks: GitMaintenanceTask[] = ['commit-graph', 'loose-objects', 'incremental-repack'];
+		const tasks: GitMaintenanceTask[] = ['commit-graph', 'loose-objects', 'incremental-repack', 'pack-refs'];
 
 		// Join the SAME single-flight the auto pass uses. This is now reachable from a button, and opening
 		// the Health view is itself what queues a pass — so without this a click lands straight on top of
@@ -273,10 +504,14 @@ export class GitHealthService implements Disposable {
 		try {
 			// Sequential for the same reason: they contend on that one lock.
 			for (const task of tasks) {
-				results.push({ task: task, ran: await this.runTaskWithTelemetry(repoPath, task, cancellation) });
+				results.push({
+					task: task,
+					ran: await this.runTaskWithTelemetry(repoPath, task, false, cancellation),
+				});
 			}
 		} finally {
 			this._runningPasses.delete(commonPath);
+			this.invalidateDetails(resolved.repo);
 			await this.reprobe(resolved.repo);
 		}
 		return results;
@@ -320,6 +555,10 @@ export class GitHealthService implements Disposable {
 
 		this._reports.clear();
 		this._levers.clear();
+		this._details.clear();
+		this._reportStates.clear();
+		this._detailsChanged.clear();
+		this._detailsEpochs.clear();
 		for (const repo of this.container.git.openRepositories) {
 			this._onDidChange.fire(repo.path);
 		}
@@ -329,10 +568,14 @@ export class GitHealthService implements Disposable {
 		// Re-probe only on changes that can alter object-store / working-tree shape. Crucially, a coarse
 		// `gkConfig` change (which our own `gk.maintenanceLastRun` write echoes back as) is NOT in this set,
 		// so a maintenance-timestamp write can never re-trigger the daily pass.
-		if (!e.changed('heads', 'index', 'remotes')) return;
+		if (!e.changed('heads', 'index', 'remotes', 'stash', 'tags')) return;
 
 		const repo = this.container.git.getRepository(e.repository.path);
 		if (repo == null) return;
+
+		if (e.changed('heads', 'remotes', 'stash', 'tags')) {
+			this.invalidateDetails(repo);
+		}
 
 		this.scheduleProbe(repo);
 	}
@@ -420,18 +663,34 @@ export class GitHealthService implements Disposable {
 
 			const capabilities = getSettledValue(capabilitiesResult) ?? [];
 			const slowness = this.getSlowness().get(repo.path);
+			const slownessCount = Object.values(slowness ?? {}).reduce((sum, sample) => sum + sample.count, 0);
 			const report = computeHealthReport(snapshot, slowness, capabilities);
+			const levers = computeLevers(snapshot, capabilities, report);
+			const state = JSON.stringify([report, levers]);
+			const visibleStateChanged = this._reportStates.get(repo.path) !== state;
+			const detailsChanged = this._detailsChanged.delete(repo.path);
 
 			this._reports.set(repo.path, report);
-			this._levers.set(repo.path, computeLevers(snapshot, capabilities, report));
+			this._levers.set(repo.path, levers);
+			this._reportStates.set(repo.path, state);
 			const event = {
+				'repository.shallow': snapshot.repository.shallow,
+				'repository.partial': snapshot.repository.partial,
+				'repository.sparseCheckout': snapshot.repository.sparseCheckout,
+				'repository.sparseIndex': snapshot.repository.sparseIndex,
+				'repository.splitIndex': snapshot.repository.splitIndex,
+				'repository.refFormat': snapshot.repository.refFormat,
 				'packs.count': snapshot.packCount,
+				'packs.outsideMultiPackIndex': snapshot.packsOutsideMultiPackIndex,
 				'packs.bytes': snapshot.packBytes,
+				'refs.loose': snapshot.looseRefs.count,
+				'refs.looseExact': snapshot.looseRefs.exact,
 				'estimate.looseObjects': report.estimatedLooseObjects,
 				'estimate.trackedFiles': report.estimatedTrackedFiles,
 				'estimate.trackedFilesExact': report.trackedFilesExact,
 				'commitGraph.present': snapshot.commitGraph.present,
 				multiPackIndex: snapshot.multiPackIndex,
+				'multiPackIndex.enabled': snapshot.multiPackIndexEnabled,
 				// Telemetry stays boolean — an unreadable registration coarsens to `false` here, but the report
 				// itself (and the lever's `unavailable` status) still tracks the tri-state distinction.
 				maintenanceRegistered: snapshot.maintenanceRegistered ?? false,
@@ -439,7 +698,12 @@ export class GitHealthService implements Disposable {
 				'findings.total': report.findings.length,
 				'findings.auto': report.findings.filter(f => f.tier === 'auto').length,
 				'findings.ask': report.findings.filter(f => f.tier === 'ask').length,
-				'slowness.count': slowness?.count ?? 0,
+				'slowness.count': slownessCount,
+				'slowness.worktree': slowness?.worktree?.count ?? 0,
+				'slowness.history': slowness?.history?.count ?? 0,
+				'slowness.refs': slowness?.refs?.count ?? 0,
+				'slowness.objects': slowness?.objects?.count ?? 0,
+				'slowness.commitFiles': slowness?.commitFiles?.count ?? 0,
 			};
 			// Re-probes are frequent (debounced index changes, post-fix refreshes) — only report changes.
 			const serialized = JSON.stringify(event);
@@ -449,11 +713,23 @@ export class GitHealthService implements Disposable {
 			}
 
 			// Repo-open (and each re-probe) hints the commit-graph write so the cache stays warm across the
-			// whole extension, not just the Commit Graph webview. Fire-and-forget — the maintenance service's
-			// demand throttle decides whether anything runs.
-			maintenance.request('commit-graph');
+			// whole extension. A completed write schedules one post-write probe; the provider's demand throttle
+			// makes that probe's next request a no-op, so completion cannot form a refresh loop.
+			const graphWrite = maintenance.request('commit-graph');
+			if (graphWrite != null) {
+				void graphWrite
+					.then(wrote => {
+						if (wrote && !this._disposed && this.container.git.getRepository(repo.path) != null) {
+							return this.reprobe(repo);
+						}
+						return undefined;
+					})
+					.catch((ex: unknown) => Logger.error(ex, 'GitHealthService.probe.commitGraphCompletion'));
+			}
 
-			this._onDidChange.fire(repo.path);
+			if (visibleStateChanged || detailsChanged) {
+				this._onDidChange.fire(repo.path);
+			}
 
 			return report;
 		} catch (ex) {
@@ -510,7 +786,7 @@ export class GitHealthService implements Disposable {
 				if (!configuration.get('gitOptimizations.enabled')) return;
 
 				try {
-					await this.runTaskWithTelemetry(repo.path, task, this._disposeAbort.signal);
+					await this.runTaskWithTelemetry(repo.path, task, true, this._disposeAbort.signal);
 				} catch (ex) {
 					Logger.error(ex, `GitHealthService.runAutoPassIfDue.task(${task})`);
 				}
@@ -532,7 +808,8 @@ export class GitHealthService implements Disposable {
 				}
 			}
 
-			// Re-probe so the report reflects the post-maintenance object store.
+			// Re-probe so the report and on-demand object counts reflect the post-maintenance object store.
+			this.invalidateDetails(repo);
 			await this.probe(repo);
 		} finally {
 			this._runningPasses.delete(commonPath);
@@ -568,25 +845,31 @@ export class GitHealthService implements Disposable {
 	}
 
 	/**
-	 * Runs one maintenance task and, if it actually ran, reports telemetry. Returns whether it ran. A genuine
-	 * task failure PROPAGATES (the ask-tier caller surfaces it; the auto-tier caller catches+logs).
+	 * Invokes one maintenance task and reports supported invocations. In auto mode Git can intentionally no-op
+	 * after evaluating its native condition. A genuine failure PROPAGATES (ask-tier surfaces it; auto catches).
 	 */
 	private async runTaskWithTelemetry(
 		repoPath: string,
 		task: GitMaintenanceTask,
+		auto: boolean,
 		cancellation?: AbortSignal,
 	): Promise<boolean> {
 		const maintenance = this.getMaintenance(repoPath);
 		if (maintenance == null) return false;
 
+		// The pack-refs task predates its useful native auto condition by years; on Git versions at our 2.31
+		// support floor, `maintenance run --auto --task=pack-refs` skips it entirely. Keep using Git Health's
+		// bounded loose-ref threshold there. The object tasks have had native auto conditions since inception.
+		const nativeAuto = auto && task !== 'pack-refs' && task !== 'commit-graph';
 		const start = Date.now();
-		const ran = await maintenance.runMaintenanceTask(task, cancellation);
-		// No event for unsupported (not-applicable) attempts — the event means "a maintenance task actually ran".
+		const ran = await maintenance.runMaintenanceTask(task, { auto: nativeAuto, cancellation: cancellation });
+		// No event for unsupported attempts. An auto invocation may still be a native no-op by design.
 		if (!ran) return false;
 
 		const duration = Date.now() - start;
 		this.container.telemetry.sendEvent('gitOptimizations/maintenance/run', {
 			task: task,
+			auto: nativeAuto,
 			duration: duration,
 			'duration.bucket': bucketDuration(duration),
 		});
@@ -605,6 +888,10 @@ export class GitHealthService implements Disposable {
 	private evict(repo: GlRepository): void {
 		this._reports.delete(repo.path);
 		this._levers.delete(repo.path);
+		this._details.delete(repo.path);
+		this._reportStates.delete(repo.path);
+		this._detailsChanged.delete(repo.path);
+		this._detailsEpochs.delete(repo.path);
 		this._lastProbeTelemetry.delete(repo.path);
 		this._inflightProbes.delete(repo.path);
 		const timer = this._probeTimers.get(repo.path);
@@ -614,15 +901,36 @@ export class GitHealthService implements Disposable {
 		}
 	}
 
+	private invalidateDetails(repo: GlRepository): void {
+		this._details.delete(repo.path);
+		this._detailsChanged.add(repo.path);
+		this._detailsEpochs.set(repo.path, Symbol());
+	}
+
 	private getSlowness(): Map<string, GitHealthSlowness> {
 		if (this._slowness == null) {
-			const stored = this.container.storage.getWorkspace('gitHealth:slowness') ?? {};
+			const stored = this.container.storage.getWorkspace('gitHealth:slowness:v3') ?? {};
 			// Age-prune at hydrate so entries for long-gone repos don't accumulate in workspace storage
 			// forever (entries are deliberately kept across repo close/reopen within the window).
 			const cutoff = Date.now() - slownessMaxAgeMs;
-			this._slowness = new Map<string, GitHealthSlowness>(
-				Object.entries(stored).filter(([, value]) => value.lastAt >= cutoff),
-			);
+			this._slowness = new Map<string, GitHealthSlowness>();
+			for (const [repoPath, value] of Object.entries(stored)) {
+				const recent: GitHealthSlowness = {};
+				for (const category of healthSlownessCategories) {
+					const sample = (value as Record<string, unknown> | null)?.[category];
+					if (isSlownessSample(sample) && sample.lastAt >= cutoff) {
+						recent[category] = sample;
+					}
+				}
+				if (Object.keys(recent).length !== 0) {
+					this._slowness.set(repoPath, recent);
+				}
+			}
+
+			// One-time cleanup of the aggregate v1/v2 data. Neither can be assigned to an operation family
+			// without inventing evidence, so fail toward no recommendation instead of migrating it.
+			void this.container.storage.deleteWorkspace('gitHealth:slowness').catch(() => {});
+			void this.container.storage.deleteWorkspace('gitHealth:slowness:v2').catch(() => {});
 		}
 		return this._slowness;
 	}
@@ -631,9 +939,53 @@ export class GitHealthService implements Disposable {
 		if (this._slowness == null) return;
 
 		try {
-			await this.container.storage.storeWorkspace('gitHealth:slowness', Object.fromEntries(this._slowness));
+			await this.container.storage.storeWorkspace('gitHealth:slowness:v3', Object.fromEntries(this._slowness));
 		} catch (ex) {
 			Logger.error(ex, 'GitHealthService.persistSlowness');
+		}
+	}
+
+	/** Clears every repo's banner dismiss/visit suppression — the "Reset Onboarding" path. */
+	async resetBannerSuppression(): Promise<void> {
+		const suppression = this.getBannerSuppression();
+		const repoPaths = [...suppression.keys()];
+		suppression.clear();
+		await this.container.storage.deleteWorkspace('gitHealth:banner:v1');
+
+		for (const repoPath of repoPaths) {
+			this._onDidChange.fire(repoPath);
+		}
+	}
+
+	private getBannerSuppression(): Map<string, StoredGitHealthBannerSuppression> {
+		if (this._bannerSuppression == null) {
+			const stored = this.container.storage.getWorkspace('gitHealth:banner:v1') ?? {};
+			// Age-prune at hydrate by the NEWEST timestamp — suppression expires at 30d, so an entry whose
+			// latest dismiss/visit is already past that window is dead weight in workspace storage.
+			const cutoff = Date.now() - slownessMaxAgeMs;
+			this._bannerSuppression = new Map<string, StoredGitHealthBannerSuppression>();
+			for (const [repoPath, value] of Object.entries(stored)) {
+				if (!isBannerSuppression(value)) continue;
+
+				const newest = Math.max(value.dismissedAt ?? 0, value.visitedAt ?? 0);
+				if (newest >= cutoff) {
+					this._bannerSuppression.set(repoPath, value);
+				}
+			}
+		}
+		return this._bannerSuppression;
+	}
+
+	private async persistBannerSuppression(): Promise<void> {
+		if (this._bannerSuppression == null) return;
+
+		try {
+			await this.container.storage.storeWorkspace(
+				'gitHealth:banner:v1',
+				Object.fromEntries(this._bannerSuppression),
+			);
+		} catch (ex) {
+			Logger.error(ex, 'GitHealthService.persistBannerSuppression');
 		}
 	}
 }

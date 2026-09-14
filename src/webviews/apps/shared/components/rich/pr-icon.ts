@@ -1,11 +1,12 @@
+import * as l10n from '@vscode/l10n';
 import { html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
+import type { AutolinkIconStatus } from '@gitlens/components/components/icons/providerIcons.js';
+import { getAutolinkIcon } from '@gitlens/components/components/icons/providerIcons.js';
 import { prIconStyles } from './pr.css.js';
-import type { AutolinkIconStatus } from './utils.js';
-import { getAutolinkIcon } from './utils.js';
-import '../code-icon.js';
-import '../overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 @customElement('pr-icon')
 export class PrIcon extends LitElement {
@@ -36,7 +37,7 @@ export class PrIcon extends LitElement {
 	}
 
 	get label(): string {
-		const type = this.draft ? 'Draft pull request' : 'Pull request';
+		const type = this.draft ? l10n.t('Draft pull request') : l10n.t('Pull request');
 		if (!this.state) return type;
 
 		return `${type} ${this.prId ? `#${this.prId}` : ''} is ${this.state}`;

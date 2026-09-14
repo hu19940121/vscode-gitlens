@@ -1,3 +1,5 @@
+import { shortRefName } from '@gitkraken/commit-graph-ui/rows/markers.js';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues, TemplateResult } from 'lit';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
@@ -5,21 +7,20 @@ import { classMap } from 'lit/directives/class-map.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { repeat } from 'lit/directives/repeat.js';
 import { when } from 'lit/directives/when.js';
-import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/git/utils/branch.utils.js';
+import { focusableBaseStyles } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
 import type { OverviewBranch, OverviewBranchWip } from '../../../../shared/overviewBranches.js';
 import type { AgentSessionCategory } from '../../../shared/agentUtils.js';
-import { focusableBaseStyles } from '../../../shared/components/styles/lit/a11y.css.js';
-import { boxSizingBase } from '../../../shared/components/styles/lit/base.css.js';
 import { ContextMenuProxyController } from '../../../shared/controllers/context-menu-proxy.js';
 import { providerIconName } from '../../../shared/git-utils.js';
-import { shortRefName } from '../utils/rowMarker.utils.js';
 import { normalizeWheelDelta } from '../utils/wheel.utils.js';
 import { overviewBarStyles } from './gl-graph-overview-bar.css.js';
 import './gl-branch-hover.js';
 import './gl-graph-coachmark.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 export interface OverviewBarItem {
 	/** The WIP's id: `uncommitted` for the graph's own worktree, its `wipRowsById` row id (see
@@ -94,6 +95,17 @@ export interface OverviewBarJumpDetail {
 	sha: string;
 }
 
+export interface OverviewBarFocusDetail {
+	branchId: string;
+	branch: string;
+	/** The focused pill's worktree path (`OverviewBarItem.repoPath`) — lets the handler stamp a
+	 *  worktree scope origin for a SECONDARY pill without re-resolving it. */
+	repoPath: string;
+	/** Whether the focused pill is the graph's own (primary) worktree — a primary focus stays a plain
+	 *  branch scope (the graph is already bound there); only a secondary rebinds the graph. */
+	isPrimary: boolean;
+}
+
 @customElement('gl-graph-overview-bar')
 export class GlGraphOverviewBar extends LitElement {
 	static override styles = [boxSizingBase, focusableBaseStyles, overviewBarStyles];
@@ -137,6 +149,28 @@ export class GlGraphOverviewBar extends LitElement {
 		if (id == null) return;
 
 		this.selectWipById(id, e);
+	};
+
+	/** Double-click a pill → focus (scope) the graph on its worktree's branch, same vocabulary as the
+	 *  sidebar rows. Detached worktrees (no `branchId`) have no branch to focus — no-op. */
+	private readonly onItemDblClick = (e: MouseEvent): void => {
+		const id = (e.currentTarget as HTMLElement).dataset.id;
+		const item = id != null ? this.items.find(i => i.id === id) : undefined;
+		if (item?.branchId == null) return;
+
+		e.stopPropagation();
+		this.dispatchEvent(
+			new CustomEvent<OverviewBarFocusDetail>('gl-graph-overview-bar-focus', {
+				detail: {
+					branchId: item.branchId,
+					branch: item.branch,
+					repoPath: item.repoPath,
+					isPrimary: item.isPrimary === true,
+				},
+				bubbles: true,
+				composed: true,
+			}),
+		);
 	};
 
 	private selectWipById(id: string, e: Event): void {
@@ -494,7 +528,7 @@ export class GlGraphOverviewBar extends LitElement {
 					class="pills"
 					role="toolbar"
 					aria-orientation="horizontal"
-					aria-label="Overview"
+					aria-label=${l10n.t('Overview')}
 					@keydown=${this.onPillsKeyDown}
 				>
 					${repeat(
@@ -558,6 +592,7 @@ export class GlGraphOverviewBar extends LitElement {
 						data-id=${item.id}
 						data-index=${index}
 						@click=${this.onItemClick}
+						@dblclick=${this.onItemDblClick}
 						@mouseenter=${this.onPillHover}
 						@focus=${this.onPillHover}
 						aria-current=${isSelected ? 'true' : nothing}

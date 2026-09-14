@@ -1,5 +1,6 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement } from 'lit/decorators.js';
 import type { VisualizationMode } from '../../../../plus/graph/protocol.js';
@@ -9,11 +10,12 @@ import { graphStateContext } from '../context.js';
 import { getSelectedRepo } from '../utils/repository.utils.js';
 import type { GraphVisualizationKey } from './visualizations.utils.js';
 import { getEffectiveVisualizationKey } from './visualizations.utils.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '../../../shared/components/indicators/new-indicator.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 /** Flat enumeration of the visualizations the switcher offers. Each entry collapses the two-axis
- *  (mode × treemapMode) state into a single key, so the UI is one tablist instead of two nested
+ *  (mode × treemapMode) state into a single key, so the UI is one button group instead of two nested
  *  toggles. Add a new visualization by extending this map; the rest of the component derives icon,
  *  tooltip, and dispatch from the entry. Aliased to the shared {@link GraphVisualizationKey} so the
  *  switcher, the wrapper's routing, and the `closed` telemetry all name visualizations identically. */
@@ -27,11 +29,21 @@ interface VisualizationConfig {
 }
 
 const visualizationConfigs: Record<VisualizationKey, VisualizationConfig> = {
-	timeline: { mode: 'timeline', icon: 'graph-scatter', label: 'Visual History' },
-	'treemap-files': { mode: 'treemap', treemapMode: 'files', icon: 'folder', label: 'Files Treemap' },
-	'treemap-commits': { mode: 'treemap', treemapMode: 'commits', icon: 'git-commit', label: 'Commits Treemap' },
-	'treemap-activity': { mode: 'treemap', treemapMode: 'activity', icon: 'robot', label: 'Agent Activity Treemap' },
-	health: { mode: 'health', icon: 'heart', label: 'Repository Health' },
+	timeline: { mode: 'timeline', icon: 'graph-scatter', label: l10n.t('Visual History') },
+	'treemap-files': { mode: 'treemap', treemapMode: 'files', icon: 'folder', label: l10n.t('Files Treemap') },
+	'treemap-commits': {
+		mode: 'treemap',
+		treemapMode: 'commits',
+		icon: 'git-commit',
+		label: l10n.t('Commits Treemap'),
+	},
+	'treemap-activity': {
+		mode: 'treemap',
+		treemapMode: 'activity',
+		icon: 'robot',
+		label: l10n.t('Agent Activity Treemap'),
+	},
+	health: { mode: 'health', icon: 'heart', label: l10n.t('Repository Health') },
 };
 
 /**
@@ -56,9 +68,9 @@ export interface GraphTreemapModeChangeDetail {
 }
 
 /**
- * Compact icon-button group for switching between Visual History (timeline) and the three treemap
- * modes. Embedded directly into each visualization's header — the wrapping `gl-graph-visualizations`
- * routes the active mode; this component is the user-visible control.
+ * Compact icon-button group for switching between Visual History (timeline), the three treemap modes,
+ * and Repository Health. Embedded directly into each visualization's header — the wrapping
+ * `gl-graph-visualizations` routes the active mode; this component is the user-visible control.
  *
  * Clicking an entry dispatches `gl-graph-visualization-mode-change` and (when applicable)
  * `gl-graph-treemap-mode-change` so graph-app's existing per-axis handlers continue to own
@@ -81,7 +93,7 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 		}
 
 		/* Separates the visualization lenses from Repository Health, which is a control surface rather
-		   than another way of drawing the repo. */
+   than another way of drawing the repo. */
 		.visualization-separator {
 			align-self: center;
 			width: var(--gl-border-width);
@@ -131,7 +143,7 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 		}
 	`;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
 
 	private get mode(): VisualizationMode {
@@ -147,17 +159,11 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 	}
 
 	/** Map current `(mode, treemapMode)` state to the active switcher key via the shared resolver, so
-	 *  the pressed tab, the wrapper's routing, and the `closed` telemetry can't drift. The switcher
-	 *  renders only when the flag is on (see `render`), so the gate is always satisfied here. */
+	 *  the pressed button, the wrapper's routing, and the `closed` telemetry can't drift. */
 	private get activeKey(): VisualizationKey {
-		const key = getEffectiveVisualizationKey(
-			this.mode,
-			this.treemapMode,
-			this.graphState.config?.experimentalVisualizationsEnabled === true,
-		);
-		// The roving-tabindex contract requires exactly one RENDERED tab to be selected. `health` is
-		// omitted where the capability is absent, so fall back to the tab the router lands on instead —
-		// otherwise every button gets `tabindex="-1"` and the switcher drops out of the tab order.
+		const key = getEffectiveVisualizationKey(this.mode, this.treemapMode);
+		// `health` is omitted where the capability is absent, so fall back to the button the router lands
+		// on instead. This also keeps exactly one rendered button pressed.
 		if (key === 'health' && this.graphState.config?.gitHealthAvailable !== true) return 'timeline';
 
 		return key;
@@ -192,7 +198,7 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 		// Emitted here (per click) rather than in graph-app's per-axis handlers — a single switch
 		// like timeline → Commits Treemap can dispatch BOTH events above, which would double-count
 		// the one user action.
-		emitTelemetrySentEvent<'graph/visualizations/modeChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/visualizations/modeChanged',
 			data: { 'mode.old': previous, 'mode.new': key, reason: 'user' },
 		});
@@ -210,11 +216,9 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 		return html`<gl-tooltip placement="bottom" content=${tooltipContent} .distance=${6}>
 			<button
 				class="visualization-button"
-				role="tab"
 				aria-pressed=${selected ? 'true' : 'false'}
 				aria-label=${config.label}
 				?disabled=${disabled}
-				tabindex=${selected ? '0' : '-1'}
 				@click=${() => this.select(key)}
 			>
 				<code-icon icon=${config.icon}></code-icon>
@@ -223,25 +227,22 @@ export class GlGraphVisualizationsSwitcher extends SignalWatcher(LitElement) {
 	}
 
 	override render(): unknown {
-		// Gate the entire switcher behind the experimental Visualizations flag — when disabled,
-		// only the Visual History (timeline) is offered to the user, so showing the multi-tab
-		// switcher would just dangle dead options.
-		if (this.graphState.config?.experimentalVisualizationsEnabled !== true) return nothing;
-
 		const active = this.activeKey;
 		const commitsUnavailable = this.commitsUnavailable;
 
 		// Health is omitted entirely where the repo has no maintenance sub-provider (web, virtual repos,
-		// Live Share) — the tab would render permanently empty with every lever unavailable.
+		// Live Share) — the button would render permanently empty with every lever unavailable.
 		const healthAvailable = this.graphState.config?.gitHealthAvailable === true;
 
-		return html`<div role="tablist" aria-label="Visualization" class="visualization-tablist">
+		return html`<div role="group" aria-label=${l10n.t('Visualization')} class="visualization-tablist">
 			${visualizationOrder.map(key => {
 				if (key === 'health') {
 					if (!healthAvailable) return nothing;
 
 					return html`<span class="visualization-separator" role="separator"></span>
-						${this.renderButton(key, active, false, undefined)}`;
+						<gl-new-indicator key="graph:visualizations:health:callout"
+							>${this.renderButton(key, active, false, undefined)}</gl-new-indicator
+						>`;
 				}
 
 				const disabled = key === 'treemap-commits' && commitsUnavailable;

@@ -1,11 +1,13 @@
+import * as l10n from '@vscode/l10n';
 import { css, html } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
+import { GlElement, observe } from '@gitlens/components/components/element.js';
+import { elevatedSurface } from '@gitlens/components/components/styles/lit/elevation.css.js';
 import { getCssVariable } from '@gitlens/utils/color.js';
 import { groupByMap } from '@gitlens/utils/iterable.js';
-import { capitalize, pluralize } from '@gitlens/utils/string.js';
-import { GlElement, observe } from '../../../shared/components/element.js';
-import { elevatedSurface } from '../../../shared/components/styles/lit/elevation.css.js';
-import { formatDate, formatNumeric, fromNow } from '../../../shared/date.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { capitalize } from '@gitlens/utils/string.js';
+import { formatDate, fromNow } from '../../../shared/date.js';
 import type { Disposable } from '../../../shared/events.js';
 import { onDidChangeTheme } from '../../../shared/theme.js';
 import { normalizeWheelDelta } from '../utils/wheel.utils.js';
@@ -23,7 +25,7 @@ import {
 	xToDay,
 	xToTimestamp,
 } from './minimapRenderer.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 
 // Click-vs-brush slop. At 3px, normal clicks (which carry a few px of incidental pointer movement)
 // crossed into "brush" and zoomed instead of selecting the day's commit. 6px lets clicks through while
@@ -1211,19 +1213,21 @@ export class GlGraphMinimap extends GlElement {
 		changes.className = 'changes';
 		const changesSpan = doc.createElement('span');
 		if (stat?.commits) {
-			let text = pluralize('commit', stat.commits, { format: c => formatNumeric(c) });
+			let text = formatPlural(l10n.t('{0, plural, one{{0} commit} other{{0} commits}}'), [stat.commits]);
 			if (this.dataType === 'lines') {
-				text += `, ${pluralize('file', stat.files ?? 0, {
-					format: c => formatNumeric(c),
-					zero: 'No',
-				})}, ${pluralize('line', (stat.activity?.additions ?? 0) + (stat.activity?.deletions ?? 0), {
-					format: c => formatNumeric(c),
-					zero: 'No',
-				})} changed`;
+				const files = stat.files ?? 0;
+				const lines = (stat.activity?.additions ?? 0) + (stat.activity?.deletions ?? 0);
+				const fileText = formatPlural(l10n.t('{0, plural, =0{No files} one{{0} file} other{{0} files}}'), [
+					files,
+				]);
+				const lineText = formatPlural(l10n.t('{0, plural, =0{No lines} one{{0} line} other{{0} lines}}'), [
+					lines,
+				]);
+				text += l10n.t(', {0}, {1} changed', fileText, lineText);
 			}
 			changesSpan.textContent = text;
 		} else {
-			changesSpan.textContent = 'No commits';
+			changesSpan.textContent = l10n.t('No commits');
 		}
 		changes.append(changesSpan);
 		el.append(changes);
@@ -1234,7 +1238,10 @@ export class GlGraphMinimap extends GlElement {
 			resultsDiv.className = 'results';
 			const resultSpan = doc.createElement('span');
 			resultSpan.className = 'result';
-			resultSpan.textContent = pluralize('matching commit', results.count);
+			resultSpan.textContent = formatPlural(
+				l10n.t('{0, plural, one{{0} matching commit} other{{0} matching commits}}'),
+				[results.count],
+			);
 			resultsDiv.append(resultSpan);
 			el.append(resultsDiv);
 		}
@@ -1246,7 +1253,7 @@ export class GlGraphMinimap extends GlElement {
 			if (stashesCount > 0) {
 				const s = doc.createElement('span');
 				s.className = 'stash';
-				s.textContent = pluralize('stash', stashesCount, { plural: 'stashes' });
+				s.textContent = formatPlural(l10n.t('{0, plural, one{{0} stash} other{{0} stashes}}'), [stashesCount]);
 				refs1.append(s);
 			}
 			const branches = groups.get('branch');
@@ -1276,7 +1283,9 @@ export class GlGraphMinimap extends GlElement {
 			if (pullRequestsCount > 0) {
 				const s = doc.createElement('span');
 				s.className = 'pull-request';
-				s.textContent = pluralize('pull request', pullRequestsCount, { plural: 'pull requests' });
+				s.textContent = formatPlural(l10n.t('{0, plural, one{{0} pull request} other{{0} pull requests}}'), [
+					pullRequestsCount,
+				]);
 				refs2.append(s);
 			}
 			const remotes = groups.get('remote');
@@ -1307,7 +1316,7 @@ export class GlGraphMinimap extends GlElement {
 			<canvas
 				id="canvas"
 				role="img"
-				aria-label="Repository activity minimap. Click or drag to navigate the graph."
+				aria-label=${l10n.t('Repository activity minimap. Click or drag to navigate the graph.')}
 				@pointerdown=${this.onPointerDown}
 				@pointermove=${this.onPointerMove}
 				@pointerup=${this.onPointerUp}

@@ -10,14 +10,14 @@ architecture see `docs/architecture.md`; for the row/layout pipeline see
 - **In (parent → panel)**: `gl-graph-app` (`src/webviews/apps/plus/graph/graph-app.ts`) pushes
   the selection down as Lit `@property`/attribute bindings on `<gl-graph-details-panel>`: `sha`,
   `repo-path`, `.shas`, `.graphReachability`, `.commitLite`/`.commitLites` (eager per-row shells
-  built from graph row data, so metadata can paint before the IPC round-trip resolves), plus
+  built from graph row data, so metadata can paint before the RPC round-trip resolves), plus
   layout/chrome flags (`show-maximize`, `maximized`, `sheet-maximized`, `graph-ready`,
   `.showSearchBox`, `.searchBoxFilter`) and `.navigation`/`.pushOverlay` controllers. The panel
   consumes several Lit contexts: `graphServicesContext` (the resolved `Remote<GraphServices>` RPC
   surface) and `graphStateContext` (`AppState` — the graph's own reactive state, e.g.
   `ingestWip`/`getWipState` for the WIP mirror shared with the row list) are the two that carry
   domain data; `graphCrossPaneContext` (the cross-pane running-operations registry, see below),
-  `graphLaunchpadContext`, `ipcContext`, and `webviewContext` carry narrower concerns. The panel
+  `graphLaunchpadContext`, and `webviewContext` carry narrower concerns. The panel
   then **provides** its own contexts downward to sub-panels and sheets —
   `detailsStateContext`/`detailsActionsContext`/`detailsWorkflowContext` (`detailsContext.ts`) —
   so a sheet or mode panel several levels down can reach `DetailsState`/`DetailsActions`/the
@@ -37,14 +37,14 @@ architecture see `docs/architecture.md`; for the row/layout pipeline see
   - **Durable** — fetch/capability results (`commit`, `wip`, `commitFrom`/`commitTo`,
     `branchCompare*`, enrichment chips, capabilities). Survives mode transitions; cleared only when
     a fetch supersedes it or `resetRepoScoped()`/`resetDurable()` runs.
-  - **Transient** — interaction/workflow state (`activeMode`, `compareSheetOpen`, `scope`,
+  - **Transient** — interaction/workflow state (`activeMode`, `comparePresentation`, `scope`,
     commit-input form fields, forward-chip availability). `resetTransient()` returns the panel to
     its just-opened baseline without discarding fetched data.
     Every durable signal is declared as `repoScoped` or `capability` at its definition in
     `createDurableState()` — membership lives at the signal, not in a separate reset checklist.
     Ownership of writes is split, not uniform: `DetailsActions` owns the durable/fetch-result
     signals, while the mode-machine's transient signals (`activeMode`, `activeModeContext`,
-    `activeModeRepoPath`, `activeModeSha`/`Shas`, `compareSheetOpen`, `compareAsPanel`, `scope`, …)
+    `activeModeRepoPath`, `activeModeSha`/`Shas`, `comparePresentation`, `scope`, …)
     are written by `DetailsWorkflowController` (see the cross-cutting section below) —
     `DetailsState` itself is a passive signal bag with no logic of its own.
 - **Out (sub-panel → panel → action)**: events bubble (`composed: true`) from leaf components up
@@ -80,8 +80,7 @@ because it composes from uncommitted changes, resolve because it operates on the
 merge/rebase's conflicted files, which live on the WIP.
 
 **Compare is not a mode.** It has an independent lifecycle (`DetailsWorkflowController.openCompare`
-/ `closeCompare` / `openCompareAsPanel`) driven by `state.compareSheetOpen` and
-`state.compareAsPanel`, and can coexist with an active review/compose/resolve mode — the compare
+/ `closeCompare` / `openCompareAsPanel`) driven by `state.comparePresentation` (`'closed'`, `'sheet'`, or `'pinned'`), and can coexist with an active review/compose/resolve mode — the compare
 sheet sits over the panel, which stays inert but present beneath it. This is a structural change
 from a signal-per-run "mode": Compare's own state is a large `branchCompare*` slice of
 `DetailsState` (documented in its own section below).
@@ -185,7 +184,7 @@ a paused operation); an empty working tree renders `gl-details-wip-empty-pane` i
 Launchpad-integrated empty state (next-step suggestions, associated issue/PR) rather than a bare
 "nothing here" message.
 
-### IPC out
+### RPC out
 
 - `graphInspect.getWip` (gating on cache miss; background-revalidated otherwise)
 - `repository.hasRemotes` (parallel, fire-and-forget)
@@ -220,8 +219,11 @@ A scope-picker change re-fetches `resources.scopeFiles` for the new `ScopeSelect
 registry entry are the source of truth; `RunningOperationExecState` (`'generating' | 'complete' |
 'backed' | 'error' | 'orphaned'`) drives which of idle/loading/results/error the review panel
 renders. `back()`/`forward()` snapshot/restore a successfully-resolved result without re-running
-the AI (`_reviewBackSnapshot` on the controller); `'backed'` is the state that makes a subsequent
-Close destructive (the back-then-close gate, `destroyEngagedOperation`).
+the AI (`_reviewBackSnapshot` is the engaged projection). Before hiding, the anchor's registry
+entry captures Resume eligibility, unsubmitted instructions, selected scope and file/commit exclusions, and prior-result error
+recovery. Re-entry restores that projection; typing or changing scope invalidates Resume, and
+re-entry must not revive it. Close always hides and preserves the operation, including a backed
+result or an in-flight run. Discard explicitly destroys it via `destroyEngagedOperation`.
 
 ### What's different from WIP normal
 
@@ -249,9 +251,11 @@ via `refreshWip()` + `fetchDetails(sha, repoPath)` on the new HEAD.
 ### What's unique
 
 - `resources.compose` (a `Resource<ComposeResult, …>`); refine continuation state
-  (`composeCurrentCacheKey`, `composeRefineExcludedCommitIds`, `composeRegeneratingCommitId`);
+  (the anchor entry's `cacheKey`, `composeRefineExcludedCommitIds`, `composeRegeneratingCommitId`);
   apply/progress state (`composeProgressMessage`, `composeApplying`); error-recovery snapshot
-  (`composePreErrorValue`, `composeLastFailedAction`, `composeLastCommitAllIncludedIds`).
+  (`composePreErrorValue`, `composeLastFailedAction`, `composeLastCommitAllIncludedIds`) projected
+  from the anchor entry on re-entry. These survive Close/navigation together with the ready-state
+  Refine draft, so a failed refinement can still return to its previous plan.
 - `composeCommitAll`/`composeCommitTo` are the only operations in this doc that mutate the repo
   directly from a mode panel.
 
@@ -374,7 +378,7 @@ flowchart LR
     cmtPanel -- "toggle-mode" --> panel
 ```
 
-### IPC out
+### RPC out
 
 - `graphInspect.getCommit` (gated on cache miss + settle window)
 - `repository.hasRemotes`, `graphInspect.getSearchContext` (parallel, conditional)
@@ -407,11 +411,11 @@ user). Sequence:
 5. Enriched autolinks (issues/PRs resolved from the raw autolinks) are lazy — fired only on an
    explicit `enrich-autolinks` event from the panel, not eagerly.
 
-### State read / IPC out
+### State read / RPC out
 
 `state.commitFrom`/`commitTo`, `compareFiles`, `compareStats`, `compareBetweenCount`,
 `signatureFrom`/`signatureTo`, `compareAutolinks` (+ `compareAutolinksLoading`),
-`compareEnrichedItems` (+ `compareEnrichmentLoading`), `swapped`. IPC: `getCompareDiff`,
+`compareEnrichedItems` (+ `compareEnrichmentLoading`), `swapped`. RPC: `getCompareDiff`,
 `getCommit` ×2 (parallel, cache-skippable), `getCommitSignature` ×2, `getAutolinksForCompareRange`
 (conditional), enriched-autolinks fetch (lazy, on demand).
 
@@ -463,14 +467,13 @@ silently re-fetching.
 
 ### Presentation forms
 
-Compare renders in one of two forms, tracked by independent booleans that are mutually exclusive
-at any instant but each togglable on their own:
+Compare renders in one of two forms, tracked by `comparePresentation`; `'closed'` hides both:
 
-- **Sheet** (`state.compareSheetOpen`) — the default; a `SheetDescriptor { kind: 'compare' }` on
+- **Sheet** (`state.comparePresentation === 'sheet'`) — the default; a `SheetDescriptor { kind: 'compare' }` on
   the panel's sheet stack (see §8). `gl-graph-compare-sheet` supplies only the chrome (title, the
   "Move Beside/Below" promote action); the panel's `renderCompareMode()` output is passed in as its
   slotted default-slot content, so the sheet wraps the same compare body the panel form uses.
-- **Panel** (`state.compareAsPanel`) — `openCompareAsPanel(orientation?)` promotes the sheet into a
+- **Panel** (`state.comparePresentation === 'pinned'`) — `openCompareAsPanel(orientation?)` promotes the sheet into a
   nested split inside the details panel itself (side-by-side or top/bottom, `compareSplitPosition`
   - `compareSplitOrientation`). Getting back to sheet form requires closing and re-opening; there is
     no demote action.
@@ -484,10 +487,10 @@ top-of-sheet-stack render target changes.
 
 `branchCompareLeftRef`/`RightRef` (+ `RefType`), `branchCompareIncludeWorkingTree`,
 `branchCompareRightRefWorktreePath`, `branchCompareMergeBase`, `branchCompareStale`,
-`branchCompareAheadCount`/`BehindCount`/`AllFilesCount`, `branchCompareAheadCommits`/
-`BehindCommits`/`AllFiles`, `branchCompareAheadFiles`/`BehindFiles`, `branchCompareAheadLoaded`/
-`BehindLoaded`, `branchCompareAheadHasMore`/`BehindHasMore`, `branchCompareAheadLimit`/
-`BehindLimit`, `branchCompareAheadLoadingMore`/`BehindLoadingMore`, `branchCompareActiveTab`
+`branchCompareAheadCount`/`BehindCount`/`AllFilesCount`, `branchCompareAllFiles`, the per-side
+Phase-2 records `branchCompareCommitsBySide`/`FilesBySide`/`LoadedBySide`/`HasMoreBySide`/
+`LimitBySide`/`LoadingMoreBySide` (each a `{ ahead, behind }` record of signals),
+`branchCompareActiveTab`
 (`'all' | 'ahead' | 'behind'`), `branchCompareSelectedCommitShaByTab` (a `Map`, one selection per
 tab) + the derived `branchCompareSelectedCommitSha` computed signal, `branchCompareActiveView`
 (`'files' | 'contributors'`), `branchCompareAutolinksByScope`/`EnrichedAutolinksByScope`/
@@ -508,7 +511,7 @@ and renders only `_sheetStack.at(-1)` — sheets below the top are held but not 
 `pushSheet` (re-pushing the current top in place replaces it instead of growing the stack, via
 `sheetKey` structural-identity comparison), `replaceStack` (discards everything, starts a fresh
 single-sheet stack), `popSheet` (no-op-safe on empty), `removeKind`, and
-`projectCompareSignal(stack, open, mode)` — reconciles `state.compareSheetOpen` onto the
+`projectCompareSignal(stack, open, mode)` — reconciles `state.comparePresentation === 'sheet'` onto the
 descriptor stack every render (`mode: 'push'` stacks the compare sheet on top of whatever it was
 opened from, e.g. a pull request sheet's "Compare Changes" action, so closing returns there;
 `'replace'` is the default for any other opener).
@@ -553,7 +556,7 @@ from `DetailsActions`' data-fetch responsibilities:
 
 - `toggleMode(mode, selection, scopeOverride?)` — enter/exit/re-target a review/compose/resolve
   mode. Toggling the same mode off on the _same_ anchor hides it (registry entry survives, run
-  keeps going) unless the entry is `'backed'`, in which case it destroys (back-then-close gate).
+  keeps going), including `'backed'` entries. Only explicit Discard destroys the operation.
   Toggling the same mode on a _different_ anchor re-targets. Switching to a different mode while
   one is active hides the outgoing one first — both kinds may coexist per anchor.
 - `hostUpdate()` (called every render) drives two triggers independent of the panel's own

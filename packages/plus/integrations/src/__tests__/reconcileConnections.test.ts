@@ -2,7 +2,7 @@ import * as assert from 'node:assert/strict';
 import { suite, test } from 'mocha';
 import type { Account } from '@gitlens/git/models/author.js';
 import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
-import { createIntegrationManager } from '../index.js';
+import { createIntegrationService as createIntegrationManager } from '../integrationService.js';
 import { createFakeRuntime } from './fakeRuntime.js';
 
 /**
@@ -15,8 +15,10 @@ import { createFakeRuntime } from './fakeRuntime.js';
 interface TokenBackend {
 	/** GET /v1/provider-tokens list payload (primary + secondaries per provider). */
 	connections: unknown;
+	/** Optional status for the connection-list response. */
+	connectionsStatus?: number;
 	/** Per-path token responses; return null to simulate a failed/absent token. */
-	token: (path: string) => unknown;
+	token: (path: string) => unknown | Promise<unknown>;
 	/** HTTP status for a failed token fetch (token() returned null). Defaults to 500 (transient). */
 	errorStatus?: number;
 }
@@ -25,14 +27,15 @@ function createManager(backend: TokenBackend) {
 	const runtime = createFakeRuntime();
 	const paths: string[] = [];
 	runtime.account.getAccount = async () => ({ id: 'me' });
-	runtime.account.fetchGkApi = (path: string) => {
+	runtime.account.fetchGkApi = async (path: string) => {
 		paths.push(path);
 		let payload: unknown = { data: null };
 		let status = 200;
 		if (path === 'v1/provider-tokens') {
-			payload = { data: backend.connections };
+			status = backend.connectionsStatus ?? 200;
+			payload = status >= 200 && status < 300 ? { data: backend.connections } : { error: 'boom' };
 		} else if (path.startsWith('v1/provider-tokens/')) {
-			const data = backend.token(path);
+			const data = await backend.token(path);
 			if (data == null) {
 				status = backend.errorStatus ?? 500;
 				payload = { error: 'boom' };
@@ -40,7 +43,7 @@ function createManager(backend: TokenBackend) {
 				payload = { data: data };
 			}
 		}
-		return Promise.resolve(new Response(JSON.stringify(payload), { status: status }));
+		return new Response(JSON.stringify(payload), { status: status });
 	};
 	return { runtime: runtime, manager: createIntegrationManager(runtime), paths: paths };
 }
@@ -58,6 +61,49 @@ const githubToken = (path: string) => {
 };
 
 suite('cloud sync — multi-account reconcile (#5430)', () => {
+	test('refreshConnections rejects and preserves configured state when the backend list fails', async () => {
+		const { runtime, manager } = createManager({
+			connections: [],
+			connectionsStatus: 503,
+			token: () => ({}),
+		});
+		await runtime.storage.store('integrations:configured', {
+			github: [{ id: 'p1', cloud: true, integrationId: 'github', scopes: 'repo', primary: true }],
+		});
+
+		assert.equal(manager.getConfigured(GitCloudHostIntegrationId.GitHub).length, 1, 'cached state is hydrated');
+		await assert.rejects(manager.refreshConnections(), /Failed to refresh provider connections/);
+		assert.equal(
+			manager.getConfigured(GitCloudHostIntegrationId.GitHub).length,
+			1,
+			'a failed authoritative refresh does not masquerade as a successful empty list',
+		);
+
+		manager.dispose();
+	});
+
+	test('connection mutations reject ids configured for another provider before calling the backend', async () => {
+		const { runtime, manager, paths } = createManager({
+			connections: [],
+			token: () => ({}),
+		});
+		await runtime.storage.store('integrations:configured', {
+			gitlab: [{ id: 'gl-1', cloud: true, integrationId: 'gitlab', scopes: 'api', primary: true }],
+		});
+
+		await assert.rejects(
+			manager.setPrimaryConnection(GitCloudHostIntegrationId.GitHub, 'gl-1'),
+			/Connection 'gl-1' is not configured for 'github'/,
+		);
+		await assert.rejects(
+			manager.deleteConnection(GitCloudHostIntegrationId.GitHub, 'gl-1'),
+			/Connection 'gl-1' is not configured for 'github'/,
+		);
+		assert.deepEqual(paths, [], 'provider-agnostic token endpoints are never called with the mismatched id');
+
+		manager.dispose();
+	});
+
 	test('refreshConnections persists every account with wire account names and a single primary', async () => {
 		const { manager } = createManager({
 			connections: [
@@ -94,6 +140,188 @@ suite('cloud sync — multi-account reconcile (#5430)', () => {
 		assert.equal(byId.get('p1')?.type, 'oauth');
 
 		manager.dispose();
+	});
+
+	test('refreshConnections fetches connection sessions concurrently', async () => {
+		const started = new Set<string>();
+		let releaseRequests!: () => void;
+		let resolveBothStarted!: () => void;
+		const requestsReleased = new Promise<void>(resolve => (releaseRequests = resolve));
+		const bothStarted = new Promise<void>(resolve => (resolveBothStarted = resolve));
+		const { manager } = createManager({
+			connections: [
+				{
+					tokenId: 'p1',
+					provider: 'github',
+					type: 'oauth',
+					domain: 'github.com',
+					accountName: 'octo',
+					secondaries: [
+						{
+							tokenId: 's1',
+							provider: 'github',
+							type: 'oauth',
+							domain: 'github.com',
+							accountName: 'hubot',
+						},
+					],
+				},
+			],
+			token: async path => {
+				const tokenId = path === 'v1/provider-tokens/github' ? 'p1' : path.split('/').pop()!;
+				if (path.startsWith('v1/provider-tokens/tokens/')) {
+					started.add(tokenId);
+					if (started.size === 2) {
+						resolveBothStarted();
+					}
+					await requestsReleased;
+				}
+				return {
+					tokenId: tokenId,
+					accessToken: `tok-${tokenId}`,
+					expiresIn: 3600,
+					scopes: 'repo',
+					type: 'oauth',
+				};
+			},
+		});
+		const refresh = manager.refreshConnections();
+
+		try {
+			await Promise.race([
+				bothStarted,
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error('connection session fetches remained sequential')), 1000),
+				),
+			]);
+			assert.deepEqual(started, new Set(['p1', 's1']));
+		} finally {
+			releaseRequests();
+			await refresh;
+			manager.dispose();
+		}
+	});
+
+	test('refreshConnections reconciles independent providers concurrently', async () => {
+		const started = new Set<string>();
+		let releaseRequests!: () => void;
+		let resolveBothStarted!: () => void;
+		const requestsReleased = new Promise<void>(resolve => (releaseRequests = resolve));
+		const bothStarted = new Promise<void>(resolve => (resolveBothStarted = resolve));
+		const { manager } = createManager({
+			connections: [
+				{
+					tokenId: 'gh1',
+					provider: 'github',
+					type: 'oauth',
+					domain: 'github.com',
+					accountName: 'octo',
+				},
+				{
+					tokenId: 'gl1',
+					provider: 'gitlab',
+					type: 'oauth',
+					domain: 'gitlab.com',
+					accountName: 'tanuki',
+				},
+			],
+			token: async path => {
+				const provider = path.split('/').pop()!;
+				if (path.startsWith('v1/provider-tokens/tokens/')) {
+					const tokenId = provider;
+					started.add(tokenId);
+					if (started.size === 2) {
+						resolveBothStarted();
+					}
+					await requestsReleased;
+				}
+				const tokenId = provider === 'github' ? 'gh1' : provider === 'gitlab' ? 'gl1' : provider;
+				return {
+					tokenId: tokenId,
+					accessToken: `tok-${tokenId}`,
+					expiresIn: 3600,
+					scopes: 'repo',
+					type: 'oauth',
+				};
+			},
+		});
+		const refresh = manager.refreshConnections();
+
+		try {
+			await Promise.race([
+				bothStarted,
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error('provider reconciliations remained sequential')), 1000),
+				),
+			]);
+			assert.deepEqual(started, new Set(['gh1', 'gl1']));
+		} finally {
+			releaseRequests();
+			await refresh;
+			manager.dispose();
+		}
+	});
+
+	test('refreshConnections syncs cloud connections concurrently', async () => {
+		// The sibling tests above gate on `v1/provider-tokens/tokens/…`, the per-connection reconcile pass.
+		// This one gates on the PROVIDER-scoped path, which is what the `syncCloudConnection` loop resolves
+		// through — a different pass, and the one that used to await each provider in turn.
+		const started = new Set<string>();
+		let releaseRequests!: () => void;
+		let resolveBothStarted!: () => void;
+		const requestsReleased = new Promise<void>(resolve => (releaseRequests = resolve));
+		const bothStarted = new Promise<void>(resolve => (resolveBothStarted = resolve));
+		const { manager } = createManager({
+			connections: [
+				{
+					tokenId: 'gh1',
+					provider: 'github',
+					type: 'oauth',
+					domain: 'github.com',
+					accountName: 'octo',
+				},
+				{
+					tokenId: 'gl1',
+					provider: 'gitlab',
+					type: 'oauth',
+					domain: 'gitlab.com',
+					accountName: 'tanuki',
+				},
+			],
+			token: async path => {
+				const provider = path.split('/').pop()!;
+				if (path === 'v1/provider-tokens/github' || path === 'v1/provider-tokens/gitlab') {
+					started.add(provider);
+					if (started.size === 2) {
+						resolveBothStarted();
+					}
+					await requestsReleased;
+				}
+				const tokenId = provider === 'github' ? 'gh1' : provider === 'gitlab' ? 'gl1' : provider;
+				return {
+					tokenId: tokenId,
+					accessToken: `tok-${tokenId}`,
+					expiresIn: 3600,
+					scopes: 'repo',
+					type: 'oauth',
+				};
+			},
+		});
+		const refresh = manager.refreshConnections();
+
+		try {
+			await Promise.race([
+				bothStarted,
+				new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error('cloud connection syncs remained sequential')), 1000),
+				),
+			]);
+			assert.deepEqual(started, new Set(['github', 'gitlab']));
+		} finally {
+			releaseRequests();
+			await refresh;
+			manager.dispose();
+		}
 	});
 
 	test('blank wire account names fall back to the cached account name', async () => {
@@ -538,7 +766,7 @@ suite('cloud sync — multi-account reconcile (#5430)', () => {
 		await flush();
 		runtime.emittedEvents.length = 0;
 
-		await manager.deleteConnection(GitCloudHostIntegrationId.GitHub, 'p1', true);
+		await manager.deleteConnection(GitCloudHostIntegrationId.GitHub, 'p1');
 		await flush();
 
 		assert.ok(
@@ -554,7 +782,7 @@ suite('cloud sync — multi-account reconcile (#5430)', () => {
 		manager.dispose();
 	});
 
-	test('deleteConnection without an explicit cloud arg is cloud-scoped by default, preserving a shared-id local PAT', async () => {
+	test('deleteConnection is cloud-scoped, preserving a shared-id local PAT', async () => {
 		const { runtime, manager } = createManager({
 			connections: [],
 			token: () => ({}),
@@ -580,7 +808,7 @@ suite('cloud sync — multi-account reconcile (#5430)', () => {
 
 		assert.ok(
 			(await runtime.storage.getSecret('integration.auth:github|shared')) != null,
-			'local PAT secret preserved by a default (unscoped) deleteConnection call',
+			'local PAT secret preserved by the cloud-only deleteConnection call',
 		);
 		assert.equal(
 			await runtime.storage.getSecret('integration.auth.cloud:github|shared'),

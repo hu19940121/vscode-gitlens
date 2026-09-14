@@ -1,17 +1,18 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { when } from 'lit/directives/when.js';
+import { GlElement } from '@gitlens/components/components/element.js';
 import type { ConnectRemoteProviderCommandArgs } from '../../../../commands/remoteProviders.js';
 import type { Source } from '../../../../constants.telemetry.js';
 import type { RepositoryShape } from '../../../../git/models/repositoryShape.js';
 import { createCommandLink } from '../../../../system/commands.js';
 import { linkStyles, ruleStyles } from '../../plus/shared/components/vscode.css.js';
-import { GlElement } from './element.js';
 import { pickerIconStyles, refButtonBaseStyles, truncatedButtonStyles } from './ref.css.js';
 import './button.js';
-import './code-icon.js';
-import './overlays/popover.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/popover.js';
 import './indicators/indicator.js';
 
 export interface RepoButtonGroupClickEvent {
@@ -44,11 +45,11 @@ export class GlRepoButtonGroup extends GlElement {
 			}
 
 			/* Single-repo (no label rendered): grid sizes exactly to the icons.
-	   max-content cols keep each icon column at full content width —
-	   auto cols can collapse under flex shrink pressure, hiding icons
-	   behind one another. Explicit min-width: max-content prevents the
-	   host itself from shrinking past the icons under flex pressure
-	   (which otherwise lets the trailing chevron separator overlap). */
+max-content cols keep each icon column at full content width —
+auto cols can collapse under flex shrink pressure, hiding icons
+behind one another. Explicit min-width: max-content prevents the
+host itself from shrinking past the icons under flex pressure
+(which otherwise lets the trailing chevron separator overlap). */
 			:host(:not([multi-repo])) {
 				grid-template-columns: max-content max-content;
 				min-width: max-content;
@@ -60,8 +61,8 @@ export class GlRepoButtonGroup extends GlElement {
 			}
 
 			/* Multi-repo: include a flexible label column that can shrink
-		   so the label ellipses naturally while preserving enough room for
-		   the fallback repo icon + chevron compact state. */
+ so the label ellipses naturally while preserving enough room for
+ the fallback repo icon + chevron compact state. */
 			:host([multi-repo]) {
 				--compact-width: 0px;
 
@@ -159,8 +160,8 @@ export class GlRepoButtonGroup extends GlElement {
 			}
 
 			/* Tighten the icon buttons themselves — they sit adjacent in the grid
-	   and we don't want extra horizontal padding bloating the group's
-	   trailing edge near the chevron separator. */
+and we don't want extra horizontal padding bloating the group's
+trailing edge near the chevron separator. */
 			[part='provider-icon'],
 			[part='connect-icon'] {
 				--button-padding: 0.2rem;
@@ -171,8 +172,8 @@ export class GlRepoButtonGroup extends GlElement {
 			}
 
 			/* Stack the provider popover's lines as a column with breathing room
-	   between them (instead of relying on <br> / inline-flow which gives
-	   too-tight visual spacing). */
+between them (instead of relying on <br> / inline-flow which gives
+too-tight visual spacing). */
 			.provider-popover {
 				display: flex;
 				flex-direction: column;
@@ -194,7 +195,7 @@ export class GlRepoButtonGroup extends GlElement {
 			}
 
 			/* :host([expandable]) .truncated-button {
-		transition: max-width 0.3s cubic-bezier(0.25, 1, 0.5, 1);
+transition: max-width 0.3s cubic-bezier(0.25, 1, 0.5, 1);
 	} */
 
 			:host([expandable]:not(:hover, :focus-within)) .truncated-button .picker-icon::before {
@@ -219,11 +220,11 @@ export class GlRepoButtonGroup extends GlElement {
 			}
 
 			/* When the surrounding gl-breadcrumb-item is hovered or focused, expand the
-	   truncated-button as if the gl-repo-button-group itself were hovered. This
-	   lets users hover anywhere in the breadcrumb-item (e.g., the chevron
-	   separator) to reveal the repo name. !important is required because the
-	   collapse rule above (with :host attribute + :not) has higher specificity
-	   than :host-context. */
+truncated-button as if the gl-repo-button-group itself were hovered. This
+lets users hover anywhere in the breadcrumb-item (e.g., the chevron
+separator) to reveal the repo name. !important is required because the
+collapse rule above (with :host attribute + :not) has higher specificity
+than :host-context. */
 			:host-context(gl-breadcrumb-item:hover) .truncated-button .picker-icon::before,
 			:host-context(gl-breadcrumb-item:focus-within) .truncated-button .picker-icon::before {
 				visibility: visible !important;
@@ -360,7 +361,7 @@ export class GlRepoButtonGroup extends GlElement {
 	expandable = false;
 
 	private get displayName(): string {
-		return this.repository?.name ?? 'none selected';
+		return this.repository?.name ?? l10n.t('none selected');
 	}
 
 	override render() {
@@ -465,7 +466,7 @@ export class GlRepoButtonGroup extends GlElement {
 					part="provider-icon"
 					appearance="toolbar"
 					href=${ifDefined(provider.url)}
-					aria-label=${`Open Repository on ${provider.name}`}
+					aria-label=${l10n.t('Open Repository on {provider}', { provider: provider.name })}
 					@click=${(e: MouseEvent) =>
 						this.emit('gl-click', {
 							event: e,
@@ -480,7 +481,9 @@ export class GlRepoButtonGroup extends GlElement {
 					${when(connectedIntegration, () => html`<gl-indicator class="indicator-dot"></gl-indicator>`)}
 				</gl-button>
 				<div slot="content" class="provider-popover">
-					<div class="provider-popover__title">Open Repository on ${provider.name}</div>
+					<div class="provider-popover__title">
+						${l10n.t('Open Repository on {provider}', { provider: provider.name })}
+					</div>
 					<hr />
 					<div class="provider-popover__line">
 						<code-icon class="popover-status-icon" icon="gl-repository" aria-hidden="true"></code-icon>
@@ -491,7 +494,7 @@ export class GlRepoButtonGroup extends GlElement {
 						() => html`
 							<div class="provider-popover__line">
 								<code-icon class="popover-status-icon" icon="check" aria-hidden="true"></code-icon>
-								Connected to ${provider.name}
+								${l10n.t('Connected to {provider}', { provider: provider.name })}
 							</div>
 						`,
 						() => {
@@ -506,9 +509,9 @@ export class GlRepoButtonGroup extends GlElement {
 											{ repoPath: repo.path, remote: provider.bestRemoteName },
 										)}
 									>
-										Connect to ${repo.provider!.name}
+										${l10n.t('Connect to {provider}', { provider: repo.provider!.name })}
 									</a>
-									<span>&mdash; not connected</span>
+									<span>${l10n.t('— not connected')}</span>
 								</div>
 							`;
 						},
@@ -538,9 +541,9 @@ export class GlRepoButtonGroup extends GlElement {
 			>
 				<code-icon class="connect-icon" icon="plug"></code-icon>
 				<span slot="tooltip">
-					Connect to ${provider.name}
+					${l10n.t('Connect to {provider}', { provider: provider.name })}
 					<hr />
-					View pull requests and issues in Home, Commit Graph, Launchpad, autolinks, and more
+					${l10n.t('View pull requests and issues in the Commit Graph, Launchpad, autolinks, and more')}
 				</span>
 			</gl-button>
 		`;

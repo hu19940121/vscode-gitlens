@@ -1,5 +1,7 @@
+.agents/**
 .augment/**
 .claude/**
+.codegen-cache/**
 .devcontainer/**
 .github/**
 .husky/**
@@ -7,6 +9,7 @@
 .vscode-clean/**
 .vscode-test/**
 .vscode-test-web/**
+.work/**
 .yarn/**
 docs/**
 emoji/**
@@ -54,3 +57,7 @@ tsconfig*.tsbuildinfo
 webpack.config*.mjs
 yarn.lock
 .wdio-vscode-service
+
+package.nls.qps-ploc.json
+l10n/bundle.l10n.qps-ploc.json
+l10n/README.md

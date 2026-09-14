@@ -1,25 +1,35 @@
 import { css } from 'lit';
 
 export const splitPanelStyles = css`
+	/* --gl-split-panel-end-reserve (default 0px, opt-in per consumer): space the start track can
+	   never take from the end slot, whatever the position or a --gl-split-panel-start-size override
+	   asks for — grid track sizing gives the start track its size first and lets the 1fr end track
+	   overflow, so rigid end content (e.g. a commit box) gets crushed without this cap. */
 	:host {
 		display: grid;
 		grid-template-rows: 1fr;
 		grid-template-columns:
 			var(
 				--gl-split-panel-start-size,
-				min(var(--_start-size, 0%), calc(100% - var(--gl-split-panel-divider-width, 4px)))
+				min(
+					var(--_start-size, 0%),
+					calc(100% - var(--gl-split-panel-divider-width, 4px) - var(--gl-split-panel-end-reserve, 0px))
+				)
 			)
 			var(--gl-split-panel-divider-width, 4px) 1fr;
 		width: 100%;
 		height: 100%;
-		overflow: hidden;
+		overflow: clip;
 	}
 
 	:host([orientation='vertical']) {
 		grid-template-rows:
 			var(
 				--gl-split-panel-start-size,
-				min(var(--_start-size, 0%), calc(100% - var(--gl-split-panel-divider-width, 4px)))
+				min(
+					var(--_start-size, 0%),
+					calc(100% - var(--gl-split-panel-divider-width, 4px) - var(--gl-split-panel-end-reserve, 0px))
+				)
 			)
 			var(--gl-split-panel-divider-width, 4px) 1fr;
 		grid-template-columns: 1fr;
@@ -173,5 +183,27 @@ export const splitPanelStyles = css`
 
 	:host([mode='overlay'][dragging]) .divider {
 		transition: none;
+	}
+
+	/*
+	 * Maximize — the end panel floats over the full container instead of redistributing space.
+	 * Unlike a grid-track collapse, the start panel keeps its exact pre-maximize layout underneath,
+	 * so content behind it (e.g. the commit graph) never reflows and restoring is instant. The
+	 * divider is hidden since consumers disable it alongside this state anyway.
+	 */
+	:host([maximized]) {
+		position: relative;
+	}
+
+	:host([maximized]) ::slotted([slot='end']) {
+		position: absolute;
+		inset: 0;
+		z-index: 2;
+		width: 100%;
+		box-shadow: 0 0 0.5rem var(--vscode-widget-shadow, rgb(0 0 0 / 36%));
+	}
+
+	:host([maximized]) .divider {
+		display: none;
 	}
 `;

@@ -1,12 +1,15 @@
 import { eslintCompatPlugin } from '@oxlint/plugins';
 import newlineAfterControlFlow from './eslint-rules/newline-after-control-flow.mjs';
 import noInstanceofCancellationError from './eslint-rules/no-instanceof-cancellation-error.mjs';
+import noRawErrorMessage from './eslint-rules/no-raw-error-message.mjs';
 import noScssInCssTemplate from './eslint-rules/no-scss-in-css-template.mjs';
 import noSelfPackageImports from './eslint-rules/no-self-package-imports.mjs';
 import noSrcImports from './eslint-rules/no-src-imports.mjs';
 import oneVar from './eslint-rules/one-var.mjs';
 import requireBlockBody from './eslint-rules/require-block-body.mjs';
+import requireFormatPlural from './eslint-rules/require-format-plural.mjs';
 import requireJsExtension from './eslint-rules/require-js-extension.mjs';
+import requireLiteralL10n from './eslint-rules/require-literal-l10n.mjs';
 import logScopeUsage from './eslint-rules/scoped-logger-usage.mjs';
 import validPackageImports from './eslint-rules/valid-package-imports.mjs';
 
@@ -18,9 +21,12 @@ export default eslintCompatPlugin({
 		'no-src-imports': noSrcImports,
 		'no-self-package-imports': noSelfPackageImports,
 		'no-instanceof-cancellation-error': noInstanceofCancellationError,
+		'no-raw-error-message': noRawErrorMessage,
 		'no-scss-in-css-template': noScssInCssTemplate,
 		'one-var': oneVar,
 		'require-js-extension': requireJsExtension,
+		'require-literal-l10n': requireLiteralL10n,
+		'require-format-plural': requireFormatPlural,
 		'scoped-logger-usage': logScopeUsage,
 		'require-block-body': requireBlockBody,
 		'newline-after-control-flow': newlineAfterControlFlow,

@@ -1,6 +1,6 @@
 import { css } from 'lit';
-import { focusableBaseStyles, focusOutline } from '../shared/components/styles/lit/a11y.css.js';
-import { boxSizingBase } from '../shared/components/styles/lit/base.css.js';
+import { focusableBaseStyles, focusOutline } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase } from '@gitlens/components/components/styles/lit/base.css.js';
 
 export const settingsAppStyles = [
 	boxSizingBase,
@@ -146,7 +146,7 @@ export const settingsAppStyles = [
 		/* Initial-load gate — mirrors the two-pane layout so the real UI doesn't shift in */
 		.body--loading {
 			display: flex;
-			overflow: hidden;
+			overflow: clip;
 		}
 
 		.body--loading__nav {

@@ -19,9 +19,9 @@ git clone https://github.com/gitkraken/vscode-gitlens.git
 **Prerequisites**
 
 - [Git](https://git-scm.com/), `>= 2.7.2`
-- [NodeJS](https://nodejs.org/), `>= 22.12.0`
-- [Corepack](https://nodejs.org/docs/latest-v22.x/api/corepack.html), `>= 0.31.0`
-- [pnpm](https://pnpm.io/), `>= 10.x` (installs using corepack)
+- [NodeJS](https://nodejs.org/), `>= 24`
+- [Corepack](https://nodejs.org/docs/latest-v24.x/api/corepack.html), `>= 0.31.0`
+- [pnpm](https://pnpm.io/), `>= 11.x` (installs using corepack)
 
 > 👉 **NOTE!** Corepack version
 >
@@ -236,6 +236,10 @@ The [Publish Pre-release workflow](.github/workflows/cd-pre.yml) is automaticall
 ### Insiders (deprecated use pre-release instead)
 
 The Publish Insiders workflow is no longer available and was replaced with the pre-release edition.
+
+## Localization
+
+GitLens follows VS Code's display language. Wrap user-facing text with `l10n.t()` and run `pnpm run generate:l10n` after changing messages; `pnpm run check:l10n` (part of `pnpm run check`) validates the catalogs. See [docs/localization.md](docs/localization.md) for the authoring rules and [l10n/README.md](l10n/README.md) for translating GitLens into another language.
 
 ## Updating GL Icons
 

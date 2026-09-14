@@ -1,11 +1,11 @@
 import type { QuickInputButton, QuickPick } from 'vscode';
-import { ThemeIcon, window } from 'vscode';
+import { l10n, ThemeIcon, window } from 'vscode';
 import type { GitCommit } from '@gitlens/git/models/commit.js';
 import type { SearchOperators, SearchOperatorsLongForm, SearchQuery } from '@gitlens/git/models/search.js';
 import type { SearchCommitsResult } from '@gitlens/git/providers/commits.js';
 import { getSearchQueryComparisonKey, parseSearchQuery } from '@gitlens/git/utils/search.utils.js';
 import { first, join, map } from '@gitlens/utils/iterable.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { GlyphChars } from '../../constants.js';
 import type { Container } from '../../container.js';
 import { showCommitInDetailsView } from '../../git/actions/commit.js';
@@ -51,22 +51,22 @@ import {
 
 const UseAuthorPickerQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('person-add'),
-	tooltip: 'Pick Authors',
+	tooltip: l10n.t('Pick Authors'),
 };
 
 const UseFilePickerQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('new-file'),
-	tooltip: 'Pick Files',
+	tooltip: l10n.t('Pick Files'),
 };
 
 const UseFolderPickerQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('new-folder'),
-	tooltip: 'Pick Folder',
+	tooltip: l10n.t('Pick Folder'),
 };
 
 const UseRefPickerQuickInputButton: QuickInputButton = {
 	iconPath: new ThemeIcon('git-branch'),
-	tooltip: 'Pick Reference',
+	tooltip: l10n.t('Pick Reference'),
 };
 
 const Steps = {
@@ -101,33 +101,38 @@ export interface SearchGitCommandArgs {
 }
 
 const searchOperatorToTitleMap = new Map<SearchOperators, string>([
-	['', 'Search by Message'],
-	['=:', 'Search by Message'],
-	['message:', 'Search by Message'],
-	['@:', 'Search by Author'],
-	['author:', 'Search by Author'],
-	['#:', 'Search by Commit SHA'],
-	['commit:', 'Search by Commit SHA'],
-	['?:', 'Search by File'],
-	['file:', 'Search by File'],
-	['~:', 'Search by Changes'],
-	['change:', 'Search by Changes'],
-	['is:', 'Search by Type'],
-	['type:', 'Search by Type'],
-	['after:', 'Search After Date'],
-	['since:', 'Search After Date'],
-	['before:', 'Search Before Date'],
-	['until:', 'Search Before Date'],
-	['^:', 'Search by Reference or Range'],
-	['ref:', 'Search by Reference or Range'],
+	['', l10n.t('Search by Message')],
+	['=:', l10n.t('Search by Message')],
+	['message:', l10n.t('Search by Message')],
+	['-message:', l10n.t('Exclude by Message')],
+	['@:', l10n.t('Search by Author')],
+	['author:', l10n.t('Search by Author')],
+	['committer:', l10n.t('Search by Committer')],
+	['#:', l10n.t('Search by Commit SHA')],
+	['commit:', l10n.t('Search by Commit SHA')],
+	['?:', l10n.t('Search by File')],
+	['file:', l10n.t('Search by File')],
+	['~:', l10n.t('Search by Changes')],
+	['change:', l10n.t('Search by Changes')],
+	['is:', l10n.t('Search by Type')],
+	['type:', l10n.t('Search by Type')],
+	['after:', l10n.t('Search After Date')],
+	['since:', l10n.t('Search After Date')],
+	['before:', l10n.t('Search Before Date')],
+	['until:', l10n.t('Search Before Date')],
+	['^:', l10n.t('Search by Reference or Range')],
+	['ref:', l10n.t('Search by Reference or Range')],
 ]);
 
 export class SearchGitCommand extends QuickCommand<State> {
+	private readonly prefillOnly: boolean;
+
 	constructor(container: Container, args?: SearchGitCommandArgs) {
-		super(container, 'search', 'search', 'Commit Search', {
-			description: 'aka grep, searches for commits',
+		super(container, 'search', 'search', l10n.t('Commit Search'), {
+			description: l10n.t('aka grep, searches for commits'),
 		});
 
+		this.prefillOnly = args?.prefillOnly ?? false;
 		this.initialState = { confirm: false, ...args?.state };
 	}
 
@@ -168,6 +173,9 @@ export class SearchGitCommand extends QuickCommand<State> {
 		state.matchWholeWord ??= cfg.matchWholeWord;
 		state.showResultsInSideBar ??= cfg.showResultsInSideBar ?? undefined;
 
+		// A prefilled query still needs one trip through the picker before it runs
+		let prefillOnly = this.prefillOnly;
+
 		while (!steps.isComplete) {
 			context.title = this.title;
 
@@ -191,7 +199,9 @@ export class SearchGitCommand extends QuickCommand<State> {
 
 			assertStepState<State<GlRepository>>(state);
 
-			if (steps.isAtStep(Steps.PickSearchOperator) || state.query == null) {
+			if (steps.isAtStep(Steps.PickSearchOperator) || state.query == null || prefillOnly) {
+				prefillOnly = false;
+
 				using step = steps.enterStep(Steps.PickSearchOperator);
 
 				const result = yield* this.pickSearchOperatorStep(state, context);
@@ -226,11 +236,24 @@ export class SearchGitCommand extends QuickCommand<State> {
 				context.resultsKey = searchKey;
 			}
 
+			const nl = typeof search.naturalLanguage === 'object' ? search.naturalLanguage : undefined;
+			if (nl?.error) {
+				void window.showErrorMessage(l10n.t('Unable to build a search from your description — {0}', nl.error));
+
+				// Re-enter the query step with the typed sentence intact: the step reads its value from
+				// `naturalLanguage.query` when it's an object.
+				state.naturalLanguage = nl;
+				state.query = undefined!;
+				context.resultPromise = undefined;
+				context.resultsKey = undefined;
+				continue;
+			}
+
 			if (state.showResultsInSideBar) {
 				void this.container.views.searchAndCompare.search(
 					state.repo.path,
 					search,
-					{ label: { label: `for ${state.query}` } },
+					{},
 					context.resultPromise.then(r => r.log),
 					state.showResultsInSideBar instanceof SearchResultsNode ? state.showResultsInSideBar : undefined,
 				);
@@ -247,21 +270,30 @@ export class SearchGitCommand extends QuickCommand<State> {
 					ignoreFocusOut: true,
 					log: await context.resultPromise.then(r => r.log),
 					onDidLoadMore: log => (context.resultPromise = Promise.resolve({ search: search, log: log })),
-					placeholder: (_context, log) =>
-						!log?.commits.size
-							? `No results for ${state.query}`
-							: `${pluralize('result', log.count, {
-									format: c => (log.hasMore ? `${c}+` : String(c)),
-								})} for ${state.query}`,
+					placeholder: (_context, log) => {
+						if (!log?.commits.size) {
+							return l10n.t('No results for {0}', state.query);
+						}
+
+						const count = log.count;
+						return log.hasMore
+							? formatPlural(
+									l10n.t('{0, plural, one{{0}+ result for {1}} other{{0}+ results for {1}}}'),
+									[count, state.query],
+								)
+							: formatPlural(l10n.t('{0, plural, one{{0} result for {1}} other{{0} results for {1}}}'), [
+									count,
+									state.query,
+								]);
+					},
 					picked: context.commit?.ref,
 					showInSideBarCommand: new ActionQuickPickItem(
-						'$(link-external)  Show Results in Side Bar',
+						l10n.t('$(link-external)  Show Results in Side Bar'),
 						() =>
 							void this.container.views.searchAndCompare.search(
 								repoPath,
 								search,
 								{
-									label: { label: `for ${state.query}` },
 									reveal: { select: true, focus: false, expand: true },
 								},
 								context.resultPromise?.then(r => r.log),
@@ -274,7 +306,6 @@ export class SearchGitCommand extends QuickCommand<State> {
 								repoPath,
 								search,
 								{
-									label: { label: `for ${state.query}` },
 									reveal: { select: true, focus: false, expand: true },
 								},
 								context.resultPromise?.then(r => r.log),
@@ -328,26 +359,60 @@ export class SearchGitCommand extends QuickCommand<State> {
 		const items: QuickPickItemOfT<Items>[] = [
 			{
 				label: searchOperatorToTitleMap.get('')!,
-				description: `<message> or message:<message> or =:<message> ${GlyphChars.Dash} use quotes to search for phrases`,
+				description: l10n.t(
+					'{message} or {messageOperator} or {messageAlias} {dash} use quotes to search for phrases',
+					{
+						message: '<message>',
+						messageOperator: 'message:<message>',
+						messageAlias: '=:<message>',
+						dash: GlyphChars.Dash,
+					},
+				),
 				alwaysShow: true,
 				item: { type: 'add', operator: 'message:' },
 			},
 			{
+				label: searchOperatorToTitleMap.get('-message:')!,
+				description: l10n.t('{messageOperator} {dash} excludes commits whose message contains the term', {
+					messageOperator: '-message:<message>',
+					dash: GlyphChars.Dash,
+				}),
+				alwaysShow: true,
+				item: { type: 'add', operator: '-message:' },
+			},
+			{
 				label: searchOperatorToTitleMap.get('author:')!,
-				description: 'author:<author> or @:<author>',
+				description: l10n.t('{author} or {authorAlias}', {
+					author: 'author:<author>',
+					authorAlias: '@:<author>',
+				}),
 				buttons: [UseAuthorPickerQuickInputButton],
 				alwaysShow: true,
 				item: { type: 'add', operator: 'author:' },
 			},
 			{
+				label: searchOperatorToTitleMap.get('committer:')!,
+				description: 'committer:<committer>',
+				alwaysShow: true,
+				item: { type: 'add', operator: 'committer:' },
+			},
+			{
 				label: searchOperatorToTitleMap.get('commit:')!,
-				description: '<sha> or commit:<sha> or #:<sha>',
+				description: l10n.t('{sha} or {commit} or {commitAlias}', {
+					sha: '<sha>',
+					commit: 'commit:<sha>',
+					commitAlias: '#:<sha>',
+				}),
 				alwaysShow: true,
 				item: { type: 'add', operator: 'commit:' },
 			},
 			{
 				label: searchOperatorToTitleMap.get('ref:')!,
-				description: 'ref:<ref> or ^:<ref> (supports ranges like main..feature)',
+				description: l10n.t('{ref} or {refAlias} (supports ranges like {range})', {
+					ref: 'ref:<ref>',
+					refAlias: '^:<ref>',
+					range: 'main..feature',
+				}),
 				buttons: [UseRefPickerQuickInputButton],
 				alwaysShow: true,
 				item: { type: 'add', operator: 'ref:' },
@@ -358,34 +423,51 @@ export class SearchGitCommand extends QuickCommand<State> {
 			items.push(
 				{
 					label: searchOperatorToTitleMap.get('type:')!,
-					description: 'type:stash or is:stash; type:tip or is:tip',
+					description: l10n.t('{stashType} or {stashAlias}; {tipType} or {tipAlias}', {
+						stashType: 'type:stash',
+						stashAlias: 'is:stash',
+						tipType: 'type:tip',
+						tipAlias: 'is:tip',
+					}),
 					alwaysShow: true,
 					item: { type: 'add', operator: 'type:' },
 				},
 				createQuickPickSeparator(),
 				{
 					label: searchOperatorToTitleMap.get('file:')!,
-					description: 'file: glob or ?: glob',
+					description: l10n.t('{fileGlob} or {fileAlias}', {
+						fileGlob: 'file: glob',
+						fileAlias: '?: glob',
+					}),
 					buttons: [UseFilePickerQuickInputButton, UseFolderPickerQuickInputButton],
 					alwaysShow: true,
 					item: { type: 'add', operator: 'file:' },
 				},
 				{
 					label: searchOperatorToTitleMap.get('change:')!,
-					description: 'change: pattern or ~: pattern',
+					description: l10n.t('{changePattern} or {changeAlias}', {
+						changePattern: 'change: pattern',
+						changeAlias: '~: pattern',
+					}),
 					alwaysShow: true,
 					item: { type: 'add', operator: 'change:' },
 				},
 				createQuickPickSeparator(),
 				{
 					label: searchOperatorToTitleMap.get('after:')!,
-					description: 'after: date or since: date',
+					description: l10n.t('{afterDate} or {sinceDate}', {
+						afterDate: 'after: date',
+						sinceDate: 'since: date',
+					}),
 					alwaysShow: true,
 					item: { type: 'add', operator: 'after:' },
 				},
 				{
 					label: searchOperatorToTitleMap.get('before:')!,
-					description: 'before: date or until: date',
+					description: l10n.t('{beforeDate} or {untilDate}', {
+						beforeDate: 'before: date',
+						untilDate: 'until: date',
+					}),
 					alwaysShow: true,
 					item: { type: 'add', operator: 'before:' },
 				},
@@ -403,8 +485,8 @@ export class SearchGitCommand extends QuickCommand<State> {
 			title: appendReposToTitle(context.title, state, context),
 			placeholder:
 				aiAllowed && state.naturalLanguage
-					? 'e.g. "Show my commits from last month"'
-					: 'e.g. "Updates dependencies" author:eamodio',
+					? l10n.t('e.g. "Show my commits from last month"')
+					: l10n.t('e.g. "Updates dependencies" {authorQuery}', { authorQuery: 'author:eamodio' }),
 			ignoreFocusOut: true,
 			matchOnDescription: true,
 			matchOnDetail: true,
@@ -486,7 +568,7 @@ export class SearchGitCommand extends QuickCommand<State> {
 
 				quickpick.title = appendReposToTitle(
 					operations.size === 1
-						? `Commit ${searchOperatorToTitleMap.get(first(operations.keys())!)}`
+						? l10n.t('Commit {0}', searchOperatorToTitleMap.get(first(operations.keys())!)!)
 						: context.title,
 					state,
 					context,
@@ -502,7 +584,7 @@ export class SearchGitCommand extends QuickCommand<State> {
 					const newItems: QuickPickItemOfT<Items>[] = [...items];
 
 					const searchItem: QuickPickItemOfT<Items> = {
-						label: 'Search for',
+						label: l10n.t('Search for'),
 						description: quickpick.value,
 						iconPath: new ThemeIcon('search'),
 						item: { type: 'search', useNaturalLanguage: false },
@@ -511,7 +593,7 @@ export class SearchGitCommand extends QuickCommand<State> {
 
 					if (aiAllowed) {
 						const naturalLanguageItem: QuickPickItemOfT<Items> = {
-							label: 'Search using Natural Language',
+							label: l10n.t('Search using Natural Language'),
 							description: quickpick.value,
 							iconPath: new ThemeIcon('sparkle'),
 							alwaysShow: true,
@@ -572,8 +654,8 @@ async function updateSearchQuery(
 		const contributors = await showContributorsPicker(
 			context.container,
 			state.repo,
-			'Search by Author',
-			'Choose contributors to include commits from',
+			l10n.t('Search by Author'),
+			l10n.t('Choose contributors to include commits from'),
 			{
 				appendReposToTitle: true,
 				clearButton: true,
@@ -608,8 +690,8 @@ async function updateSearchQuery(
 			canSelectFiles: usePickers.file.type === 'file',
 			canSelectFolders: usePickers.file.type === 'folder',
 			canSelectMany: usePickers.file.type === 'file',
-			title: 'Search by File',
-			openLabel: 'Add to Search',
+			title: l10n.t('Search by File'),
+			openLabel: l10n.t('Add to Search'),
 			defaultUri: state.repo.folder?.uri,
 		});
 
@@ -636,8 +718,8 @@ async function updateSearchQuery(
 
 		const pick = await showReferencePicker2(
 			state.repo.path,
-			'Search by Reference or Range',
-			'Choose a reference to search',
+			l10n.t('Search by Reference or Range'),
+			l10n.t('Choose a reference to search'),
 			{
 				allowedAdditionalInput: { range: true, rev: false },
 				include: ['branches', 'tags', 'HEAD'],

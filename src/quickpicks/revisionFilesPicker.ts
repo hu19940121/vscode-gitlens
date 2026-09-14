@@ -1,5 +1,5 @@
 import type { Disposable, QuickInputButton, Uri } from 'vscode';
-import { ThemeIcon, window } from 'vscode';
+import { l10n, ThemeIcon, window } from 'vscode';
 import type { GitRevisionReference } from '@gitlens/git/models/reference.js';
 import type { GitTreeEntry } from '@gitlens/git/models/tree.js';
 import { filterMap } from '@gitlens/utils/iterable.js';
@@ -76,15 +76,24 @@ export async function showRevisionFilesPicker(
 		}
 
 		quickpick.title = options.title;
-		quickpick.placeholder = options?.placeholder ?? 'Search files by name';
+		quickpick.placeholder = options?.placeholder ?? l10n.t('Search files by name');
 		quickpick.matchOnDescription = true;
 
 		quickpick.value = value;
 		quickpick.busy = true;
 		quickpick.show();
 
+		// Track hides while the revision tree is loading: `onDidHide` isn't subscribed until after
+		// the fetch completes, so a hide during the fetch (e.g. the quick-pick focus race when
+		// opened from a webview click) would otherwise leave the caller's await pending forever.
+		let hiddenWhileLoading = false;
+		disposables.push(quickpick.onDidHide(() => (hiddenWhileLoading = true)));
+
 		const allowFolders = options?.allowFolders ?? false;
-		const pickFolder: QuickInputButton = { iconPath: new ThemeIcon('folder-opened'), tooltip: 'Choose Folder' };
+		const pickFolder: QuickInputButton = {
+			iconPath: new ThemeIcon('folder-opened'),
+			tooltip: l10n.t('Choose Folder'),
+		};
 		const supportsFileIcons = supportedInVSCodeVersion('quickpick-resourceuri');
 
 		const svc = container.git.getRepositoryService(repoPath);
@@ -116,6 +125,10 @@ export async function showRevisionFilesPicker(
 
 		quickpick.items = items;
 		quickpick.busy = false;
+
+		// Bail out if the picker was hidden during the fetch — the promise below subscribes to
+		// `onDidHide` too late and no user interaction can ever resolve it.
+		if (hiddenWhileLoading) return undefined;
 
 		const pick = await new Promise<RevisionQuickPickItem | undefined>(resolve => {
 			disposables.push(

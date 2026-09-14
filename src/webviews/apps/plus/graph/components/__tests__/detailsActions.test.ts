@@ -8,6 +8,7 @@ import type {
 	BranchComparisonSummary,
 	CommitResult,
 	ComposeResult,
+	ComposeSessionKey,
 	ScopeSelection,
 } from '../../../../../plus/graph/graphService.js';
 import { createResource } from '../../../../shared/state/resource.js';
@@ -20,7 +21,10 @@ function createResources(overrides: Partial<DetailsResources> = {}): DetailsReso
 	return {
 		commit: createResource(async (_signal, _repoPath: string, _sha: string) => undefined),
 		wip: createResource(async (_signal, _repoPath: string) => undefined),
-		pastAgentSessions: createResource(async (_signal, _worktreePath: string) => undefined),
+		pastAgentSessions: createResource(async (_signal, _worktreePath: string, _limit?: number) => undefined),
+		pastAgentSessionDetail: createResource(
+			async (_signal, _sessionId: string, _providerId: string | undefined, _cwd: string | undefined) => undefined,
+		),
 		compare: createResource(async (_signal, _repoPath: string, _fromSha: string, _toSha: string) => undefined),
 		branchCompareSummary: createResource(
 			async (
@@ -49,7 +53,11 @@ function createResources(overrides: Partial<DetailsResources> = {}): DetailsReso
 	};
 }
 
-function createServices(commitCompose?: (repoPath: string, plan: unknown) => Promise<CommitResult>): ResolvedServices {
+const sessionKey = 'wip|/repo' as string as ComposeSessionKey;
+
+function createServices(
+	commitCompose?: (repoPath: string, sessionKey: ComposeSessionKey, plan: unknown) => Promise<CommitResult>,
+): ResolvedServices {
 	return {
 		graphInspect: {
 			commitCompose: commitCompose ?? (async () => ({ success: true })),
@@ -179,7 +187,6 @@ suite('DetailsActions', () => {
 		state.activeMode.set('compose');
 		state.activeModeContext.set('wip');
 		state.composeForwardAvailable.set(true);
-		state.composeCurrentCacheKey.set('cache-key');
 		state.composeRefineExcludedCommitIds.set(new Set(['c1']));
 
 		let committedPlan: unknown;
@@ -188,7 +195,7 @@ suite('DetailsActions', () => {
 
 		const actions = new DetailsActions(
 			state,
-			createServices(async (_repoPath, plan) => {
+			createServices(async (_repoPath, _sessionKey, plan) => {
 				committedPlan = plan;
 				return { success: true };
 			}),
@@ -199,7 +206,7 @@ suite('DetailsActions', () => {
 			fetchedDetails = { sha: sha, repoPath: repoPath };
 		};
 
-		await actions.composeCommitAll('/repo', 'abc');
+		await actions.composeCommitAll('/repo', sessionKey, 'abc');
 
 		assert.deepStrictEqual(committedPlan, {
 			commits: composeResult.result.commits,
@@ -209,7 +216,6 @@ suite('DetailsActions', () => {
 		assert.strictEqual(state.activeMode.get(), null);
 		assert.strictEqual(state.activeModeContext.get(), null);
 		assert.strictEqual(state.composeForwardAvailable.get(), false);
-		assert.strictEqual(state.composeCurrentCacheKey.get(), undefined);
 		assert.strictEqual(resources.compose.status.get(), 'idle');
 		assert.strictEqual(resources.compose.value.get(), undefined);
 		assert.deepStrictEqual(fetchedDetails, { sha: 'abc', repoPath: '/repo' });
@@ -226,7 +232,7 @@ suite('DetailsActions', () => {
 
 		const actions = new DetailsActions(
 			state,
-			createServices(async (_repoPath, plan) => {
+			createServices(async (_repoPath, _sessionKey, plan) => {
 				committedPlan = plan;
 				return { success: true };
 			}),
@@ -234,7 +240,7 @@ suite('DetailsActions', () => {
 		);
 		actions.fetchDetails = async () => undefined;
 
-		await actions.composeCommitAll('/repo', 'abc', undefined, ['c1']);
+		await actions.composeCommitAll('/repo', sessionKey, 'abc', undefined, ['c1']);
 
 		assert.deepStrictEqual(committedPlan, {
 			commits: composeResult.result.commits,
@@ -252,8 +258,8 @@ suite('DetailsActions', () => {
 		const state = createDetailsState();
 		state.branchCompareLeftRef.set('main');
 		state.branchCompareRightRef.set('feature');
-		state.branchCompareAheadLoaded.set(true);
-		state.branchCompareBehindLoaded.set(true);
+		state.branchCompareLoadedBySide.ahead.set(true);
+		state.branchCompareLoadedBySide.behind.set(true);
 		state.branchCompareSelectedCommitShaByTab.set(new Map([['ahead', 'abc']]));
 		state.branchCompareAutolinksByScope.set(new Map([['ahead', []]]));
 		state.branchCompareEnrichmentRequested.set(true);
@@ -287,8 +293,8 @@ suite('DetailsActions', () => {
 
 		assert.deepStrictEqual(summaryFetches, [{ includeWorkingTree: true }]);
 		assert.strictEqual(state.branchCompareIncludeWorkingTree.get(), true);
-		assert.strictEqual(state.branchCompareAheadLoaded.get(), false);
-		assert.strictEqual(state.branchCompareBehindLoaded.get(), false);
+		assert.strictEqual(state.branchCompareLoadedBySide.ahead.get(), false);
+		assert.strictEqual(state.branchCompareLoadedBySide.behind.get(), false);
 		assert.strictEqual(state.branchCompareStale.get(), false);
 		assert.strictEqual(state.branchCompareSelectedCommitShaByTab.get().size, 0);
 		assert.strictEqual(state.branchCompareAutolinksByScope.get().size, 0);
@@ -370,7 +376,7 @@ suite('DetailsActions', () => {
 		const state = createDetailsState();
 		state.branchCompareLeftRef.set('main');
 		state.branchCompareRightRef.set('feature');
-		state.compareSheetOpen.set(true);
+		state.comparePresentation.set('sheet');
 
 		const summaryFetches: BranchComparisonOptions[] = [];
 		const resources = createResources({
@@ -393,8 +399,8 @@ suite('DetailsActions', () => {
 		assert.strictEqual(state.branchCompareStale.get(), false);
 
 		state.branchCompareIncludeWorkingTree.set(true);
-		state.branchCompareAheadLoaded.set(true);
-		state.branchCompareBehindLoaded.set(true);
+		state.branchCompareLoadedBySide.ahead.set(true);
+		state.branchCompareLoadedBySide.behind.set(true);
 		state.branchCompareSelectedCommitShaByTab.set(new Map([['behind', 'def']]));
 		actions.markBranchCompareStale();
 		assert.strictEqual(state.branchCompareStale.get(), true);
@@ -404,8 +410,8 @@ suite('DetailsActions', () => {
 
 		assert.deepStrictEqual(summaryFetches, [{ includeWorkingTree: true }]);
 		assert.strictEqual(state.branchCompareStale.get(), false);
-		assert.strictEqual(state.branchCompareAheadLoaded.get(), false);
-		assert.strictEqual(state.branchCompareBehindLoaded.get(), false);
+		assert.strictEqual(state.branchCompareLoadedBySide.ahead.get(), false);
+		assert.strictEqual(state.branchCompareLoadedBySide.behind.get(), false);
 		assert.strictEqual(state.branchCompareSelectedCommitShaByTab.get().size, 0);
 	});
 
@@ -842,7 +848,7 @@ suite('DetailsActions', () => {
 		// An open compare sheet is anchored to its own refs.
 		const commit = { repoPath: '/repo1', sha: 'c1' } as any;
 		state.commit.set(commit);
-		state.compareSheetOpen.set(true);
+		state.comparePresentation.set('sheet');
 		actions.resetRepoScopedStateOnSwitch('/repo2');
 		assert.strictEqual(state.commit.get(), commit, 'an open compare sheet keeps its repo-scoped state');
 	});

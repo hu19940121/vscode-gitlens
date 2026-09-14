@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import type { TemplateResult } from 'lit';
 import { css, html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
@@ -5,16 +6,18 @@ import { ifDefined } from 'lit/directives/if-defined.js';
 import { when } from 'lit/directives/when.js';
 import type { Disposable } from 'vscode';
 import { isMac } from '@env/platform.js';
+import { GlElement } from '@gitlens/components/components/element.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { SearchQuery } from '@gitlens/git/models/search.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { DOM } from '@gitlens/utils/dom.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import type { GraphSearchRelaxation } from '../../../../plus/graph/protocol.js';
 import type { AppState } from '../../../plus/graph/context.js';
-import { DOM } from '../../dom.js';
-import { GlElement } from '../element.js';
 import type { GlSearchInput, SearchModeChangeEventDetail, SearchNavigationEventDetail } from './search-input.js';
 import '../button.js';
 import '../actions/action-nav.js';
-import '../code-icon.js';
-import '../overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import './search-input.js';
 
 export type { SearchModeChangeEventDetail, SearchNavigationEventDetail };
@@ -185,6 +188,22 @@ export class GlSearchBox extends GlElement {
 
 	@property({ type: Boolean }) aiAllowed = true;
 	@property({ type: String }) errorMessage = '';
+	/** Renders {@link errorMessage} in calm/info styling instead of error/red — a ref name that's
+	 *  merely incomplete mid-typing (`reason === 'invalidRef'`), not a real error. */
+	@property({ type: Boolean }) errorCalm = false;
+	/** The active search's pattern failed to compile as regex and matched literally instead — dims the
+	 *  regex toggle (still checked) rather than flipping it off. */
+	@property({ type: Boolean }) fallbackActive = false;
+	@property({ type: String }) fallbackDetail = '';
+	/** The settled (non-partial) search used the literal fallback and found nothing — offers a
+	 *  "Match literally" action in the message area instead of a bare zero-results count. */
+	@property({ type: Boolean }) showFallbackHelper = false;
+	@property({ type: Array }) relaxations: GraphSearchRelaxation[] = [];
+	/** The settled (non-partial) NL search found nothing but has counted relaxation offers — renders
+	 *  them as calm inline chips instead of a bare zero-results count. */
+	@property({ type: Boolean }) showRelaxationsHelper = false;
+	/** The active error is an unavailable-AI NL failure — offers a "Search as text instead" action. */
+	@property({ type: Boolean }) showSearchAsTextHelper = false;
 	@property({ type: Boolean }) filter = false;
 	@property({ type: Boolean }) matchAll = false;
 	@property({ type: Boolean }) matchCase = false;
@@ -194,7 +213,6 @@ export class GlSearchBox extends GlElement {
 	@property({ type: String }) navigating: AppState['navigating'] = false;
 	@property({ type: Boolean }) resultHidden = false;
 	@property({ type: Boolean }) resultsHasMore = false;
-	@property({ type: String }) resultsLabel = 'result';
 	@property({ type: Boolean }) resultsLoaded = false;
 	@property({ type: Boolean }) searching = false;
 	@property({ type: Boolean }) showAutocompleteOnFocus = true;
@@ -248,8 +266,8 @@ export class GlSearchBox extends GlElement {
 		this.emit('gl-search-navigate', { direction: direction });
 	}
 
-	logSearch(query: SearchQuery): void {
-		void this.searchInput?.logSearch(query);
+	logSearch(query: SearchQuery, options?: { store?: boolean }): void {
+		void this.searchInput?.logSearch(query, options);
 	}
 
 	setSearchQuery(query: string): void {
@@ -269,6 +287,13 @@ export class GlSearchBox extends GlElement {
 		this.matchWholeWord = search.matchWholeWord ?? false;
 		this.naturalLanguage = Boolean(search.naturalLanguage);
 		this.searchInput?.setExternalSearchQuery(search);
+	}
+
+	/** Restores only the filter toggle — see `search-input`'s `setExternalFilter` for why this must
+	 *  never carry the query text. */
+	setExternalFilter(filter: boolean): void {
+		this.filter = filter;
+		this.searchInput?.setExternalFilter(filter);
 	}
 
 	async pickAuthors(): Promise<void> {
@@ -336,7 +361,7 @@ export class GlSearchBox extends GlElement {
 			return html`<gl-button
 				class="search-button"
 				appearance="toolbar"
-				tooltip="Stop Searching"
+				tooltip=${l10n.t('Stop Searching')}
 				@click="${this.handleCancel}"
 			>
 				<code-icon class="search-button__spinner" icon="loading" modifier="spin"></code-icon>
@@ -349,7 +374,7 @@ export class GlSearchBox extends GlElement {
 			return html`<gl-button
 				class="search-button"
 				appearance="toolbar"
-				tooltip="Resume Search"
+				tooltip=${l10n.t('Resume Search')}
 				@click="${() => this.emit('gl-search-resume')}"
 			>
 				<code-icon icon="play-circle"></code-icon>
@@ -373,29 +398,36 @@ export class GlSearchBox extends GlElement {
 
 		if (hasResults) {
 			// We have results - show count (whether searching or complete)
-			const totalFormatted = pluralize(this.resultsLabel, this.total, {
-				infix: this.resultsHasMore ? '+ ' : undefined,
-			});
+			const totalFormatted = this.resultsHasMore
+				? formatPlural(l10n.t('{0, plural, one{{0}+ result} other{{0}+ results}}'), [this.total])
+				: formatPlural(l10n.t('{0, plural, one{{0} result} other{{0} results}}'), [this.total]);
 			const total = `${this.total}${this.resultsHasMore ? '+' : ''}`;
 
 			if (this.resultHidden) {
-				tooltip = html`This result is hidden or unable to be shown on the Commit Graph`;
+				tooltip = html`${l10n.t('This result is hidden or unable to be shown on the Commit Graph')}`;
 			} else {
-				tooltip = `${totalFormatted} found`;
+				tooltip = this.resultsHasMore
+					? formatPlural(l10n.t('{0, plural, one{{0}+ result found} other{{0}+ results found}}'), [
+							this.total,
+						])
+					: formatPlural(l10n.t('{0, plural, one{{0} result found} other{{0} results found}}'), [this.total]);
 			}
 
 			countText = html`<span class="${ifDefined(this.resultHidden ? 'sr-hidden' : '')}"
-				><span aria-current="step">${this.step}</span> of <span>${total}</span
-				><span class="sr-only"> ${totalFormatted}</span></span
+				>${localizedContent(l10n.t('{current} of {total}'), { current: html`<span aria-current="step">${this.step}</span>`, total: html`<span>${total}</span>` })}<span
+					class="sr-only"
+				>
+					${totalFormatted}</span
+				></span
 			>`;
 		} else if (isComplete) {
 			// Search is complete with 0 results found
-			const totalFormatted = pluralize(this.resultsLabel, 0, { zero: 'No' });
-			tooltip = `${totalFormatted} found`;
+			const totalFormatted = l10n.t('No results');
+			tooltip = l10n.t('No results found');
 			countText = html`<span>${totalFormatted}</span>`;
 		} else if (hasNoSearch) {
 			// No search initiated yet
-			countText = html`<span>${pluralize(this.resultsLabel, 0, { zero: 'No' })}</span>`;
+			countText = html`<span>${l10n.t('No results')}</span>`;
 		} else {
 			// Searching with no results received yet - show blank
 			countText = html`<span></span>`;
@@ -415,6 +447,13 @@ export class GlSearchBox extends GlElement {
 				exportparts="search: search"
 				?aiAllowed="${this.aiAllowed}"
 				.errorMessage="${this.errorMessage}"
+				?errorCalm="${this.errorCalm}"
+				?fallbackActive="${this.fallbackActive}"
+				.fallbackDetail="${this.fallbackDetail}"
+				?showFallbackHelper="${this.showFallbackHelper}"
+				.relaxations="${this.relaxations}"
+				?showRelaxationsHelper="${this.showRelaxationsHelper}"
+				?showSearchAsTextHelper="${this.showSearchAsTextHelper}"
 				?filter=${this.filter}
 				?matchAll="${this.matchAll}"
 				?matchCase="${this.matchCase}"
@@ -447,7 +486,7 @@ export class GlSearchBox extends GlElement {
 				() =>
 					html`<div class="search-navigation">
 						${this.resultsCount}
-						<action-nav role="toolbar" aria-label="Search navigation">
+						<action-nav role="toolbar" aria-label=${l10n.t('Search navigation')}>
 							${this.progressButton}
 							<gl-tooltip>
 								<button
@@ -458,10 +497,12 @@ export class GlSearchBox extends GlElement {
 								>
 									<code-icon
 										icon="arrow-up"
-										aria-label="Previous Match (Shift+Enter)&#10;First Match (Shift+Click)"
+										aria-label=${l10n.t('Previous Match (Shift+Enter)\nFirst Match (Shift+Click)')}
 									></code-icon>
 								</button>
-								<span slot="content">Previous Match (Shift+Enter)<br />First Match (Shift+Click)</span>
+								<span slot="content"
+									>${l10n.t('Previous Match (Shift+Enter)')}<br />${l10n.t('First Match (Shift+Click)')}</span
+								>
 							</gl-tooltip>
 							<gl-tooltip>
 								<button
@@ -472,19 +513,24 @@ export class GlSearchBox extends GlElement {
 								>
 									<code-icon
 										icon="arrow-down"
-										aria-label="Next Match (Enter)&#10;Last Match (Shift+Click)"
+										aria-label=${l10n.t('Next Match (Enter)\nLast Match (Shift+Click)')}
 									></code-icon>
 								</button>
-								<span slot="content">Next Match (Enter)<br />Last Match (Shift+Click)</span>
+								<span slot="content"
+									>${l10n.t('Next Match (Enter)')}<br />${l10n.t('Last Match (Shift+Click)')}</span
+								>
 							</gl-tooltip>
-							<gl-tooltip content="Show Results in Side Bar">
+							<gl-tooltip content=${l10n.t('Show Results in Side Bar')}>
 								<button
 									type="button"
 									class="button"
 									?disabled="${!this.hasResults}"
 									@click="${this.handleOpenInView}"
 								>
-									<code-icon icon="link-external" aria-label="Show Results in Side Bar"></code-icon>
+									<code-icon
+										icon="link-external"
+										aria-label=${l10n.t('Show Results in Side Bar')}
+									></code-icon>
 								</button>
 							</gl-tooltip>
 						</action-nav>

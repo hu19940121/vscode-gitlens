@@ -1,15 +1,18 @@
+import * as l10n from '@vscode/l10n';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { keyed } from 'lit/directives/keyed.js';
 import { repeat } from 'lit/directives/repeat.js';
+import { redispatch } from '@gitlens/components/components/element.js';
+import { boxSizingBase, subPanelEnterStyles } from '@gitlens/components/components/styles/lit/base.css.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
 import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
-import { splitCommitMessage } from '@gitlens/git/utils/commit.utils.js';
-import { fromNow } from '@gitlens/utils/date.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { fromNow, getNumericFormat } from '@gitlens/utils/date.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { splitMessage } from '@gitlens/utils/string.js';
 import type { ViewFilesLayout } from '../../../../../config.js';
-import { serializeWebviewItemContext } from '../../../../../system/webview.js';
+import { getWipFileWebviewItem, serializeWebviewItemContext } from '../../../../../system/webview.js';
 import type { DetailsItemTypedContext } from '../../../../plus/graph/detailsProtocol.js';
 import { buildFolderContext } from '../../../../plus/graph/detailsProtocol.js';
 import type {
@@ -20,8 +23,6 @@ import type {
 } from '../../../../plus/graph/graphService.js';
 import type { AiModelInfo } from '../../../../rpc/services/types.js';
 import type { GlAiInput } from '../../../shared/components/ai-input.js';
-import { redispatch } from '../../../shared/components/element.js';
-import { elementBase, subPanelEnterStyles } from '../../../shared/components/styles/lit/base.css.js';
 import type { TreeItemAction, TreeItemCheckedDetail } from '../../../shared/components/tree/base.js';
 import { treeItemFileDragDataType } from '../../../shared/components/tree/base.js';
 import { renderOpenChangesAction } from '../../../shared/components/tree/file-tree-utils.js';
@@ -39,15 +40,24 @@ import {
 	panelStaleBannerStyles,
 	resumeBarStyles,
 } from './gl-details-compose-mode-panel.css.js';
-import { getScopeSplitPickerChrome, renderErrorState, renderLoadingState } from './shared-panel-templates.js';
-import '../../../shared/components/code-icon.js';
+import {
+	checkAllExclusion,
+	fileCheckedExclusion,
+	liveRefineDraft,
+	liveRefineMode,
+	scopeSplitSnap,
+	syncRefinePosture,
+	wipScopeSelectionIds,
+} from './shared-panel-helpers.js';
+import { renderErrorState, renderLoadingState } from './shared-panel-templates.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/ai-input.js';
 import '../../../shared/components/checkbox/checkbox.js';
 import '../../../shared/components/gl-ai-model-chip.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/markdown/markdown.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../../shared/components/split-panel/split-panel.js';
 import '../../../shared/components/panes/pane-group.js';
 import '../../../shared/components/tree/gl-file-tree-pane.js';
@@ -104,7 +114,7 @@ export interface ComposeMoveFileDetail {
 @customElement('gl-details-compose-mode-panel')
 export class GlDetailsComposeModePanel extends LitElement {
 	static override styles = [
-		elementBase,
+		boxSizingBase,
 		subPanelEnterStyles,
 		panelHostStyles,
 		panelActionInputStyles,
@@ -224,13 +234,13 @@ export class GlDetailsComposeModePanel extends LitElement {
 	@state() private _selectedFiles: readonly { path: string }[] = [];
 	/** Mirrors the idle curation pane's multi-selection; separate from `_selectedFiles` (ready-state tree) so selection doesn't leak across states. */
 	@state() private _idleSelectedFiles: readonly { path: string }[] = [];
-	@state() private _excludedFiles = new Set<string>();
+	@property({ attribute: false }) excludedFiles: ReadonlySet<string> = new Set();
 	@state() private _aiExcludedSet: ReadonlySet<string> | undefined;
 	/** Commit ids the user has excluded from the next "Commit" action. Independent of the
 	 *  refine-excluded set — refine-exclusion affects what the AI leaves alone during recompose,
 	 *  commit-exclusion affects what gets applied at commit time. Panel-local because it resets
 	 *  per plan (a fresh recompose result starts with all commits included). */
-	@state() private _excludedCommitIds = new Set<string>();
+	@property({ attribute: false }) commitExcludedIds: ReadonlySet<string> = new Set();
 
 	/** Panel posture: false = commit (green checkmarks pick what will be committed), true = refine
 	 *  (orange checkmarks pick what the AI may reshape). Toggled by the "Refine with AI" checkbox.
@@ -288,10 +298,6 @@ export class GlDetailsComposeModePanel extends LitElement {
 	@property({ attribute: false })
 	regeneratingCommitId?: string;
 
-	get excludedFiles(): ReadonlySet<string> {
-		return this._excludedFiles;
-	}
-
 	/** Picker selection IDs (within shadow root) for the orchestrator's scope-fetch flow. */
 	get selectedIds(): ReadonlySet<string> | undefined {
 		const picker = this.renderRoot.querySelector<GlCommitsScopePane>('gl-commits-scope-pane');
@@ -299,35 +305,44 @@ export class GlDetailsComposeModePanel extends LitElement {
 		return new Set(picker.selectedIds);
 	}
 
+	/** Live unsubmitted instructions, captured before the idle input unmounts. */
+	get idleDraftLive(): string | undefined {
+		if (this.status !== 'idle') return undefined;
+		return this.renderRoot.querySelector<GlAiInput>('gl-ai-input.review-action-input')?.currentValue;
+	}
+
 	/** Live Refine posture, read by the host on mode-leave to persist onto the engaged entry. Only
 	 *  meaningful in the ready state (the gate/refine input only exist there); other states report the
 	 *  default so a non-ready leave can't clobber a captured posture. */
 	get refineModeLive(): boolean {
-		return this.status === 'ready' ? this._refineMode : false;
+		return liveRefineMode(this.status, this._refineMode);
 	}
 
 	/** Live unsubmitted Refine text, read by the host on mode-leave. Empty unless the refine input is
 	 *  actually mounted (ready + refine posture). */
 	get refineDraftLive(): string {
-		if (this.status !== 'ready' || !this._refineMode) return '';
-		return this.renderRoot.querySelector<GlAiInput>('gl-ai-input.compose-plan__refine-input')?.currentValue ?? '';
+		return liveRefineDraft(
+			this.status,
+			this._refineMode,
+			() => this.renderRoot.querySelector<GlAiInput>('gl-ai-input.compose-plan__refine-input')?.currentValue,
+		);
 	}
 
 	override willUpdate(changedProperties: Map<string, unknown>): void {
 		if (changedProperties.has('aiExcludedFiles')) {
-			const result = syncAiExcluded(this.aiExcludedFiles, this._aiExcludedSet, this._excludedFiles);
+			const result = syncAiExcluded(this.aiExcludedFiles, this._aiExcludedSet, this.excludedFiles);
 			if (result != null) {
 				this._aiExcludedSet = result.aiExcludedSet;
 				if (result.excludedFiles != null) {
-					this._excludedFiles = result.excludedFiles;
+					this.excludedFiles = result.excludedFiles;
 				}
 			}
 		}
 
 		if (changedProperties.has('files')) {
-			const pruned = prunePathsToFiles(this._excludedFiles, this.files);
+			const pruned = prunePathsToFiles(this.excludedFiles, this.files);
 			if (pruned != null) {
-				this._excludedFiles = pruned;
+				this.excludedFiles = pruned;
 			}
 			this._idleSelectedFiles = [];
 		}
@@ -335,35 +350,29 @@ export class GlDetailsComposeModePanel extends LitElement {
 		// Exclusions picked before the scope settled into an interior range would silently violate
 		// the whole-plan contract, so drop them the moment the range becomes interior.
 		if (this.isInteriorScope) {
-			if (this._excludedFiles.size > 0) {
-				this._excludedFiles = new Set();
+			if (this.excludedFiles.size > 0) {
+				this.excludedFiles = new Set();
 			}
-			if (this._excludedCommitIds.size > 0) {
-				this._excludedCommitIds = new Set();
+			if (this.commitExcludedIds.size > 0) {
+				this.commitExcludedIds = new Set();
 			}
 		}
 
-		// After a recompose (AI refine) completes, drop back to the commit posture so the user lands
-		// on the refined plan ready to commit rather than staying in the recompose input. Guard on the
-		// loading -> ready transition (success only) so a failed recompose keeps the posture for a
-		// retry, and on `_refineMode` so the initial compose (posture already false) is a no-op.
-		if (
-			changedProperties.has('status') &&
-			changedProperties.get('status') === 'loading' &&
-			this.status === 'ready' &&
-			this._refineMode
-		) {
-			this._refineMode = false;
-		}
-
-		// Seed the live posture from the persisted `refineMode` on mount and on an anchor switch
-		// (the panel element is reused across WIP-row switches). Gated on the property actually
-		// changing — the entry only writes `refineMode` on mode-leave, so during a session (incl. a
-		// same-mount refine round-trip) the property is stable and this never fights the user's local
-		// toggle. Placed AFTER the loading→ready reset so a completed recompose still lands in Commit
-		// posture (that transition doesn't change `refineMode`, so this branch stays dormant there).
-		if (changedProperties.has('refineMode')) {
-			this._refineMode = this.refineMode;
+		// Shared Refine-posture lifecycle (see `syncRefinePosture`): after a completed recompose —
+		// the loading->ready transition ONLY, so a failed recompose keeps the posture for a retry —
+		// drop back to the commit posture, then reseed from the persisted `refineMode` on mount and
+		// on an anchor switch (the panel element is reused across WIP-row switches). The seed is
+		// gated on the property actually changing — the entry only writes `refineMode` on mode-leave,
+		// so during a session (incl. a same-mount refine round-trip) it's stable and never fights
+		// the user's local toggle.
+		const refinePosture = syncRefinePosture(changedProperties, {
+			status: this.status,
+			refineMode: this._refineMode,
+			persistedRefineMode: this.refineMode,
+			resetOnEveryReadyEntry: false,
+		});
+		if (refinePosture != null) {
+			this._refineMode = refinePosture;
 		}
 
 		// A file move can prune the selected commit (its last file moved away); drop the stale
@@ -381,11 +390,11 @@ export class GlDetailsComposeModePanel extends LitElement {
 		// Excluded commits, in contrast, are panel-local and need to be pruned here when the
 		// plan changes — a refined plan may rename / drop commit ids, so stale entries would
 		// silently filter from a commit the user didn't intend to exclude.
-		if (changedProperties.has('commits') && this._excludedCommitIds.size > 0) {
+		if (changedProperties.has('commits') && this.commitExcludedIds.size > 0) {
 			const validIds = new Set(this.commits?.map(c => c.id));
 			let changed = false;
 			const next = new Set<string>();
-			for (const id of this._excludedCommitIds) {
+			for (const id of this.commitExcludedIds) {
 				if (validIds.has(id)) {
 					next.add(id);
 				} else {
@@ -393,19 +402,19 @@ export class GlDetailsComposeModePanel extends LitElement {
 				}
 			}
 			if (changed) {
-				this._excludedCommitIds = next;
+				this.commitExcludedIds = next;
 			}
 		}
 	}
 
 	private getEffectiveFileCount(): number {
-		return countIncludedFiles(this.files, this._excludedFiles, this._aiExcludedSet);
+		return countIncludedFiles(this.files, this.excludedFiles, this._aiExcludedSet);
 	}
 
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 		this.setAttribute('role', 'region');
-		this.setAttribute('aria-label', 'Compose Changes');
+		this.setAttribute('aria-label', l10n.t('Compose Changes'));
 	}
 
 	override disconnectedCallback(): void {
@@ -458,7 +467,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 
 	private renderCancelButton() {
 		return html`<gl-button class="compose-cancel" appearance="secondary" @click=${this.handleCancel}
-			>Cancel</gl-button
+			>${l10n.t('Cancel')}</gl-button
 		>`;
 	}
 
@@ -477,7 +486,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 		// editable and the action is uncancellable, so we render a loading overlay regardless
 		// of whether `status` is still 'ready'.
 		if (this.applying) {
-			return renderLoadingState('Applying commits…');
+			return renderLoadingState(l10n.t('Applying commits…'));
 		}
 
 		if (this.status === 'idle') {
@@ -496,7 +505,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 					variant="compose"
 				></gl-categorizing-loading-animation>
 				<div class="panel-loading-stage__foreground">
-					${renderLoadingState(this.progressMessage ?? 'Composing changes…')}${this.renderCancelButton()}
+					${renderLoadingState(this.progressMessage ?? l10n.t('Composing changes…'))}${this.renderCancelButton()}
 				</div>
 			</div>`;
 		}
@@ -504,7 +513,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 		if (this.status === 'error') {
 			return renderErrorState(
 				this.errorMessage,
-				'An error occurred during composition.',
+				l10n.t('An error occurred during composition.'),
 				this.errorKind === 'invalid-scope' ? undefined : 'compose-error-retry',
 				'compose-error-back',
 			);
@@ -533,14 +542,14 @@ export class GlDetailsComposeModePanel extends LitElement {
 					multiline
 					active
 					rows="2"
-					button-label="Compose"
-					busy-label="Composing changes…"
+					button-label=${l10n.t('Compose')}
+					busy-label=${l10n.t('Composing changes…')}
 					event-name="compose-generate"
-					placeholder='Instructions — e.g. "Group by feature, keep perf changes separate"'
+					placeholder=${l10n.t('Instructions — e.g. "Group by feature, keep perf changes separate"')}
 					.value=${this.basePrompt}
 					.busy=${this.status === 'loading'}
 					?disabled=${disabled}
-					disabled-reason="Include Files to Compose"
+					disabled-reason=${l10n.t('Include Files to Compose')}
 					@input=${this.onAiInputType}
 				>
 					<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
@@ -553,11 +562,12 @@ export class GlDetailsComposeModePanel extends LitElement {
 				<div class="review-idle">
 					<div class="review-idle__scope">
 						<code-icon icon="wand"></code-icon>
-						Compose Changes
+						${l10n.t('Compose Changes')}
 					</div>
 					<div class="review-idle__desc">
-						AI will analyze your working changes and unpushed commits to create a clean, logical commit
-						sequence.
+						${l10n.t(
+							'AI will analyze your working changes and unpushed commits to create a clean, logical commit sequence.',
+						)}
 					</div>
 				</div>
 				${aiInput}
@@ -588,6 +598,18 @@ export class GlDetailsComposeModePanel extends LitElement {
 		`;
 	}
 
+	/** Memoized `.filesLayout` payload for the inner panes — a fresh literal per render would trip
+	 * the pane's tree-model rebuild via Lit's reference-equality dirty check. */
+	private _paneFilesLayout?: { layout: ViewFilesLayout };
+	private get paneFilesLayout(): { layout: ViewFilesLayout } {
+		let cached = this._paneFilesLayout;
+		if (cached?.layout !== this.fileLayout) {
+			cached = { layout: this.fileLayout };
+			this._paneFilesLayout = cached;
+		}
+		return cached;
+	}
+
 	private renderFileCuration() {
 		// Always render the section — empty-text shows the empty state inside the pane so the
 		// header / scope context stays visible even when the current scope yields zero files.
@@ -597,12 +619,12 @@ export class GlDetailsComposeModePanel extends LitElement {
 
 		const checkableStates = new Map<string, { state?: 'checked'; disabled?: boolean; disabledReason?: string }>();
 		for (const file of files) {
-			const checked = !this._excludedFiles.has(file.path);
+			const checked = !this.excludedFiles.has(file.path);
 			const disabled = aiExcluded?.has(file.path) ?? false;
 			if (checked || disabled) {
 				checkableStates.set(file.path, {
 					...(checked ? { state: 'checked' as const } : {}),
-					...(disabled ? { disabled: true, disabledReason: 'Excluded by AI ignore rules' } : {}),
+					...(disabled ? { disabled: true, disabledReason: l10n.t('Excluded by AI ignore rules') } : {}),
 				});
 			}
 		}
@@ -615,7 +637,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 					?multi-selectable=${true}
 					?show-file-icons=${true}
 					.collapsable=${false}
-					.filesLayout=${{ layout: this.fileLayout }}
+					.filesLayout=${this.paneFilesLayout}
 					.checkableStates=${checkableStates}
 					.fileActions=${this.idleFileActionsForFile}
 					.fileContext=${this.getIdleFileContext}
@@ -624,9 +646,8 @@ export class GlDetailsComposeModePanel extends LitElement {
 					.searchContext=${this.searchContext}
 					.showSearchBox=${this.showSearchBox}
 					.searchBoxFilter=${this.searchBoxFilter}
-					check-verb="Include"
-					uncheck-verb="Exclude"
-					empty-text="No files changed"
+					check-action="include"
+					empty-text=${l10n.t('No files changed')}
 					@file-checked=${this.onFileChecked}
 					@gl-check-all=${this.onToggleCheckAll}
 					@file-open=${this.redispatch}
@@ -657,7 +678,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 	}
 
 	private idleFileActionsForFile = (_file: GitFileChangeShape): TreeItemAction[] => {
-		return [{ icon: 'go-to-file', label: 'Open File', action: 'file-open' }];
+		return [{ icon: 'go-to-file', label: l10n.t('Open File'), action: 'file-open' }];
 	};
 
 	private getIdleFileContext = (file: ScopeFile): string | undefined => {
@@ -693,7 +714,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 		}
 
 		const context: DetailsItemTypedContext = {
-			webviewItem: file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged',
+			webviewItem: getWipFileWebviewItem(file),
 			webviewItemValue: {
 				type: 'file',
 				path: file.path,
@@ -707,64 +728,33 @@ export class GlDetailsComposeModePanel extends LitElement {
 	};
 
 	private onFileChecked(e: CustomEvent<TreeItemCheckedDetail>): void {
-		if (this.isInteriorScope) return;
-		if (!e.detail.context) return;
+		const next = fileCheckedExclusion(e, this.excludedFiles, () => !this.isInteriorScope);
+		if (next == null) return;
 
-		const [file] = e.detail.context as unknown as GitFileChangeShape[];
-		if (!file) return;
-
-		const next = new Set(this._excludedFiles);
-		if (e.detail.checked) {
-			next.delete(file.path);
-		} else {
-			next.add(file.path);
-		}
-		this._excludedFiles = next;
+		this.excludedFiles = next;
 		this.invalidateForward();
 	}
 
 	private onToggleCheckAll(e: CustomEvent<{ checked: boolean; paths: readonly string[] }>): void {
-		if (this.isInteriorScope) return;
+		const next = checkAllExclusion(e, this.excludedFiles, () => !this.isInteriorScope);
+		if (next == null) return;
 
-		const next = new Set(this._excludedFiles);
-		if (e.detail.checked) {
-			for (const path of e.detail.paths) {
-				next.delete(path);
-			}
-		} else {
-			for (const path of e.detail.paths) {
-				next.add(path);
-			}
-		}
-		this._excludedFiles = next;
+		this.excludedFiles = next;
 		this.invalidateForward();
 	}
 
 	private _scopeSplitSnap = ({ pos, size }: { pos: number; size: number }): number => {
-		const scopeEl = this.renderRoot.querySelector<GlCommitsScopePane>('gl-commits-scope-pane');
-		if (!scopeEl || size <= 0) return Math.max(15, Math.min(pos, 70));
-
-		// `contentHeight` measures only the inner scroll pane; the .scope-split__picker wrapper adds
-		// padding + a border-bottom. Include that chrome so the fit-content track isn't clamped
-		// short of the picker's true height (which would clip its content / desync the divider).
-		const maxPercent = Math.min(70, ((scopeEl.contentHeight + getScopeSplitPickerChrome(scopeEl)) / size) * 100);
-		return Math.max(15, Math.min(pos, maxPercent));
+		return scopeSplitSnap(this.renderRoot.querySelector<GlCommitsScopePane>('gl-commits-scope-pane'), pos, size);
 	};
 
 	private scopeSelectionIds(): readonly string[] | undefined {
-		const scope = this.scope;
-		if (scope?.type !== 'wip') return undefined;
-		return [
-			...(scope.includeUnstaged ? ['unstaged'] : []),
-			...(scope.includeStaged ? ['staged'] : []),
-			...scope.includeShas,
-		];
+		return wipScopeSelectionIds(this.scope);
 	}
 
 	private renderStaleBanner() {
 		return html`<div class="stale-banner" role="status">
 			<code-icon icon="warning"></code-icon>
-			<span>Working changes have changed since this plan was generated.</span>
+			<span>${l10n.t('Working changes have changed since this plan was generated.')}</span>
 		</div>`;
 	}
 
@@ -793,8 +783,9 @@ export class GlDetailsComposeModePanel extends LitElement {
 		return html`<div class="stale-banner" role="status">
 			<code-icon icon="info"></code-icon>
 			<span
-				>Newer commits build on this range — files can't be excluded and the plan will be committed in
-				full.</span
+				>${l10n.t(
+					"Newer commits build on this range — files can't be excluded and the plan will be committed in full.",
+				)}</span
 			>
 		</div>`;
 	}
@@ -802,19 +793,32 @@ export class GlDetailsComposeModePanel extends LitElement {
 	private renderPushedCommitWarning() {
 		return html`<div class="stale-banner" role="status">
 			<code-icon icon="warning"></code-icon>
-			<span>Rewriting pushed commits will rewrite history — you'll need to force-push afterward.</span>
+			<span
+				>${l10n.t("Rewriting pushed commits will rewrite history — you'll need to force-push afterward.")}</span
+			>
 		</div>`;
 	}
 
 	private renderPlan() {
 		if (!this.commits?.length) return nothing;
 
-		const includedCount = this.commits.length - this._excludedCommitIds.size;
-		const allIncluded = this._excludedCommitIds.size === 0;
+		const includedCount = this.commits.length - this.commitExcludedIds.size;
+		// Applying or discarding the plan ends it, and a message still being written belongs to it —
+		// let that land first so the plan the user acts on is the one they can see.
+		const regenerating = this.regeneratingCommitId != null;
+		const regeneratingReason = l10n.t('Wait for the commit message to finish generating');
+		const allIncluded = this.commitExcludedIds.size === 0;
 		// "Change Sets" only appears with a count (a partial selection); the whole-set and disabled
 		// cases use the plain "Changes" (matching the gate), so the button never reads "0" or "All".
 		const commitButtonLabel =
-			allIncluded || includedCount === 0 ? 'Commit Changes' : `Commit ${pluralize('Change Set', includedCount)}`;
+			allIncluded || includedCount === 0
+				? l10n.t('Commit Changes')
+				: formatPlural(
+						l10n.t('{count, plural, one{Commit {count} Change Set} other{Commit {count} Change Sets}}'),
+						{
+							count: includedCount,
+						},
+					);
 
 		// Refine posture mirrors the commit label: it counts the commits the AI is free to touch
 		// (checked = editable), i.e. everything minus the refine-excluded ones in the current plan.
@@ -822,8 +826,15 @@ export class GlDetailsComposeModePanel extends LitElement {
 		const refineCount = this.commits.length - refineExcludedCount;
 		const refineButtonLabel =
 			refineExcludedCount === 0 || refineCount === 0
-				? 'Recompose Changes'
-				: `Recompose ${pluralize('Change Set', refineCount)}`;
+				? l10n.t('Recompose Changes')
+				: formatPlural(
+						l10n.t(
+							'{count, plural, one{Recompose {count} Change Set} other{Recompose {count} Change Sets}}',
+						),
+						{
+							count: refineCount,
+						},
+					);
 
 		const actions = html`<div class="compose-plan__actions">
 			<gl-checkbox
@@ -831,7 +842,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 				?checked=${this._refineMode}
 				@gl-change-value=${this.handleToggleRefineMode}
 			>
-				<code-icon icon="wand"></code-icon> Recompose Changes
+				<code-icon icon="wand"></code-icon> ${l10n.t('Recompose Changes')}
 			</gl-checkbox>
 			${
 				this._refineMode
@@ -844,16 +855,21 @@ export class GlDetailsComposeModePanel extends LitElement {
 								rows="2"
 								button-label=${refineButtonLabel}
 								?disabled=${refineCount === 0}
-								disabled-reason="Include Changes to Recompose"
-								busy-label="Recomposing…"
+								disabled-reason=${l10n.t('Include Changes to Recompose')}
+								busy-label=${l10n.t('Recomposing…')}
 								event-name="compose-refine"
-								placeholder='Recompose — e.g. "Merge commits 1 and 2, they&apos;re related"'
+								placeholder=${l10n.t('Recompose — e.g. "Merge commits 1 and 2, they\'re related"')}
 								.recall=${this.lastPrompt}
 								.value=${this.refineDraft}
 							>
 								<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
-								<gl-button slot="actions" appearance="secondary" @click=${this.handleDiscard}
-									>Discard</gl-button
+								<gl-button
+									slot="actions"
+									appearance="secondary"
+									aria-disabled=${regenerating ? 'true' : nothing}
+									tooltip=${regenerating ? regeneratingReason : nothing}
+									@click=${this.handleDiscard}
+									>${l10n.t('Discard')}</gl-button
 								>
 							</gl-ai-input>`,
 						)
@@ -861,16 +877,28 @@ export class GlDetailsComposeModePanel extends LitElement {
 							<gl-button
 								class="compose-plan__commit"
 								full
-								aria-disabled=${includedCount === 0 ? 'true' : nothing}
-								tooltip=${includedCount === 0 ? 'Include a change set to commit' : nothing}
+								aria-disabled=${includedCount === 0 || regenerating ? 'true' : nothing}
+								tooltip=${
+									includedCount === 0
+										? l10n.t('Include a change set to commit')
+										: regenerating
+											? regeneratingReason
+											: nothing
+								}
 								@click=${() => {
-									if (includedCount === 0) return;
+									if (includedCount === 0 || regenerating) return;
 
 									this.handleCommitAll();
 								}}
 								>${commitButtonLabel}</gl-button
 							>
-							<gl-button appearance="secondary" @click=${this.handleDiscard}>Discard</gl-button>
+							<gl-button
+								appearance="secondary"
+								aria-disabled=${regenerating ? 'true' : nothing}
+								tooltip=${regenerating ? regeneratingReason : nothing}
+								@click=${this.handleDiscard}
+								>${l10n.t('Discard')}</gl-button
+							>
 						</div>`
 			}
 		</div>`;
@@ -911,7 +939,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 	 *  Multi-paragraph bodies collapse to a single line with the summary; the popover anchor
 	 *  carries the full markdown for hover. */
 	private renderCommitMessageInline(message: string) {
-		const { summary, body } = splitCommitMessage(message);
+		const { summary, body } = splitMessage(message);
 		if (!body) {
 			return html`<gl-markdown .markdown=${summary} inline></gl-markdown>`;
 		}
@@ -923,7 +951,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 		const num = this.commits!.length - index;
 		const isSelected = this._selectedCommitId === commit.id;
 		const isRefineExcluded = this.excludedCommitIds.has(commit.id);
-		const isExcluded = this._excludedCommitIds.has(commit.id);
+		const isExcluded = this.commitExcludedIds.has(commit.id);
 		// One checkmark per row; posture decides which axis it edits. Checked always means "let
 		// this commit flow through" (commit it / let the AI reshape it); unchecked "holds it back".
 		// Commit-posture exclusion is unavailable for an interior range (the plan applies whole);
@@ -932,17 +960,13 @@ export class GlDetailsComposeModePanel extends LitElement {
 		const isChecked = this._refineMode ? !isRefineExcluded : !isExcluded;
 		const checkLabel = this._refineMode
 			? isRefineExcluded
-				? 'Excluded when Recomposing'
-				: 'Included when Recomposing'
+				? l10n.t('Excluded when Recomposing')
+				: l10n.t('Included when Recomposing')
 			: commitCheckBlocked
-				? 'Always committed — newer commits depend on this range'
+				? l10n.t('Always committed — newer commits depend on this range')
 				: isExcluded
-					? 'Excluded when Committing'
-					: 'Included when Committing';
-
-		const ariaState = [isRefineExcluded ? 'excluded from recompose' : '', isExcluded ? 'excluded from commit' : '']
-			.filter(Boolean)
-			.join(', ');
+					? l10n.t('Excluded when Committing')
+					: l10n.t('Included when Committing');
 
 		// Per-commit message regen gate. Disabled when AI isn't configured (the existing flow's
 		// model-picker entry point is on the bigger Compose/Refine input — keep this button
@@ -954,12 +978,13 @@ export class GlDetailsComposeModePanel extends LitElement {
 		const regenDisabled = regenBlocked && !isRegeneratingThis;
 		const regenLabel =
 			this.aiModel == null
-				? 'AI model required to regenerate commit messages'
+				? l10n.t('AI model required to regenerate commit messages')
 				: isRegeneratingThis
-					? 'Regenerating commit message…'
-					: 'Regenerate Commit Message';
+					? l10n.t('Regenerating commit message…')
+					: l10n.t('Regenerate Commit Message');
 
 		const reorderEnabled = this.reorderEnabled;
+		const ariaLabel = this.getCommitAriaLabel(num, commit.files.length, isRefineExcluded, isExcluded);
 		return html`<div
 			class="compose-commit ${isSelected ? 'compose-commit--selected' : ''} ${
 				isExcluded ? 'compose-commit--excluded' : ''
@@ -969,8 +994,8 @@ export class GlDetailsComposeModePanel extends LitElement {
 			data-commit-id=${commit.id}
 			draggable=${reorderEnabled ? 'true' : 'false'}
 			aria-current=${isSelected ? 'true' : 'false'}
-			aria-roledescription=${reorderEnabled ? 'Draggable commit, use Alt+Arrow keys to reorder' : nothing}
-			aria-label="Commit ${num}, ${pluralize('file', commit.files.length)}${ariaState ? `, ${ariaState}` : ''}"
+			aria-roledescription=${reorderEnabled ? l10n.t('Draggable commit, use Alt+Arrow keys to reorder') : nothing}
+			aria-label=${ariaLabel}
 			@click=${() => this.handleSelectCommit(commit.id)}
 			@keydown=${(e: KeyboardEvent) => this.handleCommitKeydown(e, commit.id)}
 		>
@@ -978,7 +1003,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 				<span class="compose-commit__grip" aria-hidden="true"
 					>${reorderEnabled ? html`<code-icon icon="gripper"></code-icon>` : nothing}</span
 				>
-				<span class="compose-commit__num-value">${num}</span>
+				<span class="compose-commit__num-value">${getNumericFormat()(num)}</span>
 			</span>
 			<div class="compose-commit__info">
 				<div class="compose-commit__message-row">
@@ -1010,9 +1035,11 @@ export class GlDetailsComposeModePanel extends LitElement {
 					</gl-tooltip>
 				</div>
 				<span class="compose-commit__stats">
-					${pluralize('file', commit.files.length)}
-					<span class="compose-commit__additions">+${commit.additions}</span>
-					<span class="compose-commit__deletions">&minus;${commit.deletions}</span>
+					${formatPlural(l10n.t('{count, plural, one{{count} file} other{{count} files}}'), {
+						count: commit.files.length,
+					})}
+					<span class="compose-commit__additions">+${getNumericFormat()(commit.additions)}</span>
+					<span class="compose-commit__deletions">&minus;${getNumericFormat()(commit.deletions)}</span>
 				</span>
 			</div>
 			<div class="compose-commit__actions">
@@ -1041,13 +1068,45 @@ export class GlDetailsComposeModePanel extends LitElement {
 		</div>`;
 	}
 
+	private getCommitAriaLabel(num: number, fileCount: number, isRefineExcluded: boolean, isExcluded: boolean): string {
+		const args = { number: getNumericFormat()(num), count: fileCount };
+		if (isRefineExcluded && isExcluded) {
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{Commit {number}, {count} file, excluded from recompose, excluded from commit} other{Commit {number}, {count} files, excluded from recompose, excluded from commit}}',
+				),
+				args,
+			);
+		}
+		if (isRefineExcluded) {
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{Commit {number}, {count} file, excluded from recompose} other{Commit {number}, {count} files, excluded from recompose}}',
+				),
+				args,
+			);
+		}
+		if (isExcluded) {
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{Commit {number}, {count} file, excluded from commit} other{Commit {number}, {count} files, excluded from commit}}',
+				),
+				args,
+			);
+		}
+		return formatPlural(
+			l10n.t('{count, plural, one{Commit {number}, {count} file} other{Commit {number}, {count} files}}'),
+			args,
+		);
+	}
+
 	private renderBaseCommit() {
 		const base = this.baseCommit!;
 		const shortSha = base.sha.substring(0, 7);
-		const headline = base.message?.split('\n')[0]?.trim() || '(no message)';
+		const headline = base.message?.split('\n')[0]?.trim() || l10n.t('(no message)');
 		const dateLabel = base.date ? fromNow(new Date(base.date)) : undefined;
 
-		return html`<gl-tooltip content="Anchored at ${shortSha}"
+		return html`<gl-tooltip content=${l10n.t('Anchored at {revision}', { revision: shortSha })}
 			><div class="compose-base">
 				<span class="compose-base__marker" aria-hidden="true">&#9675;</span>
 				<div class="compose-base__body">
@@ -1068,7 +1127,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 						}
 					</span>
 				</div>
-				<span class="compose-base__tag">base</span>
+				<span class="compose-base__tag">${l10n.t('base')}</span>
 			</div></gl-tooltip
 		>`;
 	}
@@ -1076,14 +1135,14 @@ export class GlDetailsComposeModePanel extends LitElement {
 	private renderSelectedCommitFiles() {
 		const commit = this._selectedCommitId ? this.commits?.find(c => c.id === this._selectedCommitId) : undefined;
 		const files = commit?.files ?? [];
-		const emptyText = commit ? 'No files changed' : 'Select a commit above to see the file changes';
+		const emptyText = commit ? l10n.t('No files changed') : l10n.t('Select a commit above to see the file changes');
 
 		return html`<gl-file-tree-pane
 			.files=${files}
-			.filesLayout=${{ layout: this.fileLayout }}
+			.filesLayout=${this.paneFilesLayout}
 			.collapsable=${false}
 			show-file-icons
-			header="File Changes"
+			header=${l10n.t('File Changes')}
 			empty-text=${emptyText}
 			?multi-selectable=${true}
 			?draggable-files=${this.reorderEnabled}
@@ -1164,7 +1223,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 	};
 
 	private fileActionsForFile = (_file: ProposedCommitFile): TreeItemAction[] => {
-		return [{ icon: 'go-to-file', label: 'Open File', action: 'file-open' }];
+		return [{ icon: 'go-to-file', label: l10n.t('Open File'), action: 'file-open' }];
 	};
 
 	private getFileContext = (file: ProposedCommitFile): string | undefined => {
@@ -1184,7 +1243,7 @@ export class GlDetailsComposeModePanel extends LitElement {
 			};
 		} else {
 			context = {
-				webviewItem: file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged',
+				webviewItem: getWipFileWebviewItem(file),
 				webviewItemValue: {
 					type: 'file',
 					path: file.path,
@@ -1221,9 +1280,9 @@ export class GlDetailsComposeModePanel extends LitElement {
 
 	private handleCommitAll(): void {
 		const includedCommitIds =
-			this.isInteriorScope || this._excludedCommitIds.size === 0
+			this.isInteriorScope || this.commitExcludedIds.size === 0
 				? undefined
-				: this.commits?.filter(c => !this._excludedCommitIds.has(c.id)).map(c => c.id);
+				: this.commits?.filter(c => !this.commitExcludedIds.has(c.id)).map(c => c.id);
 
 		this.dispatchEvent(
 			new CustomEvent<ComposeCommitAllDetail>('compose-commit-all', {
@@ -1573,13 +1632,13 @@ export class GlDetailsComposeModePanel extends LitElement {
 	private handleToggleCommitIncluded(commitId: string): void {
 		if (this.isInteriorScope) return;
 
-		const next = new Set(this._excludedCommitIds);
+		const next = new Set(this.commitExcludedIds);
 		if (next.has(commitId)) {
 			next.delete(commitId);
 		} else {
 			next.add(commitId);
 		}
-		this._excludedCommitIds = next;
+		this.commitExcludedIds = next;
 	}
 
 	private handleToggleRefineMode(e: Event): void {

@@ -1,50 +1,49 @@
 import type { Remote } from '@eamodio/supertalk';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { TemplateResult } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { classMap } from 'lit/directives/class-map.js';
+import { ifDefined } from 'lit/directives/if-defined.js';
 import { when } from 'lit/directives/when.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { srOnlyStyles } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { AgentSessionState } from '../../../../../agents/models/agentSessionState.js';
 import type { GlWebviewCommandsOrCommandsWithSuffix } from '../../../../../constants.commands.js';
-import type { BranchRef } from '../../../../home/protocol.js';
+import { serializeWebviewItemContext } from '../../../../../system/webview.js';
 import type { GraphServices } from '../../../../plus/graph/graphService.js';
-import type {
-	OverviewBranch,
-	OverviewBranchEnrichment,
-	OverviewBranchWip,
-} from '../../../../shared/overviewBranches.js';
-import type { ActionItem } from '../../../shared/components/actions/action-item.js';
-import { srOnlyStyles } from '../../../shared/components/styles/lit/a11y.css.js';
+import type { GraphOverviewBranch } from '../../../../plus/graph/protocol.js';
+import type { BranchRef } from '../../../../shared/branchRefs.js';
+import type { OverviewBranchEnrichment, OverviewBranchWip } from '../../../../shared/overviewBranches.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
-import type { AppState } from '../context.js';
-import { graphServicesContext, graphStateContext } from '../context.js';
+import { graphServicesContext } from '../context.js';
 import {
-	commandToOverviewActionName,
 	getLaunchpadItemGroup,
 	getLaunchpadItemGrouping,
+	getOverviewBranchContextData,
+	resolveOverviewActionItemClick,
 } from '../utils/overviewActions.utils.js';
 import '../components/gl-branch-hover.js';
 import '../../../shared/components/branch-icon.js';
 import '../../../shared/components/card/card.js';
 import '../../../shared/components/pills/agent-status-pill.js';
 import '../../../shared/components/pills/tracking-status.js';
-import '../../../shared/components/commit/commit-stats.js';
-import '../../../shared/components/commit/wip-stats.js';
+import '@gitlens/components/components/commitStats.js';
+import '@gitlens/components/components/wipStats.js';
 import '../../../shared/components/avatar/avatar-list.js';
 import '../../../shared/components/rich/pr-icon.js';
 import '../../../shared/components/rich/issue-icon.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/actions/action-item.js';
 import '../../../shared/components/actions/action-nav.js';
 
 function getBranchCardIndicator(
-	branch: OverviewBranch,
+	branch: GraphOverviewBranch,
 	wip?: OverviewBranchWip,
 	enrichment?: OverviewBranchEnrichment,
 ): string | undefined {
@@ -143,8 +142,8 @@ export class GlGraphOverviewCard extends LitElement {
 		}
 
 		/* Lights up when one or more selected/focused graph rows live on this branch.
-	   Overrides the --gl-card-background cascade so the inner-shadow :hover rule
-	   in card.css.ts continues to compose on top via --gl-card-hover-background. */
+  Overrides the --gl-card-background cascade so the inner-shadow :hover rule
+  in card.css.ts continues to compose on top via --gl-card-hover-background. */
 		:host([contains-selection]) {
 			--gl-card-background: color-mix(
 				in lab,
@@ -164,11 +163,11 @@ export class GlGraphOverviewCard extends LitElement {
 
 		gl-popover {
 			/* Anchor wrapper inside the popover defaults to fit-content; grow it so the
-		   whole card is the hover-target. */
+   whole card is the hover-target. */
 			--gl-popover-anchor-width: 100%;
 
 			/* Slightly slower show keeps quick scan-passes from triggering the rich hover;
-		   short hide gives users a beat to move into the popover without it dismissing. */
+   short hide gives users a beat to move into the popover without it dismissing. */
 			--show-delay: 600ms;
 			--hide-delay: 120ms;
 		}
@@ -280,8 +279,8 @@ export class GlGraphOverviewCard extends LitElement {
 		}
 
 		/* One-line layout: tracking + wip pill folded into the name row's right edge when there
-	   are no issues / PRs / agents to take the second meta line. flex-none + margin-inline-start
-	   keeps the pills hugging the right edge while the name shrinks first under width pressure. */
+  are no issues / PRs / agents to take the second meta line. flex-none + margin-inline-start
+  keeps the pills hugging the right edge while the name shrinks first under width pressure. */
 		.branch-item__meta-inline {
 			display: inline-flex;
 			flex: none;
@@ -309,8 +308,8 @@ export class GlGraphOverviewCard extends LitElement {
 			gap: var(--gl-space-4);
 
 			/* flex-start so a compact-fallback pill (needs-input + !canResolve) shrinks to its
-		   content instead of inheriting stretch. Full-mode pills still span the row via their
-		   own width: 100%. */
+   content instead of inheriting stretch. Full-mode pills still span the row via their
+   own width: 100%. */
 			align-items: flex-start;
 		}
 
@@ -320,9 +319,9 @@ export class GlGraphOverviewCard extends LitElement {
 
 		.branch-item__inline-actions {
 			/* Anchored to row 1 (grouping is position: relative). Absolute so it floats over the
-		   branch name on hover without pushing layout. Spans grouping height and centers
-		   content via flex — using transform here would create a containing block for the
-		   action-item hoisted (fixed-positioned) tooltip and clip it. */
+   branch name on hover without pushing layout. Spans grouping height and centers
+   content via flex — using transform here would create a containing block for the
+   action-item hoisted (fixed-positioned) tooltip and clip it. */
 			position: absolute;
 			top: 0;
 			right: 0;
@@ -355,11 +354,8 @@ export class GlGraphOverviewCard extends LitElement {
 	@consume({ context: graphServicesContext, subscribe: true })
 	private _services?: Remote<GraphServices> | undefined;
 
-	@consume({ context: graphStateContext, subscribe: true })
-	private _graphState?: AppState;
-
 	@property({ type: Object })
-	branch!: OverviewBranch;
+	branch!: GraphOverviewBranch;
 
 	@property({ type: Object })
 	wip?: OverviewBranchWip;
@@ -442,6 +438,11 @@ export class GlGraphOverviewCard extends LitElement {
 		const hasRight = issuesIndicator !== nothing || prIndicator !== nothing || agentsIndicator !== nothing;
 		const inlineFold = !branch.opened && !hasRight && hasLeft;
 
+		// Same serialized shape the sidebar branches panel stamps on its tree leaves — gets the card
+		// the identical native right-click branch menu. `ContextMenuProxyController` on the sidebar
+		// panel bridges it across the shadow-DOM boundaries up to where VS Code can read it.
+		const vscodeContext = branch.context != null ? serializeWebviewItemContext(branch.context) : undefined;
+
 		// placement="right" so the popover floats over the Graph (which sits to the right of
 		// the sidebar in typical layouts) rather than into the editor's left margin. The
 		// popover's flip behavior auto-corrects when there isn't room.
@@ -457,7 +458,9 @@ export class GlGraphOverviewCard extends LitElement {
 					slot="anchor"
 					class=${cardClasses}
 					focusable
+					.pressed=${this.scoped}
 					.indicator=${branchIndicator}
+					data-vscode-context=${ifDefined(vscodeContext)}
 					@click=${this.onCardClick}
 					@keydown=${this.onCardKeydown}
 					@focusin=${this.onCardFocusIn}
@@ -666,7 +669,11 @@ export class GlGraphOverviewCard extends LitElement {
 					() => html`<span>${sessions.length}</span>`,
 				)}</span
 			>
-			<span slot="content">${pluralize('agent session', sessions.length)}</span></gl-tooltip
+			<span slot="content"
+				>${formatPlural(l10n.t('{0, plural, one{{0} agent session} other{{0} agent sessions}}'), [
+					sessions.length,
+				])}</span
+			></gl-tooltip
 		>`;
 	}
 
@@ -705,7 +712,7 @@ export class GlGraphOverviewCard extends LitElement {
 				if (tracking?.behind) {
 					actions.push(
 						html`<action-item
-							label="Pull"
+							label=${l10n.t('Pull')}
 							icon="repo-pull"
 							href=${this.createCommandLink('gitlens.graph.pull')}
 						></action-item>`,
@@ -713,7 +720,7 @@ export class GlGraphOverviewCard extends LitElement {
 				} else if (tracking?.ahead) {
 					actions.push(
 						html`<action-item
-							label="Push"
+							label=${l10n.t('Push')}
 							icon="repo-push"
 							href=${this.createCommandLink('gitlens.graph.push')}
 						></action-item>`,
@@ -721,7 +728,7 @@ export class GlGraphOverviewCard extends LitElement {
 				} else {
 					actions.push(
 						html`<action-item
-							label="Fetch"
+							label=${l10n.t('Fetch')}
 							icon="repo-fetch"
 							href=${this.createCommandLink('gitlens.fetch:')}
 						></action-item>`,
@@ -730,7 +737,7 @@ export class GlGraphOverviewCard extends LitElement {
 			} else {
 				actions.push(
 					html`<action-item
-						label="Publish Branch"
+						label=${l10n.t('Publish Branch')}
 						icon="cloud-upload"
 						href=${this.createCommandLink('gitlens.publishBranch:')}
 					></action-item>`,
@@ -739,8 +746,8 @@ export class GlGraphOverviewCard extends LitElement {
 		} else if (this.isWorktree) {
 			actions.push(
 				html`<action-item
-					label="Open Worktree in New Window"
-					alt-label="Open Worktree"
+					label=${l10n.t('Open Worktree in New Window')}
+					alt-label=${l10n.t('Open Worktree')}
 					icon="empty-window"
 					alt-icon="browser"
 					href=${this.createCommandLink('gitlens.openWorktreeInNewWindow:')}
@@ -750,7 +757,7 @@ export class GlGraphOverviewCard extends LitElement {
 		} else {
 			actions.push(
 				html`<action-item
-					label="Switch to Branch..."
+					label=${l10n.t('Switch to Branch...')}
 					icon="gl-switch"
 					href=${this.createCommandLink('gitlens.switchToBranch:')}
 				></action-item>`,
@@ -807,15 +814,9 @@ export class GlGraphOverviewCard extends LitElement {
 	}
 
 	private dispatchBranchSelected() {
-		emitTelemetrySentEvent<'graph/overview/branchSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/overview/branchSelected',
-			data: {
-				isActive: this.branch.opened,
-				isWorktree: this.isWorktree,
-				hasPr: this.enrichment?.pr != null,
-				hasIssues: (this.enrichment?.issues?.length ?? 0) > 0 || (this.enrichment?.autolinks?.length ?? 0) > 0,
-				hasWip: this.hasWip,
-			},
+			data: getOverviewBranchContextData(this.branch, this.enrichment, this.hasWip),
 		});
 
 		this.dispatchEvent(
@@ -839,31 +840,16 @@ export class GlGraphOverviewCard extends LitElement {
 		// Bound on the popover host, so clicks from the hover's action-nav reach here too — but
 		// <gl-branch-hover> emits its own `action` event (with the right surface), so bail on those or
 		// we'd double-count. What's left is the card's own inline action-nav.
-		let action: ActionItem | undefined;
-		for (const node of e.composedPath()) {
-			const el = node as Element;
-			if (el?.tagName === 'GL-BRANCH-HOVER') return;
+		const click = resolveOverviewActionItemClick(e, 'GL-BRANCH-HOVER');
+		if (click == null) return;
 
-			// Native click events compose through shadow boundaries, so composedPath surfaces the
-			// original `<action-item>` even though the event target has been retargeted upward.
-			if (action == null && el?.tagName === 'ACTION-ITEM') {
-				action = el as ActionItem;
-			}
-		}
-
-		if (action == null) return;
-
-		const altKeyPressed = e.altKey || e.shiftKey;
-		const href = altKeyPressed && action.altHref ? action.altHref : action.href;
-		if (href == null) return;
-
-		emitTelemetrySentEvent<'graph/overview/action'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/overview/action',
 			data: {
-				name: commandToOverviewActionName(href),
+				name: click.name,
 				location: 'inline',
 				surface: 'overview',
-				alt: altKeyPressed,
+				alt: click.alt,
 			},
 		});
 	}

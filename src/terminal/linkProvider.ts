@@ -1,11 +1,12 @@
 import type { CancellationToken, Disposable, TerminalLink, TerminalLinkContext, TerminalLinkProvider } from 'vscode';
-import { commands, window } from 'vscode';
+import { commands, l10n, window } from 'vscode';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { GitTag } from '@gitlens/git/models/tag.js';
-import { getBranchNameWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
+import { getBranchNameWithoutRemote } from '@gitlens/utils/gitRefs.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
+import { wait } from '@gitlens/utils/promise.js';
 import type { CompareWithCommandArgs } from '../commands/compareWith.js';
 import type { GitWizardCommandArgs } from '../commands/gitWizard.js';
 import type { InspectCommandArgs } from '../commands/inspect.js';
@@ -35,6 +36,9 @@ const refRegexShared = /\b((?!.*\/\.)(?!.*\.\.)(?!.*\/\/)(?!.*@\{)[^\x00-\x1F\x7
 // by single dots) mirrors the range side in `packages/git`'s revision utils and can't swallow the `..`.
 const rangesRegexShared = /\b([\w/-]+(?:\.[\w/-]+)*(?:[~^]\d*)*)(\.\.\.?)([\w/-]+(?:\.[\w/-]+)*(?:[~^]\d*)*)/gi;
 const shaRegex = /^[0-9a-f]{7,40}$/;
+
+const maxCachedLines = 200;
+const linkDetectionRestDelay = 150; // ms — a mouse sweeping across lines cancels each superseded call before this elapses
 
 interface GitTerminalLink<T = object> extends TerminalLink {
 	command: {
@@ -127,14 +131,19 @@ function createRangeLinkCommand(
 }
 
 export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider<GitTerminalLink> {
-	private disposable: Disposable;
+	private readonly disposables: Disposable[] = [];
+	private readonly _cache = new Map<string, GitTerminalLink[]>();
 
 	constructor(private readonly container: Container) {
-		this.disposable = window.registerTerminalLinkProvider(this);
+		this.disposables.push(
+			window.registerTerminalLinkProvider(this),
+			container.git.onDidChangeRepository(() => this._cache.clear()),
+			container.git.onDidChangeRepositories(() => this._cache.clear()),
+		);
 	}
 
 	dispose(): void {
-		this.disposable.dispose();
+		this.disposables.forEach(d => void d.dispose());
 	}
 
 	async provideTerminalLinks(context: TerminalLinkContext, token: CancellationToken): Promise<GitTerminalLink[]> {
@@ -144,6 +153,18 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 		if (!repoPath) return [];
 
 		const showIn = configuration.get('terminalLinks.showIn');
+
+		const key = `${repoPath}|${showIn}|${context.line}`;
+		const cached = this._cache.get(key);
+		if (cached != null) {
+			this._cache.delete(key);
+			this._cache.set(key, cached);
+
+			return cached;
+		}
+
+		await wait(linkDetectionRestDelay);
+		if (token.isCancellationRequested) return [];
 
 		const links: GitTerminalLink[] = [];
 
@@ -198,7 +219,7 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 			links.push({
 				startIndex: rangeMatch.index,
 				length: range.length,
-				tooltip: showIn === 'quickpick' ? 'Show Commits' : 'Show Comparison',
+				tooltip: showIn === 'quickpick' ? l10n.t('Show Commits') : l10n.t('Show Comparison'),
 				command: createRangeLinkCommand(
 					showIn,
 					repoPath,
@@ -224,7 +245,7 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 				const link: GitTerminalLink<GitWizardCommandArgs> = {
 					startIndex: match.index + git.length,
 					length: command.length,
-					tooltip: 'Open in Git Command Palette',
+					tooltip: l10n.t('Open in Git Command Palette'),
 					command: createTerminalLinkCommand<GitWizardCommandArgs>('gitlens.gitCommands', {
 						command: command as GitWizardCommandArgs['command'],
 					}),
@@ -245,7 +266,7 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 				links.push({
 					startIndex: index,
 					length: ref.length,
-					tooltip: 'Show HEAD',
+					tooltip: l10n.t('Show HEAD'),
 					command: createRefLinkCommand(
 						showIn,
 						repoPath,
@@ -268,7 +289,7 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 				links.push({
 					startIndex: index,
 					length: ref.length,
-					tooltip: 'Show Branch',
+					tooltip: l10n.t('Show Branch'),
 					command: createRefLinkCommand(showIn, repoPath, getReferenceFromBranch(branch), branch.sha, {
 						repoPath: repoPath,
 						branch: branch.name,
@@ -287,7 +308,7 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 				links.push({
 					startIndex: index,
 					length: ref.length,
-					tooltip: 'Show Tag',
+					tooltip: l10n.t('Show Tag'),
 					command: createRefLinkCommand(showIn, repoPath, getReferenceFromTag(tag), tag.sha, {
 						repoPath: repoPath,
 						tag: tag.name,
@@ -303,11 +324,22 @@ export class GitTerminalLinkProvider implements Disposable, TerminalLinkProvider
 				links.push({
 					startIndex: index,
 					length: ref.length,
-					tooltip: 'Show Commit',
+					tooltip: l10n.t('Show Commit'),
 					command: createCommitLinkCommand(showIn, repoPath, ref),
 				});
 			}
 		} while (true);
+
+		if (!token.isCancellationRequested) {
+			if (this._cache.size >= maxCachedLines) {
+				const oldestKey = this._cache.keys().next().value;
+				if (oldestKey != null) {
+					this._cache.delete(oldestKey);
+				}
+			}
+
+			this._cache.set(key, links);
+		}
 
 		return links;
 	}

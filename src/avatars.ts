@@ -1,5 +1,5 @@
 import type { MessageItem } from 'vscode';
-import { EventEmitter, Uri, window, workspace } from 'vscode';
+import { EventEmitter, l10n, Uri, window, workspace } from 'vscode';
 import { fetch } from '@env/fetch.js';
 import type { CommitAuthor } from '@gitlens/git/models/author.js';
 import { CustomRemoteProvider } from '@gitlens/git/remotes/custom.js';
@@ -8,6 +8,7 @@ import { base64 } from '@gitlens/utils/base64.js';
 import { md5 } from '@gitlens/utils/crypto.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { filterMap } from '@gitlens/utils/iterable.js';
+import type { ResourceUsage } from '@gitlens/utils/resourceUsage.js';
 import { equalsIgnoreCase } from '@gitlens/utils/string.js';
 import type { GravatarDefaultStyle } from './config.js';
 import type { StoredAvatar } from './constants.storage.js';
@@ -73,6 +74,14 @@ const retryDecay = [
 	millisecondsPerDay,
 	millisecondsPerDay * 7,
 ];
+
+/** Resource usage retained by the avatar cache and fetch queue. */
+export function getAvatarResourceUsage(): ResourceUsage {
+	return {
+		'cache.entries.count': avatarCache?.size ?? 0,
+		'fetchQueue.pending.count': avatarQueue.size,
+	};
+}
 
 export function getAvatarUri(
 	email: string | undefined,
@@ -405,12 +414,15 @@ async function promptForAvatarTemplateApproval(template: string): Promise<void> 
 
 	promptedAvatarTemplates.add(template);
 
-	const allow: MessageItem = { title: 'Allow' };
-	const deny: MessageItem = { title: 'Deny' };
-	const notNow: MessageItem = { title: 'Not Now', isCloseAffordance: true };
+	const allow: MessageItem = { title: l10n.t('Allow') };
+	const deny: MessageItem = { title: l10n.t('Deny') };
+	const notNow: MessageItem = { title: l10n.t('Not Now'), isCloseAffordance: true };
 
 	const result = await window.showInformationMessage(
-		`The \`gitlens.remotes\` setting in this workspace includes an avatar URL template that will be requested for every commit author.\n\nTemplate: ${template}\n\nDo you trust this workspace to make these requests?`,
+		l10n.t(
+			'The `gitlens.remotes` setting in this workspace includes an avatar URL template that will be requested for every commit author.\n\nTemplate: {0}\n\nDo you trust this workspace to make these requests?',
+			template,
+		),
 		allow,
 		deny,
 		notNow,

@@ -11,13 +11,17 @@
 // resolution so the tests exercise the same code paths consumers will.
 
 import { execFileSync } from 'node:child_process';
+import { rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as esbuild from 'esbuild';
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const workspaceRoot = dirname(dirname(dirname(packageRoot)));
 const outDir = join(packageRoot, 'out');
+
+await rm(outDir, { recursive: true, force: true });
 
 await esbuild.build({
 	absWorkingDir: packageRoot,
@@ -41,4 +45,25 @@ const mocha = createRequire(import.meta.url).resolve('mocha/bin/mocha.js');
 execFileSync(process.execPath, [mocha, '--ui', 'tdd', '--timeout', '30000', `${outDir}/**/__tests__/**/*.test.cjs`], {
 	stdio: 'inherit',
 	cwd: packageRoot,
+});
+
+// `tsc -b` is this package's type-check gate (it has no `check` script of its own). Run it before
+// exercising the external-consumer boundary below, so a type error here fails loudly rather than
+// surfacing as a confusing resolution error inside the fixture.
+const pnpm = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+execFileSync(pnpm, ['build'], {
+	stdio: 'inherit',
+	cwd: packageRoot,
+});
+
+// Generate Core's flattened exports before running the workspace fixture. CI additionally installs the packed
+// tarball via packages/core/scripts/verify-package.mjs, which catches pack-time manifest/export regressions.
+execFileSync(pnpm, ['--filter', '@gitkraken/core-gitlens', 'build'], {
+	stdio: 'inherit',
+	cwd: workspaceRoot,
+});
+
+execFileSync(pnpm, ['--filter', '@gitlens/integrations-consumer-fixture', 'test'], {
+	stdio: 'inherit',
+	cwd: workspaceRoot,
 });

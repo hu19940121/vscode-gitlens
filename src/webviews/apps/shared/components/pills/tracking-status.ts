@@ -1,9 +1,11 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { renderBranchName } from '../branch-name.js';
-import '../overlays/tooltip.js';
-import './tracking.js';
+import '@gitlens/components/components/overlays/tooltip.js';
+import '@gitlens/components/components/pills/tracking.js';
 
 @customElement('gl-tracking-status')
 export class GlTrackingStatus extends LitElement {
@@ -62,25 +64,37 @@ export class GlTrackingStatus extends LitElement {
 	}
 
 	private renderDescription() {
+		let message: string;
 		if (this.missingUpstream) {
-			return html`${renderBranchName(this.branchName)} is missing its upstream
-			${renderBranchName(this.upstreamName)}`;
+			message = l10n.t('{branch} is missing its upstream {upstream}');
+		} else if (this.behind && this.ahead) {
+			message = formatPlural(
+				l10n.t(
+					'{behind, plural, one{{ahead, plural, one{{branch} is {behind} commit behind, {ahead} commit ahead of {upstream}} other{{branch} is {behind} commit behind, {ahead} commits ahead of {upstream}}}} other{{ahead, plural, one{{branch} is {behind} commits behind, {ahead} commit ahead of {upstream}} other{{branch} is {behind} commits behind, {ahead} commits ahead of {upstream}}}}}',
+				),
+				{ behind: this.behind, ahead: this.ahead },
+			);
+		} else if (this.behind) {
+			message = formatPlural(
+				l10n.t(
+					'{behind, plural, one{{branch} is {behind} commit behind {upstream}} other{{branch} is {behind} commits behind {upstream}}}',
+				),
+				{ behind: this.behind },
+			);
+		} else if (this.ahead) {
+			message = formatPlural(
+				l10n.t(
+					'{ahead, plural, one{{branch} is {ahead} commit ahead of {upstream}} other{{branch} is {ahead} commits ahead of {upstream}}}',
+				),
+				{ ahead: this.ahead },
+			);
+		} else {
+			message = l10n.t('{branch} is up to date with {upstream}');
 		}
-
-		const status: string[] = [];
-		if (this.behind) {
-			status.push(`${pluralize('commit', this.behind)} behind`);
-		}
-		if (this.ahead) {
-			status.push(`${pluralize('commit', this.ahead)} ahead of`);
-		}
-
-		if (status.length) {
-			return html`${renderBranchName(this.branchName)} is ${status.join(', ')}
-			${renderBranchName(this.upstreamName)}`;
-		}
-
-		return html`${renderBranchName(this.branchName)} is up to date with ${renderBranchName(this.upstreamName)}`;
+		return localizedContent(message, {
+			branch: renderBranchName(this.branchName),
+			upstream: renderBranchName(this.upstreamName),
+		});
 	}
 }
 

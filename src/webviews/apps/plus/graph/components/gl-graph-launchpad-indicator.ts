@@ -1,7 +1,9 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement } from 'lit/decorators.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { LaunchpadCommandArgs } from '../../../../../plus/launchpad/launchpad.js';
 import type { LaunchpadSummaryResult } from '../../../../../plus/launchpad/launchpadIndicator.js';
 import { ruleStyles } from '../../shared/components/vscode.css.js';
@@ -10,8 +12,8 @@ import { graphLaunchpadContext } from '../graphLaunchpadState.js';
 import { actionButton } from '../styles/graph.css.js';
 import './gl-launchpad-summary.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/overlays/popover.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/popover.js';
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -49,16 +51,16 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 			}
 
 			/* line-height: 1 collapses the cell to the rocket's own 1.6rem glyph box, so overlays anchor to the
-	   glyph instead of the pill's 2.2rem line box (the .action-button code-icon rule). The :is() bump
-	   beats that rule on specificity rather than on static-styles ordering. */
+glyph instead of the pill's 2.2rem line box (the .action-button code-icon rule). The :is() bump
+beats that rule on specificity rather than on static-styles ordering. */
 			.rocket code-icon:is(.rocket__icon, .rocket__badge) {
 				grid-area: 1 / 1;
 				line-height: 1;
 			}
 
 			/* 1.2rem corner badge overhanging the rocket's bottom-right — the one slot every state overlay uses
-	   (spinner, plug, circle-slash). Negative margins, not translate: the spin animation owns transform,
-	   so a translate here would fight it and the badge would bob instead of spin. */
+(spinner, plug, circle-slash). Negative margins, not translate: the spin animation owns transform,
+so a translate here would fight it and the badge would bob instead of spin. */
 			.rocket__badge {
 				--code-icon-size: 1.2rem;
 
@@ -69,9 +71,9 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 			}
 
 			/* Punch a hole in the rocket behind the badge rather than backing the badge with an opaque chip: the
-	   pill is transparent at rest and tinted on hover, and a cutout tracks neither. Geometry resolves in
-	   the rocket's own em box (1em = 1.6rem): the 1.2rem badge centers 0.69em in from each edge, so a
-	   0.4em radius clears it. Only applied with a badge present, so a lone rocket isn't notched. */
+pill is transparent at rest and tinted on hover, and a cutout tracks neither. Geometry resolves in
+the rocket's own em box (1em = 1.6rem): the 1.2rem badge centers 0.69em in from each edge, so a
+0.4em radius clears it. Only applied with a badge present, so a lone rocket isn't notched. */
 			.rocket__icon--badged {
 				--gl-launchpad-badge-cutout: radial-gradient(circle 0.4em at 0.69em 0.69em, transparent 96%, #000 100%);
 
@@ -174,11 +176,11 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 			</a>
 			<div slot="content">
 				<div class="popover__header">
-					<h3 class="popover__heading">Launchpad</h3>
+					<h3 class="popover__heading">${l10n.t('Launchpad')}</h3>
 					<gl-button
 						appearance="toolbar"
 						density="compact"
-						tooltip="Refresh Launchpad"
+						tooltip=${l10n.t('Refresh Launchpad')}
 						?disabled=${this._state?.loading.get() ?? false}
 						aria-busy=${this._state?.loading.get() ?? false}
 						@click=${() => this._state?.refresh()}
@@ -190,8 +192,9 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 					${
 						connected !== true
 							? html`<p class="welcome">
-									Launchpad organizes your pull requests into actionable groups to help you focus and
-									keep your team unblocked.
+									${l10n.t(
+										'Launchpad organizes your pull requests into actionable groups to help you focus and keep your team unblocked.',
+									)}
 								</p>`
 							: nothing
 					}
@@ -202,7 +205,9 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 					></gl-launchpad-summary>
 				</div>
 				<div class="popover__footer">
-					<gl-button full appearance="secondary" href=${this.openLaunchpadLink}>Open Launchpad</gl-button>
+					<gl-button full appearance="secondary" href=${this.openLaunchpadLink}
+						>${l10n.t('Open Launchpad')}</gl-button
+					>
 				</div>
 			</div>
 		</gl-popover>`;
@@ -267,11 +272,47 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 	}
 
 	private getCountGroups(summary: LaunchpadSummaryResult): CountGroup[] {
+		const mergeable = summary.mergeable?.total ?? 0;
+		const blocked = summary.blocked?.total ?? 0;
+		const followUp = summary.followUp?.total ?? 0;
+		const needsReview = summary.needsReview?.total ?? 0;
 		const groups: CountGroup[] = [
-			{ total: summary.mergeable?.total ?? 0, label: 'can be merged' },
-			{ total: summary.blocked?.total ?? 0, label: 'blocked' },
-			{ total: summary.followUp?.total ?? 0, label: 'need follow-up' },
-			{ total: summary.needsReview?.total ?? 0, label: 'need your review' },
+			{
+				total: mergeable,
+				label: formatPlural(
+					l10n.t(
+						'{count, plural, one{{count} pull request can be merged} other{{count} pull requests can be merged}}',
+					),
+					{ count: mergeable },
+				),
+			},
+			{
+				total: blocked,
+				label: formatPlural(
+					l10n.t(
+						'{count, plural, one{{count} pull request is blocked} other{{count} pull requests are blocked}}',
+					),
+					{ count: blocked },
+				),
+			},
+			{
+				total: followUp,
+				label: formatPlural(
+					l10n.t(
+						'{count, plural, one{{count} pull request requires follow-up} other{{count} pull requests require follow-up}}',
+					),
+					{ count: followUp },
+				),
+			},
+			{
+				total: needsReview,
+				label: formatPlural(
+					l10n.t(
+						'{count, plural, one{{count} pull request needs your review} other{{count} pull requests need your review}}',
+					),
+					{ count: needsReview },
+				),
+			},
 		];
 		return groups.filter(g => g.total > 0);
 	}
@@ -281,20 +322,24 @@ export class GlGraphLaunchpadIndicator extends SignalWatcher(LitElement) {
 		// reader hears the same bare "Launchpad" for loading, not-connected, and failure alike.
 		switch (this.overlay) {
 			case 'plug':
-				return 'Launchpad — connect an integration to see pull requests';
+				return l10n.t('Launchpad — connect an integration to see pull requests');
 			case 'spinner':
-				return 'Launchpad — loading';
+				return l10n.t('Launchpad — loading');
 			case 'circle-slash':
-				return 'Launchpad — unable to load pull requests';
+				return l10n.t('Launchpad — unable to load pull requests');
 		}
 
 		const summary = this.summary;
-		if (summary == null || !('total' in summary)) return 'Launchpad';
+		if (summary == null || !('total' in summary)) return l10n.t('Launchpad');
 
 		const groups = this.getCountGroups(summary);
-		if (groups.length === 0) return 'Launchpad — all caught up';
+		if (groups.length === 0) return l10n.t('Launchpad — all caught up');
 
-		return `Launchpad — ${groups.map(g => `${g.total} ${g.label}`).join(', ')}`;
+		const groupList = new Intl.ListFormat(document.documentElement.lang || undefined, {
+			style: 'long',
+			type: 'conjunction',
+		}).format(groups.map(group => group.label));
+		return l10n.t('Launchpad — {groups}', { groups: groupList });
 	}
 
 	private get openLaunchpadLink(): string {

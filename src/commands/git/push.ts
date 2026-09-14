@@ -1,15 +1,22 @@
+import { l10n, ThemeIcon } from 'vscode';
+import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitBranchReference, GitReference } from '@gitlens/git/models/reference.js';
+import type { GitRemote } from '@gitlens/git/models/remote.js';
 import { getReferenceLabel, isBranchReference } from '@gitlens/git/utils/reference.utils.js';
 import { isStringArray } from '@gitlens/utils/array.js';
 import { fromNow } from '@gitlens/utils/date.js';
-import { pad, pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
+import { pad, sortCompare } from '@gitlens/utils/string.js';
 import { GlyphChars } from '../../constants.js';
 import type { Container } from '../../container.js';
 import type { GlRepository } from '../../git/models/repository.js';
+import { createQuickPickSeparator } from '../../quickpicks/items/common.js';
 import { createDirectiveQuickPickItem, Directive } from '../../quickpicks/items/directive.js';
 import type { FlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import { createFlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import { configuration } from '../../system/-webview/configuration.js';
+import { supportedInVSCodeVersion } from '../../system/-webview/vscode.js';
 import type { ViewsWithRepositoryFolders } from '../../views/viewBase.js';
 import type {
 	AsyncStepResultGenerator,
@@ -29,13 +36,443 @@ import {
 	pickRepositoryStep,
 } from '../quick-wizard/steps/repositories.js';
 import { StepsController } from '../quick-wizard/stepsController.js';
-import { appendReposToTitle, assertStepState, canPickStepContinue } from '../quick-wizard/utils/steps.utils.js';
+import {
+	appendReposToTitle,
+	assertStepState,
+	canPickStepContinue,
+	createConfirmStep,
+} from '../quick-wizard/utils/steps.utils.js';
 
 const Steps = {
 	PickRepos: 'push-pick-repos',
 	Confirm: 'push-confirm',
 } as const;
 type StepNames = (typeof Steps)[keyof typeof Steps];
+
+/** Orders publish rows: the `remote.pushDefault` remote first, then `origin`, then the rest alphabetically. */
+function sortRemotesForPublish(remotes: readonly GitRemote[], pushDefault: string | undefined): GitRemote[] {
+	return [...remotes].sort(
+		(a, b) =>
+			remotePublishRank(a.name, pushDefault) - remotePublishRank(b.name, pushDefault) ||
+			sortCompare(a.name, b.name),
+	);
+}
+
+function remotePublishRank(name: string, pushDefault: string | undefined): number {
+	if (pushDefault != null && name === pushDefault) return 0;
+	if (name === 'origin') return 1;
+	return 2;
+}
+
+type ForcePushMode = 'force' | 'force-with-lease' | 'force-with-lease-and-includes';
+
+function getForcePushMode(useForceWithLease: boolean, useForceIfIncludes: boolean): ForcePushMode {
+	if (useForceIfIncludes) return 'force-with-lease-and-includes';
+	if (useForceWithLease) return 'force-with-lease';
+	return 'force';
+}
+
+function getForcePushLabel(mode: ForcePushMode): string {
+	switch (mode) {
+		case 'force-with-lease-and-includes':
+			return l10n.t('Force Push (with lease and if includes)');
+		case 'force-with-lease':
+			return l10n.t('Force Push (with lease)');
+		case 'force':
+			return l10n.t('Force Push');
+	}
+}
+
+function getForcePushDescription(mode: ForcePushMode): string {
+	switch (mode) {
+		case 'force-with-lease-and-includes':
+			return '--force-with-lease --force-if-includes';
+		case 'force-with-lease':
+			return '--force-with-lease';
+		case 'force':
+			return '--force';
+	}
+}
+
+function getForcePushReposDetail(mode: ForcePushMode, count: number): string {
+	switch (mode) {
+		case 'force-with-lease-and-includes':
+			return l10n.t('Will force push (with lease and if includes) {0} repos', count);
+		case 'force-with-lease':
+			return l10n.t('Will force push (with lease) {0} repos', count);
+		case 'force':
+			return l10n.t('Will force push {0} repos', count);
+	}
+}
+
+function getForcePushBehindDetail(
+	mode: ForcePushMode,
+	ahead: number | undefined,
+	remote: string,
+	behind: number,
+): string {
+	const hasAhead = ahead != null && ahead > 0;
+	const hasRemote = remote.length > 0;
+
+	switch (mode) {
+		case 'force-with-lease-and-includes':
+			if (hasAhead) {
+				if (hasRemote) {
+					return formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease and if includes) {0} commit to {1}, overwriting {2, plural, one{{2} commit} other{{2} commits}} on {1}} other{Will force push (with lease and if includes) {0} commits to {1}, overwriting {2, plural, one{{2} commit} other{{2} commits}} on {1}}}',
+						),
+						[ahead, remote, behind],
+					);
+				}
+				return formatPlural(
+					l10n.t(
+						'{0, plural, one{Will force push (with lease and if includes) {0} commit, overwriting {1, plural, one{{1} commit} other{{1} commits}}} other{Will force push (with lease and if includes) {0} commits, overwriting {1, plural, one{{1} commit} other{{1} commits}}}}',
+					),
+					[ahead, behind],
+				);
+			}
+			return hasRemote
+				? formatPlural(
+						l10n.t(
+							'{1, plural, one{Will force push (with lease and if includes) to {0}, overwriting {1} commit on {0}} other{Will force push (with lease and if includes) to {0}, overwriting {1} commits on {0}}}',
+						),
+						[remote, behind],
+					)
+				: formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease and if includes), overwriting {0} commit} other{Will force push (with lease and if includes), overwriting {0} commits}}',
+						),
+						[behind],
+					);
+		case 'force-with-lease':
+			if (hasAhead) {
+				if (hasRemote) {
+					return formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease) {0} commit to {1}, overwriting {2, plural, one{{2} commit} other{{2} commits}} on {1}} other{Will force push (with lease) {0} commits to {1}, overwriting {2, plural, one{{2} commit} other{{2} commits}} on {1}}}',
+						),
+						[ahead, remote, behind],
+					);
+				}
+				return formatPlural(
+					l10n.t(
+						'{0, plural, one{Will force push (with lease) {0} commit, overwriting {1, plural, one{{1} commit} other{{1} commits}}} other{Will force push (with lease) {0} commits, overwriting {1, plural, one{{1} commit} other{{1} commits}}}}',
+					),
+					[ahead, behind],
+				);
+			}
+			return hasRemote
+				? formatPlural(
+						l10n.t(
+							'{1, plural, one{Will force push (with lease) to {0}, overwriting {1} commit on {0}} other{Will force push (with lease) to {0}, overwriting {1} commits on {0}}}',
+						),
+						[remote, behind],
+					)
+				: formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease), overwriting {0} commit} other{Will force push (with lease), overwriting {0} commits}}',
+						),
+						[behind],
+					);
+		case 'force':
+			if (hasAhead) {
+				if (hasRemote) {
+					return formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push {0} commit to {1}, overwriting {2, plural, one{{2} commit} other{{2} commits}} on {1}} other{Will force push {0} commits to {1}, overwriting {2, plural, one{{2} commit} other{{2} commits}} on {1}}}',
+						),
+						[ahead, remote, behind],
+					);
+				}
+				return formatPlural(
+					l10n.t(
+						'{0, plural, one{Will force push {0} commit, overwriting {1, plural, one{{1} commit} other{{1} commits}}} other{Will force push {0} commits, overwriting {1, plural, one{{1} commit} other{{1} commits}}}}',
+					),
+					[ahead, behind],
+				);
+			}
+			return hasRemote
+				? formatPlural(
+						l10n.t(
+							'{1, plural, one{Will force push to {0}, overwriting {1} commit on {0}} other{Will force push to {0}, overwriting {1} commits on {0}}}',
+						),
+						[remote, behind],
+					)
+				: formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push, overwriting {0} commit} other{Will force push, overwriting {0} commits}}',
+						),
+						[behind],
+					);
+	}
+}
+
+function getPushDetail(referenceName: string | undefined, ahead: number | undefined, remote: string): string {
+	if (referenceName != null) {
+		if (ahead) {
+			return remote.length === 0
+				? l10n.t('Will push commits up to and including {0}', referenceName)
+				: l10n.t('Will push commits up to and including {0} to {1}', referenceName, remote);
+		}
+		return remote.length === 0 ? l10n.t('Will push') : l10n.t('Will push to {0}', remote);
+	}
+
+	if (ahead) {
+		if (remote.length === 0) {
+			return formatPlural(l10n.t('{0, plural, one{Will push {0} commit} other{Will push {0} commits}}'), [ahead]);
+		}
+		return formatPlural(
+			l10n.t('{0, plural, one{Will push {0} commit to {1}} other{Will push {0} commits to {1}}}'),
+			[ahead, remote],
+		);
+	}
+
+	return remote.length === 0 ? l10n.t('Will push') : l10n.t('Will push to {0}', remote);
+}
+
+function getForcePushNoBehindDetail(
+	mode: ForcePushMode,
+	referenceName: string | undefined,
+	ahead: number | undefined,
+	remote: string,
+): string {
+	if (referenceName != null) {
+		if (ahead) {
+			switch (mode) {
+				case 'force-with-lease-and-includes':
+					return remote.length === 0
+						? l10n.t(
+								'Will force push (with lease and if includes) commits up to and including {0}',
+								referenceName,
+							)
+						: l10n.t(
+								'Will force push (with lease and if includes) commits up to and including {0} to {1}',
+								referenceName,
+								remote,
+							);
+				case 'force-with-lease':
+					return remote.length === 0
+						? l10n.t('Will force push (with lease) commits up to and including {0}', referenceName)
+						: l10n.t(
+								'Will force push (with lease) commits up to and including {0} to {1}',
+								referenceName,
+								remote,
+							);
+				case 'force':
+					return remote.length === 0
+						? l10n.t('Will force push commits up to and including {0}', referenceName)
+						: l10n.t('Will force push commits up to and including {0} to {1}', referenceName, remote);
+			}
+		}
+
+		switch (mode) {
+			case 'force-with-lease-and-includes':
+				return remote.length === 0
+					? l10n.t('Will force push (with lease and if includes)')
+					: l10n.t('Will force push (with lease and if includes) to {0}', remote);
+			case 'force-with-lease':
+				return remote.length === 0
+					? l10n.t('Will force push (with lease)')
+					: l10n.t('Will force push (with lease) to {0}', remote);
+			case 'force':
+				return remote.length === 0 ? l10n.t('Will force push') : l10n.t('Will force push to {0}', remote);
+		}
+	}
+
+	if (ahead) {
+		if (remote.length === 0) {
+			return mode === 'force-with-lease-and-includes'
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease and if includes) {0} commit} other{Will force push (with lease and if includes) {0} commits}}',
+						),
+						[ahead],
+					)
+				: mode === 'force-with-lease'
+					? formatPlural(
+							l10n.t(
+								'{0, plural, one{Will force push (with lease) {0} commit} other{Will force push (with lease) {0} commits}}',
+							),
+							[ahead],
+						)
+					: formatPlural(
+							l10n.t('{0, plural, one{Will force push {0} commit} other{Will force push {0} commits}}'),
+							[ahead],
+						);
+		}
+		return mode === 'force-with-lease-and-includes'
+			? formatPlural(
+					l10n.t(
+						'{0, plural, one{Will force push (with lease and if includes) {0} commit to {1}} other{Will force push (with lease and if includes) {0} commits to {1}}}',
+					),
+					[ahead, remote],
+				)
+			: mode === 'force-with-lease'
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease) {0} commit to {1}} other{Will force push (with lease) {0} commits to {1}}}',
+						),
+						[ahead, remote],
+					)
+				: formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push {0} commit to {1}} other{Will force push {0} commits to {1}}}',
+						),
+						[ahead, remote],
+					);
+	}
+
+	switch (mode) {
+		case 'force-with-lease-and-includes':
+			return remote.length === 0
+				? l10n.t('Will force push (with lease and if includes)')
+				: l10n.t('Will force push (with lease and if includes) to {0}', remote);
+		case 'force-with-lease':
+			return remote.length === 0
+				? l10n.t('Will force push (with lease)')
+				: l10n.t('Will force push (with lease) to {0}', remote);
+		case 'force':
+			return remote.length === 0 ? l10n.t('Will force push') : l10n.t('Will force push to {0}', remote);
+	}
+}
+
+function getForcePushReferenceBehindDetail(
+	mode: ForcePushMode,
+	referenceName: string,
+	hasAhead: boolean,
+	remote: string,
+	behind: number,
+): string {
+	switch (mode) {
+		case 'force-with-lease-and-includes':
+			if (hasAhead) {
+				return remote.length === 0
+					? formatPlural(
+							l10n.t(
+								'{1, plural, one{Will force push (with lease and if includes) commits up to and including {0}, overwriting {1} commit} other{Will force push (with lease and if includes) commits up to and including {0}, overwriting {1} commits}}',
+							),
+							[referenceName, behind],
+						)
+					: formatPlural(
+							l10n.t(
+								'{2, plural, one{Will force push (with lease and if includes) commits up to and including {0} to {1}, overwriting {2} commit on {1}} other{Will force push (with lease and if includes) commits up to and including {0} to {1}, overwriting {2} commits on {1}}}',
+							),
+							[referenceName, remote, behind],
+						);
+			}
+			return remote.length === 0
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease and if includes), overwriting {0} commit} other{Will force push (with lease and if includes), overwriting {0} commits}}',
+						),
+						[behind],
+					)
+				: formatPlural(
+						l10n.t(
+							'{1, plural, one{Will force push (with lease and if includes) to {0}, overwriting {1} commit on {0}} other{Will force push (with lease and if includes) to {0}, overwriting {1} commits on {0}}}',
+						),
+						[remote, behind],
+					);
+		case 'force-with-lease':
+			if (hasAhead) {
+				return remote.length === 0
+					? formatPlural(
+							l10n.t(
+								'{1, plural, one{Will force push (with lease) commits up to and including {0}, overwriting {1} commit} other{Will force push (with lease) commits up to and including {0}, overwriting {1} commits}}',
+							),
+							[referenceName, behind],
+						)
+					: formatPlural(
+							l10n.t(
+								'{2, plural, one{Will force push (with lease) commits up to and including {0} to {1}, overwriting {2} commit on {1}} other{Will force push (with lease) commits up to and including {0} to {1}, overwriting {2} commits on {1}}}',
+							),
+							[referenceName, remote, behind],
+						);
+			}
+			return remote.length === 0
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push (with lease), overwriting {0} commit} other{Will force push (with lease), overwriting {0} commits}}',
+						),
+						[behind],
+					)
+				: formatPlural(
+						l10n.t(
+							'{1, plural, one{Will force push (with lease) to {0}, overwriting {1} commit on {0}} other{Will force push (with lease) to {0}, overwriting {1} commits on {0}}}',
+						),
+						[remote, behind],
+					);
+		case 'force':
+			if (hasAhead) {
+				return remote.length === 0
+					? formatPlural(
+							l10n.t(
+								'{1, plural, one{Will force push commits up to and including {0}, overwriting {1} commit} other{Will force push commits up to and including {0}, overwriting {1} commits}}',
+							),
+							[referenceName, behind],
+						)
+					: formatPlural(
+							l10n.t(
+								'{2, plural, one{Will force push commits up to and including {0} to {1}, overwriting {2} commit on {1}} other{Will force push commits up to and including {0} to {1}, overwriting {2} commits on {1}}}',
+							),
+							[referenceName, remote, behind],
+						);
+			}
+			return remote.length === 0
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Will force push, overwriting {0} commit} other{Will force push, overwriting {0} commits}}',
+						),
+						[behind],
+					)
+				: formatPlural(
+						l10n.t(
+							'{1, plural, one{Will force push to {0}, overwriting {1} commit on {0}} other{Will force push to {0}, overwriting {1} commits on {0}}}',
+						),
+						[remote, behind],
+					);
+	}
+}
+
+/** Builds the labelled `Publish` separator plus one row per remote (pushDefault first, then origin,
+ *  then alphabetical; first row picked), or nothing when the repo has no remotes. */
+async function buildPublishItems(
+	repo: GlRepository,
+	flags: Flags[],
+	branch: GitBranch | GitBranchReference,
+	upstreamBranchName: string,
+	referenceName: string | undefined,
+): Promise<FlagsQuickPickItem<Flags>[]> {
+	const [remotesResult, pushDefaultResult] = await Promise.allSettled([
+		repo.git.remotes.getRemotes(),
+		repo.git.config.getConfig?.('remote.pushDefault'),
+	]);
+	const remotes = getSettledValue(remotesResult) ?? [];
+	if (!remotes.length) return [];
+
+	const pushDefault = getSettledValue(pushDefaultResult);
+	const items: FlagsQuickPickItem<Flags>[] = [createQuickPickSeparator<FlagsQuickPickItem<Flags>>(l10n.t('Publish'))];
+	for (const [i, remote] of sortRemotesForPublish(remotes, pushDefault).entries()) {
+		items.push(
+			createFlagsQuickPickItem<Flags>(flags, ['--set-upstream', remote.name, upstreamBranchName], {
+				label: l10n.t('Publish {0} to {1}', branch.name, remote.name),
+				detail:
+					referenceName == null
+						? l10n.t('Will publish {0} to {1}', getReferenceLabel(branch), remote.name)
+						: l10n.t(
+								'Will publish {0} up to and including {1} to {2}',
+								getReferenceLabel(branch),
+								referenceName,
+								remote.name,
+							),
+				picked: i === 0,
+			}),
+		);
+	}
+
+	return items;
+}
 
 interface Context extends StepsContext<StepNames> {
 	repos: GlRepository[];
@@ -58,8 +495,8 @@ export interface PushGitCommandArgs {
 
 export class PushGitCommand extends QuickCommand<State> {
 	constructor(container: Container, args?: PushGitCommandArgs) {
-		super(container, 'push', 'push', 'Push', {
-			description: 'pushes changes from the current branch to a remote',
+		super(container, 'push', 'push', l10n.t('Push'), {
+			description: l10n.t('pushes changes from the current branch to a remote'),
 		});
 
 		this.initialState = { confirm: args?.confirm, ...args?.state };
@@ -79,6 +516,10 @@ export class PushGitCommand extends QuickCommand<State> {
 			force: state.flags.includes('--force'),
 			reference: state.reference,
 		});
+	}
+
+	protected override get supportsSkipConfirmToggle(): boolean {
+		return true;
 	}
 
 	protected createContext(context?: StepsContext<any>): Context {
@@ -144,7 +585,19 @@ export class PushGitCommand extends QuickCommand<State> {
 
 			assertStepState<State<GlRepository[]>>(state);
 
-			if (this.confirm(state.confirm)) {
+			// An unpublished branch's confirm isn't a yes/no — it's where the publish remote gets
+			// picked — so a skipped confirmation must never skip that decision
+			let confirmOverride: boolean | undefined;
+			if (!this.confirm(state.confirm) && state.repos.length === 1) {
+				const branch = isBranchReference(state.reference)
+					? await state.repos[0].git.branches.getBranch(state.reference.name)
+					: await state.repos[0].git.branches.getBranch();
+				if (branch != null && !branch.remote && branch.upstream == null) {
+					confirmOverride = true;
+				}
+			}
+
+			if (this.confirm(confirmOverride ?? state.confirm)) {
 				using step = steps.enterStep(Steps.Confirm);
 
 				const result = yield* this.confirmStep(state, context);
@@ -174,26 +627,31 @@ export class PushGitCommand extends QuickCommand<State> {
 			(configuration.getCore('git.useForcePushIfIncludes') ?? true) &&
 			(await state.repos[0].git.supports('git:push:force-if-includes'));
 
+		// When confirmations are being skipped, this confirm was forced open because it IS the
+		// publish-remote decision — don't offer/echo the Don't Ask Again toggle on a step the
+		// setting can never skip
+		const confirmForced = !this.confirm(state.confirm);
+		const forcePushMode = getForcePushMode(useForceWithLease, useForceIfIncludes);
+
 		let step: QuickPickStep<FlagsQuickPickItem<Flags>>;
 
 		if (state.repos.length > 1) {
-			step = this.createConfirmStep(appendReposToTitle(`Confirm ${context.title}`, state, context), [
-				createFlagsQuickPickItem<Flags>(state.flags, [], {
-					label: this.title,
-					detail: `Will push ${state.repos.length} repos`,
-				}),
-				createFlagsQuickPickItem<Flags>(state.flags, ['--force'], {
-					label: `Force ${this.title}${
-						useForceIfIncludes ? ' (with lease and if includes)' : useForceWithLease ? ' (with lease)' : ''
-					}`,
-					description: `--force${
-						useForceWithLease ? `-with-lease${useForceIfIncludes ? ' --force-if-includes' : ''}` : ''
-					}`,
-					detail: `Will force push${
-						useForceIfIncludes ? ' (with lease and if includes)' : useForceWithLease ? ' (with lease)' : ''
-					} ${state.repos.length} repos`,
-				}),
-			]);
+			step = this.createConfirmStep(
+				appendReposToTitle(l10n.t('Confirm Push'), state, context),
+				[
+					createFlagsQuickPickItem<Flags>(state.flags, [], {
+						label: this.title,
+						detail: l10n.t('Will push {0} repos', state.repos.length),
+					}),
+					createFlagsQuickPickItem<Flags>(state.flags, ['--force'], {
+						label: getForcePushLabel(forcePushMode),
+						description: getForcePushDescription(forcePushMode),
+						detail: getForcePushReposDetail(forcePushMode, state.repos.length),
+						iconPath: new ThemeIcon('warning'),
+					}),
+				],
+				l10n.t('Confirm Push'),
+			);
 		} else {
 			const [repo] = state.repos;
 
@@ -204,112 +662,115 @@ export class PushGitCommand extends QuickCommand<State> {
 					step = this.createConfirmStep(
 						appendReposToTitle(context.title, state, context),
 						[],
+						l10n.t('Cannot push a remote branch'),
 						createDirectiveQuickPickItem(Directive.Cancel, true, {
-							label: 'OK',
-							detail: 'Cannot push a remote branch',
+							label: l10n.t('OK'),
+							detail: l10n.t('Cannot push a remote branch'),
 						}),
-						{ placeholder: 'Cannot push a remote branch' },
 					);
 				} else {
 					const branch = await repo.git.branches.getBranch(state.reference.name);
 
-					if (branch != null && branch?.upstream == null) {
-						for (const remote of await repo.git.remotes.getRemotes()) {
-							items.push(
-								createFlagsQuickPickItem<Flags>(
-									state.flags,
-									['--set-upstream', remote.name, branch.name],
-									{
-										label: `Publish ${branch.name} to ${remote.name}`,
-										detail: `Will publish ${getReferenceLabel(branch)} to ${remote.name}`,
-									},
-								),
-							);
-						}
+					if (branch != null && (branch.upstream == null || branch.upstream.missing)) {
+						items.push(...(await buildPublishItems(repo, state.flags, branch, branch.name, undefined)));
 
 						if (items.length) {
-							step = this.createConfirmStep(
-								appendReposToTitle('Confirm Publish', state, context),
-								items,
-								undefined,
-								{ placeholder: 'Confirm Publish' },
-							);
+							step = confirmForced
+								? createConfirmStep(
+										appendReposToTitle(l10n.t('Confirm Publish'), state, context),
+										items,
+										l10n.t('Confirm Publish'),
+									)
+								: this.createConfirmStep(
+										appendReposToTitle(l10n.t('Confirm Publish'), state, context),
+										items,
+										l10n.t('Confirm Publish'),
+									);
 						} else {
 							step = this.createConfirmStep(
-								appendReposToTitle('Publish', state, context),
+								appendReposToTitle(l10n.t('Publish'), state, context),
 								[],
+								l10n.t('Cannot publish; No remotes found'),
 								createDirectiveQuickPickItem(Directive.Cancel, true, {
-									label: 'OK',
-									detail: 'No remotes found',
+									label: l10n.t('OK'),
+									detail: l10n.t('No remotes found'),
 								}),
-								{ placeholder: 'Cannot publish; No remotes found' },
 							);
 						}
 					} else if (branch?.upstream?.state.behind) {
+						// Enter must never force -- the Cancel row is the pre-selected one, overriding
+						// createConfirmStep's default of the first confirmation
+						const cancelItem = createDirectiveQuickPickItem(Directive.Cancel, true, {
+							label: l10n.t('Cancel Push'),
+							detail: formatPlural(
+								l10n.t(
+									'{2, plural, one{Cannot push; {0} is behind {1} by {2} commit} other{Cannot push; {0} is behind {1} by {2} commits}}',
+								),
+								[getReferenceLabel(branch), branch.remoteName ?? '', branch.upstream.state.behind],
+							),
+						});
 						step = this.createConfirmStep(
-							appendReposToTitle(`Confirm ${context.title}`, state, context),
+							appendReposToTitle(l10n.t('Confirm Push'), state, context),
 							[
 								createFlagsQuickPickItem<Flags>(state.flags, ['--force'], {
-									label: `Force ${this.title}${
-										useForceIfIncludes
-											? ' (with lease and if includes)'
-											: useForceWithLease
-												? ' (with lease)'
-												: ''
-									}`,
-									description: `--force${
-										useForceWithLease
-											? `-with-lease${useForceIfIncludes ? ' --force-if-includes' : ''}`
-											: ''
-									}`,
-									detail: `Will force push${
-										useForceIfIncludes
-											? ' (with lease and if includes)'
-											: useForceWithLease
-												? ' (with lease)'
-												: ''
-									} ${
-										branch?.upstream.state.ahead
-											? ` ${pluralize('commit', branch.upstream.state.ahead)}`
-											: ''
-									}${branch.remoteName ? ` to ${branch.remoteName}` : ''}${
-										branch != null && branch.upstream.state.behind > 0
-											? `, overwriting ${pluralize('commit', branch.upstream.state.behind)}${
-													branch?.remoteName ? ` on ${branch.remoteName}` : ''
-												}`
-											: ''
-									}`,
+									label: getForcePushLabel(forcePushMode),
+									description: getForcePushDescription(forcePushMode),
+									detail: getForcePushBehindDetail(
+										forcePushMode,
+										branch.upstream.state.ahead,
+										branch.remoteName ?? '',
+										branch.upstream.state.behind,
+									),
+									iconPath: new ThemeIcon('warning'),
 								}),
 							],
-							createDirectiveQuickPickItem(Directive.Cancel, true, {
-								label: `Cancel ${this.title}`,
-								detail: `Cannot push; ${getReferenceLabel(
-									branch,
-								)} is behind ${branch.remoteName} by ${pluralize(
-									'commit',
-									branch.upstream.state.behind,
-								)}`,
-							}),
+							l10n.t('Confirm Push'),
+							cancelItem,
+							{
+								selectedItems: [cancelItem],
+								prompt: supportedInVSCodeVersion('quickpick-prompt')
+									? formatPlural(
+											l10n.t(
+												'{2, plural, one{{0} is behind {1} by {2} commit — pull first, or force push to overwrite them} other{{0} is behind {1} by {2} commits — pull first, or force push to overwrite them}}',
+											),
+											[
+												getReferenceLabel(branch),
+												branch.remoteName ?? '',
+												branch.upstream.state.behind,
+											],
+										)
+									: undefined,
+							},
 						);
 					} else if (branch?.upstream?.state.ahead) {
-						step = this.createConfirmStep(appendReposToTitle(`Confirm ${context.title}`, state, context), [
-							createFlagsQuickPickItem<Flags>(state.flags, [branch.remoteName!], {
-								label: this.title,
-								detail: `Will push ${pluralize(
-									'commit',
-									branch.upstream.state.ahead,
-								)} from ${getReferenceLabel(branch)} to ${branch.remoteName}`,
-							}),
-						]);
+						step = this.createConfirmStep(
+							appendReposToTitle(l10n.t('Confirm Push'), state, context),
+							[
+								createFlagsQuickPickItem<Flags>(state.flags, [branch.remoteName!], {
+									label: this.title,
+									detail: formatPlural(
+										l10n.t(
+											'{0, plural, one{Will push {0} commit from {1} to {2}} other{Will push {0} commits from {1} to {2}}}',
+										),
+										[
+											branch.upstream.state.ahead,
+											getReferenceLabel(branch),
+											branch.remoteName ?? '',
+										],
+									),
+								}),
+							],
+							l10n.t('Confirm Push'),
+						);
 					} else {
 						step = this.createConfirmStep(
 							appendReposToTitle(context.title, state, context),
 							[],
+							l10n.t('Nothing to push; No commits found to push'),
 							createDirectiveQuickPickItem(Directive.Cancel, true, {
-								label: 'OK',
-								detail: 'No commits found to push',
+								label: l10n.t('OK'),
+								detail: l10n.t('No commits found to push'),
 							}),
-							{ placeholder: 'Nothing to push; No commits found to push' },
 						);
 					}
 				}
@@ -325,143 +786,156 @@ export class PushGitCommand extends QuickCommand<State> {
 				};
 
 				if (status?.upstream?.state.ahead === 0) {
-					if (!isBranchReference(state.reference) && status.upstream == null) {
-						let pushDetails;
+					if (!isBranchReference(state.reference) && (status.upstream == null || status.upstream.missing)) {
+						const referenceName =
+							state.reference != null ? getReferenceLabel(state.reference, { label: false }) : undefined;
+						state.reference ??= branch;
 
-						if (state.reference != null) {
-							pushDetails = ` up to and including ${getReferenceLabel(state.reference, {
-								label: false,
-							})}`;
-						} else {
-							state.reference = branch;
-							pushDetails = '';
-						}
-
-						for (const remote of await repo.git.remotes.getRemotes()) {
-							items.push(
-								createFlagsQuickPickItem<Flags>(
-									state.flags,
-									['--set-upstream', remote.name, status.branch],
-									{
-										label: `Publish ${branch.name} to ${remote.name}`,
-										detail: `Will publish ${getReferenceLabel(branch)}${pushDetails} to ${
-											remote.name
-										}`,
-									},
-								),
-							);
-						}
+						items.push(
+							...(await buildPublishItems(repo, state.flags, branch, status.branch, referenceName)),
+						);
 					}
 
 					if (items.length) {
+						step = confirmForced
+							? createConfirmStep(
+									appendReposToTitle(l10n.t('Confirm Publish'), state, context),
+									items,
+									l10n.t('Confirm Publish'),
+								)
+							: this.createConfirmStep(
+									appendReposToTitle(l10n.t('Confirm Publish'), state, context),
+									items,
+									l10n.t('Confirm Publish'),
+								);
+					} else if (status.upstream == null || status.upstream.missing) {
 						step = this.createConfirmStep(
-							appendReposToTitle('Confirm Publish', state, context),
-							items,
-							undefined,
-							{ placeholder: 'Confirm Publish' },
-						);
-					} else if (status.upstream == null) {
-						step = this.createConfirmStep(
-							appendReposToTitle('Publish', state, context),
+							appendReposToTitle(l10n.t('Publish'), state, context),
 							[],
+							l10n.t('Cannot publish; No remotes found'),
 							createDirectiveQuickPickItem(Directive.Cancel, true, {
-								label: 'OK',
-								detail: 'No remotes found',
+								label: l10n.t('OK'),
+								detail: l10n.t('No remotes found'),
 							}),
-							{ placeholder: 'Cannot publish; No remotes found' },
 						);
 					} else {
 						step = this.createConfirmStep(
 							appendReposToTitle(context.title, state, context),
 							[],
+							l10n.t('Nothing to push; No commits ahead of {0}', status.upstream?.name),
 							createDirectiveQuickPickItem(Directive.Cancel, true, {
-								label: 'OK',
-								detail: `No commits ahead of ${status.upstream?.name}`,
+								label: l10n.t('OK'),
+								detail: l10n.t('No commits ahead of {0}', status.upstream?.name),
 							}),
-							{
-								placeholder: `Nothing to push; No commits ahead of ${status.upstream?.name}`,
-							},
 						);
 					}
 				} else {
-					let lastFetchedOn = '';
-
 					const lastFetched = await repo.getLastFetched();
+
+					let lastFetchedOn = '';
+					let lastFetchedPrompt: string | undefined;
 					if (lastFetched !== 0) {
-						lastFetchedOn = `${pad(GlyphChars.Dot, 2, 2)}Last fetched ${fromNow(new Date(lastFetched))}`;
+						lastFetchedOn = l10n.t(
+							'{0}Last fetched {1}',
+							pad(GlyphChars.Dot, 2, 2),
+							fromNow(new Date(lastFetched)),
+						);
+						lastFetchedPrompt = l10n.t('Last fetched {0}', fromNow(new Date(lastFetched)));
 					}
 
-					let pushDetails;
-					if (state.reference != null) {
-						pushDetails = `${
-							status?.upstream?.state.ahead
-								? ` commits up to and including ${getReferenceLabel(state.reference, {
-										label: false,
-									})}`
-								: ''
-						}${status?.upstream ? ` to ${status.upstream.name}` : ''}`;
-					} else {
-						pushDetails = `${
-							status?.upstream?.state.ahead ? ` ${pluralize('commit', status.upstream.state.ahead)}` : ''
-						}${status?.upstream ? ` to ${status.upstream.name}` : ''}`;
+					const behindCount = status?.upstream?.state.behind;
+					const upstreamName = status?.upstream?.name;
+					const aheadCount = status?.upstream?.state.ahead;
+					const referenceName =
+						state.reference != null ? getReferenceLabel(state.reference, { label: false }) : undefined;
+					const promptSupported = supportedInVSCodeVersion('quickpick-prompt');
+
+					let prompt: string | undefined;
+					let titleSuffix = lastFetchedOn;
+					if (promptSupported) {
+						if (behindCount) {
+							prompt = formatPlural(
+								l10n.t(
+									'{2, plural, one{{0} is behind {1} by {2} commit — pull first, or force push to overwrite them} other{{0} is behind {1} by {2} commits — pull first, or force push to overwrite them}}',
+								),
+								[getReferenceLabel(branch), upstreamName ?? '', behindCount],
+							);
+						} else {
+							prompt = lastFetchedPrompt;
+							titleSuffix = '';
+						}
 					}
 
+					// Enter must never force when the branch is behind -- the Cancel row is the pre-selected
+					// one, overriding createConfirmStep's default of the first confirmation
+					const behindCancelItem = behindCount
+						? createDirectiveQuickPickItem(Directive.Cancel, true, {
+								label: l10n.t('Cancel Push'),
+								detail: formatPlural(
+									l10n.t(
+										'{2, plural, one{Cannot push; {0} is behind {1} by {2} commit} other{Cannot push; {0} is behind {1} by {2} commits}}',
+									),
+									[getReferenceLabel(branch), upstreamName ?? '', behindCount],
+								),
+							})
+						: undefined;
 					step = this.createConfirmStep(
-						appendReposToTitle(`Confirm ${context.title}`, state, context, lastFetchedOn),
+						appendReposToTitle(l10n.t('Confirm Push'), state, context, titleSuffix),
 						[
-							...(status?.upstream?.state.behind
+							...(behindCount
 								? []
 								: [
 										createFlagsQuickPickItem<Flags>(state.flags, [], {
 											label: this.title,
-											detail: `Will push${pushDetails}`,
+											detail: getPushDetail(referenceName, aheadCount, upstreamName ?? ''),
 										}),
 									]),
 							createFlagsQuickPickItem<Flags>(state.flags, ['--force'], {
-								label: `Force ${this.title}${
-									useForceIfIncludes
-										? ' (with lease and if includes)'
-										: useForceWithLease
-											? ' (with lease)'
-											: ''
-								}`,
-								description: `--force${
-									useForceWithLease
-										? `-with-lease${useForceIfIncludes ? ' --force-if-includes' : ''}`
-										: ''
-								}`,
-								detail: `Will force push${
-									useForceIfIncludes
-										? ' (with lease and if includes)'
-										: useForceWithLease
-											? ' (with lease)'
-											: ''
-								} ${pushDetails}${
-									status?.upstream?.state.behind
-										? `, overwriting ${pluralize('commit', status.upstream.state.behind)}${
-												status?.upstream ? ` on ${status.upstream.name}` : ''
-											}`
-										: ''
-								}`,
+								label: getForcePushLabel(forcePushMode),
+								description: getForcePushDescription(forcePushMode),
+								detail: behindCount
+									? referenceName != null
+										? getForcePushReferenceBehindDetail(
+												forcePushMode,
+												referenceName,
+												Boolean(aheadCount),
+												upstreamName ?? '',
+												behindCount,
+											)
+										: getForcePushBehindDetail(
+												forcePushMode,
+												aheadCount,
+												upstreamName ?? '',
+												behindCount,
+											)
+									: getForcePushNoBehindDetail(
+											forcePushMode,
+											referenceName,
+											aheadCount,
+											upstreamName ?? '',
+										),
+								iconPath: new ThemeIcon('warning'),
 							}),
 						],
-						status?.upstream?.state.behind
-							? createDirectiveQuickPickItem(Directive.Cancel, true, {
-									label: `Cancel ${this.title}`,
-									detail: `Cannot push; ${getReferenceLabel(branch)} is behind${
-										status?.upstream ? ` ${status.upstream.name}` : ''
-									} by ${pluralize('commit', status.upstream.state.behind)}`,
-								})
-							: undefined,
+						l10n.t('Confirm Push'),
+						behindCancelItem,
+						{
+							prompt: prompt,
+							// Spread rather than a `?? undefined` value — an explicit `undefined` key would
+							// override createConfirmStep's computed default and leave no row pre-selected
+							...(behindCancelItem != null ? { selectedItems: [behindCancelItem] } : undefined),
+						},
 					);
 
 					step.additionalButtons = [FetchQuickInputButton];
 					step.onDidClickButton = async (quickpick, button) => {
 						if (button !== FetchQuickInputButton || quickpick.busy) return false;
 
-						quickpick.title = `Confirm ${context.title}${pad(GlyphChars.Dot, 2, 2)}Fetching${
-							GlyphChars.Ellipsis
-						}`;
+						quickpick.title = l10n.t(
+							'Confirm Push{0}Fetching{1}',
+							pad(GlyphChars.Dot, 2, 2),
+							GlyphChars.Ellipsis,
+						);
 
 						quickpick.busy = true;
 						try {

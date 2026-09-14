@@ -6,19 +6,21 @@ import { parseArgs } from 'node:util';
 const { values } = parseArgs({
 	args: process.argv.slice(2),
 	options: {
+		analyzeBundle: { type: 'boolean', default: false },
 		mode: { type: 'string', default: 'development' }, // development | production | none
 		build: { type: 'string', default: undefined, multiple: true }, // (extension | webviews)[]
 		debug: { type: 'boolean', default: false },
 		target: { type: 'string', default: undefined, multiple: true }, // (node | webworker)[]
 		quick: { type: 'boolean', default: false }, // skip type-checking, linting, docs, and asset generation
+		stats: { type: 'boolean', default: false }, // emit out/webviews-stats.json from the real production build
 		trace: { type: 'boolean', default: false },
 		webview: { type: 'string', default: undefined, multiple: true },
 		watch: { type: 'boolean', default: false },
 	},
 });
 
-/** @type {{ mode: 'production' | 'development' | 'none' | undefined; build: ('extension' | 'webviews' | 'unit-tests')[] | undefined; debug: boolean; target: ('node' | 'webworker')[] | undefined; quick: boolean; trace: boolean; webview: string[] | undefined; watch: boolean }} */
-const { mode, build, debug, target, quick, trace, webview: webviews, watch } = values;
+/** @type {{ analyzeBundle: boolean; mode: 'production' | 'development' | 'none' | undefined; build: ('extension' | 'webviews' | 'unit-tests')[] | undefined; debug: boolean; target: ('node' | 'webworker')[] | undefined; quick: boolean; stats: boolean; trace: boolean; webview: string[] | undefined; watch: boolean }} */
+const { analyzeBundle, mode, build, debug, target, quick, stats, trace, webview: webviews, watch } = values;
 
 const env = {
 	...process.env,
@@ -84,6 +86,14 @@ if (build?.length || webviews?.length) {
 
 if (quick) {
 	cmd += ` --env quick`;
+}
+
+if (analyzeBundle) {
+	cmd += ` --env analyzeBundle`;
+}
+
+if (stats) {
+	cmd += ` --env stats`;
 }
 
 if (trace) {
@@ -175,8 +185,8 @@ if (isFullBuild && !watch) {
 		// blocking spawnSync) — isolate it so that blocking work gets its own core instead of stalling
 		// a bundling process's event loop.
 		`${baseCmd} --config-name common`,
-		// Keep webviews:common + webviews in one process (CompileComposerTemplatesPlugin shares state).
-		`${baseCmd} --config-name webviews:common --config-name webviews --config-name unit-tests`,
+		`${baseCmd}${analyzeBundle ? ' --env analyzeBundle' : ''}${stats ? ' --env stats' : ''} --config-name webviews:common --config-name webviews`,
+		`${baseCmd} --config-name unit-tests`,
 	];
 } else {
 	bundleCmds = [cmd];
@@ -188,8 +198,9 @@ if (isFullBuild && !watch) {
 // the inline OxLintWebpackPlugin (added whenever not in quick mode), so they skip this standalone pass.
 const tasks = bundleCmds.map(c => run(c));
 if (!quick && !watch) {
-	tasks.push(run(`oxlint --type-aware --type-check --deny-warnings`));
+	tasks.push(run('oxlint --type-aware --type-check --deny-warnings'));
 	tasks.push(run(`node ./scripts/check-deps.mjs`));
+	tasks.push(run(`node ./scripts/localization.mjs check`));
 }
 
 // allSettled (not all) so a failure in one process never abandons the others mid-flight — every

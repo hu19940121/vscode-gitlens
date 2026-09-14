@@ -43,9 +43,15 @@ function generateThirdpartyNotices(packages) {
 		}
 
 		if (name === 'gitlens' || name.startsWith('@gitkraken') || name.startsWith('@gitlens/')) continue;
-		if (data.licenseFile == null) continue;
+		// @vscode/l10n's published tarball omits LICENSE; the checker otherwise selects its README.
+		// Source: https://github.com/microsoft/vscode-l10n/blob/main/LICENSE
+		const licenseFile =
+			name === '@vscode/l10n'
+				? path.join(process.cwd(), 'scripts', 'licenses', 'vscode-l10n.txt')
+				: data.licenseFile;
+		if (licenseFile == null) continue;
 
-		const license = fs.readFileSync(data.licenseFile, 'utf8').replace(/\r\n/g, '\n');
+		const license = fs.readFileSync(licenseFile, 'utf8').replace(/\r\n/g, '\n');
 
 		packageOutputs.push(`${++count}. ${name}${version ? ` version ${version}` : ''} (${data.repository})`);
 		licenseOutputs.push(
@@ -73,9 +79,9 @@ function collectDirectProductionPackages(start) {
 }
 
 async function generate() {
-	// The extension bundles the `@gitlens/*` packages from source, so their runtime dependencies
-	// (e.g. @octokit/* via @gitlens/git-github) ship in dist/ too. Scanning only the root manifest
-	// would omit their notices.
+	// The extension bundles the workspace packages from source, so their runtime dependencies (e.g.
+	// @octokit/* via @gitlens/git-github, @lit-labs/virtualizer via @gitkraken/commit-graph-ui) ship
+	// in dist/ too. Scanning only the root manifest would omit their notices.
 	const roots = [process.cwd(), ...getBundledPackageDirs()];
 	// Each scan walks node_modules independently, so run them concurrently rather than nine-in-a-row.
 	const results = await Promise.allSettled(roots.map(start => collectDirectProductionPackages(start)));

@@ -1,15 +1,15 @@
 /**
  * Shared command handlers for BranchRef / BranchAndTargetRefs command links
- * fired from webviews (home, graph, …). These back the action buttons in
+ * fired from webviews (graph, …). These back the action buttons in
  * components like `gl-merge-target-status`.
  *
  * Each webview registers a matching `@command(...)` that delegates here, so
  * the logic stays in one place and the per-webview class just wires the ID.
  */
 
-import { env, Uri, window } from 'vscode';
+import { env, l10n, Uri, window } from 'vscode';
 import { PushError } from '@gitlens/git/errors.js';
-import { getBranchNameWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
+import { getBranchNameWithoutRemote } from '@gitlens/utils/gitRefs.js';
 import type { BranchGitCommandArgs } from '../../../commands/git/branch.js';
 import type { Container } from '../../../container.js';
 import { executeGitCommand } from '../../../git/actions.js';
@@ -93,7 +93,7 @@ export async function pushBranch(container: Container, ref: BranchRef): Promise<
 		if (PushError.is(ex)) {
 			void showGitErrorMessage(ex);
 		} else {
-			void showGitErrorMessage(ex, 'Unable to push branch');
+			void showGitErrorMessage(ex, l10n.t('Unable to push branch'));
 		}
 	}
 }
@@ -130,17 +130,22 @@ export async function deleteBranchOrWorktree(
 
 	if (branch.current && mergeTarget != null && (!worktree || worktree.isDefault)) {
 		const mergeTargetLocalBranchName = getBranchNameWithoutRemote(mergeTarget.branchName);
+		const continueItem = { title: l10n.t('Continue') };
 		const confirm = await window.showWarningMessage(
-			`Before deleting the current branch '${branch.name}', you will be switched to '${mergeTargetLocalBranchName}'.`,
+			l10n.t(
+				"Before deleting the current branch '{0}', you will be switched to '{1}'.",
+				branch.name,
+				mergeTargetLocalBranchName,
+			),
 			{ modal: true },
-			{ title: 'Continue' },
+			continueItem,
 		);
-		if (confirm?.title !== 'Continue') return;
+		if (confirm !== continueItem) return;
 
 		try {
 			await container.git.getRepositoryService(ref.repoPath).ops?.checkout(mergeTargetLocalBranchName);
 		} catch (ex) {
-			void showGitErrorMessage(ex, `Unable to switch to branch '${mergeTargetLocalBranchName}'`);
+			void showGitErrorMessage(ex, l10n.t("Unable to switch to branch '{0}'", mergeTargetLocalBranchName));
 			return;
 		}
 
@@ -157,12 +162,16 @@ export async function deleteBranchOrWorktree(
 		const defaultWorktree = await repo.git.worktrees?.getWorktree(w => w.isDefault);
 		if (defaultWorktree == null || commonRepo == null) return;
 
+		const continueItem = { title: l10n.t('Continue') };
 		const confirm = await window.showWarningMessage(
-			`Before deleting the worktree for '${branch.name}', you will be switched to the default worktree.`,
+			l10n.t(
+				"Before deleting the worktree for '{0}', you will be switched to the default worktree.",
+				branch.name,
+			),
 			{ modal: true },
-			{ title: 'Continue' },
+			continueItem,
 		);
-		if (confirm?.title !== 'Continue') return;
+		if (confirm !== continueItem) return;
 
 		const schemeOverride = configuration.get('deepLinks.schemeOverride');
 		const scheme = typeof schemeOverride === 'string' ? schemeOverride : env.uriScheme;

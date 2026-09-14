@@ -1,29 +1,28 @@
 import type { Remote } from '@eamodio/supertalk';
+import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
+import type { GlPopover } from '@gitlens/components/components/overlays/popover.js';
+import { inlineCode } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { GitGraphRow } from '@gitlens/git/models/graph.js';
-import { pausedOperationStatusStringsByType } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
 import { fromNow } from '@gitlens/utils/date.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
+import { pausedOperationStatusStringsByType } from '@gitlens/utils/pausedOperation.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { StashSaveCommandArgs } from '../../../../../commands/stashSave.js';
 import { isSubscriptionTrialOrPaidFromState } from '../../../../../plus/gk/utils/subscription.utils.js';
 import { createCommandLink } from '../../../../../system/commands.js';
 import type { GraphServices } from '../../../../plus/graph/graphService.js';
 import type { BranchState, GraphAutoFetchMode, GraphWipState, State } from '../../../../plus/graph/protocol.js';
-import { UpdateGraphConfigurationCommand } from '../../../../plus/graph/protocol.js';
 import type { PullConflictPreview } from '../../../../rpc/services/branches.js';
-import type { GlPopover } from '../../../shared/components/overlays/popover.js';
-import { inlineCode } from '../../../shared/components/styles/lit/base.css.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
+import { notifyService } from '../../../shared/actions/rpc.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
-import {
-	getBranchNameWithoutRemote,
-	getRemoteNameFromBranchName,
-	providerIconName,
-} from '../../../shared/git-utils.js';
+import { providerIconName } from '../../../shared/git-utils.js';
 import { ruleStyles } from '../../shared/components/vscode.css.js';
 import type { AppState } from '../context.js';
 import { graphServicesContext, graphStateContext } from '../context.js';
@@ -32,14 +31,14 @@ import { getSelectedRepoPath } from '../utils/repository.utils.js';
 import { isUnpublishedRow, isUnpulledRow } from '../utils/rowContext.utils.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/checkbox/checkbox.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/commit/wip-stats.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/wipStats.js';
 import '../../../shared/components/menu/menu-divider.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 @customElement('gl-git-actions-buttons')
-export class GitActionsButtons extends LitElement {
+export class GitActionsButtons extends SignalWatcher(LitElement) {
 	static override styles = [
 		linkBase,
 		actionButton,
@@ -51,12 +50,13 @@ export class GitActionsButtons extends LitElement {
 
 			gl-tooltip {
 				flex-shrink: 0;
+				margin-left: var(--gl-space-4);
 			}
 
 			/* Each action yields its label completely before the next one loses a pixel — publish, then
-			   fetch, then pull/push — instead of all three shrinking halfway together and none reaching
-			   its icon-only floor. 2.4rem is that floor: the icon plus the anchor's padding. Pull/push
-			   sets its own tier on its wrappers, since its host is display: contents. */
+  fetch, then pull/push — instead of all three shrinking halfway together and none reaching
+  its icon-only floor. 2.4rem is that floor: the icon plus the anchor's padding. Pull/push
+  sets its own tier on its wrappers, since its host is display: contents. */
 			gl-publish-button {
 				flex: 0 1000000 max-content;
 				min-width: 2.4rem;
@@ -78,12 +78,8 @@ export class GitActionsButtons extends LitElement {
 				background-color: transparent;
 			}
 
-			gl-tooltip {
-				margin-left: var(--gl-space-4);
-			}
-
 			/* Room-gated, not state-gated (state gating is hasWorkingChanges in the template): hidden until
-			   the titlebar has space to spare for a fourth action button. */
+  the titlebar has space to spare for a fourth action button. */
 			.git-actions__stash {
 				display: none;
 			}
@@ -102,8 +98,8 @@ export class GitActionsButtons extends LitElement {
 	@property({ type: String })
 	branchName?: string;
 
-	@property({ type: Object })
-	lastFetched?: Date;
+	@property({ type: Number })
+	lastFetched?: number;
 
 	/** The graph's own worktree's hot WIP state — its entry in the row-keyed `wipStateById` plane. */
 	@property({ type: Object })
@@ -118,23 +114,14 @@ export class GitActionsButtons extends LitElement {
 		return stats.added + stats.deleted + stats.modified + (stats.renamed ?? 0) > 0;
 	}
 
-	private get lastFetchedDate(): Date | undefined {
-		if (!this.lastFetched) return undefined;
-
-		const d = typeof this.lastFetched === 'string' ? new Date(this.lastFetched) : this.lastFetched;
-		return d.getTime() !== 0 ? d : undefined;
-	}
-
 	private get fetchedText(): string | undefined {
-		const d = this.lastFetchedDate;
-		return d != null ? fromNow(d) : undefined;
+		return this.lastFetched ? fromNow(this.lastFetched) : undefined;
 	}
 
 	private get fetchedTextShort(): string | undefined {
-		const d = this.lastFetchedDate;
-		if (d == null) return undefined;
-		if (Date.now() - d.getTime() < 1000) return 'now';
-		return `${fromNow(d, true)} ago`;
+		if (!this.lastFetched) return undefined;
+		if (Date.now() - this.lastFetched < 1000) return l10n.t('now');
+		return l10n.t('{time} ago', { time: fromNow(this.lastFetched, true) });
 	}
 
 	private onJumpToWip() {
@@ -150,26 +137,44 @@ export class GitActionsButtons extends LitElement {
 		const pausedOp = state?.pausedOpStatus;
 		if (pausedOp != null) {
 			const opStrings = pausedOperationStatusStringsByType[pausedOp.type];
-			const headline = state?.hasConflicts === true ? opStrings.conflicts : `${opStrings.label} in progress`;
+			let headline: string;
+			if (state?.hasConflicts === true) {
+				headline = opStrings.conflicts;
+			} else {
+				switch (pausedOp.type) {
+					case 'cherry-pick':
+						headline = l10n.t('Cherry picking in progress');
+						break;
+					case 'merge':
+						headline = l10n.t('Merging in progress');
+						break;
+					case 'rebase':
+						headline = l10n.t('Rebasing in progress');
+						break;
+					case 'revert':
+						headline = l10n.t('Reverting in progress');
+						break;
+				}
+			}
 			return html`${headline}
 				<hr />
-				Jump to Working Changes`;
+				${l10n.t('Jump to Working Changes')}`;
 		}
 
-		return html`Jump to WIP
+		return html`${l10n.t('Jump to WIP')}
 		${
 			this.hasWorkingChanges
 				? html`
 						<hr />
-						Working Changes
+						${l10n.t('Working Changes')}
 						<br />
-						${stats!.added ? html`${pluralize('file', stats!.added)} added<br />` : nothing}
-						${stats!.modified ? html`${pluralize('file', stats!.modified)} modified<br />` : nothing}
-						${stats!.deleted ? html`${pluralize('file', stats!.deleted)} deleted<br />` : nothing}
+						${stats!.added ? html`${formatPlural(l10n.t('{count, plural, one{{count} file added} other{{count} files added}}'), { count: stats!.added })}<br />` : nothing}
+						${stats!.modified ? html`${formatPlural(l10n.t('{count, plural, one{{count} file modified} other{{count} files modified}}'), { count: stats!.modified })}<br />` : nothing}
+						${stats!.deleted ? html`${formatPlural(l10n.t('{count, plural, one{{count} file deleted} other{{count} files deleted}}'), { count: stats!.deleted })}<br />` : nothing}
 					`
 				: html`
 						<hr />
-						No changes
+						${l10n.t('No changes')}
 					`
 		}`;
 	}
@@ -223,8 +228,8 @@ export class GitActionsButtons extends LitElement {
 							href=${createCommandLink<StashSaveCommandArgs>('gitlens.stashSave', {
 								repoPath: this.state.selectedRepository,
 							})}
-							aria-label="Stash Changes..."
-							tooltip="Stash Changes..."
+							aria-label=${l10n.t('Stash Changes...')}
+							tooltip=${l10n.t('Stash Changes...')}
 						>
 							<code-icon icon="gl-stash-save"></code-icon>
 						</gl-button>`
@@ -257,20 +262,20 @@ export class GlFetchButton extends LitElement {
 			}
 
 			/* Use CSS Grid so the text column's min-content is 0,
-	   allowing the text to shrink and ellipsize without expanding
-	   the parent's intrinsic min-content beyond the icon size. */
+allowing the text to shrink and ellipsize without expanding
+the parent's intrinsic min-content beyond the icon size. */
 			.action-button {
 				display: grid;
 				grid-template-columns: auto minmax(0, 1fr);
+
+				/* The icon↔text separation lives on the text, not in a column gap: a gap survives even
+   when the text column reaches 0, leaving a dead strip beside the icon at the floor. As
+   padding it overflows the zero-width track and is clipped, so the floor is a true icon. */
+				column-gap: 0;
 				align-items: center;
 				width: 100%;
 				max-width: 100%;
 				overflow: hidden;
-
-				/* The icon↔text separation lives on the text, not in a column gap: a gap survives even
-				   when the text column reaches 0, leaving a dead strip beside the icon at the floor. As
-				   padding it overflows the zero-width track and is clipped, so the floor is a true icon. */
-				column-gap: 0;
 			}
 
 			.action-button__text {
@@ -368,8 +373,8 @@ export class GlFetchButton extends LitElement {
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
 
-	@consume({ context: ipcContext })
-	private _ipc!: typeof ipcContext.__context__;
+	@consume({ context: graphServicesContext, subscribe: true })
+	private _services?: Remote<GraphServices> | undefined;
 
 	@property({ type: Object })
 	state!: State;
@@ -389,16 +394,48 @@ export class GlFetchButton extends LitElement {
 	@property({ type: Number })
 	autoFetchIntervalSeconds = 180;
 
-	private get upstream() {
-		return this.branchState?.upstream
-			? html`<span class="inline-code">${this.branchState.upstream}</span>`
-			: 'remote';
+	private renderFetchDescription() {
+		const upstream = this.branchState?.upstream;
+		const provider = this.branchState?.provider?.name;
+		return localizedContent(
+			upstream
+				? provider
+					? l10n.t('Fetch from {upstream} on {provider}')
+					: l10n.t('Fetch from {upstream}')
+				: provider
+					? l10n.t('Fetch from remote on {provider}')
+					: l10n.t('Fetch from remote'),
+			{ upstream: html`<span class="inline-code">${upstream}</span>`, provider: provider },
+		);
 	}
 
-	private get intervalLabel(): string {
+	private get intervalHint(): string {
 		const seconds = this.autoFetchIntervalSeconds;
-		if (seconds < 60) return pluralize('second', seconds);
-		return pluralize('minute', Math.round(seconds / 60));
+		const inView = this.autoFetchMode !== 'vscode';
+		if (seconds < 60) {
+			return inView
+				? formatPlural(
+						l10n.t(
+							'{count, plural, one{Every {count} second while in view} other{Every {count} seconds while in view}}',
+						),
+						{ count: seconds },
+					)
+				: formatPlural(l10n.t('{count, plural, one{Every {count} second} other{Every {count} seconds}}'), {
+						count: seconds,
+					});
+		}
+
+		const minutes = Math.round(seconds / 60);
+		return inView
+			? formatPlural(
+					l10n.t(
+						'{count, plural, one{Every {count} minute while in view} other{Every {count} minutes while in view}}',
+					),
+					{ count: minutes },
+				)
+			: formatPlural(l10n.t('{count, plural, one{Every {count} minute} other{Every {count} minutes}}'), {
+					count: minutes,
+				});
 	}
 
 	private get settingsLink(): string {
@@ -417,11 +454,11 @@ export class GlFetchButton extends LitElement {
 					slot="anchor"
 					href=${this._webview.createCommandLink('gitlens.fetch:')}
 					class="action-button"
-					aria-label="Fetch"
+					aria-label=${l10n.t('Fetch')}
 				>
 					<code-icon class="action-button__icon" icon="repo-fetch"></code-icon>
 					<span class="action-button__text"
-						><span class="action-button__label">Fetch</span>${
+						><span class="action-button__label">${l10n.t('Fetch')}</span>${
 							this.fetchedTextShort
 								? html` <span class="action-button__small">(${this.fetchedTextShort})</span>`
 								: ''
@@ -430,14 +467,11 @@ export class GlFetchButton extends LitElement {
 				</a>
 				<div slot="content" class="fetch-popover__menu" role="menu">
 					<div class="fetch-popover__info">
-						Fetch from
-						${this.upstream}${
-							this.branchState?.provider?.name ? html` on ${this.branchState.provider.name}` : nothing
-						}
+						${this.renderFetchDescription()}
 						${
 							this.fetchedText
 								? html`<div class="fetch-popover__info-secondary">
-										Last fetched ${this.fetchedText}
+										${l10n.t('Last fetched {time}', { time: this.fetchedText })}
 									</div>`
 								: nothing
 						}
@@ -450,17 +484,16 @@ export class GlFetchButton extends LitElement {
 	}
 
 	private renderAutoFetchRow() {
-		const intervalLabel = this.intervalLabel;
 		if (this.autoFetchMode === 'vscode') {
 			return html`
 				<div class="fetch-popover__row fetch-popover__row--info">
 					<span class="fetch-popover__label-text">
 						<code-icon icon="check"></code-icon>
-						Auto-fetch handled by VS Code Git
+						${l10n.t('Auto-fetch handled by VS Code Git')}
 					</span>
 					${this.renderSettingsCog()}
 				</div>
-				<div class="fetch-popover__hint">Every ${intervalLabel}</div>
+				<div class="fetch-popover__hint">${this.intervalHint}</div>
 			`;
 		}
 
@@ -472,11 +505,11 @@ export class GlFetchButton extends LitElement {
 					?checked=${checked}
 					@gl-change-value=${this.handleAutoFetchToggle}
 				>
-					Auto-fetch
+					${l10n.t('Auto-fetch')}
 				</gl-checkbox>
 				${this.renderSettingsCog()}
 			</div>
-			<div class="fetch-popover__hint">Every ${intervalLabel} while in view</div>
+			<div class="fetch-popover__hint">${this.intervalHint}</div>
 		`;
 	}
 
@@ -488,7 +521,7 @@ export class GlFetchButton extends LitElement {
 				appearance="toolbar"
 				density="compact"
 				href=${this.settingsLink}
-				aria-label="Open Git Auto-fetch Settings"
+				aria-label=${l10n.t('Open Git Auto-fetch Settings')}
 			>
 				<code-icon icon="gear"></code-icon>
 			</gl-button>
@@ -499,7 +532,12 @@ export class GlFetchButton extends LitElement {
 		const $el = e.target as HTMLInputElement | null;
 		if ($el == null) return;
 
-		this._ipc.sendCommand(UpdateGraphConfigurationCommand, { changes: { autoFetchEnabled: $el.checked } });
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.configuration, 'configuration/update', svc =>
+			svc.update({ autoFetchEnabled: $el.checked }),
+		);
 	}
 }
 
@@ -526,7 +564,7 @@ function samePullConflictPreview(a: PullConflictPreview | undefined, b: PullConf
 type FooterJumpLeg = { resolve: () => string | undefined; label?: string; tooltip?: string; icon: string };
 
 @customElement('gl-push-pull-button')
-export class PushPullButton extends LitElement {
+export class PushPullButton extends SignalWatcher(LitElement) {
 	static override styles = [
 		linkBase,
 		inlineCode,
@@ -538,8 +576,8 @@ export class PushPullButton extends LitElement {
 			}
 
 			/* The host is display: contents, so the pull popover / push tooltip are themselves the flex
-			   items in the header's action group — they carry the shrink tier. Pull/push yields last:
-			   it's the action you're most likely to still want named. */
+  items in the header's action group — they carry the shrink tier. Pull/push yields last:
+  it's the action you're most likely to still want named. */
 			:host > gl-popover,
 			:host > gl-tooltip {
 				display: block;
@@ -549,17 +587,17 @@ export class PushPullButton extends LitElement {
 			}
 
 			/* Grid so the label column's min-content is 0 and the label can ellipsize away without
-			   holding the button above icon width. The pill keeps an auto column — ahead/behind counts
-			   survive the collapse. Separation lives on the items rather than in a column gap so it
-			   collapses with the label instead of leaving a dead strip beside the icon. */
+  holding the button above icon width. The pill keeps an auto column — ahead/behind counts
+  survive the collapse. Separation lives on the items rather than in a column gap so it
+  collapses with the label instead of leaving a dead strip beside the icon. */
 			.action-button {
 				display: grid;
 				grid-template-columns: auto minmax(0, 1fr) auto;
+				column-gap: 0;
 				align-items: center;
 				width: 100%;
 				max-width: 100%;
 				overflow: hidden;
-				column-gap: 0;
 			}
 
 			.action-button__text {
@@ -600,21 +638,21 @@ export class PushPullButton extends LitElement {
 			}
 
 			/* Match the tooltip this popover replaced — a header you sweep across shouldn't pop cards at
-			   120ms — while the hide delay gives you a beat to move into it. */
+  120ms — while the hide delay gives you a beat to move into it. */
 			gl-popover {
 				--show-delay: 500ms;
 				--hide-delay: 180ms;
 				/* Without a cap the popover defaults to 70vw and simply grows to fit its widest line, so a long
-				   "Fetched 3 weeks ago" would stretch the whole card instead of yielding. Capping it is what
-				   makes the footer's degradation reachable at all. */
+   "Fetched 3 weeks ago" would stretch the whole card instead of yielding. Capping it is what
+   makes the footer's degradation reachable at all. */
 				--max-width: 34rem;
 				/* Regions own their padding (see .pull-popover). */
 				--wa-tooltip-padding: 0;
 			}
 
 			/* Zero the popover's own body padding and let each region supply its own, so the banner and footer
-			   run edge to edge. Overriding the custom property is exact; a negative margin guessing at
-			   the padding's value is not. Shared by both Pull and Push cards. */
+  run edge to edge. Overriding the custom property is exact; a negative margin guessing at
+  the padding's value is not. Shared by both Pull and Push cards. */
 			.action-popover {
 				display: flex;
 				flex-direction: column;
@@ -632,11 +670,11 @@ export class PushPullButton extends LitElement {
 			}
 
 			/* Solid fill, deliberately darkened so a fixed light foreground clears contrast in BOTH themes.
-			   Knocking out to the editor background (the ref-pill convention) can't work here: in a dark theme
-			   that resolves to near-black text on a dark red fill. */
+  Knocking out to the editor background (the ref-pill convention) can't work here: in a dark theme
+  that resolves to near-black text on a dark red fill. */
 			/* Slides the verdict open instead of popping it. Animating a grid track (0fr to 1fr) is the only
-			   way to transition to a content-derived height; the inner wrapper needs min-height: 0 and a clip
-			   or the 0fr track can't actually collapse it. Same technique as the graph's row-marker rail. */
+  way to transition to a content-derived height; the inner wrapper needs min-height: 0 and a clip
+  or the 0fr track can't actually collapse it. Same technique as the graph's row-marker rail. */
 			.banner-slot {
 				display: grid;
 				grid-template-rows: 0fr;
@@ -653,7 +691,7 @@ export class PushPullButton extends LitElement {
 			}
 
 			/* Trails the slide slightly so the text fades in over an already-opening band rather than
-			   arriving with it. */
+  arriving with it. */
 			.banner-slot .banner {
 				opacity: 0;
 				transition: opacity 180ms ease 60ms;
@@ -671,11 +709,11 @@ export class PushPullButton extends LitElement {
 			}
 
 			/* Inline flow, NOT flex — code-icon aligns itself with vertical-align: text-bottom, which flex
-			   discards, and baseline-aligning an inline-block box against text rides the glyph too high.
-			   Matches how gl-merge-target-status renders the same kind of conflict line. */
+  discards, and baseline-aligning an inline-block box against text rides the glyph too high.
+  Matches how gl-merge-target-status renders the same kind of conflict line. */
 			.banner {
-				margin-block: 0;
 				padding: var(--gl-space-8) var(--gl-space-10);
+				margin-block: 0;
 				font-weight: 500;
 				color: #fff;
 				background-color: color-mix(in srgb, var(--banner-color) 82%, #000);
@@ -697,30 +735,30 @@ export class PushPullButton extends LitElement {
 				display: flex;
 				gap: var(--gl-space-6);
 				align-items: center;
-				container-type: inline-size;
-				overflow: hidden;
 				/* A touch more below than above — the button otherwise sits hard against the card's edge. */
 				padding: var(--gl-space-8) var(--gl-space-10) var(--gl-space-10);
+				container-type: inline-size;
+				overflow: hidden;
 				background-color: color-mix(in srgb, var(--vscode-foreground) 6%, transparent);
 				border-top: 1px solid var(--vscode-menu-separatorBackground);
 			}
 
 			/* The timestamp is the only thing here that yields — the action never shrinks, wraps, or gets
-			   pushed. It shrinks first, then drops out entirely rather than leaving a truncated stub; a stale
-			   repo ("Fetched 3 weeks ago") is exactly when this line is longest. */
+  pushed. It shrinks first, then drops out entirely rather than leaving a truncated stub; a stale
+  repo ("Fetched 3 weeks ago") is exactly when this line is longest. */
 			.footerbar__fetched {
 				flex: 0 1 auto;
 				min-width: 0;
 				margin-left: auto;
 				overflow: hidden;
-				color: var(--vscode-descriptionForeground);
 				text-overflow: ellipsis;
+				color: var(--vscode-descriptionForeground);
 				white-space: nowrap;
 			}
 
 			/* Threshold = the legs' own width plus a gap; below it there's no room for a useful timestamp.
-			   Lower than before Pull's Upstream leg lost its full inline "Jump to Upstream" text for a short
-			   label and Push's HEAD leg lost its label entirely — both cards' legs are narrower now. */
+  Lower than before Pull's Upstream leg lost its full inline "Jump to Upstream" text for a short
+  label and Push's HEAD leg lost its label entirely — both cards' legs are narrower now. */
 			@container (max-width: 24rem) {
 				.footerbar__fetched {
 					display: none;
@@ -754,7 +792,7 @@ export class PushPullButton extends LitElement {
 	@consume({ context: graphServicesContext, subscribe: true })
 	private _services?: Remote<GraphServices> | undefined;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private _graphState?: AppState;
 
 	@property({ type: Object })
@@ -794,14 +832,199 @@ export class PushPullButton extends LitElement {
 		return (this.branchState?.ahead ?? 0) > 0;
 	}
 
-	private get upstream() {
-		return this.branchState?.upstream
-			? html`<span class="inline-code">${this.branchState.upstream}</span>`
-			: 'remote';
+	private renderTransferDescription(action: 'pull' | 'push' | 'forcePush', count: number) {
+		const upstream = this.branchState?.upstream;
+		const provider = this.branchState?.provider?.name;
+		let message: string;
+		switch (action) {
+			case 'pull':
+				message = upstream
+					? provider
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Pull {count} commit from {upstream} on {provider}} other{Pull {count} commits from {upstream} on {provider}}}',
+								),
+								{ count: count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Pull {count} commit from {upstream}} other{Pull {count} commits from {upstream}}}',
+								),
+								{ count: count },
+							)
+					: provider
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Pull {count} commit from remote on {provider}} other{Pull {count} commits from remote on {provider}}}',
+								),
+								{ count: count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Pull {count} commit from remote} other{Pull {count} commits from remote}}',
+								),
+								{ count: count },
+							);
+				break;
+			case 'push':
+				message = upstream
+					? provider
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Push {count} commit to {upstream} on {provider}} other{Push {count} commits to {upstream} on {provider}}}',
+								),
+								{ count: count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Push {count} commit to {upstream}} other{Push {count} commits to {upstream}}}',
+								),
+								{ count: count },
+							)
+					: provider
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Push {count} commit to remote on {provider}} other{Push {count} commits to remote on {provider}}}',
+								),
+								{ count: count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Push {count} commit to remote} other{Push {count} commits to remote}}',
+								),
+								{ count: count },
+							);
+				break;
+			case 'forcePush':
+				message = upstream
+					? provider
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Force Push {count} commit to {upstream} on {provider}} other{Force Push {count} commits to {upstream} on {provider}}}',
+								),
+								{ count: count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Force Push {count} commit to {upstream}} other{Force Push {count} commits to {upstream}}}',
+								),
+								{ count: count },
+							)
+					: provider
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Force Push {count} commit to remote on {provider}} other{Force Push {count} commits to remote on {provider}}}',
+								),
+								{ count: count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Force Push {count} commit to remote} other{Force Push {count} commits to remote}}',
+								),
+								{ count: count },
+							);
+				break;
+		}
+		return localizedContent(message, {
+			upstream: html`<span class="inline-code">${upstream}</span>`,
+			provider: provider,
+		});
 	}
 
-	private renderBranchPrefix() {
-		return html`<span class="inline-code">${this.branchName}</span> is`;
+	private renderTrackingDescription(behind: number, ahead: number) {
+		const upstream = this.branchState?.upstream;
+		const provider = this.branchState?.provider?.name;
+		let message: string;
+		if (behind > 0 && ahead > 0) {
+			message = upstream
+				? provider
+					? formatPlural(
+							l10n.t(
+								'{behind, plural, one{{ahead, plural, one{{branch} is {behind} commit behind and {ahead} commit ahead of {upstream} on {provider}} other{{branch} is {behind} commit behind and {ahead} commits ahead of {upstream} on {provider}}}} other{{ahead, plural, one{{branch} is {behind} commits behind and {ahead} commit ahead of {upstream} on {provider}} other{{branch} is {behind} commits behind and {ahead} commits ahead of {upstream} on {provider}}}}}',
+							),
+							{ behind: behind, ahead: ahead },
+						)
+					: formatPlural(
+							l10n.t(
+								'{behind, plural, one{{ahead, plural, one{{branch} is {behind} commit behind and {ahead} commit ahead of {upstream}} other{{branch} is {behind} commit behind and {ahead} commits ahead of {upstream}}}} other{{ahead, plural, one{{branch} is {behind} commits behind and {ahead} commit ahead of {upstream}} other{{branch} is {behind} commits behind and {ahead} commits ahead of {upstream}}}}}',
+							),
+							{ behind: behind, ahead: ahead },
+						)
+				: provider
+					? formatPlural(
+							l10n.t(
+								'{behind, plural, one{{ahead, plural, one{{branch} is {behind} commit behind and {ahead} commit ahead of remote on {provider}} other{{branch} is {behind} commit behind and {ahead} commits ahead of remote on {provider}}}} other{{ahead, plural, one{{branch} is {behind} commits behind and {ahead} commit ahead of remote on {provider}} other{{branch} is {behind} commits behind and {ahead} commits ahead of remote on {provider}}}}}',
+							),
+							{ behind: behind, ahead: ahead },
+						)
+					: formatPlural(
+							l10n.t(
+								'{behind, plural, one{{ahead, plural, one{{branch} is {behind} commit behind and {ahead} commit ahead of remote} other{{branch} is {behind} commit behind and {ahead} commits ahead of remote}}} other{{ahead, plural, one{{branch} is {behind} commits behind and {ahead} commit ahead of remote} other{{branch} is {behind} commits behind and {ahead} commits ahead of remote}}}}',
+							),
+							{ behind: behind, ahead: ahead },
+						);
+		} else if (behind > 0) {
+			message = upstream
+				? provider
+					? formatPlural(
+							l10n.t(
+								'{behind, plural, one{{branch} is {behind} commit behind {upstream} on {provider}} other{{branch} is {behind} commits behind {upstream} on {provider}}}',
+							),
+							{ behind: behind },
+						)
+					: formatPlural(
+							l10n.t(
+								'{behind, plural, one{{branch} is {behind} commit behind {upstream}} other{{branch} is {behind} commits behind {upstream}}}',
+							),
+							{ behind: behind },
+						)
+				: provider
+					? formatPlural(
+							l10n.t(
+								'{behind, plural, one{{branch} is {behind} commit behind remote on {provider}} other{{branch} is {behind} commits behind remote on {provider}}}',
+							),
+							{ behind: behind },
+						)
+					: formatPlural(
+							l10n.t(
+								'{behind, plural, one{{branch} is {behind} commit behind remote} other{{branch} is {behind} commits behind remote}}',
+							),
+							{ behind: behind },
+						);
+		} else {
+			message = upstream
+				? provider
+					? formatPlural(
+							l10n.t(
+								'{ahead, plural, one{{branch} is {ahead} commit ahead of {upstream} on {provider}} other{{branch} is {ahead} commits ahead of {upstream} on {provider}}}',
+							),
+							{ ahead: ahead },
+						)
+					: formatPlural(
+							l10n.t(
+								'{ahead, plural, one{{branch} is {ahead} commit ahead of {upstream}} other{{branch} is {ahead} commits ahead of {upstream}}}',
+							),
+							{ ahead: ahead },
+						)
+				: provider
+					? formatPlural(
+							l10n.t(
+								'{ahead, plural, one{{branch} is {ahead} commit ahead of remote on {provider}} other{{branch} is {ahead} commits ahead of remote on {provider}}}',
+							),
+							{ ahead: ahead },
+						)
+					: formatPlural(
+							l10n.t(
+								'{ahead, plural, one{{branch} is {ahead} commit ahead of remote} other{{branch} is {ahead} commits ahead of remote}}',
+							),
+							{ ahead: ahead },
+						);
+		}
+		return localizedContent(message, {
+			branch: html`<span class="inline-code">${this.branchName}</span>`,
+			upstream: html`<span class="inline-code">${upstream}</span>`,
+			provider: provider,
+		});
 	}
 
 	/** `selectedRepository` is a repository *id*, not a path — resolve it through `repositories` rather
@@ -973,7 +1196,11 @@ export class PushPullButton extends LitElement {
 		//
 		// A landing: this fires from a popover in the HEADER, so the user isn't looking at the rows, and a
 		// target that happens to already be on screen would otherwise answer the click with nothing.
-		document.dispatchEvent(new CustomEvent('gl-jump-to-commit', { detail: { sha: sha, flash: true } }));
+		// `focus: true` — a jump hands the keyboard to the row it lands on; without it focus stays on the
+		// header control and arrow keys don't move the selection the user is now looking at.
+		document.dispatchEvent(
+			new CustomEvent('gl-jump-to-commit', { detail: { sha: sha, focus: true, flash: true } }),
+		);
 	}
 
 	private onJumpClick(e: MouseEvent, resolve: () => string | undefined): void {
@@ -1016,7 +1243,7 @@ export class PushPullButton extends LitElement {
 	}
 
 	/** The severity banner. Leads the card because it's the only thing here you can't read off the button
-	 *  itself, and it's silent unless there's something to say: clean, undetectable (Git < 2.33, a provider
+	 *  itself, and it's silent unless there's something to say: clean, undetectable (Git < 2.38, a provider
 	 *  without merge-tree, a failed simulation), and still-pending all render nothing rather than putting a
 	 *  reassurance or an error into a hover.
 	 *
@@ -1028,7 +1255,6 @@ export class PushPullButton extends LitElement {
 
 		let banner;
 		if (conflicts != null && conflicts.kind !== 'clean' && conflicts.kind !== 'unavailable') {
-			const files = pluralize('file', conflicts.count);
 			// A blocked pull outranks a predicted one: it's a fact rather than a simulation, and it tells you
 			// the click won't do anything at all. It takes `editorError` rather than the rust conflict color so
 			// that `statusMergingOrRebasingConflict` keeps describing actual conflicts for anyone retheming it.
@@ -1037,8 +1263,18 @@ export class PushPullButton extends LitElement {
 			banner = html`<p class="banner ${blocked ? 'banner--blocked' : 'banner--conflict'}">
 				<code-icon icon=${blocked ? 'error' : 'warning'}></code-icon>${
 					blocked
-						? html`Unable to pull &mdash; uncommitted changes in ${files}`
-						: html`Pulling will cause conflicts in ${files}`
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Unable to pull — uncommitted changes in {count} file} other{Unable to pull — uncommitted changes in {count} files}}',
+								),
+								{ count: conflicts.count },
+							)
+						: formatPlural(
+								l10n.t(
+									'{count, plural, one{Pulling will cause conflicts in {count} file} other{Pulling will cause conflicts in {count} files}}',
+								),
+								{ count: conflicts.count },
+							)
 				}
 			</p>`;
 		}
@@ -1058,7 +1294,7 @@ export class PushPullButton extends LitElement {
 	 *  lives in a `gl-tooltip` rather than inline, and doubles as its `aria-label`. */
 	private renderFooterBar(legs: readonly FooterJumpLeg[]) {
 		const fetched = this.fetchedTextShort
-			? html`<span class="footerbar__fetched">Fetched ${this.fetchedTextShort}</span>`
+			? html`<span class="footerbar__fetched">${l10n.t('Fetched {time}', { time: this.fetchedTextShort })}</span>`
 			: nothing;
 
 		// Nothing to jump to — keep the bar for the timestamp alone rather than dropping the fact off the card.
@@ -1093,7 +1329,7 @@ export class PushPullButton extends LitElement {
 	 *  as the default slot, so the push path passes nothing. */
 	private renderActionAnchor(action: 'pull' | 'push', slotted: boolean) {
 		const icon = action === 'pull' ? 'repo-pull' : 'repo-push';
-		const label = action === 'pull' ? 'Pull' : 'Push';
+		const label = action === 'pull' ? l10n.t('Pull') : l10n.t('Push');
 
 		return html`<a
 			slot=${slotted ? 'anchor' : nothing}
@@ -1126,7 +1362,6 @@ export class PushPullButton extends LitElement {
 	 *  (the one thing you can't read off the button), prose in the middle, doing in the footer. */
 	private renderPull() {
 		const branchState = this.branchState;
-		const providerSuffix = branchState?.provider?.name ? html` on ${branchState.provider.name}` : '';
 		const behind = branchState?.behind ?? 0;
 		const ahead = branchState?.ahead ?? 0;
 
@@ -1143,7 +1378,7 @@ export class PushPullButton extends LitElement {
 			legs.push({
 				resolve: () => this.incomingSha,
 				label: upstreamLegLabel,
-				tooltip: `Jump to Upstream (${upstreamName})`,
+				tooltip: l10n.t('Jump to Upstream ({upstream})', { upstream: upstreamName }),
 				icon: providerIconName(branchState?.provider?.icon),
 			});
 		}
@@ -1153,8 +1388,8 @@ export class PushPullButton extends LitElement {
 		// `Unpulled` flag bits keep the git layer's naming; this is user-facing copy only.
 		legs.push({
 			resolve: () => this.resolveOldestUnpulledSha(),
-			label: 'Oldest Incoming',
-			tooltip: 'Jump to Oldest Incoming Commit',
+			label: l10n.t('Oldest Incoming'),
+			tooltip: l10n.t('Jump to Oldest Incoming Commit'),
 			icon: 'arrow-down',
 		});
 
@@ -1168,13 +1403,8 @@ export class PushPullButton extends LitElement {
 			<div slot="content" class="action-popover">
 				${this.renderConflictBanner()}
 				<div class="action-popover__body">
-					<span>Pull ${pluralize('commit', behind)} from ${this.upstream}${providerSuffix}</span>
-					<span class="action-popover__status"
-						>${this.renderBranchPrefix()} ${pluralize('commit', behind)} behind
-						${
-							this.isAhead ? html`and ${pluralize('commit', ahead)} ahead of ` : ''
-						}${this.upstream}${providerSuffix}</span
-					>
+					<span>${this.renderTransferDescription('pull', behind)}</span>
+					<span class="action-popover__status">${this.renderTrackingDescription(behind, ahead)}</span>
 				</div>
 				${this.renderFooterBar(legs)}
 			</div>
@@ -1186,7 +1416,6 @@ export class PushPullButton extends LitElement {
 	 *  does; the value is structural parity with Pull plus the two jump legs. */
 	private renderPush() {
 		const branchState = this.branchState;
-		const providerSuffix = branchState?.provider?.name ? html` on ${branchState.provider.name}` : '';
 		const ahead = branchState?.ahead ?? 0;
 
 		const legs: FooterJumpLeg[] = [];
@@ -1198,7 +1427,9 @@ export class PushPullButton extends LitElement {
 			// branch reads "Jump to HEAD (undefined)".
 			legs.push({
 				resolve: () => this.headSha,
-				tooltip: this.branchName ? `Jump to HEAD (${this.branchName})` : 'Jump to HEAD',
+				tooltip: this.branchName
+					? l10n.t('Jump to HEAD ({branch})', { branch: this.branchName })
+					: l10n.t('Jump to HEAD'),
 				icon: 'vm-active',
 			});
 		}
@@ -1208,8 +1439,8 @@ export class PushPullButton extends LitElement {
 		// renders newest-at-top — the opposite end from where this leg lands).
 		legs.push({
 			resolve: () => this.resolveOldestUnpushedSha(),
-			label: 'Oldest Outgoing',
-			tooltip: 'Jump to Oldest Outgoing Commit',
+			label: l10n.t('Oldest Outgoing'),
+			tooltip: l10n.t('Jump to Oldest Outgoing Commit'),
 			icon: 'arrow-down',
 		});
 
@@ -1222,11 +1453,8 @@ export class PushPullButton extends LitElement {
 			${this.renderActionAnchor('push', true)}
 			<div slot="content" class="action-popover">
 				<div class="action-popover__body">
-					<span>Push ${pluralize('commit', ahead)} to ${this.upstream}${providerSuffix}</span>
-					<span class="action-popover__status"
-						>${this.renderBranchPrefix()} ${pluralize('commit', ahead)} ahead of
-						${this.upstream}${providerSuffix}</span
-					>
+					<span>${this.renderTransferDescription('push', ahead)}</span>
+					<span class="action-popover__status">${this.renderTrackingDescription(0, ahead)}</span>
 				</div>
 				${this.renderFooterBar(legs)}
 			</div>
@@ -1248,13 +1476,12 @@ export class PushPullButton extends LitElement {
 							<gl-button
 								appearance="toolbar"
 								href=${this._webview.createCommandLink('gitlens.graph.pushWithForce')}
-								aria-label="Force Push"
+								aria-label=${l10n.t('Force Push')}
 								tooltipPlacement="top"
 							>
 								<code-icon icon="repo-force-push" aria-hidden="true"></code-icon>
 								<span slot="tooltip">
-									Force Push ${pluralize('commit', this.branchState?.ahead)} to ${this.upstream}
-									${this.branchState?.provider?.name ? html` on ${this.branchState.provider.name}` : ''}
+									${this.renderTransferDescription('forcePush', this.branchState.ahead ?? 0)}
 								</span>
 							</gl-button>
 						`
@@ -1286,14 +1513,14 @@ export class GlPublishButton extends LitElement {
 			.action-button {
 				display: grid;
 				grid-template-columns: auto minmax(0, 1fr);
+
+				/* Separation lives on the text rather than in a column gap so it collapses with the
+   label instead of leaving a dead strip beside the icon at the floor. */
+				column-gap: 0;
 				align-items: center;
 				width: 100%;
 				max-width: 100%;
 				overflow: hidden;
-
-				/* Separation lives on the text rather than in a column gap so it collapses with the
-				   label instead of leaving a dead strip beside the icon at the floor. */
-				column-gap: 0;
 			}
 
 			.publish-button__text {
@@ -1324,14 +1551,19 @@ export class GlPublishButton extends LitElement {
 				<a
 					href=${this._webview.createCommandLink('gitlens.publishBranch:')}
 					class="action-button"
-					aria-label="Publish Branch"
+					aria-label=${l10n.t('Publish Branch')}
 				>
 					<code-icon class="action-button__icon" icon="cloud-upload"></code-icon>
-					<span class="publish-button__text">Publish Branch</span>
+					<span class="publish-button__text">${l10n.t('Publish Branch')}</span>
 				</a>
 				<span slot="content">
-					Publish (push) ${this.branchName ? html`<strong>${this.branchName}</strong>` : 'this branch'} to a
-					remote
+					${
+						this.branchName
+							? localizedContent(l10n.t('Publish (push) {branch} to a remote'), {
+									branch: html`<strong>${this.branchName}</strong>`,
+								})
+							: l10n.t('Publish (push) this branch to a remote')
+					}
 				</span>
 			</gl-tooltip>
 		`;

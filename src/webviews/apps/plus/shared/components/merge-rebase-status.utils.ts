@@ -1,13 +1,11 @@
+import * as l10n from '@vscode/l10n';
 import type { GitPausedOperationStatus, GitRebaseStatus } from '@gitlens/git/models/pausedOperationStatus.js';
 import type { GitReference, GitRevisionReference } from '@gitlens/git/models/reference.js';
-import { splitCommitMessage } from '@gitlens/git/utils/commit.utils.js';
-import type { PausedOperationVariant } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
-import {
-	getConflictCurrentRef,
-	pausedOperationStatusStringsByType,
-} from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+import { getConflictCurrentRef } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
 import { shortenRevision } from '@gitlens/git/utils/revision.utils.js';
-import { pluralize, truncate } from '@gitlens/utils/string.js';
+import type { PausedOperationVariant } from '@gitlens/utils/pausedOperation.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { splitMessage, truncate } from '@gitlens/utils/string.js';
 
 /** Longest commit subject a tooltip carries before it's elided. */
 const maxSubjectLength = 50;
@@ -20,16 +18,6 @@ export function isPausedOperationStepped(
 	return status.type === 'rebase' && variant !== 'pending';
 }
 
-/** The strip's leading phrase; the paused-at pill and the refs are appended to it by the caller. */
-export function getPausedOperationBarLabel(status: GitPausedOperationStatus, variant: PausedOperationVariant): string {
-	const strings = pausedOperationStatusStringsByType[status.type];
-	if (variant === 'conflicts') return `${strings.prose} paused`;
-	// The shared `pending` string trails a preposition for callers that append a ref inline (the tree
-	// view). The bar's refs can shed, so it carries that "of" inside the refs group instead.
-	if (variant === 'pending' && status.type === 'rebase') return 'Pending rebase';
-	return strings.label;
-}
-
 /** The primary action's label — the conflict count rides on the button, where it's acted on. */
 export function getPausedOperationBarActionLabel(
 	status: GitPausedOperationStatus,
@@ -38,9 +26,23 @@ export function getPausedOperationBarActionLabel(
 ): string {
 	if (variant === 'conflicts') {
 		// Hosts that don't carry a count still get an actionable label.
-		return conflictsCount == null ? 'Resolve Conflicts' : `Resolve ${pluralize('Conflict', conflictsCount)}`;
+		if (conflictsCount == null) return l10n.t('Resolve Conflicts');
+
+		return formatPlural(l10n.t('{count, plural, one{Resolve {count} Conflict} other{Resolve {count} Conflicts}}'), {
+			count: conflictsCount,
+		});
 	}
-	return `Continue ${pausedOperationStatusStringsByType[status.type].name}`;
+
+	switch (status.type) {
+		case 'cherry-pick':
+			return l10n.t('Continue Cherry Pick');
+		case 'merge':
+			return l10n.t('Continue Merge');
+		case 'rebase':
+			return l10n.t('Continue Rebase');
+		case 'revert':
+			return l10n.t('Continue Revert');
+	}
 }
 
 /** `Merging feature into main` — names the operands the ref chips carry, so the identity survives the
@@ -50,8 +52,16 @@ export function getPausedOperationBarRefsSummary(status: GitPausedOperationStatu
 	const incoming = nameRef(status.incoming);
 	if (current == null || incoming == null) return undefined;
 
-	const strings = pausedOperationStatusStringsByType[status.type];
-	return `${strings.label} ${incoming} ${strings.directionality} ${current}`;
+	switch (status.type) {
+		case 'cherry-pick':
+			return l10n.t('Cherry picking {incoming} into {current}', { incoming: incoming, current: current });
+		case 'merge':
+			return l10n.t('Merging {incoming} into {current}', { incoming: incoming, current: current });
+		case 'rebase':
+			return l10n.t('Rebasing {incoming} onto {current}', { incoming: incoming, current: current });
+		case 'revert':
+			return l10n.t('Reverting {incoming} in {current}', { incoming: incoming, current: current });
+	}
 }
 
 function nameRef(ref: GitReference | undefined): string | undefined {
@@ -67,25 +77,89 @@ export function getPausedOperationBarIconTooltip(
 	variant: PausedOperationVariant,
 	conflictsCount: number | undefined,
 ): string | undefined {
-	let state;
+	const state = getPausedOperationBarStateTooltip(status, variant, conflictsCount);
+	const refs = getPausedOperationBarRefsSummary(status);
+	return refs == null
+		? state
+		: l10n.t({
+				message: '{references}. {state}',
+				args: { references: refs, state: state },
+				comment: [
+					'Paused Git operation tooltip. “references” names both refs and “state” is a complete status sentence.',
+				],
+			});
+}
+
+function getPausedOperationBarStateTooltip(
+	status: GitPausedOperationStatus,
+	variant: PausedOperationVariant,
+	conflictsCount: number | undefined,
+): string {
 	if (variant === 'pending') {
-		state = 'The rebase hasn’t reached its first step';
-	} else if (variant === 'conflicts') {
-		const name = pausedOperationStatusStringsByType[status.type].prose.toLowerCase();
-		state =
-			conflictsCount == null
-				? `Conflicting files must be resolved before the ${name} can continue`
-				: `${pluralize('conflicting file', conflictsCount)} must be resolved before the ${name} can continue`;
-	} else {
-		state = 'No unresolved conflicts — ready to continue';
+		return l10n.t('The rebase hasn’t reached its first step');
 	}
 
-	const refs = getPausedOperationBarRefsSummary(status);
-	return refs == null ? state : `${refs}. ${state}`;
+	if (variant !== 'conflicts') return l10n.t('No unresolved conflicts — ready to continue');
+
+	switch (status.type) {
+		case 'cherry-pick':
+			if (conflictsCount == null) {
+				return l10n.t('Conflicting files must be resolved before the cherry-pick can continue');
+			}
+
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{{count} conflicting file must be resolved before the cherry-pick can continue} other{{count} conflicting files must be resolved before the cherry-pick can continue}}',
+				),
+				{ count: conflictsCount },
+			);
+		case 'merge':
+			if (conflictsCount == null) {
+				return l10n.t('Conflicting files must be resolved before the merge can continue');
+			}
+
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{{count} conflicting file must be resolved before the merge can continue} other{{count} conflicting files must be resolved before the merge can continue}}',
+				),
+				{ count: conflictsCount },
+			);
+		case 'rebase':
+			if (conflictsCount == null) {
+				return l10n.t('Conflicting files must be resolved before the rebase can continue');
+			}
+
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{{count} conflicting file must be resolved before the rebase can continue} other{{count} conflicting files must be resolved before the rebase can continue}}',
+				),
+				{ count: conflictsCount },
+			);
+		case 'revert':
+			if (conflictsCount == null) {
+				return l10n.t('Conflicting files must be resolved before the revert can continue');
+			}
+
+			return formatPlural(
+				l10n.t(
+					'{count, plural, one{{count} conflicting file must be resolved before the revert can continue} other{{count} conflicting files must be resolved before the revert can continue}}',
+				),
+				{ count: conflictsCount },
+			);
+	}
 }
 
 export function getPausedOperationAbortLabel(status: GitPausedOperationStatus): string {
-	return `Abort ${pausedOperationStatusStringsByType[status.type].name}`;
+	switch (status.type) {
+		case 'cherry-pick':
+			return l10n.t('Abort Cherry Pick');
+		case 'merge':
+			return l10n.t('Abort Merge');
+		case 'rebase':
+			return l10n.t('Abort Rebase');
+		case 'revert':
+			return l10n.t('Abort Revert');
+	}
 }
 
 /** The commit a skip drops: the rebase's current step, or the single commit a cherry-pick/revert applies. */
@@ -96,8 +170,8 @@ export function getPausedOperationSkipRef(status: GitPausedOperationStatus): Git
 
 /** The Skip action's title; the victim rides in the tooltip detail, not the label. */
 export function getPausedOperationSkipLabel(status: GitPausedOperationStatus): string {
-	if (getPausedOperationSkipRef(status) == null) return 'Skip';
-	return status.type === 'rebase' ? 'Skip Paused Commit' : 'Skip Commit';
+	if (getPausedOperationSkipRef(status) == null) return l10n.t('Skip');
+	return status.type === 'rebase' ? l10n.t('Skip Paused Commit') : l10n.t('Skip Commit');
 }
 
 /** The Skip tooltip's detail line — names the commit a skip would drop. */
@@ -110,13 +184,20 @@ export function getPausedOperationStepTooltipParts(status: GitRebaseStatus): {
 	detail: string;
 	subject: string | undefined;
 } {
-	const step = `step ${status.steps.current.number} of ${status.steps.total}`;
 	const sha = shortenRevision(status.steps.current.commit?.ref);
+	const current = `${status.steps.current.number}`;
+	const total = `${status.steps.total}`;
 
-	const { summary } = splitCommitMessage(status.steps.current.commit?.message);
+	const { summary } = splitMessage(status.steps.current.commit?.message);
 	return {
-		detail: sha ? `Rebase paused at ${sha} (${step})` : `Rebase paused (${step})`,
-		subject: summary ? `"${truncate(summary, maxSubjectLength)}"` : undefined,
+		detail: sha
+			? l10n.t('Rebase paused at {sha} (step {current} of {total})', {
+					sha: sha,
+					current: current,
+					total: total,
+				})
+			: l10n.t('Rebase paused (step {current} of {total})', { current: current, total: total }),
+		subject: summary ? l10n.t('"{subject}"', { subject: truncate(summary, maxSubjectLength) }) : undefined,
 	};
 }
 
@@ -127,6 +208,6 @@ export function describePausedOperationCommit(ref: GitRevisionReference | undefi
 	const sha = shortenRevision(ref.ref);
 	if (!sha) return undefined;
 
-	const { summary } = splitCommitMessage(ref.message);
-	return summary ? `${sha} "${truncate(summary, maxSubjectLength)}"` : sha;
+	const { summary } = splitMessage(ref.message);
+	return summary ? l10n.t('{sha} "{subject}"', { sha: sha, subject: truncate(summary, maxSubjectLength) }) : sha;
 }

@@ -1,16 +1,26 @@
 import type { Remote } from '@eamodio/supertalk';
+import { getWipRowWorktreePath } from '@gitkraken/commit-graph/wip/identity.js';
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume, provide } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
+import { keyed } from 'lit/directives/keyed.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
-import { getBranchId } from '@gitlens/git/utils/branch.utils.js';
 import type { Disposable } from '@gitlens/utils/disposable.js';
+import { getBranchId } from '@gitlens/utils/gitRefs.js';
 import type { OverlayEntry } from '@gitlens/utils/keys/keybinding.js';
 import { normalizePath } from '@gitlens/utils/path.js';
-import type { AgentSessionState, PastAgentSessionsResult } from '../../../../../agents/models/agentSessionState.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import type {
+	AgentSessionState,
+	PastAgentSessionDetail,
+	PastAgentSessionsResult,
+	PastAgentSessionState,
+} from '../../../../../agents/models/agentSessionState.js';
 import type { StashApplyCommandArgs } from '../../../../../commands/stashApply.js';
 import type { ViewFilesLayout } from '../../../../../config.js';
 import type { StoredGraphWipDraft } from '../../../../../constants.storage.js';
@@ -30,12 +40,7 @@ import type {
 	GraphSidebarPullRequest,
 	State,
 } from '../../../../plus/graph/protocol.js';
-import {
-	GetWipLineStatsRequest,
-	getWipRowWorktreePath,
-	isWipSelectionSha,
-	UpdateWipDraftCommand,
-} from '../../../../plus/graph/protocol.js';
+import { isWipSelectionSha } from '../../../../plus/graph/protocol.js';
 import type { AiModelInfo, ConflictDetails } from '../../../../rpc/services/types.js';
 import type { FileChangeListItemDetail } from '../../../commitDetails/components/gl-details-base.js';
 import type {
@@ -43,23 +48,34 @@ import type {
 	CopyWipPatchEventDetail,
 	OpenMultipleChangesArgs,
 } from '../../../shared/actions/file.js';
-import type { AgentSessionCategory, PastAgentSessionsResolver } from '../../../shared/agentUtils.js';
+import { noopUnlessReal, notifyService } from '../../../shared/actions/rpc.js';
+import type {
+	AgentSessionCategory,
+	PastAgentSessionsPager,
+	PastAgentSessionsResolver,
+} from '../../../shared/agentUtils.js';
 import {
 	agentPhaseToCategory,
+	createPastAgentSessionsPager,
 	createPastAgentSessionsResolver,
+	filterLiveAgentSessions,
+	initialPastAgentSessionLimit,
+	isAgentSessionCurrentForWorktree,
 	matchAgentSessionsForWorktree,
 } from '../../../shared/agentUtils.js';
 import { renderDetailsMaximizeChip } from '../../../shared/components/details-header/details-maximize-chip.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { ContextMenuProxyController } from '../../../shared/controllers/context-menu-proxy.js';
 import type { NavigationState } from '../../../shared/controllers/navigationStack.js';
+import { waitForFocusSettled } from '../../../shared/focus.js';
 import { graphServicesContext, graphStateContext } from '../context.js';
 import type { GraphCrossPaneState } from '../graphCrossPaneState.js';
 import { graphCrossPaneContext } from '../graphCrossPaneState.js';
 import type { GraphLaunchpadState } from '../graphLaunchpadState.js';
 import { graphLaunchpadContext } from '../graphLaunchpadState.js';
+import { findFixupTargetRow, parseFixupSubject } from '../utils/fixup.utils.js';
+import type { FixupTarget } from '../utils/fixup.utils.js';
 import { getSelectedRepoPath } from '../utils/repository.utils.js';
 import type { AnchorKey } from './anchorKey.js';
 import { anchorKey } from './anchorKey.js';
@@ -82,9 +98,15 @@ import type {
 } from './detailsState.js';
 import { createDetailsState, getActiveTaskAction, getOpenComparison } from './detailsState.js';
 import type { DetailsSelection } from './detailsWorkflowController.js';
-import { DetailsWorkflowController } from './detailsWorkflowController.js';
-import type { ExpandState, GlDetailsAgentStatus } from './gl-details-agent-status.js';
-import { expandVisibleCategories } from './gl-details-agent-status.js';
+import { DetailsWorkflowController, runFailureMessage } from './detailsWorkflowController.js';
+import type { GlCommitBox } from './gl-commit-box.js';
+import type {
+	ExpandState,
+	GlDetailsAgentStatus,
+	PastAgentSessionArchiveRequest,
+	PastAgentSessionsMoreRequest,
+} from './gl-details-agent-status.js';
+import { expandVisibleCategories, shouldShowPastSessions } from './gl-details-agent-status.js';
 import type { FileCompareBetweenDetail } from './gl-details-compare-mode-panel.js';
 import { hasOnlyWip } from './gl-details-compare-mode-panel.js';
 import type { GlDetailsComposeModePanel } from './gl-details-compose-mode-panel.js';
@@ -98,24 +120,33 @@ import type {
 import type { BranchSheetRef } from './gl-graph-branch-sheet-pane.js';
 import type { RebaseSummaryViewDiffDetail } from './gl-rebase-summary-sheet.js';
 import type { ConflictSheetCommitEventDetail, ConflictSheetSideEventDetail } from './gl-wip-conflict-sheet.js';
-import type { SheetDescriptor, SheetKind, SheetOverlayCoordinator } from './sheetStack.js';
+import type {
+	PullRequestSheetPayload,
+	PullRequestSheetTarget,
+	SheetDescriptor,
+	SheetKind,
+	SheetOverlayCoordinator,
+} from './sheetStack.js';
 import {
 	popSheet as popSheetFromStack,
 	projectCompareSignal,
 	pushSheet,
 	reduceOnSelectionChange,
 	removeKind,
+	removePendingPullRequestSheet,
 	replaceStack,
+	replaceTopSheet,
+	resolvePullRequestSheet,
 	sheetKey,
 } from './sheetStack.js';
 import { sheetWrapperSelector } from './sheetWrapper.js';
 import '../../../commitDetails/components/gl-details-commit-panel.js';
 import '../../../commitDetails/components/gl-details-wip-panel.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/chips/action-chip.js';
 import '../../../shared/components/commit-sha.js';
 import '../../../shared/components/overlays/detail-sheet.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../../shared/components/progress.js';
 import '../../../shared/components/split-panel/split-panel.js';
 import './gl-graph-branch-sheet.js';
@@ -123,6 +154,7 @@ import './gl-graph-compare-pinned.js';
 import './gl-graph-compare-sheet.js';
 import './gl-rebase-summary-sheet.js';
 import './gl-graph-pr-sheet.js';
+import './gl-graph-agent-sheet.js';
 import './gl-wip-conflict-sheet.js';
 import './gl-details-multicommit-panel.js';
 import './gl-details-compose-mode-panel.js';
@@ -160,13 +192,17 @@ function sheetKindsEqual(a: readonly SheetKind[], b: readonly SheetKind[]): bool
 	return a.length === b.length && a.every((k, i) => k === b[i]);
 }
 
+const emptyModeExclusions: ReadonlySet<string> = new Set();
+
 /** Renders a mode-status counts snippet with leading icons — "🟢 1 commit · 📄 2 files".
  *  When `onResume` is provided, the whole snippet becomes a clickable "Resume" affordance
  *  prefixed with the verb and trailed with an arrow — replaces the old in-panel resume bar. */
 function formatModeCounts(primary: number, files: number, primaryLabel: 'commits' | 'findings', onResume?: () => void) {
-	const singular = primaryLabel === 'commits' ? 'commit' : 'finding';
-	const primaryText = `${primary} ${primary === 1 ? singular : primaryLabel}`;
-	const fileText = `${files} ${files === 1 ? 'file' : 'files'}`;
+	const primaryText =
+		primaryLabel === 'commits'
+			? formatPlural(l10n.t('{count, plural, one{{count} commit} other{{count} commits}}'), { count: primary })
+			: formatPlural(l10n.t('{count, plural, one{{count} finding} other{{count} findings}}'), { count: primary });
+	const fileText = formatPlural(l10n.t('{count, plural, one{{count} file} other{{count} files}}'), { count: files });
 	const primaryIcon = primaryLabel === 'commits' ? 'git-commit' : 'search';
 	const counts = html`<span class="mode-status__group"
 			><code-icon icon=${primaryIcon}></code-icon>${primaryText}</span
@@ -175,7 +211,7 @@ function formatModeCounts(primary: number, files: number, primaryLabel: 'commits
 
 	if (onResume == null) return counts;
 
-	const resumeLabel = primaryLabel === 'commits' ? 'Resume Plan' : 'Resume Review';
+	const resumeLabel = primaryLabel === 'commits' ? l10n.t('Resume Plan') : l10n.t('Resume Review');
 	return html`<button class="mode-status__resume" type="button" aria-label=${resumeLabel} @click=${onResume}>
 		<span class="mode-status__resume-verb">${resumeLabel}</span>
 		${counts}
@@ -185,15 +221,28 @@ function formatModeCounts(primary: number, files: number, primaryLabel: 'commits
 
 /** "<verb> with <model>..." generating snippet for the mode-status row. The model name carries the
  *  full "provider · model" in a gl-tooltip; falls back to the bare verb when no model is known. */
-function formatGeneratingStatus(verb: 'Composing' | 'Reviewing' | 'Resolving', model: AiModelInfo | undefined) {
-	if (model == null) return `${verb}...`;
+function formatGeneratingStatus(mode: 'compose' | 'review' | 'resolve', model: AiModelInfo | undefined) {
+	if (model == null) {
+		return mode === 'compose'
+			? l10n.t('Composing...')
+			: mode === 'review'
+				? l10n.t('Reviewing...')
+				: l10n.t('Resolving...');
+	}
 
 	const full = `${model.provider.name} · ${model.name}`;
+	const message =
+		mode === 'compose'
+			? l10n.t('Composing with {model}...')
+			: mode === 'review'
+				? l10n.t('Reviewing with {model}...')
+				: l10n.t('Resolving with {model}...');
 	// Wrap in a single element so the `.mode-status` flex `gap` doesn't insert space around the
 	// model name — inside, the verb/name/ellipsis flow as plain inline text.
 	return html`<span class="mode-status__generating"
-		>${verb} with <gl-tooltip content=${full}><span class="mode-status__model">${model.name}</span></gl-tooltip
-		>...</span
+		>${localizedContent(message, {
+			model: html`<gl-tooltip content=${full}><span class="mode-status__model">${model.name}</span></gl-tooltip>`,
+		})}</span
 	>`;
 }
 
@@ -206,6 +255,9 @@ declare global {
 		/** The sheet stack's kind composition changed — e.g. the app sizes the details pane for a
 		 *  rebase summary sheet opening or closing. */
 		'gl-graph-sheet-stack-change': CustomEvent<{ kinds: SheetKind[]; prevKinds: SheetKind[] }>;
+		/** {@link GlGraphDetailsPanel.minContentHeight} changed — the app re-clamps the bottom-docked
+		 *  details split so the pane can't sit below what fits the commit box and file-list floor. */
+		'gl-graph-details-min-height-changed': CustomEvent<void>;
 	}
 }
 
@@ -218,7 +270,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	@state()
 	private _remoteServices?: Remote<GraphServices>;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private _graphState?: typeof graphStateContext.__context__;
 
 	// Shared Launchpad summary, owned/fetched by `gl-graph-app`. Read here only to feed the WIP
@@ -226,9 +278,6 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	// `detailsState` (its other consumers — compare/multi-commit panels — still need it).
 	@consume({ context: graphLaunchpadContext, subscribe: true })
 	private _launchpadState?: GraphLaunchpadState;
-
-	@consume({ context: ipcContext })
-	private _ipc?: typeof ipcContext.__context__;
 
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
@@ -351,6 +400,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 
 	private _servicesResolved = false;
 	private _pendingCompare?: {
+		options?: { silent?: boolean };
 		params: Parameters<GlGraphDetailsPanel['openCompareMode']>[0];
 		onReady?: () => void;
 	};
@@ -394,7 +444,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	private _agentStatusSplitPosition?: number;
 
 	/** Per-file working-tree line stats (keyed by normalized path) for the WIP file rows. Fetched
-	 *  lazily via {@link GetWipLineStatsRequest} — only while the WIP file list is shown — since the
+	 *  lazily via `services.wip.getLineStats` — only while the WIP file list is shown — since the
 	 *  every-tick `wip` push carries file status only, never line counts. */
 	@state()
 	private _wipFileStats?: GetWipLineStatsResponse;
@@ -403,9 +453,10 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  the same snapshot doesn't. */
 	private _wipFileStatsFetchedFor?: Wip;
 
-	/** Worktree path the past-agent-sessions resource was last fetched for — dedupes
-	 *  {@link updateWipPastSessions} so re-rendering the same WIP row doesn't refetch. */
-	private _lastPastSessionsPath?: string;
+	/** Identity the past-agent-sessions resource was last fetched for. The ended-session ids are
+	 *  part of the identity because live sessions are excluded from history at fetch time: when one
+	 *  ends, the cached result cannot represent it and must be refreshed. */
+	private _lastPastSessionsFetch?: { worktreePath: string; endedSessionIds: string; limit: number };
 
 	/** User's explicit choice for the agents-pane mode — collapsed (bar only) or expanded
 	 *  (all cards). Flipped by chevron clicks via {@link _onAgentStatusExpandRequest}. The
@@ -443,6 +494,41 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	private _cyclePastSessions: PastAgentSessionsResult | undefined;
 	private readonly _pastSessionsResolver: PastAgentSessionsResolver = createPastAgentSessionsResolver();
 
+	/** Shared "Show More" / "Archive then refetch" policy for the past-agent-sessions section — see
+	 *  {@link createPastAgentSessionsPager}. Host closures read `_lastPastSessionsFetch` and the
+	 *  `pastAgentSessions` resource live, so this can be constructed once. */
+	private readonly _pastSessionsPager: PastAgentSessionsPager = createPastAgentSessionsPager({
+		getLimit: () => this._lastPastSessionsFetch?.limit ?? 0,
+		isLoading: () => this._actions?.resources.pastAgentSessions.loading.get() ?? false,
+		isCurrent: () => {
+			const worktreePath = this._state.wip.get()?.repo?.path;
+			return (
+				this._actions?.resources.pastAgentSessions != null &&
+				this._lastPastSessionsFetch != null &&
+				this._lastPastSessionsFetch.worktreePath === worktreePath
+			);
+		},
+		fetch: async (limit: number): Promise<void> => {
+			const worktreePath = this._state.wip.get()?.repo?.path;
+			const lastFetch = this._lastPastSessionsFetch;
+			const resource = this._actions?.resources.pastAgentSessions;
+			if (worktreePath == null || lastFetch?.worktreePath !== worktreePath || resource == null) return;
+
+			await resource.fetch(worktreePath, limit);
+			if (resource.status.get() !== 'success' || this._lastPastSessionsFetch !== lastFetch) return;
+
+			this._lastPastSessionsFetch = { ...lastFetch, limit: limit };
+			this.requestUpdate();
+		},
+		archiveSession: async (sessionId: string, providerId: string): Promise<boolean> => {
+			const actions = this._actions;
+			if (actions == null) return false;
+
+			const agents = await actions.services.agents;
+			return agents.archiveSession(sessionId, providerId);
+		},
+	});
+
 	/** Clamps drag to the [10%, {@link agentStatusMaxPct}%] envelope. The visual "shrink to
 	 *  content when too small" behavior is handled by CSS `fit-content(<max>%)` — the snap
 	 *  function only enforces the absolute floor/ceiling on the user's intended size. */
@@ -467,6 +553,16 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		if (!wasCollapsed) {
 			this._selectedAgentSessionId = undefined;
 		}
+	};
+
+	private readonly _onAgentStatusPastSessionsMoreRequest = (e: CustomEvent<PastAgentSessionsMoreRequest>): void => {
+		void this._pastSessionsPager.more(e.detail.limit);
+	};
+
+	private readonly _onAgentStatusPastSessionArchiveRequest = (
+		e: CustomEvent<PastAgentSessionArchiveRequest>,
+	): void => {
+		this._pastSessionsPager.archive(e.detail.sessionId, e.detail.providerId).catch(noopUnlessReal);
 	};
 
 	private readonly _onAgentStatusSplitChange = (e: CustomEvent<{ position: number }>) => {
@@ -689,6 +785,11 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 
 		if (this._wipFileStatsFetchedFor === wip) return;
 
+		// Bail before marking `wip` as fetched — a not-yet-connected remote must retry once
+		// `_remoteServices` (a `@state()`) resolves and re-triggers `updated()`.
+		const services = this._remoteServices;
+		if (services == null) return;
+
 		// On a repo/worktree switch, drop the prior repo's numbers immediately so we never show them
 		// against the new tree; same-repo working-tree ticks update in place (no row flicker).
 		if (this._wipFileStatsFetchedFor?.repo?.path !== repoPath) {
@@ -696,26 +797,55 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		}
 		this._wipFileStatsFetchedFor = wip;
 
-		void this._ipc?.sendRequest(GetWipLineStatsRequest, { repoPath: repoPath }).then(stats => {
-			// Ignore a response a newer snapshot (or a view change) has already superseded.
-			if (this._wipFileStatsFetchedFor === wip) {
-				this._wipFileStats = stats ?? undefined;
+		void (async () => {
+			try {
+				const wipService = await services.wip;
+				const stats = await wipService.getLineStats(repoPath);
+				// Ignore a response a newer snapshot (or a view change) has already superseded.
+				if (this._wipFileStatsFetchedFor === wip) {
+					this._wipFileStats = stats ?? undefined;
+				}
+			} catch (ex) {
+				// Stats stay absent; the next working-tree tick refetches.
+				noopUnlessReal(ex);
 			}
-		});
+		})();
 	}
 
 	/** Lazily fetch the worktree's past (resumable) agent sessions while a WIP row is selected,
-	 *  mirroring {@link updateWipFileStats}. Dedupes on {@link _lastPastSessionsPath} so re-rendering
-	 *  the same worktree doesn't refetch; the `Resource` itself (a `SignalWatcher` dependency) drives
-	 *  the re-render once the fetch resolves. */
+	 *  mirroring {@link updateWipFileStats}. Dedupes on worktree + tracked-ended ids so ordinary live
+	 *  status churn doesn't refetch, while a live-to-ended transition refreshes the pull-only history.
+	 *  The `Resource` itself (a `SignalWatcher` dependency) drives the re-render once the fetch resolves. */
 	private updateWipPastSessions(): void {
 		if (!this.isWip) return;
 
-		const worktreePath = this._state.wip.get()?.repo?.path;
-		if (worktreePath == null || worktreePath === this._lastPastSessionsPath) return;
+		const wip = this._state.wip.get();
+		const worktreePath = wip?.repo?.path;
+		if (wip == null || worktreePath == null) return;
 
-		this._lastPastSessionsPath = worktreePath;
-		void this._actions?.resources.pastAgentSessions.fetch(worktreePath);
+		const endedSessionIds = JSON.stringify(
+			(this.getWorktreeAgentSessions(wip) ?? [])
+				.filter(s => s.phase === 'ended')
+				.map(s => s.id)
+				.sort(),
+		);
+		const lastFetch = this._lastPastSessionsFetch;
+		if (lastFetch?.worktreePath === worktreePath && lastFetch.endedSessionIds === endedSessionIds) return;
+
+		const resource = this._actions?.resources.pastAgentSessions;
+		if (resource == null) return;
+
+		const limit = lastFetch?.worktreePath === worktreePath ? lastFetch.limit : initialPastAgentSessionLimit;
+		resource.reset();
+		this._lastPastSessionsFetch = { worktreePath: worktreePath, endedSessionIds: endedSessionIds, limit: limit };
+		void resource.fetch(worktreePath, limit);
+	}
+
+	/** Explicit WIP refreshes restart history at its compact initial page and bypass the ordinary
+	 *  worktree/ended-session dedupe, so newly archived or otherwise changed rows are reflected. */
+	private refreshWipPastSessions(): void {
+		this._lastPastSessionsFetch = undefined;
+		this.updateWipPastSessions();
 	}
 
 	/** Attach the lazily-fetched per-file line stats to the WIP file rows so `gl-file-tree-pane`
@@ -748,7 +878,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  when no selection. Compare wins over the underlying selection context when its sheet is
 	 *  open since it's the topmost surface. */
 	get currentMode(): GraphDetailsMode {
-		if (this._state.compareSheetOpen.get()) return 'compare';
+		if (this._state.comparePresentation.get() === 'sheet') return 'compare';
 
 		const active = this._state.activeMode.get();
 		if (active != null) return active;
@@ -756,9 +886,41 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		return this.isMultiCommit ? 'multicommit' : this.isWip ? 'wip' : 'commit';
 	}
 
+	/**
+	 * Rigid minimum height (px) of the current WIP layout: everything above the file list
+	 * (header, agents bar), the file list's CSS floor, and the commit box. Used by the graph's
+	 * details split to keep the pane from being sized below what fits without clipping the
+	 * commit box. `undefined` when the WIP layout isn't rendered (other modes).
+	 */
+	get minContentHeight(): number | undefined {
+		const files = this.renderRoot.querySelector<HTMLElement>('.commit-panel__files');
+		const box = this.renderRoot.querySelector<HTMLElement>('gl-commit-box');
+		if (files == null || box == null) return undefined;
+
+		const floor = parseFloat(getComputedStyle(files).minHeight) || 0;
+		const agentSplit = this.renderRoot.querySelector<HTMLElement>('.agent-status-split');
+		if (agentSplit != null) {
+			// Count the agents section at its heading height, NOT its live track height — the track
+			// compresses under a drag (its cards scroll beneath the sticky heading), so a live
+			// measurement would let the minimum chase the drag downward. `agentSplit.offsetTop` is
+			// relative to `.details-content` (nearest positioned ancestor) and covers the header
+			// block above the split; the slack absorbs the divider and gaps below the commit box.
+			const heading =
+				this.renderRoot.querySelector<GlDetailsAgentStatus>('gl-details-agent-status')?.headingHeight ?? 0;
+			return agentSplit.offsetTop + heading + floor + box.offsetHeight + 8;
+		}
+
+		// Direct (no agents) layout: `files.offsetTop` covers everything above the file list.
+		return files.offsetTop + floor + box.offsetHeight + 4;
+	}
+
 	/** Last value reported via `gl-graph-details-mode-changed` — guards the dispatch in `updated()`
 	 *  so the event fires only on real transitions, not on re-renders that don't change the mode. */
 	private _lastNotifiedMode: GraphDetailsMode = 'none';
+
+	/** Last value reported via `gl-graph-details-min-height-changed` — guards the dispatch in
+	 *  `updated()` so the event fires only when the measured minimum actually changes. */
+	private _lastNotifiedMinContentHeight: number | undefined;
 
 	/** One-shot: set before a programmatic (ambient) mode entry so `updated()` skips the AI-input
 	 *  focus — keeps focus-on-entry for deliberate toggles only. Consumed every `updated()`. */
@@ -843,7 +1005,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	};
 
 	/** Shared handler for `compose-cancel` / `review-cancel` — aborts the in-flight generation
-	 *  for the engaged anchor and removes its registry entry. Panel stays in ENABLED-idle so
+	 *  for the engaged anchor and returns to input while retaining its prior result. Panel stays in idle so
 	 *  the user can re-run if they want. (Only ever fired by the mode panel's in-flight Cancel
 	 *  button, which is only rendered while `status === 'loading'`.) */
 	private handleCancelMode = (): void => {
@@ -886,9 +1048,9 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  explicit left/right refs (e.g. from a sidebar tree compare action). The current graph
 	 *  selection is left untouched; both sides of the comparison are driven by the supplied
 	 *  overrides. */
-	openCompareMode(params: CompareModeParams, onReady?: () => void): boolean {
+	openCompareMode(params: CompareModeParams, onReady?: () => void, options?: { silent?: boolean }): boolean {
 		if (this._workflow == null) {
-			this._pendingCompare = { params: params, onReady: onReady };
+			this._pendingCompare = { params: params, onReady: onReady, options: options };
 			return false;
 		}
 
@@ -899,13 +1061,17 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			...this.currentSelection(),
 			repoPath: params.repoPath,
 		};
-		this._workflow.openCompare(selection, {
-			leftRef: params.leftRef,
-			leftRefType: params.leftRefType,
-			rightRef: params.rightRef,
-			rightRefType: params.rightRefType,
-			includeWorkingTree: params.includeWorkingTree,
-		});
+		this._workflow.openCompare(
+			selection,
+			{
+				leftRef: params.leftRef,
+				leftRefType: params.leftRefType,
+				rightRef: params.rightRef,
+				rightRefType: params.rightRefType,
+				includeWorkingTree: params.includeWorkingTree,
+			},
+			options,
+		);
 		return true;
 	}
 
@@ -978,22 +1144,151 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		this.clearSheets();
 	}
 
-	/** Opens the pull request sheet — a details view carrying the row's own payload, so it costs no
-	 *  fetch. `layers` is the stack's members (top layer first) when the pull request is stacked.
-	 *  `push` stacks it over the current sheet (an in-sheet opener, e.g. the branch sheet's PR chip);
-	 *  otherwise it replaces the stack like any other external opener. */
+	/** Opens the pull request sheet for `target`. `payload` undefined opens it in its loading form —
+	 *  the caller doesn't have the pull request's data yet and fills it in later via
+	 *  {@link resolvePrSheet} (or discards it via {@link cancelPrSheet}); given, it opens with full
+	 *  content in one step, no loading flash. `push` stacks it over the current sheet (an in-sheet
+	 *  opener, e.g. the branch sheet's PR chip); otherwise it replaces the stack like any other
+	 *  external opener. */
 	openPrSheet(
-		pr: GraphSidebarPullRequest,
-		layers?: GraphSidebarPullRequest[],
-		options?: { push?: boolean; stackRoot?: boolean },
+		target: PullRequestSheetTarget,
+		payload: PullRequestSheetPayload | undefined,
+		options?: { push?: boolean },
 	): void {
-		this.openSheet({ kind: 'pullRequest', pr: pr, layers: layers, stackRoot: options?.stackRoot }, options);
+		this.openSheet({ kind: 'pullRequest', target: target, ...payload }, options);
+	}
+
+	/** Fills in the pending (loading-form) pull request sheet opened for `target` — a no-op if it
+	 *  already resolved, was closed, or belongs to a different target. */
+	resolvePrSheet(target: PullRequestSheetTarget, payload: PullRequestSheetPayload): void {
+		const next = resolvePullRequestSheet(this._sheetStack, target, payload);
+		if (next !== this._sheetStack) {
+			this._sheetStack = next;
+		}
+	}
+
+	/** Removes the pending (loading-form) pull request sheet opened for `target` — used when its
+	 *  resolution comes up empty, or a newer open supersedes it. A no-op if it already resolved or was
+	 *  closed. */
+	cancelPrSheet(target: PullRequestSheetTarget): void {
+		const { stack, removed } = removePendingPullRequestSheet(this._sheetStack, target);
+		if (removed.some(Boolean)) {
+			this._sheetStack = stack;
+			this._sheetFocusMemos = this._sheetFocusMemos.filter((_, i) => !removed[i]);
+		}
 	}
 
 	/** Close the pull request sheet, wherever it sits in the stack. */
 	closePrSheet(): void {
 		this.removeSheetKind('pullRequest');
 	}
+
+	/** Opens the agent session sheet for a live agent card click. Data-only: `renderSheets`
+	 *  resolves the session from the full live snapshot on every render, so this costs no fetch.
+	 *  Pushed, not replaced: a card inside the branch sheet stacks the agent sheet on top so
+	 *  closing it returns there; on an empty stack push and replace are the same. */
+	openAgentSessionSheet(sessionId: string, providerId: string): void {
+		this.openSheet({ kind: 'agentSession', sessionId: sessionId, providerId: providerId }, { push: true });
+	}
+
+	private handleAgentSessionSheetOpen = (e: CustomEvent<{ sessionId: string; providerId: string }>): void => {
+		this.openAgentSessionSheet(e.detail.sessionId, e.detail.providerId);
+	};
+
+	/** Session id the `pastAgentSessionDetail` resource is currently fetching/has fetched for —
+	 *  guards `_pastSessionDetail` against a stale response landing after the user moved on to a
+	 *  different past-session sheet (or closed it) before the fetch resolved. */
+	private _pastSessionDetailFetchId?: string;
+
+	@state() private _pastSessionDetail?: PastAgentSessionDetail;
+
+	/** Opens the past-session sheet. Snapshot rides the descriptor (static — a past session never
+	 *  changes under the sheet); `pastDetail` is a lazy enrichment fetched here and applied only if
+	 *  this sheet is still the top of the stack when it resolves. */
+	openPastAgentSessionSheet(session: PastAgentSessionState): void {
+		this.openSheet({ kind: 'pastAgentSession', session: session }, { push: true });
+		this.fetchPastSessionDetail(session);
+	}
+
+	private fetchPastSessionDetail(session: PastAgentSessionState): void {
+		if (this._pastSessionDetailFetchId === session.id) return;
+
+		this._pastSessionDetailFetchId = session.id;
+		this._pastSessionDetail = undefined;
+		const resource = this._actions?.resources.pastAgentSessionDetail;
+		if (resource == null) return;
+
+		void resource.fetch(session.id, session.providerId, session.actions.resume?.cwd).then(() => {
+			// Bail if a later open (a different past session, or the sheet closing) superseded this fetch.
+			if (this._pastSessionDetailFetchId !== session.id) return;
+
+			this._pastSessionDetail = resource.value.get();
+		});
+	}
+
+	private handlePastAgentSessionSheetOpen = (e: CustomEvent<{ session: PastAgentSessionState }>): void => {
+		this.openPastAgentSessionSheet(e.detail.session);
+	};
+
+	private handleCloseAgentSheet = (): void => {
+		this.popSheet();
+	};
+
+	/** The combined list the sheet's chevrons walk — the agents section's live cards, then its past
+	 *  rows, exactly the vertical order the section renders. */
+	private getAgentSessionCycleEntries(): SheetDescriptor[] {
+		const entries: SheetDescriptor[] = [];
+		for (const s of this._cycleAgentSessions ?? []) {
+			entries.push({ kind: 'agentSession', sessionId: s.id, providerId: s.providerId });
+		}
+
+		for (const p of this._cyclePastSessions?.sessions ?? []) {
+			entries.push({ kind: 'pastAgentSession', session: p });
+		}
+
+		return entries;
+	}
+
+	private findAgentSessionCycleIndex(entries: readonly SheetDescriptor[], top: SheetDescriptor): number {
+		if (top.kind === 'agentSession') {
+			return entries.findIndex(
+				d => d.kind === 'agentSession' && d.sessionId === top.sessionId && d.providerId === top.providerId,
+			);
+		}
+
+		if (top.kind === 'pastAgentSession') {
+			return entries.findIndex(
+				d =>
+					d.kind === 'pastAgentSession' &&
+					d.session.id === top.session.id &&
+					d.session.providerId === top.session.providerId,
+			);
+		}
+
+		return -1;
+	}
+
+	/** Walks the agent-session sheet through the SAME ordered list the agents section renders (live
+	 *  cards first, then past rows), wrapping at the ends, swapping the top descriptor in place so
+	 *  anything stacked beneath (e.g. the branch sheet it was opened from) survives. The list is
+	 *  re-read at each press — order is whatever the section currently shows, never a stale
+	 *  snapshot. */
+	private handleAgentSessionCycle = (e: CustomEvent<{ direction: -1 | 1 }>): void => {
+		const top = this._sheetStack.at(-1);
+		if (top == null || (top.kind !== 'agentSession' && top.kind !== 'pastAgentSession')) return;
+
+		const entries = this.getAgentSessionCycleEntries();
+		if (entries.length < 2) return;
+
+		const index = this.findAgentSessionCycleIndex(entries, top);
+		if (index < 0) return;
+
+		const next = entries[(index + e.detail.direction + entries.length) % entries.length];
+		this._sheetStack = replaceTopSheet(this._sheetStack, next);
+		if (next.kind === 'pastAgentSession') {
+			this.fetchPastSessionDetail(next.session);
+		}
+	};
 
 	/** Reflects a completed merge on every open pull request sheet the merge affects — the sheet stays
 	 *  up, it just stops claiming the pull request is open. Optimistic by design: the host's pull request
@@ -1004,24 +1299,25 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		let changed = false;
 
 		const next = this._sheetStack.map((d): SheetDescriptor => {
-			if (d.kind !== 'pullRequest') return d;
+			if (d.kind !== 'pullRequest' || d.pr == null) return d;
 
+			const pr = d.pr;
 			const affected =
-				stack == null ? d.pr.number === number : d.pr.number === number || d.pr.stack?.number === stack.number;
+				stack == null ? pr.number === number : pr.number === number || pr.stack?.number === stack.number;
 			if (!affected) return d;
 
 			changed = true;
-			const position = stack?.position ?? d.pr.stack?.position;
+			const position = stack?.position ?? pr.stack?.position;
 			const layers = d.layers?.map((l): GraphSidebarPullRequest =>
 				position != null && l.stack != null && l.stack.position <= position ? { ...l, state: 'merged' } : l,
 			);
 			const prMerged =
-				d.pr.number === number ||
-				(stack != null && d.pr.stack != null && d.pr.stack.position <= stack.position);
+				pr.number === number || (stack != null && pr.stack != null && pr.stack.position <= stack.position);
 
 			return {
 				kind: 'pullRequest',
-				pr: prMerged ? { ...d.pr, state: 'merged' } : d.pr,
+				target: d.target,
+				pr: prMerged ? { ...pr, state: 'merged' } : pr,
 				layers: layers,
 				stackRoot: d.stackRoot,
 			};
@@ -1074,16 +1370,24 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		this.popSheet();
 	};
 
-	/** Renders whatever's on top of {@link _sheetStack}. */
-	private renderTopSheet() {
-		const top = this._sheetStack.at(-1);
-		if (top == null) return nothing;
+	/** Renders every sheet on {@link _sheetStack} in stack order — lower sheets stay mounted (and
+	 *  `inert`) beneath the top so a push slides over them and a pop reveals them instead of
+	 *  remounting them. Lit reconciles the array positionally, so a pop leaves the lower sheets'
+	 *  DOM untouched and an in-place top replace (same kind) keeps its element. */
+	private renderSheets() {
+		if (this._sheetStack.length === 0) return nothing;
 
-		switch (top.kind) {
+		const topIndex = this._sheetStack.length - 1;
+		return this._sheetStack.map((d, i) => this.renderSheet(d, i === topIndex));
+	}
+
+	private renderSheet(d: SheetDescriptor, isTop: boolean) {
+		switch (d.kind) {
 			case 'branch':
 				return html`<gl-graph-branch-sheet
-					.ref=${top.ref}
-					.repoPath=${top.repoPath}
+					?inert=${!isTop}
+					.ref=${d.ref}
+					.repoPath=${d.repoPath}
 					.services=${this._servicesResolved && this._actions != null ? this._actions.services : undefined}
 					.dateFormat=${this._state.preferences.get()?.dateFormat}
 					.dateStyle=${this._state.preferences.get()?.dateStyle}
@@ -1091,16 +1395,19 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 					.aiModel=${this._state.aiModel.get()}
 					.orgSettings=${this._state.orgSettings.get()}
 					.changeStamp=${this._branchSheetChangeStamp}
-					?show-maximize=${this.showMaximize}
-					?maximized=${this.sheetMaximized}
+					?show-maximize=${isTop && this.showMaximize}
+					?maximized=${isTop && this.sheetMaximized}
 					@gl-detail-sheet-close=${this.handleCloseBranchSheet}
 					@gl-issue-pull-request-details=${this.handleOpenPullRequestDetails}
+					@gl-agent-session-sheet-open=${this.handleAgentSessionSheetOpen}
+					@gl-agent-past-session-sheet-open=${this.handlePastAgentSessionSheetOpen}
 				></gl-graph-branch-sheet>`;
 			case 'conflict':
 				return html`<gl-wip-conflict-sheet
-					.detail=${top.detail}
+					?inert=${!isTop}
+					.detail=${d.detail}
 					.getDetails=${this.getConflictDetails}
-					file-name=${top.fileName}
+					file-name=${d.fileName}
 					.aiEnabled=${this._state.preferences.get()?.aiEnabled ?? false}
 					.preferences=${this._state.preferences.get()}
 					@gl-detail-sheet-close=${this.handleCloseConflictDetails}
@@ -1112,7 +1419,8 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				></gl-wip-conflict-sheet>`;
 			case 'rebaseSummary':
 				return html`<gl-rebase-summary-sheet
-					.repoPath=${top.repoPath}
+					?inert=${!isTop}
+					.repoPath=${d.repoPath}
 					.getSummary=${this.getRebaseSummary}
 					.undoRebase=${this.undoRebaseSummary}
 					@gl-detail-sheet-close=${this.handleCloseRebaseSummary}
@@ -1120,24 +1428,52 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				></gl-rebase-summary-sheet>`;
 			case 'pullRequest':
 				return html`<gl-graph-pr-sheet
-					.pullRequest=${top.pr}
-					.layers=${top.layers}
+					?inert=${!isTop}
+					.target=${d.target}
+					.pullRequest=${d.pr}
+					.layers=${d.layers}
 					.dateFormat=${this._state.preferences.get()?.dateFormat}
-					.stackRoot=${top.stackRoot ?? false}
+					.stackRoot=${d.stackRoot ?? false}
 					?ai-enabled=${this._state.preferences.get()?.aiEnabled ?? false}
 					@gl-detail-sheet-close=${this.handleClosePrSheet}
 				></gl-graph-pr-sheet>`;
+			case 'agentSession':
+			case 'pastAgentSession': {
+				const entries = this.getAgentSessionCycleEntries();
+				const cycleIndex = this.findAgentSessionCycleIndex(entries, d);
+				const session =
+					d.kind === 'agentSession'
+						? this._graphState?.agentSessions?.find(
+								s => s.id === d.sessionId && s.providerId === d.providerId,
+							)
+						: undefined;
+				// One literal for both descriptor kinds: lit keys the DOM on the template literal, so two
+				// literals would remount the sheet (and replay its open animation) on every live↔past cycle.
+				return html`<gl-graph-agent-sheet
+					?inert=${!isTop}
+					.session=${session}
+					.pastSession=${d.kind === 'pastAgentSession' ? d.session : undefined}
+					.pastDetail=${d.kind === 'pastAgentSession' ? this._pastSessionDetail : undefined}
+					.cycleIndex=${cycleIndex}
+					.cycleCount=${cycleIndex >= 0 ? entries.length : 0}
+					@gl-agent-session-cycle=${this.handleAgentSessionCycle}
+					@gl-detail-sheet-close=${this.handleCloseAgentSheet}
+				></gl-graph-agent-sheet>`;
+			}
 			case 'compare':
 				return html`<gl-graph-compare-sheet
+					?inert=${!isTop}
 					.preferredOrientation=${this._preferredCompareOrientation}
 					@gl-detail-sheet-close=${this.handleCloseCompareSheet}
 					@gl-graph-compare-promote=${this.handleComparePromote}
 					>${this.renderCompareMode()}${
-						this.showMaximize ? renderDetailsMaximizeChip(this.sheetMaximized, true, true) : nothing
+						isTop && this.showMaximize
+							? renderDetailsMaximizeChip(this.sheetMaximized, true, true)
+							: nothing
 					}<gl-action-chip
 						slot="actions"
 						icon="refresh"
-						label="Refresh Comparison"
+						label=${l10n.t('Refresh Comparison')}
 						overlay="tooltip"
 						@click=${() => this._actions.refreshBranchCompare(this.effectiveRepoPath)}
 					></gl-action-chip
@@ -1152,7 +1488,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			default: {
 				// Exhaustive: a new SheetDescriptor kind without a render case would leave the details
 				// content inert (`stack.length > 0`) with no sheet mounted to close — fail at build time.
-				const exhaustive: never = top;
+				const exhaustive: never = d;
 				return exhaustive;
 			}
 		}
@@ -1350,7 +1686,11 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	 *  host, the source of truth for cross-session restore. Pass `draft: null` to clear the slot. */
 	private persistWipDraft(worktreePath: string, draft: StoredGraphWipDraft | null): void {
 		this._graphState?.setWipDraft(worktreePath, draft);
-		this._ipc?.sendCommand(UpdateWipDraftCommand, { worktreePath: worktreePath, draft: draft });
+
+		const services = this._remoteServices;
+		if (services == null) return;
+
+		notifyService(services.wip, 'wip/updateDraft', svc => svc.updateDraft(worktreePath, draft));
 	}
 
 	/** Snapshot the commit-form signals and schedule a debounced flush to the host. Re-runs on
@@ -1523,7 +1863,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	private readonly getRebaseSummary = async (repoPath: string): Promise<AutoRebaseSummary | undefined> => {
 		await this._actionsReady;
 		const result = await this._actions.fetchAutoRebaseSummary(repoPath);
-		if (result == null) throw new Error('No automatic rebase summary is available.');
+		if (result == null) throw new Error('No Auto-Rebase summary is available.');
 		if ('error' in result) throw new Error(result.error.message);
 
 		return result.summary;
@@ -1552,8 +1892,8 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	private _resizeObserver?: ResizeObserver;
 	@state() private _preferredCompareOrientation: PanelOrientation = 'vertical';
 
-	/** Stack of currently-open detail sheets — every sheet kind renders from here, top-only, via
-	 *  {@link renderTopSheet}. Compare's openness is projected in from `compareSheetOpen`. */
+	/** Stack of currently-open detail sheets — every sheet kind renders from here, via
+	 *  {@link renderSheets}. Compare's openness is projected in from `comparePresentation`. */
 	@state() private _sheetStack: SheetDescriptor[] = [];
 
 	/** Parallel to {@link _sheetStack} — the element to restore focus to when the sheet at that
@@ -1802,12 +2142,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		}
 
 		// Projects the compare-signal's open/closed state onto the sheet stack — compare's own
-		// open/close lifecycle stays owned by `compareSheetOpen` (driven by the workflow controller),
+		// open/close lifecycle stays owned by `comparePresentation` (driven by the workflow controller),
 		// this just keeps the stack in sync with it every cycle. Selection-decoupled: reads only the
 		// signal, never selection, so it can't be affected by (or interfere with) the selection-close
 		// block above.
 		{
-			const compareOpen = this._state.compareSheetOpen.get();
+			const compareOpen = this._state.comparePresentation.get() === 'sheet';
 			const mode: 'replace' | 'push' = this._comparePushRequested ? 'push' : 'replace';
 			const projected = projectCompareSignal(this._sheetStack, compareOpen, mode);
 			if (projected !== this._sheetStack) {
@@ -1816,7 +2156,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 					this.openSheet({ kind: 'compare' }, { push: mode === 'push' });
 				} else {
 					// removeSheetKind, NOT popSheet/clearSheets: those call `closeCompare()`, which
-					// would stomp `compareAsPanel` back to false and break the promote-to-pinned
+					// would reset `comparePresentation` to closed and break the promote-to-pinned
 					// transition this projection is reacting to.
 					this.removeSheetKind('compare');
 				}
@@ -1967,9 +2307,15 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// at the top of willUpdate so re-entering a WIP row re-evaluates current sessions fresh.
 		const wip = this.isWip ? this._state.wip.get() : undefined;
 		const sessions = wip != null ? this.getWorktreeAgentSessions(wip) : undefined;
-		this._cycleAgentSessions = sessions;
+		this._cycleAgentSessions = filterLiveAgentSessions(sessions);
 		if (sessions != null && sessions.length > 0) {
-			this.applyAgentAutoSurface(sessions);
+			// Gate on the CURRENT-only subset, not the ghost-inclusive `sessions.length` check above
+			// — an all-ghost worktree must not call `applyAgentAutoSurface([])`, which would wipe the
+			// snapshot this gate exists to protect.
+			const current = sessions.filter(s => isAgentSessionCurrentForWorktree(s, wip?.repo?.path));
+			if (current.length > 0) {
+				this.applyAgentAutoSurface(current);
+			}
 		}
 
 		// Resolve past sessions in the same step, for the same reason: `renderWip` gates the agents
@@ -1979,7 +2325,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// resource's value when it was fetched for THIS wip's worktree; otherwise a fetch for a
 		// just-left worktree is still in flight and its stale value must not paint here.
 		const pastForPath =
-			wip?.repo?.path != null && this._lastPastSessionsPath === wip.repo.path
+			wip?.repo?.path != null && this._lastPastSessionsFetch?.worktreePath === wip.repo.path
 				? this._actions?.resources.pastAgentSessions.value.get()
 				: undefined;
 		this._cyclePastSessions = this._pastSessionsResolver.resolve(pastForPath, this._graphState?.agentSessions);
@@ -2219,6 +2565,33 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// captures HEAD-move clears, manual amend toggles, AI generations, and user typing
 		// through a single debounced exit point.
 		this.maybeScheduleWipDraftFlush();
+
+		// Re-measured after every render of THIS panel (the app's own `updated()` can settle before
+		// this panel's WIP layout exists, so app-side polling races the first measurement). On change
+		// the app re-clamps the bottom-docked details split via `refreshSnap()`.
+		const minContentHeight = this.minContentHeight;
+		if (minContentHeight !== this._lastNotifiedMinContentHeight) {
+			this._lastNotifiedMinContentHeight = minContentHeight;
+			this.dispatchEvent(
+				new CustomEvent('gl-graph-details-min-height-changed', { bubbles: true, composed: true }),
+			);
+		}
+
+		// Reserve the bottom slot's rigid minimum (file-list floor + commit box) in the agents
+		// split's track math — without it the start track takes its content size first and the grid
+		// lets the bottom slot overflow, pushing the commit box out of view. Written imperatively
+		// (an explicit value every pass, never removed via a directive) because it derives from
+		// post-layout measurement.
+		const agentSplit = this.renderRoot.querySelector<HTMLElement>('.agent-status-split');
+		if (agentSplit != null) {
+			const files = this.renderRoot.querySelector<HTMLElement>('.commit-panel__files');
+			const box = this.renderRoot.querySelector<HTMLElement>('gl-commit-box');
+			const reserve =
+				files != null && box != null
+					? Math.ceil((parseFloat(getComputedStyle(files).minHeight) || 0) + box.offsetHeight)
+					: 0;
+			agentSplit.style.setProperty('--gl-split-panel-end-reserve', `${reserve}px`);
+		}
 	}
 
 	/** Computes the right-side identity-row snippet shown while in compose/review. Pre-formats
@@ -2238,8 +2611,8 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		if (mode === 'resolve') {
 			const status =
 				this.engagedRunningOperation?.kind === 'resolve' ? this.engagedRunningOperation.execState : undefined;
-			if (status === 'generating') return formatGeneratingStatus('Resolving', this._state.aiModel.get());
-			if (status === 'error') return 'Error';
+			if (status === 'generating') return formatGeneratingStatus('resolve', this._state.aiModel.get());
+			if (status === 'error') return l10n.t('Error');
 
 			// Complete: show a resolved-files count in the identity row, mirroring compose/review's
 			// snippet (resolve has no Resume, so this is the plain non-clickable count only).
@@ -2247,9 +2620,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			if (value != null && 'result' in value && value.result?.resolutions) {
 				const count = value.result.resolutions.filter(r => r.strategy !== 'skipped').length;
 				if (count > 0) {
+					const resolvedFiles = formatPlural(
+						l10n.t('{count, plural, one{{count} file resolved} other{{count} files resolved}}'),
+						{ count: count },
+					);
 					return html`<span class="mode-status__group"
-						><code-icon icon="gl-merge"></code-icon>${count} ${count === 1 ? 'file' : 'files'}
-						resolved</span
+						><code-icon icon="gl-merge"></code-icon>${resolvedFiles}</span
 					>`;
 				}
 			}
@@ -2259,9 +2635,9 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 
 		const status = this.engagedModeStatus?.[mode]?.execState;
 		if (status === 'generating') {
-			return formatGeneratingStatus(mode === 'compose' ? 'Composing' : 'Reviewing', this._state.aiModel.get());
+			return formatGeneratingStatus(mode, this._state.aiModel.get());
 		}
-		if (status === 'error') return 'Error';
+		if (status === 'error') return l10n.t('Error');
 
 		// Complete / backed — pull counts from the back-preview snapshot or the resolved value.
 		// When a back-preview is set (forward-available state), render the snippet as a clickable
@@ -2378,6 +2754,20 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		});
 	}
 
+	/** Focuses the WIP commit message box. Called by `graph-app.ts` after it seeds the message via
+	 *  {@link setCommitMessage} (Fixup Commit, Undo Commit, Add Co-authors) so the user can start
+	 *  typing/reviewing immediately. Mirrors {@link focusModeAiInput}'s connected-check + rAF, since
+	 *  the seed and this call happen in the same tick the panel/box may still be mounting. */
+	focusCommitMessage(): void {
+		requestAnimationFrame(() => {
+			if (!this.isConnected) return;
+
+			// This host renders into its light DOM (`createRenderRoot` returns `this`), so query the
+			// element itself — `this.shadowRoot` is always null here.
+			this.querySelector<GlCommitBox>('gl-commit-box')?.focusMessage();
+		});
+	}
+
 	private async resolveServices(services: Remote<GraphServices>): Promise<void> {
 		// Service resolution + resource wiring lives in `detailsResolver.ts` — this element
 		// stays focused on lifecycle and render routing.
@@ -2390,9 +2780,9 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		this._workflow = new DetailsWorkflowController(this, this._actions);
 
 		if (this._pendingCompare != null) {
-			const { params, onReady } = this._pendingCompare;
+			const { params, onReady, options } = this._pendingCompare;
 			this._pendingCompare = undefined;
-			this.openCompareMode(params, onReady);
+			this.openCompareMode(params, onReady, options);
 		}
 
 		if (this._pendingMode != null) {
@@ -2433,14 +2823,14 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		switch (ctx) {
 			case 'multicommit':
 				return {
-					ariaLabel: 'Multiple commits selected',
+					ariaLabel: l10n.t('Multiple commits selected'),
 					content: this.renderMultiCommit(),
 					context: 'multicommit',
 				};
 			case 'wip':
-				return { ariaLabel: 'Working changes details', content: this.renderWip(), context: 'wip' };
+				return { ariaLabel: l10n.t('Working changes details'), content: this.renderWip(), context: 'wip' };
 			case 'commit':
-				return { ariaLabel: 'Commit details', content: this.renderCommit(), context: 'commit' };
+				return { ariaLabel: l10n.t('Commit details'), content: this.renderCommit(), context: 'commit' };
 		}
 	}
 
@@ -2485,7 +2875,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// commit/worktree. When the current selection is merely refreshing (its own files/enrichment
 		// still streaming in), the content is correct, so it stays interactive. Implies `stale`.
 		const blockPointer = resolved != null && current == null;
-		const compareAsPanel = this._state.compareAsPanel.get();
+		const compareAsPanel = this._state.comparePresentation.get() === 'pinned';
 
 		// `.details-content` is the SCROLLING container — its content overflows and the user
 		// scrolls inside it. If we rendered the sheet as a child of `.details-content`, the
@@ -2496,7 +2886,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// containing block is anchored to the visible viewport regardless of scroll position.
 		const detailsContent = html`<div
 			role="region"
-			aria-label=${resolved?.ariaLabel ?? 'Commit details'}
+			aria-label=${resolved?.ariaLabel ?? l10n.t('Commit details')}
 			aria-busy=${resolved == null || stale}
 			aria-live="polite"
 			class=${`details-content${stale ? ' details-stale' : ''}${blockPointer ? ' details-replacing' : ''}`}
@@ -2524,7 +2914,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		</div>`;
 
 		if (!compareAsPanel) {
-			return html`<div class="details-host">${detailsContent}${this.renderTopSheet()}</div>`;
+			return html`<div class="details-host">${detailsContent}${this.renderSheets()}</div>`;
 		}
 
 		// Pinned compare: nested split panel inside the details host. Details on the start side,
@@ -2532,7 +2922,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// `_preferredCompareOrientation`) until the user explicitly picks one; position and an
 		// explicit orientation persist via the shared signals, so unpin → re-pin restores the
 		// user's last layout.
-		const orientation = this._state.compareSplitOrientation.get() ?? this._preferredCompareOrientation;
+		const orientation = this.compareOrientation;
 		const position = this._state.compareSplitPosition.get();
 		return html`<gl-split-panel
 			class="compare-pinned-split"
@@ -2541,7 +2931,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			@gl-split-panel-change=${this.handleCompareSplitChange}
 			@gl-split-panel-dblclick=${this.handleCompareSplitDblClick}
 		>
-			<div slot="start" class="compare-pinned-split__start">${detailsContent}${this.renderTopSheet()}</div>
+			<div slot="start" class="compare-pinned-split__start">${detailsContent}${this.renderSheets()}</div>
 			<div slot="end" class="compare-pinned-split__end">
 				<gl-graph-compare-pinned
 					orientation=${orientation}
@@ -2550,7 +2940,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 					>${this.renderCompareMode()}${this.showMaximize ? renderDetailsMaximizeChip(this.maximized) : nothing}<gl-action-chip
 						slot="actions"
 						icon="refresh"
-						label="Refresh Comparison"
+						label=${l10n.t('Refresh Comparison')}
 						overlay="tooltip"
 						@click=${() => this._actions.refreshBranchCompare(this.effectiveRepoPath)}
 					></gl-action-chip
@@ -2585,14 +2975,16 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	openSheet(descriptor: SheetDescriptor, options?: { push?: boolean }): void {
 		const focusEl = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
 
-		// The currently-mounted sheet is about to unmount (or get replaced) as a side effect of a
-		// stack change we're driving here, not the user dismissing it — the router owns focus
-		// restoration for this transition, not the sheet's own disconnect handler.
+		// Every currently-mounted sheet may be about to unmount (a `replaceStack` drops the whole
+		// stack) as a side effect of a stack change we're driving here, not the user dismissing it —
+		// the router owns focus restoration for this transition, not the sheet's own disconnect
+		// handler.
 		// A converted sheet owns its `gl-detail-sheet` inside its shadow root, which this query can't
 		// reach — its host mirrors the flag through (see `SheetWrapper`). A new sheet kind must add
 		// its tag to `sheetWrapperTags` in sheetWrapper.ts.
-		const mounted = this.querySelector<HTMLElement & { skipFocusRestore: boolean }>(sheetWrapperSelector);
-		if (mounted != null) {
+		for (const mounted of this.querySelectorAll<HTMLElement & { skipFocusRestore: boolean }>(
+			sheetWrapperSelector,
+		)) {
 			mounted.skipFocusRestore = true;
 		}
 
@@ -2690,8 +3082,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		return o === 'horizontal' ? 'vertical' : 'horizontal';
 	}
 
+	get compareOrientation(): PanelOrientation {
+		return this._state.compareSplitOrientation.get() ?? this._preferredCompareOrientation;
+	}
+
 	private handleFlipCompareOrientation = (): void => {
-		const effective = this._state.compareSplitOrientation.get() ?? this._preferredCompareOrientation;
+		const effective = this.compareOrientation;
 		this._state.compareSplitOrientation.set(this.flipOrientation(effective));
 	};
 
@@ -2712,7 +3108,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 	private renderFilesLoading() {
 		return html`<div class="commit-panel__files-loading" aria-busy="true">
 			<code-icon icon="loading" modifier="spin"></code-icon>
-			<span>Loading...</span>
+			<span>${l10n.t('Loading...')}</span>
 		</div>`;
 	}
 
@@ -2720,7 +3116,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		const wip = this._state.wip.get();
 		if (!wip) return nothing;
 
-		const branchName = wip.branch?.name ?? 'unknown';
+		const branchName = wip.branch?.name ?? l10n.t('unknown');
 		const activeMode = this._state.activeMode.get();
 		const preferences = this._state.preferences.get();
 		const hasChanges = (wip.changes?.files?.length ?? 0) > 0;
@@ -2731,14 +3127,15 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// Read the worktree-matched sessions from the cycle snapshot captured in `willUpdate` so
 		// the auto-partial trigger and the rendered card list agree on the same data within a
 		// single update. See `_cycleAgentSessions` for why this matters.
-		const worktreeAgentSessions = this._cycleAgentSessions;
-		// Likewise resolved in `willUpdate` (path-guarded + reconciled against the live set there),
-		// so this gate counts exactly the rows `gl-details-agent-status` will render.
+		const worktreeAgentSessions = this._cycleAgentSessions ?? [];
 		const pastAgentSessions = this._cyclePastSessions;
-		const hasPastSessions = (pastAgentSessions?.sessions.length ?? 0) > 0;
+		const pastAgentSessionsResource = this._actions?.resources.pastAgentSessions;
 		const wipWorktreePath = wip.repo?.path;
 		const hasPausedOp = wip.changes?.pausedOpStatus != null;
-		const showAgentStatus = (worktreeAgentSessions != null || hasPastSessions) && activeMode == null;
+		const showAgentStatus = activeMode == null;
+		const hasLiveAgentSessions = worktreeAgentSessions.length > 0;
+		const hasPastAgentSessions = (pastAgentSessions?.sessions.length ?? 0) > 0;
+		const hasAgentSessions = hasLiveAgentSessions || hasPastAgentSessions;
 		// Tri-state of the agents pane drives both splitter availability and sizing:
 		//  - `collapsed` / `partial`: pane is content-sized via CSS `fit-content(<MAX>%)` (see
 		//                              `--auto-size` rule). Splitter inert. The `position`
@@ -2747,13 +3144,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		//  - `expanded`:              splitter position is authoritative — opens at
 		//                              {@link AGENT_STATUS_DEFAULT_PCT}% until the user drags,
 		//                              then the persisted user position. Snap clamps drag to
-		//                              [10, {@link AGENT_STATUS_MAX_PCT}]. One exception: when
-		//                              the worktree match returns an empty array (sessions
-		//                              present in the source but none for this worktree), the
-		//                              `--no-cards` class forces `max-content` so the heading
-		//                              collapses instead of floating in empty space — same as
-		//                              the collapsed/partial no-cards behavior.
-		const agentStatusExpand = this.agentStatusExpand;
+		//                              [10, {@link AGENT_STATUS_MAX_PCT}]. One exception: when no
+		//                              live cards or past-only rows are visible, the `--no-cards`
+		//                              class forces `max-content` so the heading collapses instead
+		//                              of floating in empty space — same as the collapsed/partial
+		//                              no-cards behavior.
+		const agentStatusExpand = hasAgentSessions ? this.agentStatusExpand : 'collapsed';
 		const agentStatusIsExpanded = agentStatusExpand === 'expanded';
 		const agentStatusPosition = this._agentStatusSplitPosition ?? agentStatusDefaultPct;
 		// `--auto-size` (fit-content fallback) applies only in collapsed/partial states — the
@@ -2762,14 +3158,13 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// splitter position directly.
 		const useAutoSize = !agentStatusIsExpanded;
 		// Cards visible under the current expand state, derived right here from the truth
-		// (`worktreeAgentSessions` + `agentStatusExpand`) — no event-driven mirror needed. Past rows
-		// only ever render when expanded (see `gl-details-agent-status`), so they only count there.
+		// (`worktreeAgentSessions` + `agentStatusExpand`) — no event-driven mirror needed. Past
+		// history participates in the same collapsed/expanded mode alongside or without live cards.
 		const agentStatusHasVisibleCards =
-			(worktreeAgentSessions?.some(s =>
+			shouldShowPastSessions(hasPastAgentSessions, agentStatusExpand) ||
+			worktreeAgentSessions.some(s =>
 				expandVisibleCategories[agentStatusExpand].has(agentPhaseToCategory[s.phase]),
-			) ??
-				false) ||
-			(agentStatusExpand === 'expanded' && hasPastSessions);
+			);
 
 		const restContent =
 			activeMode === 'review'
@@ -2803,8 +3198,8 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 														.filesCollapsable=${false}
 														empty-text=${
 															hasPausedOp && !hasChanges
-																? 'No conflicting or changed files'
-																: 'No working changes'
+																? l10n.t('No conflicting or changed files')
+																: l10n.t('No working changes')
 														}
 														@file-open=${this.handleFileOpen}
 														@file-compare-working=${this.handleFileCompareWorking}
@@ -2846,9 +3241,11 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 										.commitError=${this._state.commitError.get()}
 										.signing=${wip.signing}
 										.aiModel=${this._state.aiModel.get()}
+										.fixupTarget=${this.fixupTarget}
 										@message-change=${this.handleCommitMessageChange}
 										@amend-change=${this.handleAmendChange}
 										@commit=${this.handleCommit}
+										@commit-squash=${this.handleCommitSquash}
 										@generate-message=${this.handleGenerateMessage}
 										@add-coauthors=${this.handleAddCoauthors}
 										@compose=${this.handleCompose}
@@ -2857,7 +3254,6 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 							: html`
 									<gl-details-wip-empty-pane
 										.wip=${wip}
-										.aiEnabled=${false}
 										.aiCreatePrEnabled=${aiCreatePrEnabled}
 										.pullRequest=${this._state.wipPullRequest.get()}
 										.pullRequestLoading=${this._state.wipPullRequestLoading.get()}
@@ -2877,6 +3273,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 										@publish-branch=${this.handlePublishBranch}
 										@pull=${this.handlePull}
 										@push=${this.handlePush}
+										@force-push=${this.handleForcePush}
 										@rebase-onto-merge-target=${this.handleRebaseOntoMergeTarget}
 										@merge-merge-target-into-current=${this.handleMergeMergeTargetIntoCurrent}
 										@review-branch-changes=${this.handleReviewBranchChanges}
@@ -2932,6 +3329,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 							} ${agentStatusHasVisibleCards ? '' : 'agent-status-split--no-cards'}"
 							orientation="vertical"
 							primary="start"
+							.anchoredPosition=${true}
 							.position=${agentStatusPosition}
 							?disabled=${!agentStatusIsExpanded}
 							.snap=${this._agentStatusSplitSnap}
@@ -2941,12 +3339,23 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 						>
 							<div slot="start" class="agent-status-split__top scrollable">
 								<gl-details-agent-status
+									wip
 									.sessions=${worktreeAgentSessions}
 									.pastSessions=${pastAgentSessions}
+									.pastSessionsLimit=${this._lastPastSessionsFetch?.limit ?? initialPastAgentSessionLimit}
+									.pastSessionsLoading=${pastAgentSessionsResource?.loading.get() ?? false}
 									.worktreePath=${wipWorktreePath}
 									.expand=${agentStatusExpand}
 									.selectedSessionId=${this._selectedAgentSessionId}
+									@gl-agent-session-sheet-open=${this.handleAgentSessionSheetOpen}
+									@gl-agent-past-session-sheet-open=${this.handlePastAgentSessionSheetOpen}
 									@gl-agent-status-expand-request=${this._onAgentStatusExpandRequest}
+									@gl-agent-status-past-sessions-more-request=${
+										this._onAgentStatusPastSessionsMoreRequest
+									}
+									@gl-agent-status-past-session-archive-request=${
+										this._onAgentStatusPastSessionArchiveRequest
+									}
 								></gl-details-agent-status>
 							</div>
 							<div slot="end" class="agent-status-split__bottom scrollable">${restContent}</div>
@@ -3013,7 +3422,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		const fallbackFiles = this._state.wip.get()?.changes?.files;
 		const composeFiles = scopeFilesValue ?? fallbackFiles;
 
-		return html`<gl-details-compose-mode-panel
+		const content = html`<gl-details-compose-mode-panel
 			.showSearchBox=${this.showSearchBox}
 			.searchBoxFilter=${this.searchBoxFilter}
 			.status=${mappedComposeStatus}
@@ -3031,7 +3440,9 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			.fileLayout=${this._state.preferences.get()?.files?.layout ?? 'auto'}
 			.aiModel=${this._state.aiModel.get()}
 			.lastPrompt=${composeEntry?.prompt}
-			.basePrompt=${composeEntry?.basePrompt ?? seedInstructions}
+			.excludedFiles=${composeEntry?.excludedFiles ?? emptyModeExclusions}
+			.commitExcludedIds=${composeEntry?.commitExcludedIds ?? emptyModeExclusions}
+			.basePrompt=${composeEntry?.idleDraft ?? composeEntry?.basePrompt ?? seedInstructions}
 			.refineMode=${composeEntry?.refineMode ?? false}
 			.refineDraft=${composeEntry?.refineDraft}
 			.progressMessage=${this._state.composeProgressMessage.get()}
@@ -3083,6 +3494,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			@file-unstage=${this.handleFileUnstage}
 			@change-files-layout=${this.handleChangeFilesLayout}
 		></gl-details-compose-mode-panel>`;
+		return keyed(this.engagedAnchorKey, content);
 	}
 
 	private renderCompareMode() {
@@ -3126,16 +3538,16 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			.aheadCount=${this._state.branchCompareAheadCount.get()}
 			.behindCount=${this._state.branchCompareBehindCount.get()}
 			.allFilesCount=${this._state.branchCompareAllFilesCount.get()}
-			.aheadCommits=${this._state.branchCompareAheadCommits.get()}
-			.behindCommits=${this._state.branchCompareBehindCommits.get()}
-			.aheadFiles=${this._state.branchCompareAheadFiles.get()}
-			.behindFiles=${this._state.branchCompareBehindFiles.get()}
-			.aheadLoaded=${this._state.branchCompareAheadLoaded.get()}
-			.behindLoaded=${this._state.branchCompareBehindLoaded.get()}
-			.aheadHasMore=${this._state.branchCompareAheadHasMore.get()}
-			.behindHasMore=${this._state.branchCompareBehindHasMore.get()}
-			.aheadLoadingMore=${this._state.branchCompareAheadLoadingMore.get()}
-			.behindLoadingMore=${this._state.branchCompareBehindLoadingMore.get()}
+			.aheadCommits=${this._state.branchCompareCommitsBySide.ahead.get()}
+			.behindCommits=${this._state.branchCompareCommitsBySide.behind.get()}
+			.aheadFiles=${this._state.branchCompareFilesBySide.ahead.get()}
+			.behindFiles=${this._state.branchCompareFilesBySide.behind.get()}
+			.aheadLoaded=${this._state.branchCompareLoadedBySide.ahead.get()}
+			.behindLoaded=${this._state.branchCompareLoadedBySide.behind.get()}
+			.aheadHasMore=${this._state.branchCompareHasMoreBySide.ahead.get()}
+			.behindHasMore=${this._state.branchCompareHasMoreBySide.behind.get()}
+			.aheadLoadingMore=${this._state.branchCompareLoadingMoreBySide.ahead.get()}
+			.behindLoadingMore=${this._state.branchCompareLoadingMoreBySide.behind.get()}
 			.allFiles=${allFiles}
 			.loading=${
 				this._actions.resources.branchCompareSummary.loading.get() ||
@@ -3213,7 +3625,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		let fallback: string | undefined;
 		if (activeTab === 'behind') {
 			fallback = leftRef;
-		} else if (activeTab === 'ahead' && hasOnlyWip(this._state.branchCompareAheadCommits.get())) {
+		} else if (activeTab === 'ahead' && hasOnlyWip(this._state.branchCompareCommitsBySide.ahead.get())) {
 			fallback = uncommitted;
 		} else {
 			fallback = rightRef;
@@ -3233,10 +3645,14 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		const primaryRepoPath = this.graphRepoPath() ?? wip.repo?.path;
 		if (primaryRepoPath == null) return undefined;
 
-		return matchAgentSessionsForWorktree(this._graphState?.agentSessions, {
-			repoPath: primaryRepoPath,
-			worktreePath: wip.repo?.path,
-		});
+		return matchAgentSessionsForWorktree(
+			this._graphState?.agentSessions,
+			{
+				repoPath: primaryRepoPath,
+				worktreePath: wip.repo?.path,
+			},
+			{ includeVisited: true },
+		);
 	}
 
 	private renderCommit() {
@@ -3296,10 +3712,13 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			@load-reachability=${() => void this._actions.loadReachability()}
 			@refresh-reachability=${() => this._actions.refreshReachability()}
 			@open-on-remote=${(e: CustomEvent<{ sha: string }>) =>
-				this._actions.openOnRemote(commit.repoPath ?? this.repoPath, e.detail.sha)}
+				void this._actions.openOnRemote(commit.repoPath ?? this.repoPath, e.detail.sha)}
 			@refresh-commit=${this.handleRefreshCommit}
 			@gl-stash-apply=${(e: CustomEvent<StashApplyCommandArgs>) =>
-				void this._actions.services.commands.execute('gitlens.stashesApply', e.detail)}
+				void (async () => {
+					await waitForFocusSettled();
+					await this._actions.services.commands.execute('gitlens.stashesApply', e.detail);
+				})()}
 			@change-files-layout=${this.handleChangeFilesLayout}
 			@toggle-mode=${this.handleToggleMode}
 			@mode-back=${this.handleModeBack}
@@ -3453,7 +3872,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 							? 'error'
 							: 'idle';
 
-		return html`<gl-details-review-mode-panel
+		const content = html`<gl-details-review-mode-panel
 			.showSearchBox=${this.showSearchBox}
 			.searchBoxFilter=${this.searchBoxFilter}
 			.scope=${this._state.scope.get()}
@@ -3472,6 +3891,10 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			.branchName=${reviewBranchName}
 			.aiModel=${this._state.aiModel.get()}
 			.lastPrompt=${reviewEntry?.prompt}
+			.excludedFiles=${reviewEntry?.excludedFiles ?? emptyModeExclusions}
+			.idleDraft=${reviewEntry?.idleDraft}
+			.refineMode=${reviewEntry?.refineMode}
+			.refineDraft=${reviewEntry?.refineDraft}
 			?forward-available=${this._state.reviewForwardAvailable.get()}
 			.backPreview=${this._state.reviewBackPreview.get()}
 			@review-run=${(e: CustomEvent<{ prompt?: string }>) => {
@@ -3566,6 +3989,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			@file-open-on-remote=${this.handleFileOpenOnRemote}
 			@change-files-layout=${this.handleChangeFilesLayout}
 		></gl-details-review-mode-panel>`;
+		return keyed(this.engagedAnchorKey, content);
 	}
 
 	private renderResolveMode() {
@@ -3649,7 +4073,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				const run = this.getResolveRunScope();
 				if (run == null) return;
 
-				this._workflow.runResolve(this.effectiveRepoPath, run.scope, e.detail?.prompt);
+				this._workflow.runResolve(this.effectiveRepoPath, run.scope, e.detail?.prompt, 'start');
 			}}
 			@resolve-view-diff=${(e: CustomEvent<{ filePath: string }>) =>
 				this.handleResolveViewDiff(e.detail.filePath)}
@@ -3679,6 +4103,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 					this.effectiveRepoPath,
 					resolveEntry?.focusedFilePaths ?? this._state.resolveFocusedFilePaths.get(),
 					e.detail?.prompt,
+					'refine',
 				);
 			}}
 			@resolve-retry-file=${(e: CustomEvent<{ filePath: string; prompt: string }>) =>
@@ -3849,6 +4274,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 				this._actions.sendTelemetryEvent('graphDetails/review/generateFocusArea/failed', {
 					...aiContext,
 					duration: duration,
+					'failure.error.message': result.error.message,
 				});
 			} else if ('result' in result && result.result) {
 				this._workflow.review.enrichFocusAreaFindings(focusAreaId, result.result);
@@ -3863,11 +4289,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 					'findings.severity.suggestion.count': counts.suggestion,
 				});
 			}
-		} catch {
+		} catch (ex) {
 			panel?.setFocusAreaError(focusAreaId);
 			this._actions.sendTelemetryEvent('graphDetails/review/generateFocusArea/failed', {
 				...aiContext,
 				duration: performance.now() - startedAt,
+				'failure.error.message': runFailureMessage(ex),
 			});
 		}
 	}
@@ -3901,6 +4328,7 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		// stale cached value — the button appeared to do nothing.
 		const repoPath = this.effectiveRepoPath;
 		if (this.isWip && repoPath != null) {
+			this.refreshWipPastSessions();
 			void this._actions.refetchWipQuiet(repoPath, true);
 		} else {
 			this._actions.refreshWip();
@@ -3923,12 +4351,12 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 
 	private handleSwitchBranch = () => {
 		this.trackWipAction('switchBranch');
-		this._actions.switchBranch(this.effectiveRepoPath);
+		void this._actions.switchBranch(this.effectiveRepoPath);
 	};
 
 	private handleCreateBranch = () => {
 		this.trackWipAction('createBranch');
-		this._actions.createBranch(this.effectiveRepoPath);
+		void this._actions.createBranch(this.effectiveRepoPath);
 	};
 
 	private handlePublishBranch = () => {
@@ -3966,21 +4394,22 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		this._actions.createPullRequest(this.effectiveRepoPath, { describeWithAI: true });
 	};
 
-	private handleShareWipAsCloudPatch = () => {
+	private handleShareWipAsCloudPatch = async (): Promise<void> => {
 		this.trackWipAction('shareAsCloudPatch');
-		void this._actions.services.commands.executeScoped('gitlens.shareWipAsCloudPatch:graph', {
+		await waitForFocusSettled();
+		await this._actions.services.commands.executeScoped('gitlens.shareWipAsCloudPatch:graph', {
 			repoPath: this.effectiveRepoPath,
 		});
 	};
 
 	private handleRebaseOntoMergeTarget = () => {
 		this.trackWipAction('rebaseOntoMergeTarget');
-		this._actions.rebaseOntoMergeTarget();
+		void this._actions.rebaseOntoMergeTarget();
 	};
 
 	private handleMergeMergeTargetIntoCurrent = () => {
 		this.trackWipAction('mergeMergeTarget');
-		this._actions.mergeMergeTargetIntoCurrent();
+		void this._actions.mergeMergeTargetIntoCurrent();
 	};
 
 	private handleReviewBranchChanges = () => this.enterBranchWorkMode('review');
@@ -4029,28 +4458,28 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 			this._actions.stashFiles([...e.detail.files]);
 		} else {
 			this.trackWipAction(e.detail?.onlyStaged ? 'stashSaveStaged' : 'stashSave');
-			this._actions.stashSave(this.effectiveRepoPath, e.detail?.onlyStaged);
+			void this._actions.stashSave(this.effectiveRepoPath, e.detail?.onlyStaged);
 		}
 	};
 
 	private handleStartWork = (e: CustomEvent<{ showOpenInAgent?: 'ask' | 'manual' | 'agent' } | undefined>) => {
 		this.trackWipAction('startWork');
-		this._actions.startWork(e.detail?.showOpenInAgent);
+		void this._actions.startWork(e.detail?.showOpenInAgent);
 	};
 
 	private handleStartReview = (e: CustomEvent<{ showOpenInAgent?: 'ask' | 'manual' | 'agent' } | undefined>) => {
 		this.trackWipAction('startReview');
-		this._actions.startPRReview(e.detail?.showOpenInAgent);
+		void this._actions.startPRReview(e.detail?.showOpenInAgent);
 	};
 
 	private handleApplyStash = () => {
 		this.trackWipAction('applyStash');
-		this._actions.applyStash(this.effectiveRepoPath);
+		void this._actions.applyStash(this.effectiveRepoPath);
 	};
 
 	private handleNewWorktree = () => {
 		this.trackWipAction('createWorktree');
-		this._actions.createWorktree();
+		void this._actions.createWorktree();
 	};
 
 	private handleRefreshLaunchpad = (): void => {
@@ -4104,6 +4533,26 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 
 	private handleCommit = () => void this._actions.commit(this.effectiveRepoPath, this.sha);
 
+	/** The commit the current WIP message resolves to as a `fixup!` target, or undefined when the
+	 *  message isn't a fixup, amend is active, or no rewriteable-from-HEAD row matches its subject.
+	 *  Reads the `@consume`d `_graphState.rows` — its changes drive a render despite skipping
+	 *  `changedProperties` (see the `willUpdate` comment above). */
+	private get fixupTarget(): FixupTarget | undefined {
+		if (this._state.amend.get()) return undefined;
+
+		const subject = parseFixupSubject(this._state.commitMessage.get());
+		if (subject == null) return undefined;
+
+		return findFixupTargetRow(this._graphState?.rows, subject);
+	}
+
+	private handleCommitSquash = () => {
+		const target = this.fixupTarget;
+		if (target == null) return;
+
+		void this._actions.commitAndSquash(this.effectiveRepoPath, this.sha, target.sha);
+	};
+
 	private handleGenerateMessage = () => this._workflow.runGenerateMessage(this.effectiveRepoPath);
 
 	/** {@link DetailsWorkflowHost.applyGeneratedCommitMessage} — land a settled generation. If the
@@ -4122,11 +4571,39 @@ export class GlGraphDetailsPanel extends SignalWatcher(LitElement) {
 		this.persistWipDraft(repoPath, { message: message, messageDirty: true, amend: existing?.amend });
 	}
 
-	/** {@link DetailsWorkflowHost.readEngagedRefineState} — read the live compose/resolve panel's
+	/** {@link DetailsWorkflowHost.readEngagedRefineState} — read the live review/compose/resolve panel's
 	 *  ready-state Refine posture + unsubmitted draft, so the controller can persist them onto the
 	 *  engaged entry on mode-leave. Returns undefined when no refine-capable panel is mounted. */
+	readEngagedExclusions(): { files: ReadonlySet<string>; commits?: ReadonlySet<string> } | undefined {
+		const mode = this._state.activeMode.get();
+		if (mode === 'compose') {
+			const panel = this.querySelector<GlDetailsComposeModePanel>('gl-details-compose-mode-panel');
+			return panel != null ? { files: panel.excludedFiles, commits: panel.commitExcludedIds } : undefined;
+		}
+		if (mode === 'review') {
+			const panel = this.findReviewModePanel();
+			return panel != null ? { files: panel.excludedFiles } : undefined;
+		}
+		return undefined;
+	}
+
+	readEngagedIdleDraft(): string | undefined {
+		const mode = this._state.activeMode.get();
+		if (mode === 'compose') {
+			return this.querySelector<GlDetailsComposeModePanel>('gl-details-compose-mode-panel')?.idleDraftLive;
+		}
+		if (mode === 'review') {
+			return this.findReviewModePanel()?.idleDraftLive;
+		}
+		return undefined;
+	}
+
 	readEngagedRefineState(): { refineMode: boolean; refineDraft: string } | undefined {
 		const mode = this._state.activeMode.get();
+		if (mode === 'review') {
+			const panel = this.findReviewModePanel();
+			return panel != null ? { refineMode: panel.refineModeLive, refineDraft: panel.refineDraftLive } : undefined;
+		}
 		if (mode === 'compose') {
 			const panel = this.querySelector<GlDetailsComposeModePanel>('gl-details-compose-mode-panel');
 			return panel != null ? { refineMode: panel.refineModeLive, refineDraft: panel.refineDraftLive } : undefined;

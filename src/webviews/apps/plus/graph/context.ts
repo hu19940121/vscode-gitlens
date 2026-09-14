@@ -1,11 +1,15 @@
 import { createContext } from '@lit/context';
+import type { GitHealthBannerState } from '@gitlens/git/gitHealth.js';
 import type { SearchQuery } from '@gitlens/git/models/search.js';
 import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import type { AgentSessionState } from '../../../../agents/models/agentSessionState.js';
 import type { StoredGraphWipDraft } from '../../../../constants.storage.js';
+import type { RunningWorktreeTask } from '../../../../worktrees/worktreeTaskService.js';
+import type { GraphSearchState } from '../../../plus/graph/graphService.js';
 import type {
 	GetOverviewWipResponse,
 	GraphColumnName,
+	GraphRefsMetadata,
 	GraphScope,
 	GraphSearchResults,
 	GraphSearchResultsError,
@@ -15,6 +19,7 @@ import type {
 	WipStats,
 } from '../../../plus/graph/protocol.js';
 import type { GetOverviewEnrichmentResponse, OverviewBranchMergeTarget } from '../../../shared/overviewBranches.js';
+import type { AgentSessionWorktreeIndex } from '../../shared/agentUtils.js';
 
 export interface AppState extends State {
 	state: State;
@@ -26,8 +31,15 @@ export interface AppState extends State {
 	 */
 	activeFilterColumns: ReadonlySet<GraphColumnName>;
 	agentSessions: AgentSessionState[];
+	/** Worktree-keyed index over `agentSessions` (see `indexAgentSessionsByRepoAndWorktree`),
+	 *  memoized on the session list so per-render consumers don't rebuild it. */
+	agentSessionIndex: AgentSessionWorktreeIndex | undefined;
+	/** Running worktree tasks keyed by worktree path — drives the WIP row's Run Task button state. */
+	runningWorktreeTasks: Record<string, RunningWorktreeTask>;
 	isBusy: boolean;
 	loading: boolean;
+	/** The rows walk failed before shipping anything — the status overlay offers Retry. */
+	rowsError: boolean;
 	/** True while one or more targeted row loads remain active past their soft display delay. */
 	ensureLoading: boolean;
 	/**
@@ -42,36 +54,65 @@ export interface AppState extends State {
 	mcpCanAutoRegister?: boolean | undefined;
 	canInstallHooks?: boolean | undefined;
 	hooksAgents?: readonly { id: string; displayName: string; installed: boolean }[] | undefined;
+	graphWalkthroughStarted?: boolean | undefined;
 	navigating: 'next' | 'previous' | false;
 	overviewWip?: { branchIds: string[]; wip: GetOverviewWipResponse };
 	overviewEnrichment?: GetOverviewEnrichmentResponse;
 	scope: GraphScope | undefined;
 	/** `scopeToBranch` parked until an attached branch arrives; any scope set or clear cancels it. */
 	pendingScopeToBranch: boolean;
+	/**
+	 * The worktree PERSPECTIVE — independent of the branch FOCUS projection (`scope`). While set, the
+	 * graph's HEAD-derived data (current-branch markers, WIP primary, `branchState`, action cwd) is the
+	 * named worktree's, but every commit stays visible — row narrowing is `scope`'s job. Deliberately NOT a
+	 * field of `GraphScope`: a worktree-origin FOCUS can exist without a perspective, and vice versa.
+	 *
+	 * READ-ONLY, and not state of its own: it IS the host's binding (a selected repository whose path isn't
+	 * `homeRepositoryPath`), overridden only while a rebind RPC is in flight.
+	 */
+	readonly worktreePerspective: { path: string; branchName?: string } | undefined;
 	searching: boolean;
 	searchMode: 'filter' | 'normal';
 	searchResultsResponse: GraphSearchResults | GraphSearchResultsError | undefined;
 	searchResults: GraphSearchResults | undefined;
+	/** The PAGING BRAKE's count of `searchResults`' matches — derived from `searchResults` and the host
+	 *  `rows`, recomputed only when either changes. Not the number the results bar shows; that one counts
+	 *  against the decorated rows (see `countRenderedSearchResults`). */
+	searchResultsLoadedCount: number;
 	searchResultsError: GraphSearchResultsError | undefined;
 	/** The active search's query, carried from the host so a rebooted/reconnected app can restore its
 	 *  search box (results ride their own channel; without this the box is blank after a reconnect). */
 	searchQuery: SearchQuery | undefined;
-	currentSearchId: number | undefined;
+	/** Mirrors the host's `GraphSearchState.fallback` — set when the active search's pattern failed to
+	 *  compile as regex and matched literally instead. Cleared the moment a search completes without
+	 *  needing the fallback. Drives the search box's dimmed regex toggle and zero-result helper row. */
+	searchFallback: GraphSearchState['fallback'];
+	/** Mirrors the host's `GraphSearchState.relaxations` — counted broader alternatives offered when the
+	 *  active NL search settled with 0 results. Cleared (mirrors 1:1) the moment any other search event
+	 *  arrives without it — a new search, cancel, or a match. */
+	searchRelaxations: GraphSearchState['relaxations'];
 	/** Bumped locally each time the user submits a NEW search, so consumers can scope per-search UI
-	 *  state to one search session. Unlike `currentSearchId` (assigned by the host, so it only lands a
-	 *  round-trip later) this changes the instant the search is issued. Navigating/resuming an existing
-	 *  search does not bump it. */
+	 *  state to one search session — the instant it's issued, not a round-trip later. Navigating/resuming
+	 *  an existing search does not bump it. */
 	searchSession: number;
 	selectedRows: GraphSelectedRows | undefined;
 	visibleDays: { top: number; bottom: number } | undefined;
 	/**
-	 * Webview-only monotonic counter bumped whenever the host ships an authoritative refsMetadata REPLACE
-	 * (`refsMetadataReset`). An integration-flip STRIP preserves a non-empty upstream map, so the graph
-	 * component can't detect the reset by emptiness — it watches this token instead to re-arm its per-id
-	 * request dedup and re-request the dropped (PR/issue) types for visible rows. Not part of the host wire
-	 * contract (`State`); lives purely in the reducer→component signal path.
+	 * Webview-only monotonic counter bumped whenever the host pushes an authoritative refsMetadata REPLACE
+	 * (`GraphRefsMetadataService.onRefsMetadataChanged`). An integration-flip STRIP preserves a non-empty
+	 * upstream map, so the graph component can't detect the reset by emptiness — it watches this token
+	 * instead to re-arm its per-id request dedup and re-request the dropped (PR/issue) types for visible
+	 * rows. Not part of the host wire contract (`State`).
 	 */
 	refsMetadataResetToken: number;
+
+	/** Evidence-gated Git Health banner state for the selected repo (webview-owned; fetched by
+	 *  gl-graph-health-banner). */
+	gitHealthBanner?: GitHealthBannerState;
+	/** Merges a `GraphAvatarsService` response (resolved or proxied) into {@link avatars}. */
+	applyAvatars(avatars: Record<string, string>): void;
+	/** Merges a `GraphRefsMetadataService.getMissingRefsMetadata` response into {@link refsMetadata}. */
+	applyRefsMetadata(metadata: GraphRefsMetadata): void;
 
 	/**
 	 * Publish a lazily-fetched merge target into `overviewEnrichment` for the given branchId. The graph
@@ -119,7 +160,7 @@ export interface AppState extends State {
 
 	/**
 	 * Re-resolve the authoritative `mergeBase` for an already-published scope. Called from the
-	 * `DidInvalidateScopeAnchorsNotification` handler after refs/config move so the live scope
+	 * `GraphScopeService.onScopeAnchorsInvalidated` handler after refs/config move so the live scope
 	 * picks up the fresh anchor without the user re-picking. Initial picks go through `setScope`.
 	 */
 	resolveScopeMergeBase(scope: GraphScope): Promise<void>;
@@ -137,7 +178,7 @@ export interface AppState extends State {
 	ensureRowMarkerMergeTarget(): void;
 
 	/**
-	 * Defer clearing the current scope until the next `DidChangeRefsVisibilityNotification` lands —
+	 * Defer clearing the current scope until the next filters push lands —
 	 * coalesces the scope clear with the filter visibility update so a mode/filter change produces
 	 * a single coordinated re-render instead of a minimap reset followed by a separate filter update.
 	 */
@@ -158,10 +199,28 @@ export interface AppState extends State {
 	clearScope(): void;
 
 	/**
+	 * Sets the worktree perspective optimistically and fires the rebind RPC immediately, ahead of any
+	 * focus/anchor IPC. Same `path` as the live perspective is a no-op, which keeps a same-worktree
+	 * re-focus from re-firing the RPC. `options.branchName` renders optimistically on the branch pill
+	 * until the rebind's `state.branch` push confirms the same repo.
+	 */
+	setWorktreePerspective(path: string, options?: { branchName?: string }): void;
+
+	/**
+	 * Clears the worktree perspective, rebinding the graph back onto its home repository. No-op when no
+	 * perspective is live.
+	 *
+	 * `restoreScopeOnRefusal` is for callers that clear the FOCUS in the same gesture (the branch pill's ✕
+	 * full exit): a refused clear restores the perspective, and the scope handed over here is restored
+	 * alongside it rather than the exit landing half-way. Capture it BEFORE the `clearScope()` that follows.
+	 */
+	clearWorktreePerspective(options?: { restoreScopeOnRefusal?: GraphScope }): void;
+
+	/**
 	 * Seed the per-repo WIP cache with an optimistically-edited `Wip` (e.g. after a local stage/
 	 * unstage). The entry is flagged so subsequent `getWipState` calls report `isLive: false`
-	 * until the host's watcher reconciles. The host-driven push paths (`DidChangeWorkingTree` /
-	 * `DidRequestWipRefetch`) seed the cache through an internal path that clears that flag.
+	 * until the host's watcher reconciles. The host-driven push paths (the `workingTreeChanged` and
+	 * `wipRefetched` RPC events) seed the cache through an internal path that clears that flag.
 	 */
 	setWip(repoPath: string, wip: Wip): void;
 
@@ -188,7 +247,7 @@ export interface AppState extends State {
 	 * Return the cached WIP for `repoPath` plus liveness metadata. `isLive` reflects whether the
 	 * host currently has an active working-tree watcher for that repo — `true` for the primary
 	 * repo while it's selected, `true` for any secondary whose row is in the latest
-	 * `SyncWipWatchesCommand` set, `false` otherwise (and after a local optimistic edit until
+	 * `wip.syncWatches` set, `false` otherwise (and after a local optimistic edit until
 	 * the host reconciles). `ageMs` is the time since the entry was last written. Consumers use
 	 * `isLive` to decide whether to background-revalidate on cache hit.
 	 */
@@ -196,14 +255,14 @@ export interface AppState extends State {
 
 	/**
 	 * Update the set of repos the host currently has working-tree watchers for. Called by
-	 * `graph-wrapper.ts` whenever it sends `SyncWipWatchesCommand` (visible secondaries) and on
+	 * `graph-wrapper.ts` whenever it calls `wip.syncWatches` (visible secondaries) and on
 	 * `selectedRepository` change. The primary `selectedRepository` is always included by the
 	 * implementation — callers only need to pass the secondary set.
 	 */
 	updateActiveWipWatchers(repoPaths: Iterable<string>): void;
 
 	/**
-	 * Stake a claim on `shas` for an outgoing `GetWipStatsRequest` and return its ticket; pair with
+	 * Stake a claim on `shas` for an outgoing `wip.getStats` call and return its ticket; pair with
 	 * {@link isCurrentWipStatsRequest} before applying the response. Concurrent batches don't cancel each
 	 * other, and the responses carry no revision, so this is what keeps an older read that lands late from
 	 * rolling a row back over a newer one.

@@ -3,38 +3,39 @@ GitLens
 THIRD-PARTY SOFTWARE NOTICES AND INFORMATION
 This project incorporates components from the projects listed below.
 
-1. @awesome.me/webawesome version 3.11.0 (https://github.com/shoelace-style/webawesome)
+1. @awesome.me/webawesome version 3.12.0 (https://github.com/shoelace-style/webawesome)
 2. @configcat/sdk version 1.1.0 (https://github.com/configcat/js-unified-sdk)
-3. @eamodio/supertalk-core version 0.0.6 (https://github.com/eamodio/supertalk)
-4. @eamodio/supertalk-signals version 0.0.6 (https://github.com/eamodio/supertalk)
-5. @eamodio/supertalk version 0.0.7 (https://github.com/eamodio/supertalk)
+3. @eamodio/supertalk-core version 0.1.4 (https://github.com/eamodio/supertalk)
+4. @eamodio/supertalk-signals version 0.0.7 (https://github.com/eamodio/supertalk)
+5. @eamodio/supertalk version 0.1.4 (https://github.com/eamodio/supertalk)
 6. @lit-labs/signals version 0.3.0 (https://github.com/lit/lit)
 7. @lit-labs/virtualizer version 2.1.1 (https://github.com/lit/lit)
 8. @lit/context version 1.1.6 (https://github.com/lit/lit)
 9. @octokit/graphql version 9.0.4 (https://github.com/octokit/graphql.js)
 10. @octokit/request-error version 7.1.1 (https://github.com/octokit/request-error.js)
-11. @octokit/request version 10.0.13 (https://github.com/octokit/request.js)
+11. @octokit/request version 10.0.14 (https://github.com/octokit/request.js)
 12. @octokit/types version 17.0.0 (https://github.com/octokit/types.ts)
 13. @opentelemetry/api version 1.9.1 (https://github.com/open-telemetry/opentelemetry-js)
-14. @opentelemetry/exporter-trace-otlp-http version 0.221.0 (https://github.com/open-telemetry/opentelemetry-js)
-15. @opentelemetry/resources version 2.10.0 (https://github.com/open-telemetry/opentelemetry-js)
-16. @opentelemetry/sdk-trace-base version 2.10.0 (https://github.com/open-telemetry/opentelemetry-js)
+14. @opentelemetry/exporter-trace-otlp-http version 0.222.0 (https://github.com/open-telemetry/opentelemetry-js)
+15. @opentelemetry/resources version 2.11.0 (https://github.com/open-telemetry/opentelemetry-js)
+16. @opentelemetry/sdk-trace-base version 2.11.0 (https://github.com/open-telemetry/opentelemetry-js)
 17. @opentelemetry/semantic-conventions version 1.43.0 (https://github.com/open-telemetry/opentelemetry-js)
 18. @vscode/codicons version 0.0.45 (https://github.com/microsoft/vscode-codicons)
-19. diff2html version 3.4.56 (https://github.com/rtfpessoa/diff2html)
-20. fast-string-truncated-width version 3.0.3 (https://github.com/fabiospampinato/fast-string-truncated-width)
-21. fflate version 0.8.3 (https://github.com/101arrowz/fflate)
-22. ignore version 7.0.6 (https://github.com/kaelzhang/node-ignore)
-23. lit version 3.3.3 (https://github.com/lit/lit)
-24. marked version 18.0.9 (https://github.com/markedjs/marked)
-25. microsoft/vscode (https://github.com/microsoft/vscode)
-26. os-browserify version 0.3.0 (https://github.com/CoderPuppy/os-browserify)
-27. path-browserify version 1.0.1 (https://github.com/browserify/path-browserify)
-28. signal-polyfill version 0.2.2 (https://github.com/proposal-signals/signal-polyfill)
-29. signal-utils version 0.21.1 (https://github.com/proposal-signals/signal-utils)
-30. slug version 12.0.1 (https://github.com/Trott/slug)
-31. sortablejs version 1.15.7 (https://github.com/SortableJS/Sortable)
-32. vscode-uri version 3.1.0 (https://github.com/microsoft/vscode-uri)
+19. @vscode/l10n version 0.0.18 (https://github.com/Microsoft/vscode-l10n)
+20. diff2html version 3.4.56 (https://github.com/rtfpessoa/diff2html)
+21. fast-string-truncated-width version 3.0.3 (https://github.com/fabiospampinato/fast-string-truncated-width)
+22. fflate version 0.8.3 (https://github.com/101arrowz/fflate)
+23. ignore version 7.0.8 (https://github.com/kaelzhang/node-ignore)
+24. lit version 3.3.3 (https://github.com/lit/lit)
+25. marked version 18.0.11 (https://github.com/markedjs/marked)
+26. microsoft/vscode (https://github.com/microsoft/vscode)
+27. os-browserify version 0.3.0 (https://github.com/CoderPuppy/os-browserify)
+28. path-browserify version 1.0.1 (https://github.com/browserify/path-browserify)
+29. signal-polyfill version 0.2.2 (https://github.com/proposal-signals/signal-polyfill)
+30. signal-utils version 0.21.1 (https://github.com/proposal-signals/signal-utils)
+31. slug version 12.0.1 (https://github.com/Trott/slug)
+32. sortablejs version 1.15.7 (https://github.com/SortableJS/Sortable)
+33. vscode-uri version 3.2.0 (https://github.com/microsoft/vscode-uri)
 
 %% @awesome.me/webawesome NOTICES AND INFORMATION BEGIN HERE
 =========================================
@@ -175,6 +176,103 @@ await remote.forEach([1, 2, 3], (item) => {
 All functions are transformed into promise-returning async functions on the
 wrapped side. Proxies are released from memory when they're no longer in use by
 the wrapped side.
+
+### One-way calls with `notify()`
+
+Every regular call is request/response — even when nothing needs the reply.
+`notify()` wraps a remote proxy (or a callback proxy received as an argument)
+so calling it sends a single wire message with no response and returns `void`,
+instead of a `Promise` nobody awaits:
+
+```ts
+import {notify} from '@supertalk/core';
+
+// Method calls on a remote object
+notify(remote).reportSelection(ids); // void — one wire message, no ack
+```
+
+```ts
+// A callback proxy received from the other side (the event-emission case)
+class Service {
+  onDidChange(cb: (e: Change) => void) {
+    const emit = notify(cb); // hoist once
+    this.#listeners.add(emit);
+    return () => this.#listeners.delete(emit);
+  }
+}
+```
+
+Hoist the notifier out of hot loops, the same way you'd hoist `remote.method`.
+Errors — a throwing handler, a serialization failure — are reported through
+the `logger` option on whichever side produced them, never as a rejection.
+`notify()` throws `TypeError` if `target` isn't a remote proxy (a `handle()`,
+for example, has no callable surface). Don't pass per-call resources like
+`AbortSignal` through `notify()`: a handler that releases on call settlement
+never gets told to, since a notify never settles.
+
+### Subscriptions with `subscribe()`
+
+Subscribing the plain way is `await remote.onEvent(cb)`, returning a
+`Promise<Unsubscribe>`. That races teardown and reconnect: every call site
+needs a staleness guard, and after a reconnect the application has to
+re-subscribe everything by hand. `subscribe()` returns a handle synchronously
+and buffers the wire subscribe call until the connection's handshake
+completes, so you can subscribe from a constructor and never `await`
+anything:
+
+```ts
+import {subscribe} from '@supertalk/core';
+
+class Panel {
+  // In a constructor. Nothing awaited. Survives reconnect.
+  #rows = subscribe(this.#connection, (remote) =>
+    remote.onDidChangeRows(this.#onRows),
+  );
+
+  dispose() {
+    this.#rows.unsubscribe();
+  }
+}
+```
+
+The `subscriber` thunk receives the current root proxy and does whatever
+subscribing means for that service; its return value, if a function, is
+treated as the remote unsubscribe. The library re-invokes it on every
+successful handshake — including after a `reset()` + `waitForReady()`
+reconnect — so the subscriber must be idempotent and must always re-derive
+whatever it subscribes on from the `remote` it's given. Only subscriptions
+anchored on the **root** proxy resurrect this way; a proxy from a dead
+session is gone by definition. When passing a bare `Connection`, the
+application still has to drive `waitForReady()` (or use `wrap()`) — that
+call is what signals ready and triggers delivery.
+
+```ts
+interface Subscription extends Disposable {
+  unsubscribe(): void; // idempotent; releases the remote side
+  readonly closed: boolean;
+  readonly ready: Promise<void>; // settles once the first subscribe lands
+}
+```
+
+`unsubscribe()` is idempotent and works even before the initial subscribe
+call has landed — the pending call's returned unsubscribe is invoked as soon
+as it arrives instead of being stored. `Subscription` implements
+`Symbol.dispose`, so `using` works too:
+
+```ts
+using rows = subscribe(connection, (remote) => remote.onDidChangeRows(cb));
+```
+
+`Subscription extends Disposable`, so a consuming project's `lib` must include
+`esnext.disposable` (`@types/node` pulls it in automatically).
+
+Failures — a throwing subscriber, a rejected `target` promise — are reported
+through the `logger` option and surface on `ready`. The exceptions are the
+`ConnectionClosedError`s that `close()`/`reset()` reject in-flight work with:
+neither is logged, since both mean deliberate teardown. A `reset()` is
+swallowed entirely — the next reconnect re-issues automatically — while a
+`close()` also settles a still-pending `ready` with the error, so awaiting
+it can never hang.
 
 ### Object proxying with `proxy()`
 
@@ -476,6 +574,38 @@ For handlers that need to send updates outside of RPC calls (like signals or obs
 - `disconnect()` — Called when the connection closes; clean up resources
 
 See [@supertalk/signals](../signals) for a complete example.
+
+**Sequenced channels:**
+
+`SequencedChannel<T>`, from the separate `@eamodio/supertalk-core/handlers/channel.js` entry
+point, guarantees ordered delivery for a one-way stream of values, with receiver-side gap
+detection and sender-side generations (epochs).
+
+```ts
+import {SequencedChannel} from '@eamodio/supertalk-core/handlers/channel.js';
+
+// Sender
+const rows = new SequencedChannel<RowSplice>('rows', {replay: 32});
+expose(service, endpoint, {handlers: [rows]});
+rows.send(splice); // stamped {generation, seq}
+rows.newGeneration(); // epoch bump: resets seq, clears replay, invalidates in-flight
+
+// Receiver
+const rows = new SequencedChannel<RowSplice>('rows');
+const connection = new Connection(endpoint, {handlers: [rows]});
+rows.subscribe((splice, meta) => ledger.apply(splice)); // in-order only
+rows.onGap((gap) => void service.resyncRows()); // domain recovery is the app's
+```
+
+Guarantee: every value is delivered in order, or `onGap` fires — never both, never neither.
+`onGap` only fires when the channel can't self-heal: a gap first triggers a replay request, and
+if `replay: N` lets the sender resend the missing messages, delivery resumes with no `onGap` at
+all. Create one instance per channel per side and register it in `handlers` on both ends; the
+library owns ordering and gap detection, and the application owns domain recovery — what a
+resync sends, and calling `newGeneration()` when it does.
+
+It is a separate entry point, like `handlers/streams.js`: importing it adds nothing to the main
+bundle unless you actually use it.
 
 ### TypeScript Types
 
@@ -3010,6 +3140,33 @@ Creative Commons may be contacted at creativecommons.org.
 Git Logo by [Jason Long](https://bsky.app/profile/jasonlong.me) is licensed under the [Creative Commons Attribution 3.0 Unported License](https://creativecommons.org/licenses/by/3.0/).
 =========================================
 END OF  @vscode/codicons NOTICES AND INFORMATION
+
+%% @vscode/l10n NOTICES AND INFORMATION BEGIN HERE
+=========================================
+    MIT License
+
+    Copyright (c) Microsoft Corporation.
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE
+
+=========================================
+END OF  @vscode/l10n NOTICES AND INFORMATION
 
 %% diff2html NOTICES AND INFORMATION BEGIN HERE
 =========================================

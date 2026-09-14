@@ -3,15 +3,16 @@ import { consume } from '@lit/context';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
+import { focusOutline } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase, linkBase } from '@gitlens/components/components/styles/lit/base.css.js';
 import { linkify } from '../../shared/components/linkify.js';
-import { focusOutline } from '../../shared/components/styles/lit/a11y.css.js';
-import { boxSizingBase, linkBase } from '../../shared/components/styles/lit/base.css.js';
 import type { SettingsActions } from '../actions.js';
-import type { CheckDescriptor, SettingDescriptor } from '../model.js';
+import type { CheckDescriptor, NumberDescriptor, SettingDescriptor } from '../model.js';
 import { evaluateStateExpression } from '../model.js';
 import type { SettingsState } from '../state.js';
 import { settingsStateContext } from '../state.js';
 import './format-input.js';
+import './settings-account.js';
 import './settings-agents.js';
 import './settings-ai.js';
 import './settings-autolinks.js';
@@ -20,7 +21,7 @@ import './settings-remotes.js';
 import './settings-scm-views.js';
 import './settings-setup.js';
 import '../../shared/components/checkbox/checkbox.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../shared/components/segmented/segmented.js';
 import '../../shared/components/select/select.js';
 import '../../shared/components/slider/slider.js';
@@ -280,18 +281,11 @@ export class GlSettingControl extends SignalWatcher(LitElement) {
 							// Buffer typing locally so a mid-edit config push doesn't reset `.value`
 							this._numberDraft = (e.target as HTMLInputElement).value;
 						}}
-						@blur=${(e: FocusEvent) => {
-							void this.actions?.applyNumber(d.key, (e.target as HTMLInputElement).value, d.defaultValue);
-							this._numberDraft = undefined;
-						}}
+						@blur=${() => this.commitNumber(d)}
 						@keydown=${(e: KeyboardEvent) => {
 							// Enter commits in place (focus stays put), matching the format inputs
 							if (e.key === 'Enter') {
-								void this.actions?.applyNumber(
-									d.key,
-									(e.target as HTMLInputElement).value,
-									d.defaultValue,
-								);
+								this.commitNumber(d);
 							} else if (e.key === 'Escape' && this._numberDraft !== undefined) {
 								// Revert to the committed config value
 								this._numberDraft = undefined;
@@ -362,10 +356,8 @@ export class GlSettingControl extends SignalWatcher(LitElement) {
 			case 'setup':
 				return html`<gl-settings-setup .actions=${this.actions}></gl-settings-setup>`;
 
-			// The account panel is rendered full-bleed by settings-detail (it replaces the
-			// category header); it never reaches a per-control render, so nothing here.
 			case 'account':
-				return nothing;
+				return html`<gl-settings-account .actions=${this.actions}></gl-settings-account>`;
 
 			case 'info':
 				return html`<div class="info" role="note">
@@ -412,6 +404,19 @@ export class GlSettingControl extends SignalWatcher(LitElement) {
 				}}
 				>${d.label}</gl-checkbox
 			>${this.renderHint(d.hint)}`;
+	}
+
+	/**
+	 * Commits the number draft on blur/Enter, mirroring `gl-format-input`: an untouched field
+	 * carries no draft, so a bare focus/blur never writes (previously an empty box committed
+	 * the default — or `null` — over a value the field couldn't display, e.g. `'auto'`).
+	 */
+	private commitNumber(d: NumberDescriptor): void {
+		if (this._numberDraft === undefined) return;
+
+		const value = this._numberDraft;
+		this._numberDraft = undefined;
+		void this.actions?.applyNumber(d.key, value, d.defaultValue);
 	}
 
 	private renderRowLabel(label: string, control: unknown) {

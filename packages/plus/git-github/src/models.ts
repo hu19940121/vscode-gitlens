@@ -133,6 +133,7 @@ export type GitHubIssueOrPullRequestState = GitHubIssueState | GitHubPullRequest
 export interface GitHubPullRequestLite extends Omit<GitHubIssueOrPullRequest, '__typename'> {
 	/** `Actor` is nullable in GitHub's schema — `null` once the author's account is deleted */
 	author: GitHubMember | null;
+	body: string | null;
 
 	baseRefName: string;
 	baseRefOid: string;
@@ -207,23 +208,32 @@ export type GitHubPullRequestMergeableState = 'MERGEABLE' | 'CONFLICTING' | 'UNK
 export type GitHubPullRequestStatusCheckRollupState = 'SUCCESS' | 'FAILURE' | 'PENDING' | 'EXPECTED' | 'ERROR';
 export type GitHubPullRequestReviewState = 'APPROVED' | 'CHANGES_REQUESTED' | 'COMMENTED' | 'DISMISSED' | 'PENDING';
 
+type GitHubPullRequestReview = {
+	id: string;
+	author: GitHubMember | null;
+	state: GitHubPullRequestReviewState;
+	commit?: { oid: string } | null;
+};
+
 export interface GitHubPullRequest extends GitHubPullRequestLite {
 	additions: number;
 	assignees: {
 		nodes: GitHubMember[];
 	};
-	body: string;
 	changedFiles: number;
 	checksUrl: string;
 	deletions: number;
 	mergeable: GitHubPullRequestMergeableState;
 	reviewDecision: GitHubPullRequestReviewDecision;
 	latestReviews: {
-		nodes: {
-			author: GitHubMember | null;
-			state: GitHubPullRequestReviewState;
-		}[];
+		nodes: GitHubPullRequestReview[];
 	};
+	/**
+	 * The current user's own latest review. `latestReviews` is capped, so on a heavily-reviewed pull request
+	 * the viewer's own review can fall outside that window — which is exactly the row a "needs my review"
+	 * surface is asking about.
+	 */
+	viewerLatestReview: GitHubPullRequestReview | null;
 	reviewRequests: {
 		nodes: {
 			asCodeOwner: boolean;
@@ -325,6 +335,8 @@ export function fromGitHubPullRequestLite(pr: GitHubPullRequestLite, provider: P
 		undefined, // version
 		undefined, // commitCount
 		fromGitHubPullRequestStack(pr),
+		undefined, // filesChanged
+		pr.body ?? undefined,
 	);
 }
 
@@ -438,6 +450,19 @@ export function fromGitHubPullRequestStatusCheckRollupState(
 }
 
 export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider): PullRequest {
+	// `latestReviews` is capped, so keep the viewer's own review even when it falls outside that window, deduped
+	// by review id since the two selections overlap. Unsubmitted drafts are dropped from the union rather than
+	// from the viewer's side alone: `PENDING` is in GitHub's review-state enum on both selections, and the field
+	// this feeds is documented as reviews already SUBMITTED — a draft there tells a "needs my review" consumer
+	// the review is done, and a reviewer with a submitted review plus a draft would get two conflicting rows.
+	const viewerLatestReview = pr.viewerLatestReview;
+	const latestReviews = [
+		...pr.latestReviews.nodes,
+		...(viewerLatestReview != null && !pr.latestReviews.nodes.some(r => r.id === viewerLatestReview.id)
+			? [viewerLatestReview]
+			: []),
+	].filter(review => review.state !== 'PENDING');
+
 	return new PullRequest(
 		provider,
 		fromGitHubMemberOrGhost(pr.author),
@@ -505,9 +530,10 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 					: undefined,
 			)
 			.filter(<T>(r?: T): r is T => Boolean(r)),
-		pr.latestReviews.nodes.map(r => ({
+		latestReviews.map(r => ({
 			reviewer: fromGitHubMemberOrGhost(r.author),
 			state: fromGitHubPullRequestReviewState(r.state),
+			commitOid: r.commit?.oid,
 		})),
 		pr.assignees.nodes.map(r => ({
 			id: r.login,
@@ -522,7 +548,7 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 		pr.commits.totalCount,
 		fromGitHubPullRequestStack(pr),
 		pr.changedFiles,
-		pr.body || undefined,
+		pr.body ?? undefined,
 	);
 }
 

@@ -80,8 +80,10 @@ export interface TreeItemDecorationBase {
 	position?: 'before' | 'after';
 }
 
-/** Color treatment for an icon decoration, keyed to the Launchpad indicator colors. */
-export type TreeItemDecorationIconKind = 'launchpad-mergeable' | 'launchpad-blocked' | 'launchpad-attention';
+/** Color treatment for an icon decoration, keyed to the Launchpad indicator colors. `scoped` reuses the
+ *  Commit Graph's scoped-worktree yellow, the same token the graph header's pills render active scope
+ *  with, so a scoped sidebar row reads as the same state rather than inventing new vocabulary. */
+export type TreeItemDecorationIconKind = 'launchpad-mergeable' | 'launchpad-blocked' | 'launchpad-attention' | 'scoped';
 
 export interface TreeItemDecorationIcon extends TreeItemDecorationBase {
 	type: 'icon';
@@ -160,7 +162,7 @@ interface TreeModelBase<Context = any[]> extends TreeItemBase {
 		| { type: 'status'; name: GitFileStatus }
 		| { type: 'branch'; status?: string; worktree?: boolean; hasChanges?: boolean }
 		| { type: 'file-icon'; filename: string }
-		| { type: 'agent'; phase: AgentSessionPhase }
+		| { type: 'agent'; phase: AgentSessionPhase; provider?: string }
 		| { type: 'pull-request'; state?: string; draft?: boolean };
 	description?: string;
 	context?: Context;
@@ -171,12 +173,14 @@ interface TreeModelBase<Context = any[]> extends TreeItemBase {
 	 *  is rendered directly, bypassing markdown — letting callers produce richer layouts with
 	 *  their own scoped styles when a markdown string would be too constrained. */
 	tooltip?: string | TemplateResult;
+	/** Overrides the tooltip's wrapping behavior under the tree's default placement. */
+	tooltipWrap?: 'break-all';
 	filterText?: string;
 	matched?: boolean;
 	/** Lower sorts first within its parent; treated as `0` when unset. */
 	priority?: number;
 	/** Dims the whole row (label, icon, description) to de-emphasize it while keeping it legible and
-	 *  its actions clickable — e.g. a completed agent session shown as done history. */
+	 *  its actions clickable — e.g. an ended agent session shown as done history. */
 	muted?: boolean;
 }
 

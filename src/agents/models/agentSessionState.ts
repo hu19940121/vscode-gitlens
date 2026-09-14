@@ -1,4 +1,4 @@
-import type { AgentSession, ResumableAgentSession } from '@gitlens/agents/types.js';
+import type { AgentSession, AgentSessionHistoryActions, AgentSessionHistoryItem } from '@gitlens/agents/types.js';
 import { basename, normalizePath } from '@gitlens/utils/path.js';
 import type { Shape } from '@gitlens/utils/types.js';
 import { deriveNameFromPrompt } from '../utils/deriveNameFromPrompt.js';
@@ -29,10 +29,10 @@ export interface AgentSessionWorktreeState {
 
 /**
  * Wire DTO for an {@link AgentSession}. Near-1:1 projection via {@link Shape} so webviews see the
- * rich session shape (provider, pendingPermission with suggestions, prompts, planFile, dates,
+ * rich session shape (provider, pendingPermission with suggestions, prompts, planFile,
  * isSubagent/parentId, etc.) without hand-projecting every field.
  *
- * Three deliberate divergences from `Shape<AgentSession>`:
+ * Four deliberate divergences from `Shape<AgentSession>`:
  *  - **`subagents` → `subagentCount`** — only the count badge consumes them today. Sending the
  *    recursive subagent tree (each with its own pendingPermission/lastPrompt) would bloat every
  *    snapshot push for a UI that doesn't walk them. `isSubagent` and `parentId` still flow
@@ -45,11 +45,30 @@ export interface AgentSessionWorktreeState {
  *    Computed once host-side so every consumer renders the same name without duplicating the
  *    cascade — the raw harness-supplied `name?: string` field still flows through for callers
  *    that want to distinguish "harness-named" from "fallback-named" sessions.
+ *  - **`lastActivity` / `phaseSince` are epoch ms**, not `Date` — same convention as
+ *    {@link PastAgentSessionState.lastActivity}. Keeps the DTO transport-independent: legacy IPC
+ *    structured-clones a `Date` fine, but the RPC channel JSON-stringifies it into an ISO string
+ *    wearing a `Date` type, which is a lie by the time it reaches the webview.
  */
-export type AgentSessionState = Omit<Shape<AgentSession>, 'subagents'> & {
+export type AgentSessionState = Omit<
+	Shape<AgentSession>,
+	'subagents' | 'visitedWorktreePaths' | 'lastActivity' | 'phaseSince'
+> & {
 	readonly displayName: string;
+	/** Host-validated management capabilities. Provider methods, not phase inference, decide which
+	 *  actions webview contexts and inline controls may expose. */
+	readonly actions?: Pick<AgentSessionHistoryActions, 'archive' | 'resume'>;
 	readonly subagentCount: number;
 	readonly worktree?: AgentSessionWorktreeState;
+	/** Distinct worktree roots this session has been observed in — see
+	 *  {@link AgentSession.visitedWorktreePaths}. Redeclared here rather than left to
+	 *  `Shape<AgentSession>`: `Shape<>` mangles a `readonly T[]` field into a method-stripped
+	 *  array-like object type (same reason {@link AgentSession.fileActivity} uses a mutable array). */
+	readonly visitedWorktreePaths?: readonly string[];
+	/** Epoch ms. */
+	readonly lastActivity: number;
+	/** Epoch ms. */
+	readonly phaseSince: number;
 };
 
 /**
@@ -60,12 +79,22 @@ export type AgentSessionState = Omit<Shape<AgentSession>, 'subagents'> & {
  */
 export interface PastAgentSessionState {
 	readonly id: string;
-	/** The directory it must be resumed from. */
-	readonly cwd: string;
+	readonly providerId: string;
+	readonly disposition: AgentSessionHistoryItem['disposition'];
+	readonly actions: AgentSessionHistoryActions;
 	readonly worktreePath: string;
 	readonly displayName: string;
 	/** Epoch ms — matches the RPC convention for dates crossing to a webview. */
 	readonly lastActivity: number;
+	readonly lastPrompt?: string;
+}
+
+/** On-demand enrichment for a past-session sheet, resolved lazily when the sheet opens — see
+ *  {@link AgentSessionProvider.resolveSessionDetails}. Never part of the base past-session listing
+ *  (that stays cheap); this is the one extra read the user's click pays for. */
+export interface PastAgentSessionDetail {
+	readonly titles?: { readonly custom?: string; readonly ai?: string; readonly agent?: string };
+	readonly firstPrompt?: string;
 	readonly lastPrompt?: string;
 }
 
@@ -76,27 +105,39 @@ export interface PastAgentSessionsResult {
 }
 
 export function serializePastAgentSession(
-	session: ResumableAgentSession,
+	providerId: string,
+	session: AgentSessionHistoryItem,
 	worktreePath: string,
 	worktreeName: string | undefined,
 ): PastAgentSessionState {
+	const cwd = session.actions.resume?.cwd;
 	return {
 		id: session.id,
-		cwd: session.cwd,
+		providerId: providerId,
+		disposition: session.disposition,
+		actions: session.actions,
 		worktreePath: worktreePath,
 		displayName: getSessionDisplayName(
 			{
-				providerName: session.providerId,
+				name: session.name,
+				providerName: providerId,
 				transcriptTitles: session.titles,
+				firstPrompt: session.firstPrompt,
 				lastPrompt: session.lastPrompt,
 				worktreePath: worktreePath,
-				cwd: session.cwd,
+				cwd: cwd,
 			},
 			worktreeName,
 		),
 		lastActivity: session.lastActivity.getTime(),
 		lastPrompt: session.lastPrompt,
 	};
+}
+
+/** Collision-safe identity shared by live and historical rows. Session ids are only unique inside
+ *  their provider; JSON tuple encoding avoids delimiter assumptions about third-party harness ids. */
+export function getAgentSessionIdentityKey(providerId: string, sessionId: string): string {
+	return JSON.stringify([providerId, sessionId]);
 }
 
 /** The fields {@link getSessionDisplayName} reads — the intersection of a live {@link AgentSession}
@@ -170,18 +211,22 @@ export interface AgentSessionWorktreeMetadata {
 export function serializeAgentSession(
 	session: AgentSession,
 	worktree: AgentSessionWorktreeMetadata | undefined,
+	actions?: Pick<AgentSessionHistoryActions, 'archive' | 'resume'>,
 ): AgentSessionState {
 	const { subagents, ...rest } = session;
 	return {
 		...rest,
+		lastActivity: session.lastActivity.getTime(),
+		phaseSince: session.phaseSince.getTime(),
 		// Backfill repo identity from the host's worktree lookup when the provider never resolved it.
-		// Completed sessions read from the CLI's durable store carry a `worktreePath` but no
+		// Ended sessions read from the CLI's durable store carry a `worktreePath` but no
 		// `commonPath` (no git probe, by design — a 30-day history must not fan out). Consumers gate
 		// on `commonPath` to decide whether a session belongs to the repo they're showing, so without
 		// this those sessions' cards would stay permanently inert rather than briefly (see
 		// `AgentSessionWorktreeMetadata.repoPath`).
 		commonPath: session.commonPath ?? worktree?.repoPath,
 		displayName: getSessionDisplayName(session, worktree?.name),
+		actions: actions,
 		subagentCount: subagents?.length ?? 0,
 		worktree:
 			session.worktreePath != null

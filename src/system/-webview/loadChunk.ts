@@ -1,4 +1,4 @@
-import { window } from 'vscode';
+import { l10n, window } from 'vscode';
 import { isErrorLike } from '@gitlens/utils/error.js';
 import { once } from '@gitlens/utils/function.js';
 import { Logger } from '@gitlens/utils/logger.js';
@@ -36,11 +36,11 @@ export function isChunkLoadError(ex: unknown): boolean {
 
 /** Asks the user to reload once per host session — repeated prompts after the first add no value. */
 const promptExtensionUpgradedReload = once((): void => {
-	const reload = { title: 'Reload Window' };
-	const dismiss = { title: 'Not Now', isCloseAffordance: true };
+	const reload = { title: l10n.t('Reload Window') };
+	const dismiss = { title: l10n.t('Not Now'), isCloseAffordance: true };
 	void window
 		.showWarningMessage(
-			'GitLens was updated in the background. Reload the window to continue using all features.',
+			l10n.t('GitLens was updated in the background. Reload the window to continue using all features.'),
 			reload,
 			dismiss,
 		)
@@ -78,5 +78,6 @@ function errorCodeOf(ex: unknown): string | undefined {
 }
 
 function errorMessageOf(ex: unknown): string {
+	// oxlint-disable-next-line @gitlens/no-raw-error-message -- telemetry only (extension/chunkLoad/failed 'error.message' attribute)
 	return isErrorLike(ex) ? ex.message : String(ex);
 }

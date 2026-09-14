@@ -1,4 +1,4 @@
-import { ThemeIcon } from 'vscode';
+import { l10n } from 'vscode';
 import { TagError } from '@gitlens/git/errors.js';
 import type { GitTagReference } from '@gitlens/git/models/reference.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
@@ -6,9 +6,13 @@ import { getReferenceLabel } from '@gitlens/git/utils/reference.utils.js';
 import { getDefaultRemoteOrOrigin } from '@gitlens/git/utils/remote.utils.js';
 import { ensureArray } from '@gitlens/utils/array.js';
 import { Logger } from '@gitlens/utils/logger.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { Container } from '../../../container.js';
 import type { GlRepository } from '../../../git/models/repository.js';
 import { showGitErrorMessage } from '../../../messages.js';
+import { createQuickPickSeparator } from '../../../quickpicks/items/common.js';
+import type { ConfirmToggleQuickPickItem, DirectiveQuickPickItem } from '../../../quickpicks/items/directive.js';
+import { createConfirmToggleQuickPickItem } from '../../../quickpicks/items/directive.js';
 import type { FlagsQuickPickItem } from '../../../quickpicks/items/flags.js';
 import { createFlagsQuickPickItem } from '../../../quickpicks/items/flags.js';
 import type {
@@ -30,7 +34,8 @@ import {
 	appendReposToTitle,
 	assertStepState,
 	canPickStepContinue,
-	createConfirmStep,
+	confirmOptionsSeparatorLabel,
+	refreshConfirmStepItems,
 } from '../../quick-wizard/utils/steps.utils.js';
 import type { TagContext } from '../tag.js';
 
@@ -62,15 +67,15 @@ export interface TagPushGitCommandArgs {
 
 export class TagPushGitCommand extends QuickCommand<State> {
 	constructor(container: Container, args?: TagPushGitCommandArgs) {
-		super(container, 'tag-push', 'push', 'Push Tags', {
-			description: 'pushes the specified tags to a remote',
+		super(container, 'tag-push', 'push', l10n.t('Push Tags'), {
+			description: l10n.t('pushes the specified tags to a remote'),
 		});
 
 		this.initialState = { confirm: args?.confirm, ...args?.state };
 	}
 
-	override get canSkipConfirm(): boolean {
-		return false; // Push always requires confirmation
+	protected override get supportsSkipConfirmToggle(): boolean {
+		return true;
 	}
 
 	protected createContext(context?: StepsContext<any>): Context {
@@ -119,7 +124,7 @@ export class TagPushGitCommand extends QuickCommand<State> {
 
 				const result = yield* pickTagsStep(state, context, {
 					picked: state.references?.map(r => r.ref),
-					placeholder: 'Choose tags to push',
+					placeholder: l10n.t('Choose tags to push'),
 				});
 				if (result === StepResultBreak) {
 					state.references = undefined!;
@@ -143,7 +148,7 @@ export class TagPushGitCommand extends QuickCommand<State> {
 
 					const result = yield* pickRemoteStep(state, context, {
 						picked: getDefaultRemoteOrOrigin(remotes)?.name,
-						placeholder: 'Choose a remote to push to',
+						placeholder: l10n.t('Choose a remote to push to'),
 					});
 					if (result === StepResultBreak) {
 						state.remote = undefined!;
@@ -181,8 +186,8 @@ export class TagPushGitCommand extends QuickCommand<State> {
 					{ force: state.flags.includes('--force') },
 				);
 			} catch (ex) {
-				Logger.error(ex, context.title);
-				void showGitErrorMessage(ex, TagError.is(ex) ? undefined : 'Unable to push tag');
+				Logger.error(ex, 'Push Tags');
+				void showGitErrorMessage(ex, TagError.is(ex) ? undefined : l10n.t('Unable to push tag'));
 			}
 		}
 
@@ -193,23 +198,64 @@ export class TagPushGitCommand extends QuickCommand<State> {
 		state: StepState<State<GlRepository, GitRemote>>,
 		context: TagContext,
 	): StepResultGenerator<Flags[]> {
-		const step: QuickPickStep<FlagsQuickPickItem<Flags>> = createConfirmStep(
-			appendReposToTitle(`Confirm ${context.title}`, state, context),
-			[
-				createFlagsQuickPickItem<Flags>(state.flags, [], {
-					label: context.title,
-					detail: `Will push ${getReferenceLabel(state.references)} to ${state.remote.name}`,
-				}),
-				createFlagsQuickPickItem<Flags>(state.flags, ['--force'], {
-					label: `Force ${context.title}`,
-					description: '--force',
-					iconPath: new ThemeIcon('warning'),
-					detail: `Will force push ${getReferenceLabel(state.references)} to ${
-						state.remote.name
-					}, overwriting the tag on the remote if it already exists`,
-				}),
-			],
-			context,
+		const references = ensureArray(state.references);
+		const refsLabel = getReferenceLabel(references);
+
+		let force = state.flags.includes('--force');
+
+		// Folds the live Force toggle value into the mode's flags and detail — the accepted item's flags
+		// are the whole contract with the executor — so the row says what will actually happen.
+		const buildItems = (): FlagsQuickPickItem<Flags>[] => [
+			createFlagsQuickPickItem<Flags>(state.flags, force ? ['--force'] : [], {
+				label: force ? l10n.t('Force Push Tags') : context.title,
+				description: force ? '--force' : undefined,
+				detail: force
+					? formatPlural(
+							l10n.t(
+								'{count, plural, one{Will force push {refs} to {remote}, overwriting the tag on the remote if it already exists} other{Will force push {refs} to {remote}, overwriting the tags on the remote if they already exist}}',
+							),
+							{ count: references.length, refs: refsLabel, remote: state.remote.name },
+						)
+					: l10n.t('Will push {0} to {1}', refsLabel, state.remote.name),
+			}),
+		];
+
+		let items = buildItems();
+
+		// Takes the toggle row rather than closing over it so this can be declared before the toggle
+		// itself, which needs `buildRows` in its handler.
+		const buildRows = (
+			toggle: ConfirmToggleQuickPickItem,
+		): (FlagsQuickPickItem<Flags> | DirectiveQuickPickItem)[] => [
+			...items,
+			createQuickPickSeparator(confirmOptionsSeparatorLabel),
+			toggle,
+		];
+
+		let step: QuickPickStep<FlagsQuickPickItem<Flags> | DirectiveQuickPickItem>;
+
+		const forceToggle = createConfirmToggleQuickPickItem({
+			label: force ? l10n.t('$(warning) Force') : l10n.t('Force'),
+			description: '--force',
+			detail: formatPlural(
+				l10n.t(
+					'{0, plural, one{Overwrite the tag on the remote if it already exists} other{Overwrite the tags on the remote if they already exist}}',
+				),
+				[references.length],
+			),
+			checked: force,
+			onDidChange: item => {
+				force = item.checked;
+				item.label = force ? l10n.t('$(warning) Force') : l10n.t('Force');
+				items = buildItems();
+				refreshConfirmStepItems(step, buildRows(item));
+			},
+		});
+
+		step = this.createConfirmStep(
+			appendReposToTitle(l10n.t('Confirm Push Tags'), state, context),
+			buildRows(forceToggle),
+			l10n.t('Confirm Push Tags'),
 		);
 		const selection: StepSelection<typeof step> = yield step;
 		return canPickStepContinue(step, state, selection) ? selection[0].item : StepResultBreak;

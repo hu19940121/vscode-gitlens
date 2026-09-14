@@ -8,9 +8,7 @@ import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import type { Event } from '@gitlens/utils/event.js';
 import type { CacheController } from '@gitlens/utils/promiseCache.js';
-import type { ConfiguredIntegrationService } from './authentication/configuredIntegrationService.js';
 import type { IntegrationAuthenticationProvider } from './authentication/integrationAuthenticationProvider.js';
-import type { IntegrationAuthenticationService } from './authentication/integrationAuthenticationService.js';
 import type { IntegrationIds } from './constants.js';
 import type { GitHostIntegration } from './models/gitHostIntegration.js';
 import type { IntegrationBase } from './models/integration.js';
@@ -155,7 +153,7 @@ export interface IntegrationCacheProvider {
 	getCurrentAccount(
 		integration: IntegrationBase,
 		cacheable: Cacheable<Account>,
-		options?: CacheExpiryOptions,
+		options?: CacheExpiryOptions & { connectionId?: string; etag?: string },
 	): CacheResult<Account>;
 	/** Evicts every cached pull request. A merge invalidates more than the merged pull request alone —
 	 *  a stacked merge lands every layer below it and retargets every layer above — and no caller can
@@ -244,7 +242,12 @@ export interface AuthenticationSessionsChangeEvent {
  */
 export interface IntegrationsRemoteConfig {
 	readonly type: string;
-	readonly domain: string;
+	/** Exact-match domain (mutually exclusive with `regex`) */
+	readonly domain?: string;
+	/** Regex pattern for flexible host matching (mutually exclusive with `domain`) */
+	readonly regex?: string;
+	/** URL protocol override (e.g., `'https'`) */
+	readonly protocol?: string;
 	readonly ignoreSSLErrors?: boolean | 'force';
 }
 
@@ -324,11 +327,7 @@ export interface IntegrationServiceHooks {
 	 * cloud-OAuth provider. GitLens omits this — the package builds its cloud providers internally; an
 	 * external consumer can plug in any auth strategy here.
 	 */
-	createAuthenticationProvider?(args: {
-		id: IntegrationIds;
-		auth: IntegrationAuthenticationService;
-		configured: ConfiguredIntegrationService;
-	}): Promise<IntegrationAuthenticationProvider | undefined>;
+	createAuthenticationProvider?(args: { id: IntegrationIds }): Promise<IntegrationAuthenticationProvider | undefined>;
 
 	/**
 	 * Outbound behavioral events, nested by domain — mirroring `@gitlens/git`'s `GitServiceHooks`. The

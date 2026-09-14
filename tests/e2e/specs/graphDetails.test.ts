@@ -12,7 +12,7 @@ import * as process from 'node:process';
 import type { FrameLocator, Locator } from '@playwright/test';
 import type { VSCodeInstance } from '../baseTest.js';
 import { test as base, createTmpDir, expect, GitFixture, MaxTimeout } from '../baseTest.js';
-import { waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
+import { graphDetailsRegion, waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
 
 // Configure with a purpose-built test repository
 const test = base.extend({
@@ -79,9 +79,10 @@ async function openGraphWithPro(vscode: VSCodeInstance): Promise<{
 
 	return {
 		graphWebview: graphWebview!,
-		dispose: () => {
-			sim[Symbol.dispose]();
-			return Promise.resolve();
+		// Awaits the real teardown: the sync disposer drops its promise, which let the next test start
+		// while the simulated subscription was still being torn down.
+		dispose: async () => {
+			await sim[Symbol.asyncDispose]();
 		},
 	};
 }
@@ -166,14 +167,24 @@ async function selectWip(graphWebview: FrameLocator): Promise<void> {
 		return;
 	}
 
-	// Match the visible WIP row label, not the hidden tooltip-content span that also carries the
-	// "Working Changes" text (a plain .first() picks the hidden tooltip span).
+	// Identify the row by its ROLE, not by its visible text. The row reads "Working Changes" only while
+	// that fits: under width pressure the renderer swaps in the short `WIP` form (`wipDisplayLabel`, the
+	// first rung of `computeWipRowFit`'s ladder in the commit-graph package), and a text gate then matches
+	// nothing — which is how this spec timed out on Windsurf while passing on VS Code with the identical
+	// bundle. The swap is visual only: the row's aria-label is built from `commit.message`, so the
+	// accessible name keeps the long form at any width. It also sidesteps the hidden tooltip-content span
+	// carrying the same text, which is why the old gate needed the visibility filter.
 	const wipRow = graphWebview
-		.getByText(/Working (Changes|Tree)/)
+		.getByRole('treeitem', { name: /Working (Changes|Tree)/ })
 		.filter({ visible: true })
 		.first();
 	await expect(wipRow).toBeVisible({ timeout: MaxTimeout });
-	await wipRow.click();
+	// Click the message ELEMENT, not the row box. `getByText` used to resolve to this very span, so this
+	// keeps the gesture the row-selection behaviour was proven with while dropping the text dependency.
+	// The row box is the wrong target: it also carries the inline branch pill, and a click resolved to a
+	// ref routes to the ref action instead of selecting the row. The pill renders OUTSIDE
+	// `.gl-graph__message`, so the message span cannot resolve to a ref.
+	await wipRow.locator('.gl-graph__message-subject').first().click();
 	await ensureDetailsPanelOpen(graphWebview);
 }
 
@@ -185,10 +196,26 @@ async function waitForDetailsLoaded(graphWebview: FrameLocator): Promise<void> {
 	await ensureDetailsPanelOpen(graphWebview);
 
 	// Wait for any of the detail sub-components to render (indicates RPC data loaded)
-	const commitDetails = graphWebview.locator('gl-details-commit-panel').first();
-	const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-	const comparePanel = graphWebview.locator('gl-details-multicommit-panel').first();
-	await expect(commitDetails.or(wipDetails).or(comparePanel)).toBeVisible({ timeout: 30000 });
+	await expect(graphDetailsRegion(graphWebview)).toBeVisible({ timeout: 30000 });
+}
+
+/**
+ * Assert the details panel is dismissed, as the implementation defines dismissed.
+ *
+ * The split panel is always rendered to avoid DOM re-parenting (which causes layout jumps): hiding
+ * collapses it (split position pinned to 100) and marks the details pane `inert` rather than unmounting
+ * `.details-content`. That element therefore stays in the DOM at ~0 size — a residual that rounds to
+ * 1–2px on some renderers (it did on Windsurf and Positron, while CI's VS Code landed on exactly 0) —
+ * so `not.toBeVisible()` on it is not an invariant the implementation guarantees. What it does
+ * guarantee: the toggle flips to "Show Details Panel" and the pane is inert, its content unreachable.
+ */
+async function expectDetailsPanelDismissed(graphWebview: FrameLocator): Promise<void> {
+	await expect(graphWebview.locator('gl-button[aria-label="Show Details Panel"]').first()).toBeVisible({
+		timeout: MaxTimeout,
+	});
+	await expect(graphWebview.locator('.graph__details-pane').first()).toHaveAttribute('inert', '', {
+		timeout: MaxTimeout,
+	});
 }
 
 // ============================================================================
@@ -221,9 +248,7 @@ test.describe('Graph Details - Panel Visibility', () => {
 		await waitForDetailsLoaded(graphWebview);
 
 		// Either commit details or WIP details should be visible (depends on auto-selection)
-		const commitDetails = graphWebview.locator('gl-details-commit-panel').first();
-		const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-		await expect(commitDetails.or(wipDetails)).toBeVisible({ timeout: 30000 });
+		await expect(graphDetailsRegion(graphWebview)).toBeVisible({ timeout: 30000 });
 
 		// Toggle button should be visible with an accessible details label
 		const toggleButton = graphWebview.locator('gl-button[aria-label$="Details Panel"]');
@@ -235,7 +260,7 @@ test.describe('Graph Details - Panel Visibility', () => {
 		await waitForDetailsLoaded(graphWebview);
 
 		// Commit details component should be visible
-		await expect(graphWebview.locator('gl-details-commit-panel').first()).toBeVisible({ timeout: MaxTimeout });
+		await expect(graphDetailsRegion(graphWebview, 'commit')).toBeVisible({ timeout: MaxTimeout });
 
 		// Toggle button should be visible with "Hide" label
 		const toggleButton = graphWebview.locator('gl-button[aria-label="Hide Details Panel"]');
@@ -259,7 +284,7 @@ test.describe('Graph Details - Panel Visibility', () => {
 		await showButton.click();
 
 		// Details should reappear
-		await expect(graphWebview.locator('gl-details-commit-panel').first()).toBeVisible({ timeout: MaxTimeout });
+		await expect(graphDetailsRegion(graphWebview, 'commit')).toBeVisible({ timeout: MaxTimeout });
 	});
 
 	test('should close details panel via the details-panel toggle', async () => {
@@ -272,17 +297,7 @@ test.describe('Graph Details - Panel Visibility', () => {
 		await expect(hideButton).toBeVisible({ timeout: MaxTimeout });
 		await hideButton.click();
 
-		// The split panel is always rendered to avoid DOM re-parenting (which causes layout jumps);
-		// hiding collapses it (split position pinned to 100) and marks the details pane `inert` rather
-		// than unmounting `.details-content`. That element therefore stays in the DOM at ~0 size — a
-		// residual that rounds to 1–2px on some renderers — so `not.toBeVisible()` on it is not an
-		// invariant the implementation guarantees. Assert the observable dismissed state instead: the
-		// toggle flips to "Show Details Panel" and the details pane is inert (its content unreachable).
-		const showButton = graphWebview.locator('gl-button[aria-label="Show Details Panel"]').first();
-		await expect(showButton).toBeVisible({ timeout: MaxTimeout });
-		await expect(graphWebview.locator('.graph__details-pane').first()).toHaveAttribute('inert', '', {
-			timeout: MaxTimeout,
-		});
+		await expectDetailsPanelDismissed(graphWebview);
 	});
 });
 
@@ -316,8 +331,7 @@ test.describe('Graph Details - Single Commit', () => {
 		await waitForDetailsLoaded(graphWebview);
 
 		// Commit details component should be visible
-		const commitDetails = graphWebview.locator('gl-details-commit-panel').first();
-		await expect(commitDetails).toBeVisible({ timeout: MaxTimeout });
+		await expect(graphDetailsRegion(graphWebview, 'commit')).toBeVisible({ timeout: MaxTimeout });
 
 		// Author element should be present
 		const author = graphWebview.locator('gl-details-commit-panel gl-commit-author').first();
@@ -395,8 +409,7 @@ test.describe('Graph Details - WIP Mode', () => {
 		await selectWip(graphWebview);
 
 		// WIP details component should appear
-		const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-		await expect(wipDetails).toBeVisible({ timeout: 15000 });
+		await expect(graphDetailsRegion(graphWebview, 'wip')).toBeVisible({ timeout: 15000 });
 
 		// Should show "Working Changes" title
 		const wipTitle = graphWebview.locator('gl-details-wip-header .graph-details-header__wip-title').first();
@@ -407,8 +420,7 @@ test.describe('Graph Details - WIP Mode', () => {
 	test('should show WIP header with branch name', async () => {
 		await selectWip(graphWebview);
 
-		const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-		await expect(wipDetails).toBeVisible({ timeout: 15000 });
+		await expect(graphDetailsRegion(graphWebview, 'wip')).toBeVisible({ timeout: 15000 });
 
 		// The branch row should show the branch name
 		const branchRow = graphWebview.locator('gl-details-wip-header .graph-details-header__branch-row').first();
@@ -418,16 +430,14 @@ test.describe('Graph Details - WIP Mode', () => {
 	test('should close WIP details via the details-panel toggle', async () => {
 		await selectWip(graphWebview);
 
-		const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-		await expect(wipDetails).toBeVisible({ timeout: 15000 });
+		await expect(graphDetailsRegion(graphWebview, 'wip')).toBeVisible({ timeout: 15000 });
 
 		// The per-panel close chip was removed; dismiss the details panel via the toggle.
 		const hideButton = graphWebview.locator('gl-button[aria-label="Hide Details Panel"]').first();
 		await expect(hideButton).toBeVisible({ timeout: MaxTimeout });
 		await hideButton.click();
 
-		// Details content should close
-		await expect(graphWebview.locator('.details-content')).not.toBeVisible({ timeout: MaxTimeout });
+		await expectDetailsPanelDismissed(graphWebview);
 	});
 });
 

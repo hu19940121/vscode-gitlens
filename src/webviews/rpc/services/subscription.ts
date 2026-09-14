@@ -12,17 +12,19 @@ import { Signal } from 'signal-polyfill';
 import { Disposable } from 'vscode';
 import { getAvatarUriFromGravatarEmail } from '../../../avatars.js';
 import type { Container } from '../../../container.js';
+import { hasAIRelevantSubscriptionChanges } from '../../../plus/ai/utils/-webview/ai.utils.js';
 import type { Subscription } from '../../../plus/gk/models/subscription.js';
 import { getContext, onDidChangeContext } from '../../../system/-webview/context.js';
 import { serialize } from '../../../system/serialize.js';
 import type { EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
 import { createRpcEvent } from '../eventVisibilityBuffer.js';
-import type { OrgSettings, RpcEventSubscription } from './types.js';
+import type { AiUsageInfo, OrgSettings, RpcEventSubscription } from './types.js';
 
 export class SubscriptionService implements Disposable {
 	readonly #container: Container;
 	readonly #disposable: Disposable;
 	#orgsFetchSeq = 0;
+	#usageFetchSeq = 0;
 
 	/**
 	 * Current subscription state as a reactive signal.
@@ -38,6 +40,22 @@ export class SubscriptionService implements Disposable {
 
 	/** Number of organizations the current user belongs to. Re-fetched when subscription changes. */
 	readonly organizationsCountState = new Signal.State<number>(0);
+
+	/**
+	 * GitKraken AI weekly usage standing. Three distinct states that consumers must keep distinct:
+	 * `undefined` = not yet resolved (the seed below is async, so a webview CAN connect before the first
+	 * fetch lands); `null` = resolved but unavailable (signed out, an on-premise org, or a failed fetch);
+	 * a value = a real allowance. Consumers render the two nullish states differently — a skeleton for
+	 * `undefined`, an error row with a Retry for `null` — so collapsing them would either strand a loading
+	 * skeleton forever or accuse a slow fetch of having failed.
+	 *
+	 * Lives on the subscription service rather than `AIService` because the allowance is plan-scoped and
+	 * its invalidation trigger is precisely the subscription change this class already observes, and this
+	 * class is the established home for host-bridged `Signal.State` with an eager-listener + async-seed
+	 * lifecycle. `AIService` has neither a signal nor a subscription listener, so hosting it there would
+	 * mean duplicating this whole pattern for one value.
+	 */
+	readonly aiUsageState = new Signal.State<AiUsageInfo | null | undefined>(undefined);
 
 	/** Organization settings. Initialized synchronously from extension context. */
 	readonly orgSettingsState: Signal.State<OrgSettings>;
@@ -65,6 +83,22 @@ export class SubscriptionService implements Disposable {
 				const serialized = serialize(e.current);
 				this.subscriptionState.set(serialized);
 				this.#updateDerivedState(serialized);
+				// The AI allowance doesn't move with every subscription tick — this event also fires on no-op
+				// ones like a session refresh, and a forced refetch on each would be a wasted round trip per
+				// open webview — so it's filtered out of the derived-state pass above and re-read only when
+				// something that feeds the allowance moved: whatever determines AI resolution (see
+				// `hasAIRelevantSubscriptionChanges`) plus the organization, which is easy to miss here.
+				// `AIProviderService` doesn't need the org when clearing its model cache, because an org
+				// switch changes that cache's key and simply misses the old entry. This filter has the
+				// opposite job — deciding whether to re-read — so leaving the org out stranded anyone
+				// switching between two same-tier orgs on the previous org's allowance and shared-pool split.
+				if (
+					hasAIRelevantSubscriptionChanges(e.previous, e.current) ||
+					e.current.activeOrganization?.id !== e.previous.activeOrganization?.id
+				) {
+					this.#updateAiUsageState(serialized, true);
+				}
+
 				subscriptionChanged.fire(serialized);
 			}),
 			onDidChangeContext(key => {
@@ -84,6 +118,10 @@ export class SubscriptionService implements Disposable {
 			const serialized = serialize(sub);
 			this.subscriptionState.set(serialized);
 			this.#updateDerivedState(serialized);
+			// Unforced, unlike the change path: nothing has invalidated the allowance yet, so a warm entry
+			// left by another open webview is exactly the value we want. Forcing here would turn opening a
+			// second and third view into two more identical round trips.
+			this.#updateAiUsageState(serialized, false);
 		});
 	}
 
@@ -108,10 +146,66 @@ export class SubscriptionService implements Disposable {
 		});
 	}
 
-	/** Read current organization settings (AI enabled, drafts enabled) from extension context. */
+	/**
+	 * Refresh `aiUsageState` for a (serialized) subscription. Deliberately NOT part of
+	 * `#updateDerivedState` — unlike the signals there, this one is fetched only when something that
+	 * feeds the allowance actually moved, and with a different cache policy depending on which caller
+	 * asked (see `force`).
+	 */
+	#updateAiUsageState(sub: Subscription, force: boolean): void {
+		// Same stale-answer guard as the orgs fetch above: a later change's fetch can resolve before an
+		// earlier one's, so only the latest sequence is allowed to publish.
+		const seq = ++this.#usageFetchSeq;
+		// A signed-out user has no allowance to fetch, so resolve synchronously — this is what makes the
+		// usage surface disappear on sign-out instead of lingering across a round trip that can only
+		// return nothing anyway.
+		if (sub.account == null) {
+			this.aiUsageState.set(null);
+			return;
+		}
+
+		// On the change path `force` is load-bearing, not belt-and-braces: `AIProviderService` clears its own
+		// usage cache from its own `container.subscription.onDidChange` listener, and listener order between
+		// it and this class is NOT guaranteed. Without it, this class running first would read and publish
+		// the PRE-change cached allowance. Forcing evicts the entry here, making the read order-independent.
+		void this.#container.ai
+			.getUsage({ force: force })
+			.then(usage => {
+				if (seq !== this.#usageFetchSeq) return;
+
+				// Copied field-by-field rather than forwarded, so a future field on the host type doesn't
+				// silently widen what crosses the RPC boundary — the nested org pool included.
+				this.aiUsageState.set(
+					usage != null
+						? {
+								limit: usage.limit,
+								used: usage.used,
+								resetsOn: usage.resetsOn,
+								organization:
+									usage.organization != null
+										? { used: usage.organization.used, limit: usage.organization.limit }
+										: undefined,
+								sharedUsed: usage.sharedUsed,
+							}
+						: null,
+				);
+			})
+			.catch(() => {
+				if (seq !== this.#usageFetchSeq) return;
+
+				// A failure is resolved-but-unavailable, never "still loading" — publish `null` so consumers
+				// hide the surface rather than skeletoning forever. Nothing escapes: every caller of this
+				// method is fire-and-forget.
+				this.aiUsageState.set(null);
+			});
+	}
+
+	/** Read current organization settings (AI enabled, drafts enabled) from extension context.
+	 *  `ai` is fail-open by design: an unset key (no org settings fetched yet, or signed out) must
+	 *  read as enabled, matching `AIProviderService` and the org service's own `?? true` default. */
 	#readOrgSettings(): OrgSettings {
 		return {
-			ai: getContext('gitlens:gk:organization:ai:enabled', false),
+			ai: getContext('gitlens:gk:organization:ai:enabled', true),
 			drafts: getContext('gitlens:gk:organization:drafts:enabled', false),
 		};
 	}
@@ -166,5 +260,27 @@ export class SubscriptionService implements Disposable {
 	 */
 	getOrgSettings(): Promise<OrgSettings> {
 		return Promise.resolve(this.#readOrgSettings());
+	}
+
+	/**
+	 * Re-fetch the AI allowance on request — what the Settings Account card's Retry asks for after the
+	 * allowance resolved unavailable. Deliberately a request rather than a webview-side write: the host
+	 * stays the single writer of `aiUsageState`, which is what removed the two-writer ordering race
+	 * (b76b89b6c). The stale-answer guard inside `#updateAiUsageState` covers a retry racing a
+	 * subscription change, so no extra coordination is needed here.
+	 */
+	refreshAiUsage(): Promise<void> {
+		const sub = this.subscriptionState.get();
+		// Nothing seeded yet means the constructor's async seed is still in flight and will publish a first
+		// value on its own — there's no subscription to retry against, and clearing the signal would only
+		// re-announce a loading state that's already true.
+		if (sub === undefined) return Promise.resolve();
+
+		// Back to the loading state for the duration of the retry. Without this the card keeps showing the
+		// failed state it's retrying out of, so Retry reads as inert until the fetch resolves.
+		this.aiUsageState.set(undefined);
+		this.#updateAiUsageState(sub, true);
+
+		return Promise.resolve();
 	}
 }

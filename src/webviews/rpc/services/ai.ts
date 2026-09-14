@@ -7,7 +7,7 @@
  */
 
 import { Disposable } from 'vscode';
-import { areHooksAllowedForAgent } from '../../../agents/utils/agentHooks.js';
+import { areHooksOfferedForAgent } from '../../../agents/utils/agentHooks.js';
 import type { Container } from '../../../container.js';
 import { resolveDefaultAgent } from '../../../plus/agents/agentRegistry.js';
 import type { AIModelScope } from '../../../plus/ai/aiProviderService.js';
@@ -62,8 +62,20 @@ export class AIService {
 			buffer,
 			'aiStateChanged',
 			'save-last',
-			buffered =>
-				Disposable.from(
+			buffered => {
+				let hooksSubscription: Disposable | undefined;
+
+				// `container.agentStatus` is created/disposed asynchronously by the container; resubscribe
+				// on the container's healing signal instead of latching a one-shot reference.
+				const wireHooksSubscription = () => {
+					hooksSubscription?.dispose();
+					hooksSubscription = container.agentStatus?.onDidChangeHooksInstallState(() => {
+						void this.#getAIState().then(buffered);
+					});
+				};
+				wireHooksSubscription();
+
+				return Disposable.from(
 					configuration.onDidChange(e => {
 						if (configuration.changed(e, ['ai.enabled', 'gitkraken.mcp.autoEnabled', 'ai.defaultAgent'])) {
 							void this.#getAIState().then(buffered);
@@ -78,13 +90,20 @@ export class AIService {
 							void this.#getAIState().then(buffered);
 						}
 					}),
-					container.agentStatus?.onDidChangeHooksInstallState(() => {
-						void this.#getAIState().then(buffered);
-					}) ?? { dispose: () => {} },
 					container.agents.onDidChangeAgents(() => {
 						void this.#getAIState().then(buffered);
 					}),
-				),
+					container.onDidChangeAgentStatus(() => {
+						wireHooksSubscription();
+						void this.#getAIState().then(buffered);
+					}),
+					{
+						dispose: () => {
+							hooksSubscription?.dispose();
+						},
+					},
+				);
+			},
 			undefined,
 			tracker,
 		);
@@ -137,7 +156,7 @@ export class AIService {
 		const agentsEnabled = getContext('gitlens:agents:enabled', false);
 		const all = agentsEnabled ? await this.#container.agents.getAll() : [];
 		const hookAgents = all
-			.filter(a => a.detected && a.hooksSupported && areHooksAllowedForAgent(a.name))
+			.filter(a => a.detected && a.hooksSupported && areHooksOfferedForAgent(a.name))
 			.map(a => ({ id: a.name, displayName: a.displayName, installed: a.hooksInstalled }));
 
 		const defaultAgentId = configuration.get('ai.defaultAgent') ?? undefined;

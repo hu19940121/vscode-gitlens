@@ -1,17 +1,19 @@
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { when } from 'lit/directives/when.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { GitPausedOperationStatus, GitRebaseStatus } from '@gitlens/git/models/pausedOperationStatus.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
-import type { PausedOperationVariant } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+import { getConflictCurrentRef } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+import type { PausedOperationVariant } from '@gitlens/utils/pausedOperation.js';
 import {
-	getConflictCurrentRef,
+	getPausedOperationLabel,
 	getPausedOperationVariant,
-	pausedOperationStatusStringsByType,
 	pausedOperationVariantIcons,
-} from '@gitlens/git/utils/pausedOperationStatus.utils.js';
+} from '@gitlens/utils/pausedOperation.js';
 import type { ContinueRebaseWithAiCommandArgs } from '../../../../../commands/autoRebase.js';
 import { createCommandLink } from '../../../../../system/commands.js';
 import type { ShowInCommitGraphCommandArgs } from '../../../../plus/graph/registration.js';
@@ -22,7 +24,6 @@ import {
 	getPausedOperationAbortLabel,
 	getPausedOperationBarActionLabel,
 	getPausedOperationBarIconTooltip,
-	getPausedOperationBarLabel,
 	getPausedOperationSkipDetail,
 	getPausedOperationSkipLabel,
 	getPausedOperationStepTooltipParts,
@@ -32,9 +33,9 @@ import '../../../shared/components/actions/action-item.js';
 import '../../../shared/components/actions/action-nav.js';
 import '../../../shared/components/branch-name.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/commit-sha.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 @customElement('gl-merge-rebase-status')
 export class GlMergeConflictWarning extends LitElement {
@@ -42,18 +43,17 @@ export class GlMergeConflictWarning extends LitElement {
 		css`
 			.status {
 				/* The strip's background is a fixed decoration color, not a theme color, so its chips can't
-				   derive from the theme either. Lightening reads on all four variants where a currentColor
-				   tint muddied the amber/green fills, so chips/pills/buttons are white overlays carrying
-				   dark ink whatever the strip's own text color is. */
-				--gl-paused-op-chip: rgb(255 255 255 / 0.45);
-				--gl-paused-op-chip-hover: rgb(255 255 255 / 0.6);
+   derive from the theme either. Lightening reads on all four variants where a currentColor
+   tint muddied the amber/green fills, so chips/pills/buttons are white overlays carrying
+   dark ink whatever the strip's own text color is. */
+				--gl-paused-op-chip: rgb(255 255 255 / 45%);
+				--gl-paused-op-chip-hover: rgb(255 255 255 / 60%);
 				--gl-paused-op-ink: #1a1a1a;
 				--action-item-foreground: #000;
 				--action-item-hover-background: var(--gl-paused-op-chip);
 				--action-item-active-background: var(--gl-paused-op-chip-hover);
 
 				box-sizing: border-box;
-				container-type: inline-size;
 				display: flex;
 				gap: var(--gl-space-6);
 				align-items: center;
@@ -62,6 +62,7 @@ export class GlMergeConflictWarning extends LitElement {
 				min-height: 2.4rem;
 				padding: 0.2rem 0.4rem 0.2rem 0.6rem;
 				margin-block: 0;
+				container-type: inline-size;
 				color: #000;
 				background-color: var(--vscode-gitlens-decorations\\.statusMergingOrRebasingForegroundColor);
 				border-radius: var(--gl-radius-sm);
@@ -123,17 +124,17 @@ export class GlMergeConflictWarning extends LitElement {
 			}
 
 			/* Under width pressure the refs are the first thing to go: the branch row directly below the
-			   strip already names the branch, and the leading icon's hover names the operands, so the
-			   phrase and the actions never lose room. The threshold is where the chips stop being able to
-			   NAME their refs — slivers are worse than absence. Every variant sheds, including pending,
-			   whose leading "of" rides inside the group so its phrase still reads once they're gone. */
+  strip already names the branch, and the leading icon's hover names the operands, so the
+  phrase and the actions never lose room. The threshold is where the chips stop being able to
+  NAME their refs — slivers are worse than absence. Every variant sheds, including pending,
+  whose leading "of" rides inside the group so its phrase still reads once they're gone. */
 			@container (max-width: 52rem) {
 				.refs {
 					display: none;
 				}
 
 				/* Refs gone, the phrase is the only thing left that can absorb the squeeze — ellipsize it
-				   rather than let the label's overflow clip it mid-word. */
+   rather than let the label's overflow clip it mid-word. */
 				.label__phrase {
 					flex: 0 1 auto;
 					min-width: 0;
@@ -148,8 +149,8 @@ export class GlMergeConflictWarning extends LitElement {
 			}
 
 			/* Read-only (mode) banner: baseline-align so the "at 3/7" step counter lines up with the
-			   status text. The branch-name chips inflate the label's line-box, so plain center-alignment
-			   leaves the counter sitting too low. Keep the leading icon centered. */
+  status text. The branch-name chips inflate the label's line-box, so plain center-alignment
+  leaves the counter sitting too low. Keep the leading icon centered. */
 			:host([readonly]) .status {
 				align-items: baseline;
 			}
@@ -163,7 +164,7 @@ export class GlMergeConflictWarning extends LitElement {
 			}
 
 			/* The ref chips wrap atomic inline-level components, which text-decoration can't reach, so the
-			   clickable affordance is the fill rather than an underline. */
+  clickable affordance is the fill rather than an underline. */
 			.chip {
 				display: inline-flex;
 				flex: 0 1 auto;
@@ -241,12 +242,6 @@ export class GlMergeConflictWarning extends LitElement {
 	 *  Only meaningful alongside `ai-resume`. */
 	@property({ type: Boolean, attribute: 'ai-active' })
 	aiActive = false;
-
-	/** Whether the working tree has anything staged. Mirrors the takeover loop's own
-	 *  `hasStagedChanges()` gate, so the "Continue using Automatic Rebase" affordance matches what a takeover would
-	 *  actually do on a rebase paused without conflicts. */
-	@property({ type: Boolean, attribute: 'has-staged-changes' })
-	hasStagedChanges = false;
 
 	/** Render the bar as a plain status read-out — no paused-op action buttons and no clickable
 	 *  conflicts text. Set by hosts that are in a mode (compose/review/resolve) so the bar doesn't
@@ -366,16 +361,30 @@ export class GlMergeConflictWarning extends LitElement {
 		variant: PausedOperationVariant,
 		stepped: GitRebaseStatus | undefined,
 	) {
-		const label = getPausedOperationBarLabel(status, variant);
+		const label = getPausedOperationLabel(status, variant);
+		const labelNode = html`<span
+			class="label__text label__phrase ${variant === 'conflicts' ? 'label__text--emphasized' : ''}"
+			>${label}</span
+		>`;
+		const stepNode = stepped != null ? this.renderStep(stepped) : nothing;
+		const refsNode = this.renderRefs(status, variant === 'pending');
 
+		// Each placeholder retains its responsive wrapper while translations can reorder the operation,
+		// step, and refs as complete units. In particular, the refs placeholder still disappears as one
+		// unit at narrow widths without taking the operation phrase or step with it.
 		return html`<span class="label"
-			><span class="label__text label__phrase ${variant === 'conflicts' ? 'label__text--emphasized' : ''}"
-				>${label}</span
-			>${stepped != null ? this.renderStep(stepped) : nothing}${this.renderRefs(
-				status,
-				// Pending's phrase reads straight into its refs ("Pending rebase" + "of <feature> onto <main>"),
-				// so it leads with that "of" where every other variant leads with a separator.
-				variant === 'pending' ? 'of' : '·',
+			>${localizedContent(
+				l10n.t({
+					message: '{operation}{step}{references}',
+					comment: [
+						'Paused Git operation status bar. Each placeholder is an independently displayed group; references can be hidden at narrow widths.',
+					],
+				}),
+				{
+					operation: labelNode,
+					step: stepNode,
+					references: refsNode,
+				},
 			)}</span
 		>`;
 	}
@@ -383,15 +392,13 @@ export class GlMergeConflictWarning extends LitElement {
 	/** The step counter IS the paused-on commit — clicking it jumps to that commit, hovering it names it. */
 	private renderStep(status: GitRebaseStatus) {
 		const steps = `${status.steps.current.number}/${status.steps.total}`;
-		const at = html`<span class="label__text">at</span>`;
-
 		const commit = status.steps.current.commit;
+		let step: unknown;
 		if (this.readOnly || commit == null) {
-			return html`${at}<span class="steps">${steps}</span>`;
-		}
-
-		const parts = getPausedOperationStepTooltipParts(status);
-		return html`${at}<gl-tooltip
+			step = html`<span class="steps">${steps}</span>`;
+		} else {
+			const parts = getPausedOperationStepTooltipParts(status);
+			step = html`<gl-tooltip
 				><a href=${this.createJumpUrl(commit)} class="steps chip">${steps}</a
 				><span slot="content"
 					>${this.getJumpLabel('paused-commit')}
@@ -399,19 +406,81 @@ export class GlMergeConflictWarning extends LitElement {
 					${parts.detail}${parts.subject ? html`<br />${parts.subject}` : nothing}</span
 				></gl-tooltip
 			>`;
+		}
+
+		return localizedContent(
+			l10n.t({
+				message: 'at {step}',
+				comment: [
+					'Rebase status position, shown as “at 3/7”. The step placeholder is an independently displayed group.',
+				],
+			}),
+			{ step: step },
+		).map(content => {
+			if (typeof content !== 'string') return content;
+
+			const text = content.trim();
+			return text.length === 0 ? nothing : html`<span class="label__text">${text}</span>`;
+		});
 	}
 
-	private renderRefs(status: GitPausedOperationStatus, lead: '·' | 'of') {
-		const strings = pausedOperationStatusStringsByType[status.type];
+	private renderRefs(status: GitPausedOperationStatus, pending: boolean) {
 		// Never null in practice: `current` is required on non-rebase models, `onto` on rebase.
 		const current = getConflictCurrentRef(status)!;
+		const separator = pending ? nothing : html`<span class="separator">·</span>`;
+		const incoming = this.renderReference(status.incoming);
+		const currentReference = this.renderReference(current);
+		let message: string;
+		switch (status.type) {
+			case 'cherry-pick':
+				message = l10n.t({
+					message: '{separator}{incoming} into {current}',
+					comment: [
+						'Cherry-pick reference relation in a status bar. The separator, incoming revision, and current branch are independently rendered elements.',
+					],
+				});
+				break;
+			case 'merge':
+				message = l10n.t({
+					message: '{separator}{incoming} into {current}',
+					comment: [
+						'Merge reference relation in a status bar. The separator, incoming branch, and current branch are independently rendered elements.',
+					],
+				});
+				break;
+			case 'rebase':
+				message = pending
+					? l10n.t({
+							message: 'of {incoming} onto {current}',
+							comment: [
+								'Rebase reference relation that directly follows the separate “Pending Rebase” label. The incoming and current references are independently rendered elements.',
+							],
+						})
+					: l10n.t({
+							message: '{separator}{incoming} onto {current}',
+							comment: [
+								'Rebase reference relation in a status bar. The separator, incoming branch, and current branch are independently rendered elements.',
+							],
+						});
+				break;
+			case 'revert':
+				message = l10n.t({
+					message: '{separator}{incoming} in {current}',
+					comment: [
+						'Revert reference relation in a status bar. The separator, incoming revision, and current branch are independently rendered elements.',
+					],
+				});
+				break;
+		}
 
 		// The leading token lives inside the group so nothing dangles when it drops at narrow widths —
 		// neither a separator nor the preposition the pending phrase would otherwise trail off with.
 		return html`<span class="refs"
-			>${
-				lead === '·' ? html`<span class="separator">·</span>` : html`<span class="label__text">of</span>`
-			}${this.renderReference(status.incoming)}<span>${strings.directionality}</span>${this.renderReference(current)}</span
+			>${localizedContent(message, {
+				separator: separator,
+				incoming: incoming,
+				current: currentReference,
+			})}</span
 		>`;
 	}
 
@@ -441,8 +510,25 @@ export class GlMergeConflictWarning extends LitElement {
 		const webviewId = this._webview.webviewId;
 		const isInGraph = webviewId === 'gitlens.graph' || webviewId === 'gitlens.views.graph';
 
-		const noun = kind === 'branch' ? 'Branch' : kind === 'commit' ? 'Commit' : 'Paused Commit';
-		return isInGraph ? `Jump to ${noun}` : `Open ${noun} in Commit Graph`;
+		if (isInGraph) {
+			switch (kind) {
+				case 'branch':
+					return l10n.t('Jump to Branch');
+				case 'commit':
+					return l10n.t('Jump to Commit');
+				case 'paused-commit':
+					return l10n.t('Jump to Paused Commit');
+			}
+		}
+
+		switch (kind) {
+			case 'branch':
+				return l10n.t('Open Branch in Commit Graph');
+			case 'commit':
+				return l10n.t('Open Commit in Commit Graph');
+			case 'paused-commit':
+				return l10n.t('Open Paused Commit in Commit Graph');
+		}
 	}
 
 	private createJumpUrl(ref: GitReference): string {
@@ -479,13 +565,12 @@ export class GlMergeConflictWarning extends LitElement {
 
 	private renderActions(status: GitPausedOperationStatus, variant: PausedOperationVariant) {
 		const type = status.type;
-		// The AI continue mirrors the takeover loop's own gate (`resumingThisStep ||
-		// hasStagedChanges()`): with conflicts it resolves them, and with a staged resolution it
-		// continues and keeps resolving the REMAINING steps — so hiding it once the user stages an
-		// escalated step would strand them on plain "Continue", which ends automation for the rest of
-		// the run. Still hidden for a genuine non-conflict stop (an interactive edit/break with nothing
-		// staged), where a takeover has nothing to continue and would only escalate.
-		const aiRebase = type === 'rebase' && this.aiResume && (this.conflicts || this.hasStagedChanges);
+		// Taking over IS consent to continue past a non-conflict pause at the step the rebase is
+		// currently sitting on: the takeover loop auto-resolves whatever follows and hands back at any
+		// later edit/break it encounters mid-run. So the action is offered for any paused rebase, not
+		// just a conflicted or already-staged one — the host's `aiResume` gate is what keeps it from
+		// showing where AI isn't allowed at all.
+		const aiRebase = type === 'rebase' && this.aiResume;
 		// Continue continues in the vein the rebase started: with an automatic session active the
 		// primary resumes it, and the manual continue becomes the secondary instead of the sparkle.
 		const aiPrimary = type === 'rebase' && this.aiResume && this.aiActive && variant !== 'conflicts';
@@ -496,7 +581,7 @@ export class GlMergeConflictWarning extends LitElement {
 				aiPrimary,
 				() =>
 					html`<action-item
-						label="Continue Rebase Manually"
+						label=${l10n.t('Continue Rebase Manually')}
 						href=${this.onContinueUrl}
 						icon="gl-continue"
 					></action-item>`,
@@ -505,7 +590,7 @@ export class GlMergeConflictWarning extends LitElement {
 				aiRebase && !aiPrimary,
 				() =>
 					html`<action-item
-						label=${this.aiActive ? 'Continue Automatic Rebase' : 'Continue using Automatic Rebase'}
+						label=${this.aiActive ? l10n.t('Continue Auto-Rebase') : l10n.t('Continue with Auto-Rebase')}
 						href=${this.onContinueWithAiUrl}
 						icon="gl-continue-sparkle"
 					></action-item>`,
@@ -514,7 +599,7 @@ export class GlMergeConflictWarning extends LitElement {
 				type === 'rebase',
 				() =>
 					html`<action-item
-						label="Open in Rebase Editor"
+						label=${l10n.t('Open in Rebase Editor')}
 						href=${this.onOpenEditorUrl}
 						icon="edit"
 					></action-item>`,
@@ -553,10 +638,10 @@ export class GlMergeConflictWarning extends LitElement {
 			const continuing = this.isContinuing;
 			const label = continuing
 				? aiPrimary
-					? 'Continuing Automatic Rebase…'
-					: `Continuing ${pausedOperationStatusStringsByType[status.type].name}…`
+					? l10n.t('Continuing Auto-Rebase…')
+					: this.getContinuingLabel(status)
 				: aiPrimary
-					? 'Continue Automatic Rebase'
+					? l10n.t('Continue Auto-Rebase')
 					: getPausedOperationBarActionLabel(status, variant, this.conflictsCount);
 
 			// One template across both states, and the href kept even while busy, so Lit reuses the button
@@ -579,7 +664,9 @@ export class GlMergeConflictWarning extends LitElement {
 			if (!continuing) return button;
 
 			return html`<gl-tooltip
-				content="Waiting for Git to finish. If a commit message tab is open, save and close it to continue."
+				content=${l10n.t(
+					'Waiting for Git to finish. If a commit message tab is open, save and close it to continue.',
+				)}
 				>${button}</gl-tooltip
 			>`;
 		}
@@ -593,5 +680,18 @@ export class GlMergeConflictWarning extends LitElement {
 		}
 
 		return html`<gl-button density="compact" href=${this.onShowConflictsUrl}>${label}</gl-button>`;
+	}
+
+	private getContinuingLabel(status: GitPausedOperationStatus): string {
+		switch (status.type) {
+			case 'cherry-pick':
+				return l10n.t('Continuing Cherry Pick…');
+			case 'merge':
+				return l10n.t('Continuing Merge…');
+			case 'rebase':
+				return l10n.t('Continuing Rebase…');
+			case 'revert':
+				return l10n.t('Continuing Revert…');
+		}
 	}
 }

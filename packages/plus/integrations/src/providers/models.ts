@@ -9,15 +9,22 @@ import type {
 	Bitbucket,
 	BitbucketServer,
 	BitbucketWorkspaceStub,
+	CollectionMetadata,
 	CursorPageInput,
 	EnterpriseOptions,
 	GetRepoInput,
 	GitBuildStatus,
+	GitBuildStatusState as GitBuildStatusStateType,
 	GitHub,
+	GitHubPullRequestFieldMap,
+	GitIssueState as GitIssueStateType,
 	GitLab,
 	GitLabGroup,
 	GitMergeStrategy,
 	GitPullRequest,
+	GitPullRequestMergeableState as GitPullRequestMergeableStateType,
+	GitPullRequestReviewState as GitPullRequestReviewStateType,
+	GitPullRequestState as GitPullRequestStateType,
 	GitRepository,
 	GitRepositoryRemoteInfo,
 	Jira,
@@ -36,32 +43,22 @@ import type {
 	SetPullRequestInput,
 	Trello,
 } from '@gitkraken/provider-apis';
-import {
-	GitBuildStatusState,
-	GitIssueState,
-	GitPullRequestMergeableState,
-	GitPullRequestReviewState,
-	GitPullRequestState,
-} from '@gitkraken/provider-apis';
 import { EntityIdentifierUtils } from '@gitkraken/provider-apis/entity-identifiers';
 import { GitProviderUtils } from '@gitkraken/provider-apis/provider-utils';
+import { githubSearchResultLimit } from '@gitlens/git-github/api/config.js';
 import type { Account as UserAccount } from '@gitlens/git/models/author.js';
-import type { IssueMember, IssueProject, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
+import type { IssueProject, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
 import type {
-	PullRequestMember,
 	PullRequestRef,
 	PullRequestRefs,
 	PullRequestRepositoryIdentityDescriptor,
-	PullRequestReviewer,
 	PullRequestState,
 	PullRequestStateFilter,
 } from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
-	PullRequestReviewDecision,
-	PullRequestReviewState,
 	PullRequestStatusCheckRollupState,
 } from '@gitlens/git/models/pullRequest.js';
 import type { Provider, ProviderReference } from '@gitlens/git/models/remoteProvider.js';
@@ -76,7 +73,103 @@ import {
 	IssuesCloudHostIntegrationId,
 } from '../constants.js';
 import type { Integration, IntegrationType } from '../models/integration.js';
+import type {
+	IssueSearchCapabilities,
+	IssueSorting,
+	PullRequestSearchCapabilities,
+	PullRequestSorting,
+} from '../providerFilters.js';
+import { IssueFilter, PullRequestFilter } from '../providerFilters.js';
+
+export { IssueFilter, PullRequestFilter } from '../providerFilters.js';
+export type {
+	IssueSearchCapabilities,
+	IssueSearchCriteria,
+	IssueSearchRelationship,
+	IssueSortField,
+	IssueSorting,
+	PullRequestSearchCapabilities,
+	PullRequestSearchCriteria,
+	PullRequestSortField,
+	PullRequestSorting,
+} from '../providerFilters.js';
+import type { ProviderRepositoryShape } from '../results.js';
+
+export type { ProviderOrganization, ProviderRepositoryShape } from '../results.js';
+import { fromProviderAccount, toProviderAccount } from './accounts.js';
+import {
+	azureAccountWideIssueSorts,
+	azureIssueSorts,
+	githubAccountWideIssueSorts,
+	githubIssueSorts,
+	gitlabAccountWideIssueSorts,
+	gitlabIssueSorts,
+	jiraIssueSorts,
+	linearIssueSorts,
+	trelloIssueSorts,
+} from './issueSorts.js';
+import type { ProviderPullRequestReview, ProviderPullRequestReviews } from './pullRequestReviews.js';
+import {
+	fromPullRequestReviewDecision,
+	providerPullRequestReviewStateDismissed,
+	toCompletedReviews,
+	toProviderReviewDecision,
+	toProviderReviews,
+	toReviewRequests,
+} from './pullRequestReviews.js';
 import { getEntityIdentifierInput } from './utils.js';
+
+type GitBuildStatusState = GitBuildStatusStateType;
+type GitIssueState = GitIssueStateType;
+type GitPullRequestMergeableState = GitPullRequestMergeableStateType;
+type GitPullRequestReviewState = GitPullRequestReviewStateType;
+type GitPullRequestState = GitPullRequestStateType;
+
+// Local runtime copies of the `@gitkraken/provider-apis` string enums. Duplicated (not imported as
+// values) because the SDK ships as CJS whose named enum exports can't be statically imported as ESM
+// values from the bundled `dist`. Exported so the enum-parity test can deep-equal them against the
+// real SDK enums and turn any upstream drift into a test failure instead of a silent mismatch.
+export const GitBuildStatusState = {
+	ActionRequired: 'ACTION_REQUIRED' as GitBuildStatusState,
+	Cancelled: 'CANCELLED' as GitBuildStatusState,
+	Error: 'ERROR' as GitBuildStatusState,
+	Failed: 'FAILED' as GitBuildStatusState,
+	Pending: 'PENDING' as GitBuildStatusState,
+	Running: 'RUNNING' as GitBuildStatusState,
+	Skipped: 'SKIPPED' as GitBuildStatusState,
+	Success: 'SUCCESS' as GitBuildStatusState,
+	Warning: 'WARNING' as GitBuildStatusState,
+	OptionalActionRequired: 'OPTIONAL_ACTION_REQUIRED' as GitBuildStatusState,
+} as const;
+
+export const GitIssueState = {
+	Open: 'OPEN' as GitIssueState,
+	Closed: 'CLOSED' as GitIssueState,
+} as const;
+
+export const GitPullRequestState = {
+	Open: 'OPEN' as GitPullRequestState,
+	Closed: 'CLOSED' as GitPullRequestState,
+	Merged: 'MERGED' as GitPullRequestState,
+} as const;
+
+export const GitPullRequestReviewState = {
+	Approved: 'APPROVED' as GitPullRequestReviewState,
+	ChangesRequested: 'CHANGES_REQUESTED' as GitPullRequestReviewState,
+	Commented: 'COMMENTED' as GitPullRequestReviewState,
+	ReviewRequested: 'REVIEW_REQUESTED' as GitPullRequestReviewState,
+} as const;
+
+export const GitPullRequestMergeableState = {
+	Behind: 'BEHIND' as GitPullRequestMergeableState,
+	Blocked: 'BLOCKED' as GitPullRequestMergeableState,
+	Conflicts: 'CONFLICTS' as GitPullRequestMergeableState,
+	FailingChecks: 'FAILING_CHECKS' as GitPullRequestMergeableState,
+	Mergeable: 'MERGEABLE' as GitPullRequestMergeableState,
+	Unknown: 'UNKNOWN' as GitPullRequestMergeableState,
+	UnknownAndBlocked: 'UNKNOWN_AND_BLOCKED' as GitPullRequestMergeableState,
+	Unstable: 'UNSTABLE' as GitPullRequestMergeableState,
+} as const;
 
 /**
  * Forward-only host type — the package only sets `EnrichablePullRequest.enrichable`
@@ -88,7 +181,29 @@ type EnrichableItem = any;
 export type ProviderAccount = Account;
 export type ProviderReposInput = (string | number)[] | GetRepoInput[];
 export type ProviderRepoInput = GetRepoInput;
-export type ProviderPullRequest = GitPullRequest;
+
+/**
+ * Which half of {@link ProviderReposInput} a caller supplied: repository IDS rather than descriptors.
+ *
+ * The union has no discriminant, so the answer is the element shape — and several layers need it for different
+ * reasons (`ProvidersApi` to pick `repoIds` vs `repos` in the SDK input, `GitHostIntegration` to refuse an
+ * id-based read a provider can't serve, `listIssuesPage` to know GitLab's id form takes the SDK's own merging
+ * aggregate). One predicate rather than one per layer, because each copy is free to disagree about the shape,
+ * and the symptom of disagreement is a read routed to the wrong provider query.
+ *
+ * Takes `unknown` rather than {@link ProviderReposInput} because `ProvidersApi.isRepoIdsInput` forwards here and
+ * is public with an unvalidated parameter, so the array check has to stay part of the rule rather than be assumed
+ * from the parameter type.
+ */
+export function isRepoIdsInput(input: unknown): input is (string | number)[] {
+	return (
+		input != null &&
+		Array.isArray(input) &&
+		input.every(repo => typeof repo === 'string' || typeof repo === 'number')
+	);
+}
+
+export type ProviderPullRequest = Omit<GitPullRequest, 'reviews'> & { reviews: ProviderPullRequestReviews };
 export type ProviderRepository = GitRepository;
 export type ProviderIssue = ProviderApiIssue;
 export type ProviderEnterpriseOptions = EnterpriseOptions;
@@ -101,39 +216,76 @@ export type ProviderAzureResource = AzureOrganization;
 export type ProviderBitbucketResource = BitbucketWorkspaceStub;
 export type ProviderGitHubOrganization = Organization;
 export type ProviderGitLabGroup = GitLabGroup;
+
+/**
+ * Returns an account-wide PR identity. Provider PR ids are commonly scoped to a repository or organization,
+ * so an id alone is never safe for deduplication across a multi-repository fan-out. Repository identity wins
+ * when available so the same row still deduplicates when a later facet adds or removes its URL.
+ */
+export function getProviderPullRequestIdentity(
+	pr: Pick<ProviderPullRequest, 'id' | 'repository' | 'url'>,
+): string | undefined {
+	const repository = pr.repository as
+		| {
+				id?: string | number;
+				name?: string;
+				namespace?: string;
+				owner?: { login?: string } | string;
+				project?: string;
+		  }
+		| undefined;
+	const urlIdentity = pr.url != null && pr.url.trim() !== '' ? `url:${pr.url}` : undefined;
+	if (repository == null) return urlIdentity;
+
+	const owner = typeof repository.owner === 'string' ? repository.owner : repository.owner?.login;
+	const repositoryId = repository.id != null ? String(repository.id).trim() : '';
+	if (repositoryId !== '') return `repository:${repositoryId}:pull-request:${pr.id}`;
+
+	const name = repository.name?.trim() ?? '';
+	const namespace = (repository.namespace ?? owner)?.trim() ?? '';
+	const project = repository.project?.trim() ?? '';
+	if (name !== '' && (namespace !== '' || project !== '')) {
+		return `repository:${namespace}/${project}/${name}:pull-request:${pr.id}`;
+	}
+	return urlIdentity;
+}
+
 export type ProviderHierarchyResult<T> = PagedResult<T> & {
 	readonly truncated?: boolean;
+	/**
+	 * SDK collection metadata merged across the drained pages. Independent from the local `truncated` backstop:
+	 * a page-drain backstop stays visible even if every fetched page reported `complete`, and SDK
+	 * incompleteness is preserved even when the drain finished within its page budget.
+	 */
+	readonly metadata?: CollectionMetadata;
 };
 
 /**
- * Normalized org/workspace/group shape returned by `GitHostIntegration.getOrganizationsForUser`.
- * `name` is the identifier to pass back into `getRepositoriesForOrg` (GitHub login, Bitbucket
- * workspace slug, Azure DevOps org name, GitLab full namespace path) — not a display name; hosts
- * where those differ (Bitbucket, GitLab) must map to the identifier, not the human-readable label.
+ * A normalized {@link PagedResult} that additionally carries the SDK's collection {@link CollectionMetadata}
+ * (completeness + per-scope failures). Named to avoid colliding with the public ProviderBackend
+ * `ProviderPagedResult` in `results.ts`: this is the integration-local carrier between the `ProvidersApi`
+ * boundary and the code that maps metadata into warnings/truncation. `metadata` is optional so providers and
+ * test doubles that predate the SDK metadata contract keep behaving exactly as before.
  */
-export interface ProviderOrganization {
-	id: string;
-	name: string;
-	url: string;
-}
+export type ProviderApiPagedResult<T> = PagedResult<T> & {
+	readonly metadata?: CollectionMetadata;
+};
+
+/**
+ * A non-paged collection result carrying SDK {@link CollectionMetadata}. Used for fan-out reads that return a
+ * flat set of values with completeness/failure metadata but no provider-native pagination (e.g. Jira project
+ * discovery across resources, Trello board search).
+ */
+export type ProviderApiCollectionResult<T> = {
+	readonly values: NonNullable<T>[];
+	readonly metadata?: CollectionMetadata;
+};
+
 export const ProviderPullRequestReviewState = GitPullRequestReviewState;
 export const ProviderBuildStatusState = GitBuildStatusState;
 export type ProviderRequestFunction = RequestFunction;
 export type ProviderRequestResponse<T> = Response<T>;
 export type ProviderRequestOptions = RequestOptions;
-
-export enum PullRequestFilter {
-	Author = 'author',
-	Assignee = 'assignee',
-	ReviewRequested = 'review-requested',
-	Mention = 'mention',
-}
-
-export enum IssueFilter {
-	Author = 'author',
-	Assignee = 'assignee',
-	Mention = 'mention',
-}
 
 export enum PagingMode {
 	Project = 'project',
@@ -178,6 +330,11 @@ export interface GetPullRequestsOptions {
 	// Opt in to repository remote metadata (clone URLs) when the PR payload lacks it. Only Azure DevOps
 	// acts on this today (extra API call); it is a no-op for the other providers.
 	includeRemoteInfo?: boolean;
+	// Field selection for the row shape. GitHub-shaped because it is the only provider whose PR read gates
+	// anything on it; the others ignore it. Declared here rather than passed through a spread so a typo or a
+	// wrong-shaped map is a compile error instead of a silently ignored key. An ABSENT map means "select
+	// everything", so only summary reads pass one.
+	fields?: GitHubPullRequestFieldMap;
 }
 
 export interface GetPullRequestsForUserOptions {
@@ -186,6 +343,12 @@ export interface GetPullRequestsForUserOptions {
 	baseUrl?: string;
 	// PR states to include; when omitted the provider returns its default (open only).
 	states?: GitPullRequestState[];
+	/**
+	 * Items to request per page. Worth setting explicitly on an account-wide read that gets DRAINED: each
+	 * provider falls back to its own historical page size when this is omitted, and GitHub's is 15
+	 * (`MAX_PR_PAGE_SIZE`), so a drain pays ~7x the round trips of the 100 its search actually allows.
+	 */
+	pageSize?: number;
 }
 
 export interface GetPullRequestsForUserInput extends GetPullRequestsForUserOptions {
@@ -220,6 +383,20 @@ export interface GetIssuesOptions {
 	page?: number;
 	// Items to request per page (numbered-page providers, plus GitHub's maxPageSize).
 	pageSize?: number;
+	/**
+	 * How the provider should order the result, as `field:direction`.
+	 *
+	 * Passed through to the SDK verbatim — the translation to each provider's own vocabulary lives THERE, next to
+	 * the capability map it validates against, so that the table this facade publishes and the table that does the
+	 * translating can't drift apart across two repositories. A key the provider can't express raises the SDK's
+	 * `UnsupportedSortError`, which is why the facade validates against `supportedIssueSorts` first: reaching that
+	 * error means this table has outrun the SDK's.
+	 *
+	 * Always supplied by the facade's reads, never omitted. Omitting it would delegate the order to each provider's
+	 * own default, which is the incoherence across providers the SDK deliberately preserves and this layer
+	 * deliberately does not.
+	 */
+	sort?: IssueSorting;
 }
 
 export interface GetIssuesForRepoInput extends GetIssuesOptions {
@@ -275,7 +452,10 @@ export type GetRepoOfProjectFn = (
 export type GetPullRequestsForReposFn = (
 	input: (GetPullRequestsForReposInput | GetPullRequestsForRepoIdsInput) & PagingInput,
 	options?: EnterpriseOptions,
-) => Promise<{ data: ProviderPullRequest[]; pageInfo?: PageInfo }>;
+	// `metadata` carries SDK collection completeness/failures for multi-repo fan-outs (Bitbucket, Azure DevOps,
+	// Bitbucket Server); `pageInfo` is present for the cursor-based aggregate (GitHub). Both are optional so
+	// each provider only sets what it actually reports.
+) => Promise<{ data: ProviderPullRequest[]; pageInfo?: PageInfo; metadata?: CollectionMetadata }>;
 
 export type GetPullRequestsForRepoFn = (
 	input: GetPullRequestsForRepoInput & PagingInput,
@@ -288,9 +468,32 @@ export type GetPullRequestsForUserFn = (
 ) => Promise<{ data: ProviderPullRequest[]; pageInfo?: PageInfo }>;
 
 export type GetPullRequestsForAzureProjectsFn = (
-	input: { projects: { namespace: string; project: string }[]; authorLogin?: string; assigneeLogins?: string[] },
+	input: {
+		projects: { namespace: string; project: string }[];
+		authorLogin?: string;
+		assigneeLogins?: string[];
+		reviewerId?: string;
+		states?: GitPullRequestState[];
+		repo?: ProviderRepoInput;
+	},
 	options?: EnterpriseOptions,
-) => Promise<{ data: ProviderPullRequest[] }>;
+	// Aggregate multi-project fan-out: no `pageInfo` (call getPullRequestsForAzureProject for that), but SDK
+	// collection metadata reports per-project completeness/failures.
+) => Promise<{ data: ProviderPullRequest[]; metadata?: CollectionMetadata }>;
+
+/** Single Azure project PR read, paginated by number (unlike the aggregate {@link GetPullRequestsForAzureProjectsFn}). */
+export type GetPullRequestsForAzureProjectFn = (
+	input: {
+		namespace: string;
+		project: string;
+		authorLogin?: string;
+		assigneeLogins?: string[];
+		reviewerId?: string;
+		states?: GitPullRequestState[];
+		repo?: ProviderRepoInput;
+	} & PagingInput,
+	options?: EnterpriseOptions,
+) => Promise<{ data: ProviderPullRequest[]; pageInfo: { hasNextPage: boolean; nextPage: number | null } }>;
 
 export type MergePullRequestFn =
 	| ((
@@ -342,10 +545,25 @@ export type GetIssueFn = (
 export type GetIssuesForReposFn = (
 	input: (GetIssuesForReposInput | GetIssuesForRepoIdsInput) & PagingInput,
 	options?: EnterpriseOptions,
-) => Promise<{ data: ProviderIssue[]; pageInfo?: PageInfo }>;
+	// GitHub's multi-repo issue search reports its 1,000-result cap — and, when it recovers past it by
+	// partitioning, what that recovery could not reach — through `metadata`. Documented on the contract for
+	// the reader; `getPagedResult` accepts and forwards `metadata` from any provider fn regardless.
+) => Promise<{ data: ProviderIssue[]; pageInfo?: PageInfo; metadata?: CollectionMetadata }>;
+
+export type GetIssuesForCurrentUserInput = PagingInput & {
+	// GitLab's account-wide REST read (`GET /issues`): `scope` controls breadth ('assigned_to_me' vs 'all') and
+	// the username fields independently narrow a broad read to a specific assignee or author. Other providers
+	// (Linear) ignore these and page purely off the cursor.
+	scope?: 'assigned_to_me' | 'all';
+	assigneeUsername?: string;
+	authorUsername?: string;
+	pageSize?: number;
+	/** See {@link GetIssuesOptions.sort}. */
+	sort?: IssueSorting;
+};
 
 export type GetIssuesForCurrentUserFn = (
-	input: PagingInput,
+	input: GetIssuesForCurrentUserInput,
 	options?: EnterpriseOptions,
 ) => Promise<{ data: ProviderIssue[]; pageInfo?: PageInfo }>;
 
@@ -377,7 +595,9 @@ export type GetReposForWorkspaceFn = (
 	options?: EnterpriseOptions,
 ) => Promise<{ data: ProviderRepository[]; pageInfo?: PageInfo }>;
 export type GetReposForCurrentUserFn = (
-	input: PagingInput,
+	// `affiliations` narrows GitHub's `/user/repos` read (owner/collaborator/organization_member);
+	// GitLab's equivalent read ignores it.
+	input: PagingInput & { affiliations?: ('owner' | 'collaborator' | 'organization_member')[] },
 	options?: EnterpriseOptions,
 ) => Promise<{ data: ProviderRepository[]; pageInfo?: PageInfo }>;
 export type GetGroupsForCurrentUserFn = (
@@ -401,10 +621,40 @@ export type GetCurrentUserForResourceFn = (
 export type GetJiraResourcesForCurrentUserFn = (options?: EnterpriseOptions) => Promise<{ data: JiraResource[] }>;
 export type GetLinearOrganizationFn = (options?: EnterpriseOptions) => Promise<{ data: LinearOrganization }>;
 export type GetLinearTeamsForCurrentUserFn = (options?: EnterpriseOptions) => Promise<{ data: LinearTeam[] }>;
+export type GetLinearIssuesFn = (
+	input: { teams?: string[]; projects?: string[]; labels?: string[] } & PagingInput,
+	options?: EnterpriseOptions,
+) => Promise<{ data: ProviderIssue[]; pageInfo?: PageInfo }>;
+/**
+ * Linear's current-user (viewer) query. Its raw `@linear/sdk` User isn't a `ProviderAccount` (no
+ * username/avatar/url), so it's typed with the minimal fields the viewer query actually returns rather than
+ * importing `@linear/sdk` (which is bundled in the SDK dist and not a resolvable top-level dependency).
+ */
+export type GetLinearCurrentUserFn = (
+	options?: EnterpriseOptions,
+) => Promise<{ data: { id: string; name?: string | null; email?: string | null; displayName?: string | null } }>;
 export type GetJiraProjectsForResourcesFn = (
 	input: { resourceIds: string[] },
 	options?: EnterpriseOptions,
-) => Promise<{ data: JiraProject[] }>;
+	// Fan-out across resources: preserves successful resources' projects and reports per-resource failures in
+	// SDK collection metadata instead of throwing when a single resource fails.
+) => Promise<{ data: JiraProject[]; metadata?: CollectionMetadata }>;
+export type GetJiraProjectsForResourceFn = (
+	input: { resourceId: string } & CursorPageInput,
+	options?: EnterpriseOptions,
+) => Promise<{ data: JiraProject[]; pageInfo?: PageInfo; metadata?: CollectionMetadata }>;
+export type GetGitLabPullRequestsForUserAssociationFn = (
+	input: {
+		username: string;
+		association: 'assigned' | 'authored' | 'reviewRequested';
+		includeFromArchivedRepos?: boolean;
+		labelNames?: string[];
+		repo?: ProviderRepoInput;
+		states?: GitPullRequestState[];
+		pageSize?: number;
+	} & CursorPageInput,
+	options?: EnterpriseOptions,
+) => Promise<{ data: ProviderPullRequest[]; pageInfo?: PageInfo }>;
 export type GetAzureResourcesForUserFn = (
 	input: { userId: string },
 	options?: EnterpriseOptions,
@@ -414,9 +664,9 @@ export type GetAzureProjectsForResourceFn = (
 	options?: EnterpriseOptions,
 ) => Promise<{ data: AzureProject[]; pageInfo?: PageInfo }>;
 export type GetBitbucketResourcesForCurrentUserFn = (
-	input: Record<string, never>,
+	input: { page?: number },
 	options?: EnterpriseOptions,
-) => Promise<{ data: BitbucketWorkspaceStub[] }>;
+) => Promise<{ data: BitbucketWorkspaceStub[]; pageInfo?: PageInfo }>;
 export type GetBitbucketPullRequestsAuthoredByUserForWorkspaceFn = (
 	input: {
 		userId: string;
@@ -442,10 +692,19 @@ export type GetBitbucketServerPullRequestsForCurrentUserFn = (
 	data: GitPullRequest[];
 }>;
 export type GetIssuesForProjectFn = Jira['getIssuesForProject'];
-export type GetIssuesForResourceForCurrentUserFn = (
-	input: { resourceId: string },
-	options?: EnterpriseOptions,
-) => Promise<{ data: ProviderIssue[] }>;
+// Derived from the client method rather than hand-declared, as its project-scoped sibling above already is: the
+// hand-written shape named only `resourceId`, so every other field the SDK accepts (the cursor, the sort, the
+// transitions switch) was invisible to the type system and had to be smuggled through `getPagedResult`'s `any`.
+export type GetIssuesForResourceForCurrentUserFn = Jira['getIssuesForResourceForCurrentUser'];
+
+// Trello reads (issues-capable provider). The Trello client is keyed by an `appKey` (the Trello app key from
+// the cloud token exchange) alongside the OAuth token, so these mirror the client method shapes directly.
+export type GetTrelloCurrentUserFn = Trello['getCurrentUser'];
+export type GetTrelloBoardsForCurrentUserFn = Trello['getBoardsForCurrentUser'];
+export type GetTrelloListsForBoardFn = Trello['getListsForTrelloBoard'];
+export type GetTrelloAccountForIdFn = Trello['getAccountForId'];
+export type GetTrelloIssuesForBoardFn = Trello['getIssuesForBoard'];
+export type GetTrelloLabelsForBoardFn = Trello['getLabelsForBoard'];
 
 export interface ProviderInfo extends ProviderMetadata {
 	provider: GitHub | GitLab | Bitbucket | BitbucketServer | Jira | Linear | Trello | AzureDevOps;
@@ -454,7 +713,9 @@ export interface ProviderInfo extends ProviderMetadata {
 	getPullRequestsForReposFn?: GetPullRequestsForReposFn;
 	getPullRequestsForRepoFn?: GetPullRequestsForRepoFn;
 	getPullRequestsForUserFn?: GetPullRequestsForUserFn;
+	getGitLabPullRequestsForUserAssociationFn?: GetGitLabPullRequestsForUserAssociationFn;
 	getPullRequestsForAzureProjectsFn?: GetPullRequestsForAzureProjectsFn;
+	getPullRequestsForAzureProjectFn?: GetPullRequestsForAzureProjectFn;
 	getIssueFn?: GetIssueFn;
 	getIssuesForReposFn?: GetIssuesForReposFn;
 	getIssuesForCurrentUserFn?: GetIssuesForCurrentUserFn;
@@ -466,11 +727,14 @@ export interface ProviderInfo extends ProviderMetadata {
 	getJiraResourcesForCurrentUserFn?: GetJiraResourcesForCurrentUserFn;
 	getLinearOrganizationFn?: GetLinearOrganizationFn;
 	getLinearTeamsForCurrentUserFn?: GetLinearTeamsForCurrentUserFn;
+	getLinearIssuesFn?: GetLinearIssuesFn;
+	getLinearCurrentUserFn?: GetLinearCurrentUserFn;
 	getAzureResourcesForUserFn?: GetAzureResourcesForUserFn;
 	getBitbucketResourcesForCurrentUserFn?: GetBitbucketResourcesForCurrentUserFn;
 	getBitbucketPullRequestsAuthoredByUserForWorkspaceFn?: GetBitbucketPullRequestsAuthoredByUserForWorkspaceFn;
 	getBitbucketServerPullRequestsForCurrentUserFn?: GetBitbucketServerPullRequestsForCurrentUserFn;
 	getJiraProjectsForResourcesFn?: GetJiraProjectsForResourcesFn;
+	getJiraProjectsForResourceFn?: GetJiraProjectsForResourceFn;
 	getAzureProjectsForResourceFn?: GetAzureProjectsForResourceFn;
 	getIssuesForProjectFn?: GetIssuesForProjectFn;
 	getReposForAzureProjectFn?: GetReposForAzureProjectFn;
@@ -481,6 +745,12 @@ export interface ProviderInfo extends ProviderMetadata {
 	getReposForWorkspaceFn?: GetReposForWorkspaceFn;
 	getReposForCurrentUserFn?: GetReposForCurrentUserFn;
 	getGroupsForCurrentUserFn?: GetGroupsForCurrentUserFn;
+	getTrelloCurrentUserFn?: GetTrelloCurrentUserFn;
+	getTrelloBoardsForCurrentUserFn?: GetTrelloBoardsForCurrentUserFn;
+	getTrelloListsForBoardFn?: GetTrelloListsForBoardFn;
+	getTrelloAccountForIdFn?: GetTrelloAccountForIdFn;
+	getTrelloIssuesForBoardFn?: GetTrelloIssuesForBoardFn;
+	getTrelloLabelsForBoardFn?: GetTrelloLabelsForBoardFn;
 }
 
 export interface ProviderMetadata {
@@ -495,11 +765,148 @@ export interface ProviderMetadata {
 	pullRequestsPagingMode?: PagingMode;
 	scopes: string[];
 	supportedPullRequestFilters?: PullRequestFilter[];
+	/**
+	 * Relationship filters the ACCOUNT-WIDE pull-request read can express as an exact OR union.
+	 * This is independent from `supportedPullRequestFilters`, which describes repo-scoped reads.
+	 */
+	supportedAccountWidePullRequestFilters?: PullRequestFilter[];
+	/**
+	 * What the filtered pull-request search can express server-side. Absent means the provider has
+	 * no such search and the facade refuses it rather than returning an unfiltered page.
+	 */
+	supportedPullRequestSearch?: PullRequestSearchCapabilities;
+	/**
+	 * Maximum results the provider will serve for one pull-request search facet. Matches beyond it are unreachable
+	 * and are reported as a succeeded omission carrying this limit plus the provider's pre-ceiling facet count.
+	 */
+	pullRequestSearchResultLimit?: number;
+	/** Filters the REPO-scoped issue read can express. */
 	supportedIssueFilters?: IssueFilter[];
+	/**
+	 * Filters the ACCOUNT-WIDE issue read can express, which is NOT the same set as
+	 * {@link ProviderMetadata.supportedIssueFilters}: the two reads are different provider queries.
+	 *
+	 * Unfiltered, each provider's account-wide read is that provider's own definition of "my issues" — GitHub/GHE
+	 * union authored + assigned + mentioned, Azure drains assigned + authored, and GitLab reads assigned-to-me.
+	 * A consumer replacing a narrower tool (`gk`'s `assignee:@me`) must select the `Assignee` filter wherever the
+	 * provider's default is wider.
+	 *
+	 * A filter listed here narrows that read server-side. Absent/empty means the read can't be narrowed at all,
+	 * so the facade refuses a filtered request rather than serving the unnarrowed union as if it had been
+	 * filtered. GitLab lists `Assignee` and `Author` because the SDK's account-wide input exposes both username
+	 * axes; it omits `Mention` because that REST read has no first-class mention filter.
+	 */
+	supportedAccountWideIssueFilters?: IssueFilter[];
+	/**
+	 * Sort keys the REPO-scoped issue read can express server-side — and, for an issue tracker (Jira/Linear/Trello),
+	 * its project-scoped read, which is the only issue surface a tracker has.
+	 *
+	 * Absent/empty means the read can't be ordered at all, so a request carrying `sort` is refused rather than
+	 * served in whatever order the provider felt like. Present, it is a promise: every key here reaches the
+	 * provider query.
+	 *
+	 * A key listed here is expressible on ONE provider query, which is what this read is when it is given ONE
+	 * scope. Given several (GitLab across repositories, Azure across projects, a tracker across projects) it merges
+	 * their results here and can only honor a key a normalized issue carries, so it additionally refuses
+	 * `priority`/`dueDate`/`resolved` — see `getIssueComparator`. That depends on the caller's scope count rather
+	 * than on the provider, which is why it is a runtime refusal and not a fourth table: encoding it here would
+	 * under-report the single-scope read, which really does support those keys.
+	 */
+	supportedIssueSorts?: IssueSorting[];
+	/**
+	 * Sort keys the ACCOUNT-WIDE issue read can express server-side, which is NOT the same set as
+	 * {@link ProviderMetadata.supportedIssueSorts} — for GitLab the two reads are different APIs (GraphQL vs REST)
+	 * with genuinely different vocabularies, not one narrowed twice.
+	 *
+	 * Absent means the account-wide read can't be ordered (or doesn't exist). An issue tracker leaves this empty
+	 * and reports under `supportedIssueSorts`, so reading a tracker's capability from here under-reports it.
+	 *
+	 * Unlike {@link ProviderMetadata.supportedIssueSorts} this needs no companion runtime refusal, because every
+	 * provider's account-wide read is a union of several queries with no scope count for a caller to reduce: it
+	 * ALWAYS merges. So the keys a merge can't order by are simply absent here — the table states what the read can
+	 * honor, which is what makes intersecting against it sufficient.
+	 */
+	supportedAccountWideIssueSorts?: IssueSorting[];
+	/**
+	 * What the provider's FILTERED issue search (`searchIssuesPage`, and the `countIssues` probe over the same
+	 * criteria) can express server-side. A third, wider surface than either filter set above: it is not bound to
+	 * the user at all, so it takes relationships those reads have no way to name (`any-assignee`, `unassigned`),
+	 * plus free text and issue attributes.
+	 *
+	 * Absent means the provider has NO filtered issue search and the read is refused. Present, it is a promise:
+	 * every field declared here reaches the provider query, so a consumer that intersects against it never has a
+	 * read refused, and a criterion is never silently ignored.
+	 */
+	supportedIssueSearch?: IssueSearchCapabilities;
+	/**
+	 * The maximum number of results the provider's filtered issue search will serve for ONE query, however it is
+	 * paged. Matches past it are UNREACHABLE, not merely unfetched, which is why a read that hits this reports an
+	 * omission with `recovery: 'none'` and the total match count rather than offering a "load more".
+	 *
+	 * Absent means the provider declares no ceiling, in which case a truncated read falls back to generic wording
+	 * instead of quoting a limit that was never published.
+	 */
+	issueSearchResultLimit?: number;
 }
 
 export type Providers = Record<IntegrationIds, ProviderInfo>;
 export type ProvidersMetadata = Record<IntegrationIds, ProviderMetadata>;
+
+/**
+ * GitHub and GitHub Enterprise express every criterion as a search qualifier on the same GraphQL `search` field,
+ * so the two share one declaration — a GHE instance running the same search syntax has the same capability, and
+ * two copies of this table would be free to drift.
+ *
+ * Every entry is a claim the implementation must keep: `searchIssuesPage` emits a qualifier for each of these,
+ * and a test asserts that (see the `issueSearch` capability tests) so the table can't quietly outrun the code.
+ */
+const githubIssueSearchCapabilities: IssueSearchCapabilities = {
+	// `author:@me` / `assignee:@me` / `mentions:@me` / `assignee:*` / `no:assignee`, each its own aliased search.
+	relationships: ['authored', 'assigned', 'mentioned', 'any-assignee', 'unassigned'],
+	text: true,
+	labels: true,
+	milestone: true,
+	updatedAfter: true,
+	createdAfter: true,
+	// `-linked:pr`.
+	withoutLinkedPullRequest: true,
+	// `is:open` / `is:closed`, or neither for all states.
+	states: true,
+	// `sort:created-desc`, `sort:updated`, `sort:comments-asc`, … — see `githubIssueSorts`.
+	sorts: githubIssueSorts,
+};
+
+/**
+ * The ordering vocabulary of GitHub's filtered PR search: `created` and `updated`, both directions.
+ *
+ * Hand-declared rather than derived from `@gitkraken/provider-apis` (which has no PR-sort surface), and narrower
+ * than the issue set on purpose: the merged relationship × state facets can only be re-ordered by a field a
+ * `PullRequestShape` carries (see `getPullRequestComparator`), and GitHub PRs have no priority and no relevance
+ * that orders stably under the result ceiling. A parity test pins this to `gitHubPullRequestSortQualifiers`' keys
+ * so the capability can't outrun the emitter.
+ */
+const githubPullRequestSorts: PullRequestSorting[] = ['updated:desc', 'updated:asc', 'created:desc', 'created:asc'];
+
+/** GitHub and GHE use the same filtered pull-request search syntax and result ceiling. */
+const githubPullRequestSearchCapabilities: PullRequestSearchCapabilities = {
+	relationships: [
+		PullRequestFilter.Author,
+		PullRequestFilter.Assignee,
+		PullRequestFilter.ReviewRequested,
+		PullRequestFilter.Reviewed,
+		PullRequestFilter.Mention,
+	],
+	states: ['open', 'closed', 'merged', 'all'],
+	text: true,
+	updatedAfter: true,
+	createdAfter: true,
+	includeArchived: true,
+	draft: true,
+	repositoryScope: true,
+	organizationScope: true,
+	// `sort:updated`, `sort:updated-asc`, `sort:created-desc`, `sort:created-asc` — see `githubPullRequestSorts`.
+	sorts: githubPullRequestSorts,
+};
 
 export const providersMetadata: ProvidersMetadata = {
 	[GitCloudHostIntegrationId.GitHub]: {
@@ -517,8 +924,26 @@ export const providersMetadata: ProvidersMetadata = {
 			PullRequestFilter.ReviewRequested,
 			PullRequestFilter.Mention,
 		],
+		supportedAccountWidePullRequestFilters: [
+			PullRequestFilter.Author,
+			PullRequestFilter.Assignee,
+			PullRequestFilter.ReviewRequested,
+			PullRequestFilter.Reviewed,
+			PullRequestFilter.Mention,
+		],
+		supportedPullRequestSearch: githubPullRequestSearchCapabilities,
+		pullRequestSearchResultLimit: githubSearchResultLimit,
 		// Use 'username' property on account for issue filters
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// The account-wide read is three independent searches (`author:@me`, `assignee:@me`, `mentions:@me`) behind
+		// one composite cursor, so any subset of them is expressible.
+		supportedAccountWideIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// One `search` field serves all three issue reads (repo-scoped, account-wide, filtered search), so the same
+		// qualifiers are expressible on each — the account-wide one narrowed to what its three-alias merge can order.
+		supportedIssueSorts: githubIssueSorts,
+		supportedAccountWideIssueSorts: githubAccountWideIssueSorts,
+		supportedIssueSearch: githubIssueSearchCapabilities,
+		issueSearchResultLimit: githubSearchResultLimit,
 		scopes: ['repo', 'read:user', 'user:email'],
 	},
 	[GitSelfManagedHostIntegrationId.CloudGitHubEnterprise]: {
@@ -536,8 +961,26 @@ export const providersMetadata: ProvidersMetadata = {
 			PullRequestFilter.ReviewRequested,
 			PullRequestFilter.Mention,
 		],
+		supportedAccountWidePullRequestFilters: [
+			PullRequestFilter.Author,
+			PullRequestFilter.Assignee,
+			PullRequestFilter.ReviewRequested,
+			PullRequestFilter.Reviewed,
+			PullRequestFilter.Mention,
+		],
+		supportedPullRequestSearch: githubPullRequestSearchCapabilities,
+		pullRequestSearchResultLimit: githubSearchResultLimit,
 		// Use 'username' property on account for issue filters
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// The account-wide read is three independent searches (`author:@me`, `assignee:@me`, `mentions:@me`) behind
+		// one composite cursor, so any subset of them is expressible.
+		supportedAccountWideIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// One `search` field serves all three issue reads (repo-scoped, account-wide, filtered search), so the same
+		// qualifiers are expressible on each — the account-wide one narrowed to what its three-alias merge can order.
+		supportedIssueSorts: githubIssueSorts,
+		supportedAccountWideIssueSorts: githubAccountWideIssueSorts,
+		supportedIssueSearch: githubIssueSearchCapabilities,
+		issueSearchResultLimit: githubSearchResultLimit,
 		scopes: ['repo', 'read:user', 'user:email'],
 	},
 	[GitCloudHostIntegrationId.GitLab]: {
@@ -554,8 +997,21 @@ export const providersMetadata: ProvidersMetadata = {
 			PullRequestFilter.Assignee,
 			PullRequestFilter.ReviewRequested,
 		],
+		supportedAccountWidePullRequestFilters: [
+			PullRequestFilter.Author,
+			PullRequestFilter.Assignee,
+			PullRequestFilter.ReviewRequested,
+		],
 		// Use 'username' property on account for issue filters
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee],
+		// The account-wide read drains one `scope=assigned_to_me` pass and one `scope=all` + `authorUsername` pass,
+		// unioned, so either axis is expressible on its own. Mention is absent because GitLab's REST issue read has
+		// no first-class mention filter to narrow with.
+		supportedAccountWideIssueFilters: [IssueFilter.Assignee, IssueFilter.Author],
+		// Two different surfaces, not one narrowed twice: the repository-scoped read is GraphQL and the
+		// account-wide one is REST, and REST has neither `title` nor `closed_at`.
+		supportedIssueSorts: gitlabIssueSorts,
+		supportedAccountWideIssueSorts: gitlabAccountWideIssueSorts,
 		scopes: ['api', 'read_user', 'read_repository'],
 	},
 	[GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted]: {
@@ -572,8 +1028,21 @@ export const providersMetadata: ProvidersMetadata = {
 			PullRequestFilter.Assignee,
 			PullRequestFilter.ReviewRequested,
 		],
+		supportedAccountWidePullRequestFilters: [
+			PullRequestFilter.Author,
+			PullRequestFilter.Assignee,
+			PullRequestFilter.ReviewRequested,
+		],
 		// Use 'username' property on account for issue filters
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee],
+		// The account-wide read drains one `scope=assigned_to_me` pass and one `scope=all` + `authorUsername` pass,
+		// unioned, so either axis is expressible on its own. Mention is absent because GitLab's REST issue read has
+		// no first-class mention filter to narrow with.
+		supportedAccountWideIssueFilters: [IssueFilter.Assignee, IssueFilter.Author],
+		// Two different surfaces, not one narrowed twice: the repository-scoped read is GraphQL and the
+		// account-wide one is REST, and REST has neither `title` nor `closed_at`.
+		supportedIssueSorts: gitlabIssueSorts,
+		supportedAccountWideIssueSorts: gitlabAccountWideIssueSorts,
 		scopes: ['api', 'read_user', 'read_repository'],
 	},
 	[GitCloudHostIntegrationId.Bitbucket]: {
@@ -585,6 +1054,7 @@ export const providersMetadata: ProvidersMetadata = {
 		pullRequestsPagingMode: PagingMode.Repo,
 		// Use 'id' property on account for PR filters (reviewer filter keyed by account id / reviewerId)
 		supportedPullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
+		supportedAccountWidePullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
 		scopes: ['account:read', 'repository:read', 'pullrequest:read', 'issue:read'],
 	},
 	[GitSelfManagedHostIntegrationId.BitbucketServer]: {
@@ -594,6 +1064,7 @@ export const providersMetadata: ProvidersMetadata = {
 		type: 'git',
 		iconKey: GitSelfManagedHostIntegrationId.BitbucketServer,
 		supportedPullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
+		supportedAccountWidePullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
 		scopes: ['Project (Read)', 'Repository (Write)'],
 	},
 	[GitCloudHostIntegrationId.AzureDevOps]: {
@@ -610,8 +1081,21 @@ export const providersMetadata: ProvidersMetadata = {
 			PullRequestFilter.Assignee,
 			PullRequestFilter.ReviewRequested,
 		],
+		supportedAccountWidePullRequestFilters: [
+			PullRequestFilter.Author,
+			PullRequestFilter.Assignee,
+			PullRequestFilter.ReviewRequested,
+		],
 		// Use 'name' property on account for issue filters
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// The account-wide read drains one (project × assignee) and one (project × author) query per project, so
+		// either axis is expressible on its own. There is no mention query to narrow to.
+		supportedAccountWideIssueFilters: [IssueFilter.Author, IssueFilter.Assignee],
+		// Both reads emit the same WIQL, but the account-wide one drains every (project x relationship) query and
+		// merges the results, so it can only honor keys a normalized issue carries — `resolved` and `priority` are
+		// dropped from that surface for the same reason they are dropped from GitLab's.
+		supportedIssueSorts: azureIssueSorts,
+		supportedAccountWideIssueSorts: azureAccountWideIssueSorts,
 		scopes: ['vso.code', 'vso.identity', 'vso.project', 'vso.profile', 'vso.work'],
 	},
 	[GitSelfManagedHostIntegrationId.AzureDevOpsServer]: {
@@ -628,8 +1112,21 @@ export const providersMetadata: ProvidersMetadata = {
 			PullRequestFilter.Assignee,
 			PullRequestFilter.ReviewRequested,
 		],
+		supportedAccountWidePullRequestFilters: [
+			PullRequestFilter.Author,
+			PullRequestFilter.Assignee,
+			PullRequestFilter.ReviewRequested,
+		],
 		// Use 'name' property on account for issue filters
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// The account-wide read drains one (project × assignee) and one (project × author) query per project, so
+		// either axis is expressible on its own. There is no mention query to narrow to.
+		supportedAccountWideIssueFilters: [IssueFilter.Author, IssueFilter.Assignee],
+		// Both reads emit the same WIQL, but the account-wide one drains every (project x relationship) query and
+		// merges the results, so it can only honor keys a normalized issue carries — `resolved` and `priority` are
+		// dropped from that surface for the same reason they are dropped from GitLab's.
+		supportedIssueSorts: azureIssueSorts,
+		supportedAccountWideIssueSorts: azureAccountWideIssueSorts,
 		scopes: ['vso.code', 'vso.identity', 'vso.project', 'vso.profile', 'vso.work'],
 	},
 	[IssuesCloudHostIntegrationId.Jira]: {
@@ -675,6 +1172,9 @@ export const providersMetadata: ProvidersMetadata = {
 			'read:project-version:jira',
 		],
 		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// A tracker's issues live under resource -> project, so it has no account-wide surface to declare: its
+		// capability is reported under `issues`, which is what `listIssueTrackerIssuesPage` validates against.
+		supportedIssueSorts: jiraIssueSorts,
 	},
 	[IssuesCloudHostIntegrationId.Linear]: {
 		domain: 'linear.app',
@@ -683,6 +1183,11 @@ export const providersMetadata: ProvidersMetadata = {
 		type: 'issues',
 		iconKey: IssuesCloudHostIntegrationId.Linear,
 		scopes: [],
+		// Linear scopes "my issues" client-side by the viewer's assignee id; author/mention aren't supported.
+		supportedIssueFilters: [IssueFilter.Assignee],
+		// Both directions, and one table for both reads: they are the same root `issues` query taking the same
+		// `sort` argument, so there is no account-wide narrowing to declare.
+		supportedIssueSorts: linearIssueSorts,
 	},
 	[IssuesCloudHostIntegrationId.Trello]: {
 		domain: 'trello.com',
@@ -691,6 +1196,10 @@ export const providersMetadata: ProvidersMetadata = {
 		type: 'issues',
 		iconKey: IssuesCloudHostIntegrationId.Trello,
 		scopes: [],
+		// Trello cards are filtered by the assignee (member) only; author/mention have no Trello equivalent.
+		supportedIssueFilters: [IssueFilter.Assignee],
+		// `sort:edited` / `sort:-edited`. Trello's other search sorts (`created`, `due`) have no card-order effect.
+		supportedIssueSorts: trelloIssueSorts,
 	},
 };
 
@@ -716,14 +1225,29 @@ export function getReasonsForUserIssue(issue: ProviderIssue, userLogin: string):
 	return reasons;
 }
 
+function toIssueIdentifier(value: string | number): string {
+	return String(value);
+}
+
 export function toIssueShape(issue: ProviderIssue, provider: ProviderReference): IssueShape | undefined {
 	// TODO: Add some protections/baselines rather than killing the transformation here
-	if (issue.updatedDate == null || issue.author == null || issue.url == null) return undefined;
+	// `author` is intentionally not required: some providers have no per-item creator (e.g. Trello cards,
+	// which the SDK maps with `author: null`), and dropping every such item would discard the whole board.
+	// Fall back to an empty author instead so these issues still surface.
+	if (issue.updatedDate == null || issue.url == null) return undefined;
 
 	return {
 		type: 'issue',
 		provider: provider,
-		id: issue.number,
+		// `id` is the provider's display number/key (GitHub number, Jira/Linear key, Trello idShort), NOT a
+		// globally-unique id: it's rendered to users as `#{id}`, used to build branch names, and passed back
+		// to the provider as the `getIssue`/cache lookup key, all of which expect the number. `nodeId` is the
+		// provider-native stable id, but its uniqueness scope is provider-specific (Azure work-item ids are
+		// organization-scoped), so cross-scope consumers must include provider/domain/container identity too.
+		// provider-apis declares this as a string, but some providers (notably
+		// Azure's broadened work-item path) return a number at runtime. Keep the
+		// public IssueShape contract truthful for consumers that use string APIs.
+		id: toIssueIdentifier(issue.number),
 		nodeId: issue.graphQLId ?? issue.id,
 		title: issue.title,
 		url: issue.url,
@@ -733,35 +1257,60 @@ export function toIssueShape(issue: ProviderIssue, provider: ProviderReference):
 		closed: issue.closedDate != null,
 		state: issue.closedDate != null ? 'closed' : 'opened',
 		author: {
-			id: issue.author.id ?? '',
-			name: issue.author.name ?? '',
-			avatarUrl: issue.author.avatarUrl ?? undefined,
-			url: issue.author.url ?? undefined,
+			id: issue.author?.id ?? '',
+			// An absent name stays absent, matching {@link fromProviderAccount}; see `IssueMember.name`.
+			name: issue.author?.name ?? undefined,
+			avatarUrl: issue.author?.avatarUrl ?? undefined,
+			url: issue.author?.url ?? undefined,
 		},
 		assignees:
 			issue.assignees?.map(assignee => ({
 				id: assignee.id ?? '',
-				name: assignee.name ?? '',
+				name: assignee.name ?? undefined,
 				avatarUrl: assignee.avatarUrl ?? undefined,
 				url: assignee.url ?? undefined,
 			})) ?? [],
-		project: {
-			id: issue.project?.id ?? '',
-			name: issue.project?.name ?? '',
-			resourceId: issue.project?.resourceId ?? '',
-			resourceName: issue.project?.namespace ?? '',
-		},
+		project:
+			issue.project?.id && issue.project.resourceId && issue.project.namespace
+				? {
+						id: issue.project.id,
+						name: issue.project.name,
+						resourceId: issue.project.resourceId,
+						resourceName: issue.project.namespace,
+					}
+				: undefined,
 		repository:
 			issue.repository?.owner?.login != null
 				? {
 						owner: issue.repository.owner.login,
 						repo: issue.repository.name,
+						id: issue.repository.id,
 					}
 				: undefined,
 		labels: issue.labels.map(label => ({ color: label.color ?? undefined, name: label.name })),
 		commentsCount: issue.commentCount ?? undefined,
 		thumbsUpCount: issue.upvoteCount ?? undefined,
 		body: issue.description ?? undefined,
+		issueType: issue.type ?? undefined,
+	};
+}
+
+/**
+ * Maps a raw provider-apis {@link ProviderRepository} to the GitLens-owned {@link ProviderRepositoryShape}
+ * the ProviderBackend `listRepos` facade surfaces, so consumers don't depend on the SDK repo type. The SDK's
+ * nullable fields (`webUrl`/`httpsUrl`/`sshUrl`/`defaultBranch`) collapse to `undefined`, matching the
+ * `?? undefined` convention in {@link toIssueShape}/{@link toAccount}.
+ */
+export function toProviderRepositoryShape(repo: ProviderRepository): ProviderRepositoryShape {
+	return {
+		id: repo.id,
+		namespace: repo.namespace,
+		name: repo.name,
+		project: repo.project ?? undefined,
+		url: repo.webUrl ?? undefined,
+		cloneUrlHttps: repo.httpsUrl ?? undefined,
+		cloneUrlSsh: repo.sshUrl ?? undefined,
+		defaultBranch: repo.defaultBranch?.name ?? undefined,
 	};
 }
 
@@ -837,22 +1386,6 @@ function toStatusCheckRollupState(
 	return rollup;
 }
 
-export const toProviderPullRequestReviewState = {
-	[PullRequestReviewState.Approved]: GitPullRequestReviewState.Approved,
-	[PullRequestReviewState.ChangesRequested]: GitPullRequestReviewState.ChangesRequested,
-	[PullRequestReviewState.Commented]: GitPullRequestReviewState.Commented,
-	[PullRequestReviewState.ReviewRequested]: GitPullRequestReviewState.ReviewRequested,
-	[PullRequestReviewState.Dismissed]: null,
-	[PullRequestReviewState.Pending]: null,
-};
-
-export const fromProviderPullRequestReviewState = {
-	[GitPullRequestReviewState.Approved]: PullRequestReviewState.Approved,
-	[GitPullRequestReviewState.ChangesRequested]: PullRequestReviewState.ChangesRequested,
-	[GitPullRequestReviewState.Commented]: PullRequestReviewState.Commented,
-	[GitPullRequestReviewState.ReviewRequested]: PullRequestReviewState.ReviewRequested,
-};
-
 export const toProviderPullRequestMergeableState = {
 	[PullRequestMergeableState.Mergeable]: GitPullRequestMergeableState.Mergeable,
 	[PullRequestMergeableState.Conflicting]: GitPullRequestMergeableState.Conflicts,
@@ -872,68 +1405,6 @@ export const fromProviderPullRequestMergeableState = {
 	[GitPullRequestMergeableState.Unstable]: PullRequestMergeableState.Unknown,
 };
 
-export function toProviderReviews(reviewers: PullRequestReviewer[]): ProviderPullRequest['reviews'] {
-	return reviewers
-		.filter(r => r.state !== PullRequestReviewState.Dismissed && r.state !== PullRequestReviewState.Pending)
-		.map(reviewer => ({
-			reviewer: toProviderAccount(reviewer.reviewer),
-			state: toProviderPullRequestReviewState[reviewer.state] ?? GitPullRequestReviewState.ReviewRequested,
-		}));
-}
-
-export function toReviewRequests(reviews: ProviderPullRequest['reviews']): PullRequestReviewer[] | undefined {
-	return reviews == null
-		? undefined
-		: reviews
-				?.filter(r => r.state === GitPullRequestReviewState.ReviewRequested)
-				.map(r => ({
-					isCodeOwner: false, // TODO: Find this value, and implement in the shared lib if needed
-					reviewer: fromProviderAccount(r.reviewer),
-					state: PullRequestReviewState.ReviewRequested,
-				}));
-}
-
-export function toCompletedReviews(reviews: ProviderPullRequest['reviews']): PullRequestReviewer[] | undefined {
-	return reviews == null
-		? undefined
-		: reviews
-				?.filter(r => r.state !== GitPullRequestReviewState.ReviewRequested)
-				.map(r => ({
-					isCodeOwner: false, // TODO: Find this value, and implement in the shared lib if needed
-					reviewer: fromProviderAccount(r.reviewer),
-					state: fromProviderPullRequestReviewState[r.state],
-				}));
-}
-
-export function toProviderReviewDecision(
-	reviewDecision?: PullRequestReviewDecision,
-	reviewers?: PullRequestReviewer[],
-): GitPullRequestReviewState | null {
-	switch (reviewDecision) {
-		case PullRequestReviewDecision.Approved:
-			return GitPullRequestReviewState.Approved;
-		case PullRequestReviewDecision.ChangesRequested:
-			return GitPullRequestReviewState.ChangesRequested;
-		case PullRequestReviewDecision.ReviewRequired:
-			return GitPullRequestReviewState.ReviewRequested;
-		default: {
-			if (reviewers?.some(r => r.state === PullRequestReviewState.ReviewRequested)) {
-				return GitPullRequestReviewState.ReviewRequested;
-			} else if (reviewers?.some(r => r.state === PullRequestReviewState.Commented)) {
-				return GitPullRequestReviewState.Commented;
-			}
-			return null;
-		}
-	}
-}
-
-export const fromPullRequestReviewDecision = {
-	[GitPullRequestReviewState.Approved]: PullRequestReviewDecision.Approved,
-	[GitPullRequestReviewState.ChangesRequested]: PullRequestReviewDecision.ChangesRequested,
-	[GitPullRequestReviewState.Commented]: undefined,
-	[GitPullRequestReviewState.ReviewRequested]: PullRequestReviewDecision.ReviewRequired,
-};
-
 export function toProviderPullRequestState(state: PullRequestState): GitPullRequestState {
 	return state === 'opened'
 		? GitPullRequestState.Open
@@ -946,12 +1417,12 @@ export function fromProviderPullRequestState(state: GitPullRequestState): PullRe
 	return state === GitPullRequestState.Open ? 'opened' : state === GitPullRequestState.Closed ? 'closed' : 'merged';
 }
 
-/** Maps a PR state filter to the SDK's `states` input. `undefined`/omitted preserves the open-only default. */
-export function toProviderPullRequestStates(
-	state: PullRequestStateFilter | undefined,
-): GitPullRequestState[] | undefined {
+type PullRequestStateInput = PullRequestState | PullRequestStateFilter;
+
+function toProviderPullRequestStatesCore(state: PullRequestStateInput): GitPullRequestState[] {
 	switch (state) {
 		case 'open':
+		case 'opened':
 			return [GitPullRequestState.Open];
 		case 'closed':
 			return [GitPullRequestState.Closed];
@@ -959,9 +1430,17 @@ export function toProviderPullRequestStates(
 			return [GitPullRequestState.Merged];
 		case 'all':
 			return [GitPullRequestState.Open, GitPullRequestState.Closed, GitPullRequestState.Merged];
-		default:
-			return undefined;
 	}
+}
+
+/** Maps PR include/state filters to the SDK's `states` input. `undefined`/omitted preserves the open-only default. */
+export function toProviderPullRequestStates(
+	state: PullRequestStateInput | PullRequestStateInput[] | undefined,
+): GitPullRequestState[] | undefined {
+	if (state == null) return undefined;
+
+	const states = (Array.isArray(state) ? state : [state]).flatMap(s => toProviderPullRequestStatesCore(s));
+	return states.length > 0 ? [...new Set(states)] : undefined;
 }
 
 /** Maps an issue state filter to the SDK's `states` input. `undefined`/omitted preserves the open-only default. */
@@ -1000,6 +1479,13 @@ export function resolveProviderScope(
 	return { reposInput: reposInput };
 }
 
+export function providerPullRequestMatchesSearch(pr: ProviderPullRequest, search: string): boolean {
+	const term = search.trim().toLowerCase();
+	if (term.length === 0) return true;
+
+	return pr.title.toLowerCase().includes(term) || (pr.description?.toLowerCase().includes(term) ?? false);
+}
+
 function toProviderRemoteInfo(ref: PullRequestRef | undefined): GitRepositoryRemoteInfo | null {
 	// Match the SDK convention: only populate remoteInfo when both clone URLs are known.
 	return ref?.cloneHttps && ref?.cloneSsh ? { cloneUrlHTTPS: ref.cloneHttps, cloneUrlSSH: ref.cloneSsh } : null;
@@ -1010,9 +1496,9 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 	return {
 		id: pr.id,
 		graphQLId: pr.nodeId,
-		number: Number.parseInt(pr.id, 10),
+		number: pr.number ?? Number.parseInt(pr.id, 10),
 		title: pr.title,
-		description: null,
+		description: pr.body ?? null,
 		url: pr.url,
 		state: toProviderPullRequestState(pr.state),
 		isCrossRepository: pr.refs?.isCrossRepository ?? false,
@@ -1043,12 +1529,16 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 						name: pr.refs.head.branch,
 						oid: pr.refs.head.sha,
 					},
-		reviews: toProviderReviews(prReviews),
+		// `null` when the source carried no review data at all, rather than the empty array a lite read would
+		// otherwise produce: `toCompletedReviews`/`toReviewRequests` map `null` back to `undefined`, which is what
+		// lets a consumer tell "nobody has reviewed this" from "this read never fetched reviews" (see
+		// `PullRequestShape.latestReviews`). An empty array from a full projection stays an empty array.
+		reviews: pr.reviewRequests == null && pr.latestReviews == null ? null : toProviderReviews(prReviews),
 		reviewDecision: toProviderReviewDecision(pr.reviewDecision, prReviews),
 		repository:
 			pr.repository != null
 				? {
-						id: pr.repository.repo,
+						id: pr.repository.id ?? '',
 						name: pr.repository.repo,
 						owner: {
 							login: pr.repository.owner,
@@ -1113,8 +1603,15 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 export function fromProviderPullRequest(
 	pr: ProviderPullRequest,
 	provider: Provider,
-	options?: { project?: IssueProject },
+	options?: { project?: IssueProject; currentAccountId?: string },
 ): PullRequest {
+	const repository = pr.repository;
+	const repositoryName = repository?.name ?? '';
+	const repositoryOwner = repository?.owner?.login ?? '';
+	const repositoryRemoteInfo = repository?.remoteInfo;
+	const headRepository = pr.headRepository;
+	const headRepositoryRemoteInfo = headRepository?.remoteInfo;
+
 	return new PullRequest(
 		provider,
 		fromProviderAccount(pr.author),
@@ -1123,11 +1620,11 @@ export function fromProviderPullRequest(
 		pr.title,
 		pr.url ?? '',
 		{
-			owner: pr.repository.owner.login,
-			repo: pr.repository.name,
+			owner: repositoryOwner,
+			repo: repositoryName,
 			// This has to be here until we can take this information from ProviderPullRequest:
 			accessLevel: RepositoryAccessLevel.Write,
-			id: pr.repository.id,
+			id: repository?.id ?? '',
 		},
 		fromProviderPullRequestState(pr.state),
 		pr.createdDate,
@@ -1140,27 +1637,27 @@ export function fromProviderPullRequest(
 			base: {
 				branch: pr.baseRef?.name ?? '',
 				sha: pr.baseRef?.oid ?? '',
-				repo: pr.repository.name,
-				owner: pr.repository.owner.login,
+				repo: repositoryName,
+				owner: repositoryOwner,
 				exists: pr.baseRef != null,
-				url: pr.repository.remoteInfo?.cloneUrlHTTPS
-					? pr.repository.remoteInfo.cloneUrlHTTPS.replace(gitSuffixRegex, '')
+				url: repositoryRemoteInfo?.cloneUrlHTTPS
+					? repositoryRemoteInfo.cloneUrlHTTPS.replace(gitSuffixRegex, '')
 					: '',
-				cloneHttps: pr.repository.remoteInfo?.cloneUrlHTTPS || undefined,
-				cloneSsh: pr.repository.remoteInfo?.cloneUrlSSH || undefined,
+				cloneHttps: repositoryRemoteInfo?.cloneUrlHTTPS || undefined,
+				cloneSsh: repositoryRemoteInfo?.cloneUrlSSH || undefined,
 			},
 			head: {
 				branch: pr.headRef?.name ?? '',
 				sha: pr.headRef?.oid ?? '',
-				repo: pr.headRepository?.name ?? '',
-				owner: pr.headRepository?.owner.login ?? '',
+				repo: headRepository?.name ?? '',
+				owner: headRepository?.owner?.login ?? '',
 				exists: pr.headRef != null,
-				url: pr.headRepository?.remoteInfo?.cloneUrlHTTPS
-					? pr.headRepository.remoteInfo.cloneUrlHTTPS.replace(gitSuffixRegex, '')
+				url: headRepositoryRemoteInfo?.cloneUrlHTTPS
+					? headRepositoryRemoteInfo.cloneUrlHTTPS.replace(gitSuffixRegex, '')
 					: '',
-				cloneHttps: pr.headRepository?.remoteInfo?.cloneUrlHTTPS || undefined,
-				cloneSsh: pr.headRepository?.remoteInfo?.cloneUrlSSH || undefined,
-				isFork: pr.headRepository?.isFork,
+				cloneHttps: headRepositoryRemoteInfo?.cloneUrlHTTPS || undefined,
+				cloneSsh: headRepositoryRemoteInfo?.cloneUrlSSH || undefined,
+				isFork: headRepository?.isFork,
 			},
 			isCrossRepository: pr.isCrossRepository,
 		},
@@ -1180,6 +1677,8 @@ export function fromProviderPullRequest(
 		undefined, // stack — GK's proxy type has no stack concept; membership is joined host-side
 		pr.fileCount ?? undefined,
 		pr.description ?? undefined,
+		pr.number,
+		options?.currentAccountId != null ? pr.author?.id === options.currentAccountId : undefined,
 	);
 }
 
@@ -1188,10 +1687,11 @@ export function fromProviderIssue(
 	integration: Integration,
 	options?: { project?: IssueProject },
 ): Issue {
+	const identifier = toIssueIdentifier(issue.number);
 	return new Issue(
 		integration,
-		issue.id,
-		issue.graphQLId,
+		identifier,
+		issue.graphQLId ?? issue.id,
 		issue.title,
 		issue.url ?? '',
 		issue.createdDate,
@@ -1200,9 +1700,15 @@ export function fromProviderIssue(
 		issue.closedDate != null ? 'closed' : 'opened',
 		fromProviderAccount(issue.author),
 		issue.assignees?.map(fromProviderAccount) ?? undefined,
-		undefined, // TODO: issue repo
+		issue.repository != null
+			? {
+					owner: issue.repository.owner.login ?? '',
+					repo: issue.repository.name,
+					id: issue.repository.id,
+				}
+			: undefined,
 		issue.closedDate ?? undefined,
-		undefined,
+		issue.labels?.map(label => ({ name: label.name, color: label.color ?? undefined })),
 		issue.commentCount ?? undefined,
 		issue.upvoteCount ?? undefined,
 		issue.description ?? undefined,
@@ -1221,45 +1727,37 @@ export function fromProviderIssue(
 						resourceName: issue.project.namespace,
 					}
 				: undefined,
-		issue.number,
+		identifier,
+		issue.type ?? undefined,
 	);
 }
 
 export function toProviderPullRequestWithUniqueId(pr: PullRequest): PullRequestWithUniqueID {
+	const { reviews, ...providerPr } = toProviderPullRequest(pr);
 	return {
-		...toProviderPullRequest(pr),
+		...providerPr,
+		// The SDK boundary: `getActionablePullRequests` categorizes by review state and only knows
+		// provider-apis' own vocabulary, so the locally-added dismissed state is dropped here rather than
+		// handed over as a value it would fall through on. Our own projection keeps it — see
+		// `providerPullRequestReviewStateDismissed`. `commitOid` rides along on the surviving reviews: it is an
+		// extra property the SDK ignores, not a value it could misread.
+		reviews:
+			reviews?.filter(
+				(r): r is ProviderPullRequestReview & { state: GitPullRequestReviewState } =>
+					r.state !== providerPullRequestReviewStateDismissed,
+			) ?? null,
 		uuid: EntityIdentifierUtils.encode(getEntityIdentifierInput(pr)),
-	};
-}
-
-export function toProviderAccount(account: PullRequestMember | IssueMember): ProviderAccount {
-	return {
-		// Stays the provider id because the categorizer matches the viewer to a pull request's people by `id`,
-		// and every provider but GitHub already agrees on that namespace. Re-keying to the login breaks Azure,
-		// whose account `username` is a display name while its members' is a UPN — different namespaces.
-		id: account.id ?? null,
-		avatarUrl: account.avatarUrl ?? null,
-		name: account.name ?? null,
-		url: account.url ?? null,
-		// TODO: Implement these in our own model
-		email: '',
-		username: account.name ?? null,
-	};
-}
-
-export function fromProviderAccount(account: ProviderAccount | null): PullRequestMember | IssueMember {
-	return {
-		id: account?.id ?? '',
-		name: account?.name ?? 'unknown',
-		username: account?.username ?? undefined,
-		avatarUrl: account?.avatarUrl ?? undefined,
-		url: account?.url ?? '',
 	};
 }
 
 export type ProviderActionablePullRequest = ActionablePullRequest;
 
-export type EnrichablePullRequest = ProviderPullRequest & {
+/**
+ * Built on the SDK's `GitPullRequest`, NOT the local {@link ProviderPullRequest} widening: this is handed to
+ * `getActionablePullRequests`, which categorizes by review state and only knows provider-apis' vocabulary.
+ * {@link toProviderPullRequestWithUniqueId} is what narrows `reviews` down to it.
+ */
+export type EnrichablePullRequest = GitPullRequest & {
 	uuid: string;
 	type: 'pullrequest';
 	provider: ProviderReference;
@@ -1288,7 +1786,10 @@ export function isGitLabDotCom(domain: string | null | undefined): boolean {
 	return equalsIgnoreCase(domain, 'gitlab.com');
 }
 
-const azureCloudDomainRegex = /^dev\.azure\.com$|\bvisualstudio\.com$/i;
+// Anchor the `visualstudio.com` alternative on a label boundary (`^` or `.`) rather than `\b`: `\b` treats a
+// hyphen as a word boundary, so `\bvisualstudio\.com$` matched attacker-controlled hosts like
+// `evil-visualstudio.com` and classified them as Azure cloud, changing their auth/URL handling.
+const azureCloudDomainRegex = /^dev\.azure\.com$|(?:^|\.)visualstudio\.com$/i;
 export function isAzureCloudDomain(domain: string | undefined): boolean {
 	return domain != null && azureCloudDomainRegex.test(domain);
 }

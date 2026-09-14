@@ -3,14 +3,14 @@ import { customElement, property, query, state } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { when } from 'lit/directives/when.js';
 import { getAltKeySymbol } from '@env/platform.js';
-import { ModifierKeysController } from '../../controllers/modifier-keys.js';
-import { GlElement } from '../element.js';
+import { GlElement } from '@gitlens/components/components/element.js';
+import { ModifierKeysController } from '@gitlens/components/controllers/modifierKeys.js';
 import type { TreeItemCheckedDetail, TreeItemSelectionDetail } from './base.js';
 import { treeItemFileDragDataType } from './base.js';
 import { treeItemStyles } from './tree.css.js';
 import '../actions/action-nav.js';
-import '../code-icon.js';
-import '../overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 @customElement('gl-tree-item')
 export class GlTreeItem extends GlElement {
@@ -269,7 +269,7 @@ export class GlTreeItem extends GlElement {
 		></span>`;
 		const tooltipContent = this.getEffectiveCheckboxTooltip();
 		// `content` attribute (rather than the `content` slot) so multi-line tooltips with `\n`
-		// get converted to `<br>` by gl-tooltip's `handleUnsafeOverlayContent` — slot content
+		// get converted to `<br>` by gl-tooltip's `renderOverlayContent` — slot content
 		// flows through CSS `white-space: normal` and collapses newlines to spaces.
 		return tooltipContent
 			? html`<gl-tooltip placement="right" content=${tooltipContent}>${checkbox}</gl-tooltip>`

@@ -1,11 +1,14 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues, TemplateResult } from 'lit';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
+import { boxSizingBase, metadataBarVarsBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import { getStackedMergeCount } from '@gitlens/git/utils/pullRequest.utils.js';
 import { arePathsEqual } from '@gitlens/utils/path.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { PastAgentSessionsResult } from '../../../../../agents/models/agentSessionState.js';
 import type { AssociateIssueWithBranchCommandArgs } from '../../../../../plus/startWork/associateIssueWithBranch.js';
 import { createCommandLink } from '../../../../../system/commands.js';
@@ -20,16 +23,25 @@ import type {
 	OverviewBranchPullRequest,
 	OverviewBranchRemote,
 } from '../../../../shared/overviewBranches.js';
-import { isAbortError, noopUnlessReal } from '../../../shared/actions/rpc.js';
-import type { PastAgentSessionsResolver } from '../../../shared/agentUtils.js';
-import { createPastAgentSessionsResolver, matchAgentSessionsForWorktree } from '../../../shared/agentUtils.js';
-import { elementBase, metadataBarVarsBase } from '../../../shared/components/styles/lit/base.css.js';
+import { isAbortError, noopUnlessReal, notifyService } from '../../../shared/actions/rpc.js';
+import type { PastAgentSessionsPager, PastAgentSessionsResolver } from '../../../shared/agentUtils.js';
+import {
+	createPastAgentSessionsPager,
+	createPastAgentSessionsResolver,
+	filterLiveAgentSessions,
+	initialPastAgentSessionLimit,
+	matchAgentSessionsForWorktree,
+} from '../../../shared/agentUtils.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { providerIconName } from '../../../shared/git-utils.js';
 import { graphStateContext } from '../context.js';
 import type { ResolvedServices } from './detailsActions.js';
-import type { ExpandState } from './gl-details-agent-status.js';
+import type {
+	ExpandState,
+	PastAgentSessionArchiveRequest,
+	PastAgentSessionsMoreRequest,
+} from './gl-details-agent-status.js';
 import { graphBranchSheetPaneStyles } from './gl-graph-branch-sheet-pane.css.js';
 import type { NextStep } from './nextStep.js';
 import { nextStepStyles, renderNextStep } from './nextStep.js';
@@ -40,8 +52,8 @@ import '../../../shared/components/button-container.js';
 import '../../../shared/components/chips/action-chip.js';
 import '../../../shared/components/chips/autolink-chip.js';
 import '../../../shared/components/chips/chip-overflow.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../../shared/components/pills/tracking-status.js';
 
 /** Minimal branch/tag identity carried by the `gl-graph-open-branch` event (a ref-pill click).
@@ -84,6 +96,7 @@ interface BranchSheetCacheEntry {
 	hasPullRequest?: boolean;
 	pastSessions?: PastAgentSessionsResult;
 	hasPastSessions?: boolean;
+	pastSessionsLimit?: number;
 	remote?: OverviewBranchRemote;
 }
 
@@ -109,14 +122,14 @@ function onlyTrustedCommandLinkClicks(e: MouseEvent): void {
  */
 @customElement('gl-graph-branch-sheet-pane')
 export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
-	static override styles = [elementBase, metadataBarVarsBase, nextStepStyles, graphBranchSheetPaneStyles];
+	static override styles = [boxSizingBase, metadataBarVarsBase, nextStepStyles, graphBranchSheetPaneStyles];
 
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
 
 	/** Live agent sessions — self-served via the graph's reactive state (see `stateProvider.ts`)
 	 *  rather than threaded in as a 13th property, matching `gl-graph-treemap`'s precedent. */
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
 
 	/** The ref this sheet is scoped to (name/refType/remote/sha). */
@@ -144,8 +157,10 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	@state() private _pullRequestLoading = false;
 	@state() private _remote?: OverviewBranchRemote;
 	@state() private _pastAgentSessions?: PastAgentSessionsResult;
+	@state() private _pastAgentSessionsLimit = initialPastAgentSessionLimit;
+	@state() private _pastAgentSessionsLoading = false;
 
-	/** Cycle-stable projection of {@link _pastAgentSessions} reconciled against the live set, so the
+	/** Cycle-stable projection of {@link _pastAgentSessions} reconciled against the tracked set, so the
 	 *  section's visibility gate and the rendered rows agree — see the resolver's doc. */
 	private _cyclePastSessions?: PastAgentSessionsResult;
 	private readonly _pastSessionsResolver: PastAgentSessionsResolver = createPastAgentSessionsResolver();
@@ -291,6 +306,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		const controller = new AbortController();
 		this._controller = controller;
 		const signal = controller.signal;
+		this._pastAgentSessionsLoading = false;
 
 		if (!isRefresh) {
 			// Hydrate from cache synchronously (instant continuity) or reset to loading (first visit).
@@ -305,11 +321,15 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 				this._pullRequestLoading = !cached.hasPullRequest;
 				this._remote = cached.remote;
 				this._pastAgentSessions = cached.hasPastSessions ? cached.pastSessions : undefined;
+				this._pastAgentSessionsLimit = cached.pastSessionsLimit ?? initialPastAgentSessionLimit;
 			} else {
 				this.resetEnrichmentState();
 				this._mergeTargetLoading = true;
 				this._pullRequestLoading = true;
 			}
+		}
+		if (this._pastAgentSessions != null) {
+			this._pastAgentSessionsLoading = true;
 		}
 		// On refresh, leave whatever is currently displayed alone — the fresh values land in place
 		// as each leg resolves, so the sheet never flashes back to a loading/skeleton state.
@@ -320,6 +340,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			if (enrichment == null) {
 				this._mergeTargetLoading = false;
 				this._pullRequestLoading = false;
+				this._pastAgentSessionsLoading = false;
 				// A refresh resolving null means the branch no longer exists (e.g. deleted from the
 				// sheet) — ask the panel to close. An initial null just leaves the identity fallback.
 				if (isRefresh) {
@@ -337,12 +358,15 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			// worktree has past sessions too.
 			const pastWorktreePath = enrichment.branch.worktree?.path;
 			if (pastWorktreePath != null) {
-				void services.agents.getPastSessionsForWorktree(pastWorktreePath, { limit: 3 }, signal).then(result => {
-					if (signal.aborted || this._loadedKey !== key) return;
-
-					this._pastAgentSessions = result;
-					this.updateCache(key, { pastSessions: result, hasPastSessions: true });
-				}, noopUnlessReal);
+				void this.fetchPastAgentSessions(
+					key,
+					pastWorktreePath,
+					services,
+					this._pastAgentSessionsLimit,
+					controller,
+				).catch(noopUnlessReal);
+			} else {
+				this._pastAgentSessionsLoading = false;
 			}
 
 			void enrichment.autolinks.then(autolinks => {
@@ -397,6 +421,34 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 
 			this._mergeTargetLoading = false;
 			this._pullRequestLoading = false;
+			this._pastAgentSessionsLoading = false;
+		}
+	}
+
+	private async fetchPastAgentSessions(
+		key: string,
+		worktreePath: string,
+		services: ResolvedServices,
+		limit: number,
+		controller: AbortController,
+	): Promise<void> {
+		this._pastAgentSessionsLoading = true;
+		try {
+			const agents = await services.agents;
+			const result = await agents.getPastSessionsForWorktree(worktreePath, { limit: limit }, controller.signal);
+			if (controller.signal.aborted || this._loadedKey !== key) return;
+
+			this._pastAgentSessions = result;
+			this._pastAgentSessionsLimit = limit;
+			this.updateCache(key, {
+				pastSessions: result,
+				hasPastSessions: true,
+				pastSessionsLimit: limit,
+			});
+		} finally {
+			if (this._controller === controller && this._loadedKey === key) {
+				this._pastAgentSessionsLoading = false;
+			}
 		}
 	}
 
@@ -419,6 +471,8 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		this._pullRequestLoading = false;
 		this._remote = undefined;
 		this._pastAgentSessions = undefined;
+		this._pastAgentSessionsLimit = initialPastAgentSessionLimit;
+		this._pastAgentSessionsLoading = false;
 	}
 
 	/** Fetch the tag's tip-commit summary (tip line) and its previous reachable tag (changelog
@@ -489,7 +543,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 
 	/** The ref's display name — remote-qualified ("origin/main") for a remote ref, else the bare
 	 *  name. `ref.name` alone is the bare branch name shared with its local tracking counterpart
-	 *  (see `resolveRef` in gl-lit-graph), so a remote sheet needs the remote prefixed back on.
+	 *  (see `resolveRef` in gl-commit-graph), so a remote sheet needs the remote prefixed back on.
 	 *  Prefers the authoritative name from the ref's context when available. */
 	private displayName(ref: BranchSheetRef): string {
 		if (ref.refType !== 'remote') return ref.name;
@@ -519,7 +573,10 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			${
 				ref.sha != null
 					? html`<div class="identity__tip">
-							Tip <code-icon icon="git-commit" size="12"></code-icon> ${ref.sha.slice(0, 7)}
+							${localizedContent(l10n.t('Tip {commit} {revision}'), {
+								commit: html`<code-icon icon="git-commit" size="12"></code-icon>`,
+								revision: ref.sha.slice(0, 7),
+							})}
 						</div>`
 					: nothing
 			}
@@ -529,8 +586,12 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	private renderRemoteStrip(): TemplateResult | typeof nothing {
 		if (this._pullRequest == null && !this._pullRequestLoading) return nothing;
 
+		// Same right-anchored .branch-ops slot as the local strip, so the PR chip lands in the same
+		// place whether or not the issues side of the row has anything to show.
 		return html`<div class="metadata">
-			<div class="strip-row">${this.renderPullRequest()}</div>
+			<div class="strip-row">
+				<div class="branch-ops">${this.renderPullRequest()}</div>
+			</div>
 		</div>`;
 	}
 
@@ -545,11 +606,11 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		const steps =
 			context != null
 				? html`<section class="section">
-						<h3 class="section__heading">Next steps</h3>
+						<h3 class="section__heading">${l10n.t('Next steps')}</h3>
 						${renderNextStep({
 							icon: 'gl-switch',
-							label: `Switch to ${this.displayName(ref)}`,
-							actionLabel: 'Switch',
+							label: l10n.t('Switch to {branch}', { branch: this.displayName(ref) }),
+							actionLabel: l10n.t('Switch'),
 							href: this._webview.createCommandLink<GraphItemContext>('gitlens.switchToBranch:', context),
 						})}
 					</section>`
@@ -586,8 +647,8 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		if (this.aiEnabled && this.orgSettings?.ai !== false && prevTag != null) {
 			steps.push({
 				icon: 'list-unordered',
-				label: `Changelog since ${prevTag}`,
-				actionLabel: 'Generate',
+				label: l10n.t('Changelog since {tag}', { tag: prevTag }),
+				actionLabel: l10n.t('Generate'),
 				loading: this._generateChangelogBusy,
 				onClick: () => this.onTagGenerateChangelog(prevTag, ref.name),
 			});
@@ -597,20 +658,20 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			steps.push(
 				{
 					icon: 'git-branch',
-					label: `Create Branch from ${ref.name}`,
-					actionLabel: 'Create Branch…',
+					label: l10n.t('Create Branch from {tag}', { tag: ref.name }),
+					actionLabel: l10n.t('Create Branch…'),
 					href: this._webview.createCommandLink<GraphItemContext>('gitlens.createBranch:', context),
 				},
 				{
 					icon: 'gl-switch',
-					label: `Switch to ${ref.name} (Detached)`,
-					actionLabel: 'Switch',
+					label: l10n.t('Switch to {tag} (Detached)', { tag: ref.name }),
+					actionLabel: l10n.t('Switch'),
 					href: this._webview.createCommandLink<GraphItemContext>('gitlens.graph.switchToTag', context),
 				},
 				{
 					icon: 'repo-push',
-					label: `Push ${ref.name} to a remote`,
-					actionLabel: 'Push…',
+					label: l10n.t('Push {tag} to a remote', { tag: ref.name }),
+					actionLabel: l10n.t('Push…'),
 					href: this._webview.createCommandLink<GraphItemContext>('gitlens.graph.pushTag', context),
 				},
 			);
@@ -620,7 +681,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 
 		return html`<div class="hub">
 			<section class="section">
-				<h3 class="section__heading">Next steps</h3>
+				<h3 class="section__heading">${l10n.t('Next steps')}</h3>
 				${steps.map(step => renderNextStep(step))}
 			</section>
 		</div>`;
@@ -704,7 +765,10 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 
 	private renderMergePullRequest(pr: OverviewBranchPullRequest): TemplateResult {
 		const count = getStackedMergeCount(pr.stack);
-		const label = count > 1 ? `Merge ${count} Pull Requests...` : 'Merge Pull Request...';
+		const label = formatPlural(
+			l10n.t('{count, plural, one{Merge Pull Request...} other{Merge {count} Pull Requests...}}'),
+			{ count: count },
+		);
 
 		return html`<gl-action-chip
 			icon="git-merge"
@@ -730,7 +794,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	private renderWorktreeOps(worktree: NonNullable<BranchSnapshot['worktree']>): TemplateResult {
 		return html`<gl-action-chip
 				icon="terminal"
-				label="Open in Integrated Terminal"
+				label=${l10n.t('Open in Integrated Terminal')}
 				overlay="tooltip"
 				href=${this._webview.createCommandLink('gitlens.openInIntegratedTerminal:', {
 					worktreeUri: worktree.uri,
@@ -738,9 +802,9 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			></gl-action-chip>
 			<gl-action-chip
 				icon="empty-window"
-				label="Open Worktree in New Window"
+				label=${l10n.t('Open Worktree in New Window')}
 				alt-icon="window"
-				alt-label="Open Worktree"
+				alt-label=${l10n.t('Open Worktree')}
 				overlay="tooltip"
 				href=${this._webview.createCommandLink('gitlens.openWorktreeInNewWindow:', {
 					worktreeUri: worktree.uri,
@@ -779,7 +843,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			return html`<gl-action-chip
 				class="associate-issue"
 				icon="link"
-				label="Associate Issue with Branch"
+				label=${l10n.t('Associate Issue with Branch')}
 				overlay="tooltip"
 				href=${href}
 			></gl-action-chip>`;
@@ -788,10 +852,10 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		return html`<gl-action-chip
 			class="associate-issue"
 			icon="link"
-			label="Associate Issue with Branch"
+			label=${l10n.t('Associate Issue with Branch')}
 			overlay="tooltip"
 			href=${href}
-			>&nbsp;Associate Issue…</gl-action-chip
+			>&nbsp;${l10n.t('Associate Issue…')}</gl-action-chip
 		>`;
 	}
 
@@ -809,7 +873,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			${
 				steps.length > 0
 					? html`<section class="section">
-							<h3 class="section__heading">Next steps</h3>
+							<h3 class="section__heading">${l10n.t('Next steps')}</h3>
 							${steps.map(step => renderNextStep(step))}
 						</section>`
 					: nothing
@@ -826,10 +890,13 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		const worktreePath = branch.worktree?.path;
 		if (worktreePath == null) return nothing;
 
-		const sessions = matchAgentSessionsForWorktree(this.graphState?.agentSessions, {
-			repoPath: branch.repoPath,
-			worktreePath: worktreePath,
-		});
+		const sessions = filterLiveAgentSessions(
+			matchAgentSessionsForWorktree(
+				this.graphState?.agentSessions,
+				{ repoPath: branch.repoPath, worktreePath: worktreePath },
+				{ includeVisited: true },
+			),
+		);
 		// Gate on the resolved list, not the raw cache — see `_cyclePastSessions`.
 		if ((sessions?.length ?? 0) === 0 && (this._cyclePastSessions?.sessions.length ?? 0) === 0) return nothing;
 
@@ -838,15 +905,64 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 				flat
 				.sessions=${sessions}
 				.pastSessions=${this._cyclePastSessions}
+				.pastSessionsLimit=${this._pastAgentSessionsLimit}
+				.pastSessionsLoading=${this._pastAgentSessionsLoading}
 				.worktreePath=${worktreePath}
 				.expand=${this._agentExpand}
 				@gl-agent-status-expand-request=${this._onAgentExpandRequest}
+				@gl-agent-status-past-sessions-more-request=${this._onAgentPastSessionsMoreRequest}
+				@gl-agent-status-past-session-archive-request=${this._onAgentPastSessionArchiveRequest}
 			></gl-details-agent-status>
 		</section>`;
 	}
 
 	private readonly _onAgentExpandRequest = (): void => {
 		this._agentExpand = this._agentExpand === 'expanded' ? 'collapsed' : 'expanded';
+	};
+
+	/** Builds a pager scoped to this event's captured `key`/`controller` — see
+	 *  {@link createPastAgentSessionsPager}. Cheap to construct per event; keeps the guard against a
+	 *  loaded-key change (branch switch mid-request) inline rather than threaded through instance state. */
+	private createPastSessionsPager(
+		key: string,
+		worktreePath: string,
+		services: ResolvedServices,
+		controller: AbortController,
+	): PastAgentSessionsPager {
+		return createPastAgentSessionsPager({
+			getLimit: () => this._pastAgentSessionsLimit,
+			isLoading: () => this._pastAgentSessionsLoading,
+			isCurrent: () => !controller.signal.aborted && this._loadedKey === key,
+			fetch: (limit: number) => this.fetchPastAgentSessions(key, worktreePath, services, limit, controller),
+			archiveSession: async (sessionId: string, providerId: string): Promise<boolean> => {
+				const agents = await services.agents;
+				return agents.archiveSession(sessionId, providerId);
+			},
+		});
+	}
+
+	private readonly _onAgentPastSessionsMoreRequest = (e: CustomEvent<PastAgentSessionsMoreRequest>): void => {
+		const key = this._loadedKey;
+		const worktreePath = this._branch?.worktree?.path;
+		const services = this.services;
+		const controller = this._controller;
+		if (key == null || worktreePath == null || services == null || controller == null) return;
+
+		void this.createPastSessionsPager(key, worktreePath, services, controller)
+			.more(e.detail.limit)
+			.catch(noopUnlessReal);
+	};
+
+	private readonly _onAgentPastSessionArchiveRequest = (e: CustomEvent<PastAgentSessionArchiveRequest>): void => {
+		const key = this._loadedKey;
+		const worktreePath = this._branch?.worktree?.path;
+		const services = this.services;
+		const controller = this._controller;
+		if (key == null || worktreePath == null || services == null || controller == null) return;
+
+		this.createPastSessionsPager(key, worktreePath, services, controller)
+			.archive(e.detail.sessionId, e.detail.providerId)
+			.catch(noopUnlessReal);
 	};
 
 	/** "Upstream" relationship card — the branch's own remote tracking counterpart, always rendered
@@ -859,17 +975,17 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		const branchRef = this.toBranchRef(branch);
 		const checkoutPath = this.checkoutPath(branch);
 		// Starts as `cloud` and swaps in place once the remote leg settles — never a shimmer.
-		const kindIcon = this.renderKindIcon(providerIconName(this._remote?.provider?.icon), 'Upstream');
+		const kindIcon = this.renderKindIcon(providerIconName(this._remote?.provider?.icon), l10n.t('Upstream'));
 
 		// Unpublished has no situation to report — but Publish still goes in the foot, so it lands on
 		// the same baseline as the merge-target card's buttons instead of floating up beside the name.
 		if (upstream == null) {
 			return html`<div class="relationship-card">
 				<div class="relationship-card__head">
-					${kindIcon}<span class="relationship-card__connector">Upstream</span>
+					${kindIcon}<span class="relationship-card__connector">${l10n.t('Upstream')}</span>
 					${this.renderEditToken(
-						'Unpublished',
-						'Set Upstream…',
+						l10n.t('Unpublished'),
+						l10n.t('Set Upstream…'),
 						this._webview.createCommandLink<BranchRef>('gitlens.git.branch.setUpstream:', branchRef),
 						true,
 					)}
@@ -879,7 +995,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 						<gl-button
 							appearance="secondary"
 							href=${this._webview.createCommandLink<BranchRef>('gitlens.publishBranch:', branchRef)}
-							>Publish</gl-button
+							>${l10n.t('Publish')}</gl-button
 						>
 					</div>
 				</div>
@@ -891,59 +1007,61 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		if (upstream.missing) {
 			// Usually means the PR merged and the remote branch was auto-deleted, so deleting the
 			// local branch leads and re-publishing is the fallback.
-			status = 'Missing from the remote';
+			status = l10n.t('Missing from the remote');
 			actions = html`<gl-button
 					appearance="secondary"
 					href=${this._webview.createCommandLink<BranchRef>('gitlens.deleteBranchOrWorktree:', branchRef)}
-					>Delete Local Branch</gl-button
+					>${l10n.t('Delete Local Branch')}</gl-button
 				><gl-button
 					appearance="secondary"
 					href=${this._webview.createCommandLink<BranchRef>('gitlens.publishBranch:', branchRef)}
-					>Publish</gl-button
+					>${l10n.t('Publish')}</gl-button
 				>`;
 		} else {
 			// The pill owns the counts, so the words never repeat them.
 			const fetch = html`<gl-button
 				appearance="secondary"
 				href=${this._webview.createCommandLink<BranchRef>('gitlens.fetch:', branchRef)}
-				>Fetch</gl-button
+				>${l10n.t('Fetch')}</gl-button
 			>`;
 
 			if (ahead > 0 && behind > 0) {
-				status = 'Diverged';
+				status = l10n.t('Diverged');
 				actions =
 					checkoutPath != null
-						? html`<gl-button appearance="secondary" @click=${() => this.pull(checkoutPath)}>Pull</gl-button
+						? html`<gl-button appearance="secondary" @click=${() => this.pull(checkoutPath)}
+									>${l10n.t('Pull')}</gl-button
 								><gl-button appearance="secondary" @click=${() => this.forcePush(checkoutPath)}
-									>Force Push</gl-button
+									>${l10n.t('Force Push')}</gl-button
 								>${fetch}`
 						: fetch;
 			} else if (behind > 0) {
-				status = `${behind} to pull`;
+				status = l10n.t('{count} to pull', { count: behind });
 				actions =
 					checkoutPath != null
-						? html`<gl-button appearance="secondary" @click=${() => this.pull(checkoutPath)}>Pull</gl-button
+						? html`<gl-button appearance="secondary" @click=${() => this.pull(checkoutPath)}
+									>${l10n.t('Pull')}</gl-button
 								>${fetch}`
 						: fetch;
 			} else if (ahead > 0) {
-				status = `${ahead} to push`;
+				status = l10n.t('{count} to push', { count: ahead });
 				actions = html`<gl-button
 						appearance="secondary"
 						href=${this._webview.createCommandLink<BranchRef>('gitlens.pushBranch:', branchRef)}
-						>Push</gl-button
+						>${l10n.t('Push')}</gl-button
 					>${fetch}`;
 			} else {
-				status = 'Up to date';
+				status = l10n.t('Up to date');
 				actions = fetch;
 			}
 		}
 
 		return html`<div class="relationship-card">
 			<div class="relationship-card__head">
-				${kindIcon}<span class="relationship-card__label">Upstream</span>
+				${kindIcon}<span class="relationship-card__label">${l10n.t('Upstream')}</span>
 				${this.renderEditToken(
 					upstream.name,
-					'Change Upstream…',
+					l10n.t('Change Upstream…'),
 					this._webview.createCommandLink<BranchRef>('gitlens.git.branch.setUpstream:', branchRef),
 					false,
 				)}
@@ -970,7 +1088,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	 *  Upstream card's bare name and the Merge Target card's directional sentence. */
 	private renderEditToken(text: string, tooltip: string, href: string, muted: boolean): TemplateResult {
 		// Lead the tooltip with the full name — the visible text ellipsizes at narrow card widths.
-		return html`<gl-tooltip content="${text} — ${tooltip}"
+		return html`<gl-tooltip content=${l10n.t('{text} — {action}', { text: text, action: tooltip })}
 			><a
 				class="relationship-card__token${muted ? ' relationship-card__token--muted' : ''}"
 				href=${href}
@@ -991,12 +1109,25 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		const upstream = branch.upstream;
 		const ahead = upstream?.state.ahead ?? 0;
 		if (upstream != null && !upstream.missing && ahead > 0) {
-			scopes.unpushed = { from: upstream.name, to: branch.name, label: pluralize('unpushed commit', ahead) };
+			scopes.unpushed = {
+				from: upstream.name,
+				to: branch.name,
+				label: formatPlural(
+					l10n.t('{count, plural, one{{count} unpushed commit} other{{count} unpushed commits}}'),
+					{
+						count: ahead,
+					},
+				),
+			};
 		}
 
 		const mergeTarget = this._mergeTarget?.mergeTarget;
 		if (mergeTarget != null) {
-			scopes.target = { from: mergeTarget.name, to: branch.name, label: `all changes vs ${mergeTarget.name}` };
+			scopes.target = {
+				from: mergeTarget.name,
+				to: branch.name,
+				label: l10n.t('all changes vs {target}', { target: mergeTarget.name }),
+			};
 		}
 
 		return scopes;
@@ -1075,15 +1206,15 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		if (!checkedOut && worktree == null) {
 			steps.push({
 				icon: 'gl-switch',
-				label: `Switch to ${branch.name}`,
-				actionLabel: 'Switch',
+				label: l10n.t('Switch to {branch}', { branch: branch.name }),
+				actionLabel: l10n.t('Switch'),
 				href: this._webview.createCommandLink<BranchRef>('gitlens.switchToBranch:', branchRef),
 				alt:
 					context != null
 						? {
-								actionLabel: 'Create Worktree…',
+								actionLabel: l10n.t('Create Worktree…'),
 								icon: 'gl-worktree',
-								tooltip: 'Create Worktree…',
+								tooltip: l10n.t('Create Worktree…'),
 								href: this._webview.createCommandLink<GraphItemContext>(
 									'gitlens.graph.createWorktree',
 									context,
@@ -1097,13 +1228,13 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		if (inOtherWorktree && worktree != null) {
 			steps.push({
 				icon: 'gl-worktree',
-				label: `In worktree · ${worktree.name}`,
-				actionLabel: 'Open Worktree',
+				label: l10n.t('In worktree · {worktree}', { worktree: worktree.name }),
+				actionLabel: l10n.t('Open Worktree'),
 				href: this._webview.createCommandLink('gitlens.openWorktree:', { worktreeUri: worktree.uri }),
 				alt: {
-					actionLabel: 'Open Worktree in New Window',
+					actionLabel: l10n.t('Open Worktree in New Window'),
 					icon: 'empty-window',
-					tooltip: 'Open Worktree in New Window',
+					tooltip: l10n.t('Open Worktree in New Window'),
 					href: this._webview.createCommandLink('gitlens.openWorktreeInNewWindow:', {
 						worktreeUri: worktree.uri,
 					}),
@@ -1119,22 +1250,22 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 			if (pr != null) {
 				steps.push({
 					icon: 'git-pull-request',
-					label: `Pull Request #${pr.id}: ${pr.title}`,
-					actionLabel: 'View',
+					label: l10n.t('Pull Request #{id}: {title}', { id: pr.id, title: pr.title }),
+					actionLabel: l10n.t('View'),
 					href: pr.url,
 				});
 			} else if (this._pullRequestLoading) {
 				steps.push({
 					icon: 'git-pull-request',
-					label: 'Checking for pull request…',
-					actionLabel: 'Checking',
+					label: l10n.t('Checking for pull request…'),
+					actionLabel: l10n.t('Checking'),
 					loading: true,
 				});
 			} else if (context != null) {
 				steps.push({
 					icon: 'git-pull-request-create',
-					label: 'Create a Pull Request',
-					actionLabel: 'Create PR',
+					label: l10n.t('Create a Pull Request'),
+					actionLabel: l10n.t('Create PR'),
 					href: this._webview.createCommandLink<GraphItemContext>('gitlens.createPullRequest:', context),
 				});
 			}
@@ -1145,14 +1276,14 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		if (checkedOut && context != null) {
 			steps.push({
 				icon: 'checklist',
-				label: 'Review Changes',
-				actionLabel: 'Review',
+				label: l10n.t('Review Changes'),
+				actionLabel: l10n.t('Review'),
 				href: this._webview.createCommandLink<GraphItemContext>('gitlens.reviewChanges:', context),
 			});
 			steps.push({
 				icon: 'wand',
-				label: 'Recompose Branch',
-				actionLabel: 'Recompose',
+				label: l10n.t('Recompose Branch'),
+				actionLabel: l10n.t('Recompose'),
 				href: this._webview.createCommandLink<GraphItemContext>('gitlens.ai.recomposeBranch:', context),
 			});
 		}
@@ -1209,16 +1340,17 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		return html`<div class="relationship-card">
 			<div class="relationship-card__head">
 				${this.renderMergeTargetGlyph(verdict)}
-				<span class="relationship-card__connector">Merges into</span>
-				${this.renderEditToken(
-					mergeTarget.name,
-					'Change Merge Target…',
-					this._webview.createCommandLink<BranchAndTargetRefs>(
-						'gitlens.git.branch.setMergeTarget:',
-						targetRef,
+				${localizedContent(l10n.t('Merges into {target}'), {
+					target: this.renderEditToken(
+						mergeTarget.name,
+						l10n.t('Change Merge Target…'),
+						this._webview.createCommandLink<BranchAndTargetRefs>(
+							'gitlens.git.branch.setMergeTarget:',
+							targetRef,
+						),
+						false,
 					),
-					false,
-				)}
+				})}
 			</div>
 			<div class="relationship-card__foot">
 				${this.renderMergeTargetChip(mergeTarget, verdict)}
@@ -1235,7 +1367,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	 *  be carried by the overlay plus colour. Same verdict as the chip, never a separate variable. */
 	private renderMergeTargetGlyph(verdict: MergeTargetVerdict): TemplateResult {
 		const indicator = mergeTargetVerdictIndicators[verdict];
-		return html`<gl-tooltip content="Merge Target"
+		return html`<gl-tooltip content=${l10n.t('Merge Target')}
 			><span class="relationship-card__mt relationship-card__mt--${verdict}"
 				><code-icon class="relationship-card__mt-glyph" icon="gl-merge-target" size="18"></code-icon
 				><code-icon class="relationship-card__mt-indicator" icon=${indicator} size="12"></code-icon></span
@@ -1255,10 +1387,14 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		let tooltip: string;
 		switch (verdict) {
 			case 'clean':
-				[icon, label, tooltip] = ['check', 'No Conflicts', `Merges cleanly into ${mergeTarget.name}`];
+				[icon, label, tooltip] = [
+					'check',
+					l10n.t('No Conflicts'),
+					l10n.t('Merges cleanly into {target}', { target: mergeTarget.name }),
+				];
 				break;
 			case 'unknown':
-				[icon, label, tooltip] = ['question', 'Unknown', 'Unable to check for conflicts'];
+				[icon, label, tooltip] = ['question', l10n.t('Unknown'), l10n.t('Unable to check for conflicts')];
 				break;
 			case 'conflicts': {
 				const files =
@@ -1266,18 +1402,29 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 						? mergeTarget.potentialConflicts.conflict.files.length
 						: 0;
 				icon = 'warning';
-				label = pluralize('Conflict', files);
-				tooltip = `Merging into ${mergeTarget.name} will conflict in ${pluralize('file', files)}`;
+				label = formatPlural(l10n.t('{count, plural, one{{count} Conflict} other{{count} Conflicts}}'), {
+					count: files,
+				});
+				tooltip = formatPlural(
+					l10n.t(
+						'{count, plural, one{Merging into {target} will conflict in {count} file} other{Merging into {target} will conflict in {count} files}}',
+					),
+					{ count: files, target: mergeTarget.name },
+				);
 				break;
 			}
 			case 'merged':
-				[icon, label, tooltip] = ['check', 'Merged', `Merged into ${mergeTarget.name}`];
+				[icon, label, tooltip] = [
+					'check',
+					l10n.t('Merged'),
+					l10n.t('Merged into {target}', { target: mergeTarget.name }),
+				];
 				break;
 			case 'likely-merged':
 				[icon, label, tooltip] = [
 					'git-merge',
-					'Likely Merged',
-					`Content matches ${mergeTarget.name}, but the commits differ`,
+					l10n.t('Likely Merged'),
+					l10n.t('Content matches {target}, but the commits differ', { target: mergeTarget.name }),
 				];
 				break;
 			case 'merged-local': {
@@ -1285,8 +1432,16 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 					? mergeTarget.mergedStatus.localBranchOnly?.name
 					: undefined;
 				icon = 'git-merge';
-				label = 'Merged Locally';
-				tooltip = `Merged into your local ${local ?? 'branch'} — which hasn't been pushed to ${mergeTarget.name}`;
+				label = l10n.t('Merged Locally');
+				tooltip =
+					local != null
+						? l10n.t("Merged into your local {branch} — which hasn't been pushed to {target}", {
+								branch: local,
+								target: mergeTarget.name,
+							})
+						: l10n.t("Merged into your local branch — which hasn't been pushed to {target}", {
+								target: mergeTarget.name,
+							});
 				break;
 			}
 		}
@@ -1301,7 +1456,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	private renderMergeTargetCardLoading(): TemplateResult {
 		return html`<div class="relationship-card relationship-card--loading" aria-busy="true">
 			<div class="relationship-card__head">
-				${this.renderKindIcon('gl-merge-target', 'Merge Target')}
+				${this.renderKindIcon('gl-merge-target', l10n.t('Merge Target'))}
 				<div class="relationship-card__shimmer-line relationship-card__shimmer-line--head"></div>
 			</div>
 			<div class="relationship-card__shimmer-line relationship-card__shimmer-line--status"></div>
@@ -1325,19 +1480,31 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	): string {
 		switch (verdict) {
 			case 'merged':
-				return 'Safe to delete';
+				return l10n.t('Safe to delete');
 			case 'likely-merged':
-				return 'Squashed or rebased';
+				return l10n.t('Squashed or rebased');
 			case 'merged-local':
-				return 'Not yet pushed to the remote';
+				return l10n.t('Not yet pushed to the remote');
 			case 'in-sync': {
 				const ahead = mergeTarget.status?.ahead ?? 0;
-				return ahead > 0
-					? `Based on ${mergeTarget.name} with ${pluralize('new commit', ahead)}`
-					: `Based on ${mergeTarget.name}`;
+				if (ahead === 0) return l10n.t('Based on {target}', { target: mergeTarget.name });
+
+				return formatPlural(
+					l10n.t(
+						'{count, plural, one{Based on {target} with {count} new commit} other{Based on {target} with {count} new commits}}',
+					),
+					{ count: ahead, target: mergeTarget.name },
+				);
 			}
-			default:
-				return `Behind ${mergeTarget.name} by ${pluralize('commit', mergeTarget.status?.behind ?? 0)}`;
+			default: {
+				const behind = mergeTarget.status?.behind ?? 0;
+				return formatPlural(
+					l10n.t(
+						'{count, plural, one{Behind {target} by {count} commit} other{Behind {target} by {count} commits}}',
+					),
+					{ count: behind, target: mergeTarget.name },
+				);
+			}
 		}
 	}
 
@@ -1356,8 +1523,8 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	 *  the tooltip names the one that actually applies. */
 	private rebaseOrMergeBlockedReason(branch: BranchSnapshot): string {
 		return !branch.opened && branch.worktree == null
-			? "This branch isn't checked out"
-			: 'Push or pull this branch first';
+			? l10n.t("This branch isn't checked out")
+			: l10n.t('Push or pull this branch first');
 	}
 
 	/**
@@ -1372,7 +1539,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	): TemplateResult | typeof nothing {
 		const branchRef = this.toBranchRef(branch);
 		const isWorktree = this.isOtherWorktree(branch.worktree);
-		const deleteLabel = isWorktree ? 'Delete Worktree' : 'Delete Branch';
+		const deleteLabel = isWorktree ? l10n.t('Delete Worktree') : l10n.t('Delete Branch');
 
 		const mergedStatus = mergeTarget.mergedStatus;
 		if (mergedStatus?.merged) {
@@ -1393,7 +1560,7 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 					<gl-button
 						appearance="secondary"
 						href=${this._webview.createCommandLink<BranchRef>('gitlens.pushBranch:', localTargetRef)}
-						>Push ${mergedStatus.localBranchOnly.name}</gl-button
+						>${l10n.t('Push {branch}', { branch: mergedStatus.localBranchOnly.name })}</gl-button
 					>
 					<gl-button
 						appearance="secondary"
@@ -1424,8 +1591,8 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		if (!this.canRebaseOrMerge(branch)) {
 			const reason = this.rebaseOrMergeBlockedReason(branch);
 			return html`<button-container>
-				<gl-button appearance="secondary" disabled tooltip=${reason}>Merge</gl-button>
-				<gl-button appearance="secondary" disabled tooltip=${reason}>Rebase</gl-button>
+				<gl-button appearance="secondary" disabled tooltip=${reason}>${l10n.t('Merge')}</gl-button>
+				<gl-button appearance="secondary" disabled tooltip=${reason}>${l10n.t('Rebase')}</gl-button>
 			</button-container>`;
 		}
 
@@ -1442,15 +1609,21 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 		return html`<button-container>
 			<gl-button
 				appearance="secondary"
-				tooltip=${`Merge ${mergeTarget.name} into ${branch.name} — ${mergeTarget.name} is not changed`}
+				tooltip=${l10n.t('Merge {target} into {branch} — {target} is not changed', {
+					target: mergeTarget.name,
+					branch: branch.name,
+				})}
 				href=${this._webview.createCommandLink<BranchRef>('gitlens.mergeIntoCurrent:', targetRef)}
-				>Merge</gl-button
+				>${l10n.t('Merge')}</gl-button
 			>
 			<gl-button
 				appearance="secondary"
-				tooltip=${`Rebase ${branch.name} onto ${mergeTarget.name} — ${mergeTarget.name} is not changed`}
+				tooltip=${l10n.t('Rebase {branch} onto {target} — {target} is not changed', {
+					branch: branch.name,
+					target: mergeTarget.name,
+				})}
 				href=${this._webview.createCommandLink<BranchRef>('gitlens.rebaseCurrentOnto:', targetRef)}
-				>Rebase</gl-button
+				>${l10n.t('Rebase')}</gl-button
 			>
 		</button-container>`;
 	}
@@ -1481,11 +1654,17 @@ export class GlGraphBranchSheetPane extends SignalWatcher(LitElement) {
 	}
 
 	private pull(checkoutPath: string): void {
-		void this.services?.repository.pull(checkoutPath);
+		const repository = this.services?.repository;
+		if (repository == null) return;
+
+		notifyService(repository, 'repository/pull', svc => svc.pull(checkoutPath));
 	}
 
 	private forcePush(checkoutPath: string): void {
-		void this.services?.repository.push(checkoutPath, true);
+		const repository = this.services?.repository;
+		if (repository == null) return;
+
+		notifyService(repository, 'repository/push', svc => svc.push(checkoutPath, true));
 	}
 }
 

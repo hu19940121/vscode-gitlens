@@ -1,32 +1,48 @@
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { pluralize } from '@gitlens/utils/string.js';
-import type { PastAgentSessionsResult, PastAgentSessionState } from '../../../../../agents/models/agentSessionState.js';
+import { boxSizingBase, metadataBarVarsBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
+import { basename } from '@gitlens/utils/path.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import type {
+	AgentSessionState,
+	PastAgentSessionsResult,
+	PastAgentSessionState,
+} from '../../../../../agents/models/agentSessionState.js';
+import { getAgentSessionIdentityKey } from '../../../../../agents/models/agentSessionState.js';
 import { createCommandLink } from '../../../../../system/commands.js';
-import type { AgentSessionState } from '../../../../home/protocol.js';
+import { serializeWebviewItemContext } from '../../../../../system/webview.js';
 import type { AgentSessionCategory, StickyDetailResolver } from '../../../shared/agentUtils.js';
 import {
 	agentPhaseToCategory,
+	buildAgentSessionContext,
+	buildPastAgentSessionContext,
 	canResolvePermission,
-	createAgentSessionOpenHref,
+	createAgentSessionArchiveHref,
+	createAgentSessionOpenHrefs,
 	createStickyDetailResolver,
 	describeAgentSession,
 	formatAgentElapsed,
 	fpField,
 	getAgentPhaseLabel,
-	getAgentSessionOpenAction,
+	getAgentSessionArchiveAction,
+	getPastAgentSessionResumeActions,
+	initialPastAgentSessionLimit,
+	isAgentSessionCurrentForWorktree,
+	pastAgentSessionPageSize,
 	permissionFingerprint,
 } from '../../../shared/agentUtils.js';
 import { renderRunningTool } from '../../../shared/components/agents/agent-status-render.js';
 import { agentPhaseElapsedStyles, agentToolStyles } from '../../../shared/components/agents/agent-status-styles.css.js';
-import { elementBase, metadataBarVarsBase } from '../../../shared/components/styles/lit/base.css.js';
+import '@gitlens/components/components/agentMark.js';
 import '../../../shared/components/agents/gl-agent-prompt-detail.js';
 import '../../../shared/components/chips/action-chip.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 /** User-facing modes are `collapsed` (bar only) and `expanded` (all cards) — toggled by the
  *  chevron. `partial` is a panel-driven derived state: when the user is collapsed and a session
@@ -39,9 +55,9 @@ export type ExpandState = 'collapsed' | 'partial' | 'expanded';
  *  so the heading width stays bounded. */
 const maxClusterDots = 5;
 
-/** Cap on completed rows in the session hovers. Active sessions are never truncated — only
- *  completed ones accumulate (retained ~30 days), and the footer counts the remainder. */
-const maxHoverCompletedRows = 3;
+/** Cap on ended rows in the session hovers. Active sessions are never truncated — only
+ *  ended ones accumulate (retained ~30 days), and the footer counts the remainder. */
+const maxHoverEndedRows = 3;
 
 /** Periodic re-render driver matching the kanban's tick. Without this, the component's
  *  `shouldUpdate` short-circuit would freeze elapsed labels (`Working · 5m`) and prevent the
@@ -57,8 +73,23 @@ const liveTickIntervalMs = 30 * 1000;
 export const expandVisibleCategories: Record<ExpandState, ReadonlySet<AgentSessionCategory>> = {
 	collapsed: new Set<AgentSessionCategory>(),
 	partial: new Set<AgentSessionCategory>(['needs-input']),
-	expanded: new Set<AgentSessionCategory>(['needs-input', 'working', 'idle', 'completed']),
+	expanded: new Set<AgentSessionCategory>(['needs-input', 'working', 'idle', 'ended']),
 };
+
+/** Past sessions share the main Agents disclosure in every non-compact presentation. */
+export function shouldShowPastSessions(hasPastSessions: boolean, expand: ExpandState): boolean {
+	return hasPastSessions && expand === 'expanded';
+}
+
+export type PastAgentSessionsMoreRequest = { limit: number };
+export type PastAgentSessionArchiveRequest = { sessionId: string; providerId: string };
+
+/** Returns the next cumulative fetch limit, or `undefined` once every discovered row was requested. */
+export function getNextPastAgentSessionsLimit(currentLimit: number, total: number): number | undefined {
+	if (currentLimit >= total) return undefined;
+
+	return Math.min(total, currentLimit + pastAgentSessionPageSize);
+}
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -70,6 +101,18 @@ declare global {
 		 *  and decides the next mode. The component renders from the `expand` property only,
 		 *  never from internal state. No payload — the panel knows its current user choice. */
 		'gl-agent-status-expand-request': CustomEvent<void>;
+		/** Requests the next cumulative page of inline past sessions. */
+		'gl-agent-status-past-sessions-more-request': CustomEvent<PastAgentSessionsMoreRequest>;
+		/** Requests archival of a transcript-backed past session. */
+		'gl-agent-status-past-session-archive-request': CustomEvent<PastAgentSessionArchiveRequest>;
+		/** A live card was activated (click/Enter/Space) outside any of its interactive descendants —
+		 *  the panel opens the agent session sheet for it. Past-session cards fire the past-session
+		 *  variant below instead. */
+		'gl-agent-session-sheet-open': CustomEvent<{ sessionId: string; providerId: string }>;
+		/** A past-session card was activated (click/Enter/Space) outside any of its interactive
+		 *  descendants — the panel opens the past-session sheet for it, passing the full snapshot
+		 *  (no live-session lookup needed). */
+		'gl-agent-past-session-sheet-open': CustomEvent<{ session: PastAgentSessionState }>;
 	}
 }
 
@@ -78,14 +121,16 @@ declare global {
  * (chevron + label + dot cluster + counts, with a hover popover for per-session detail) above
  * a cards list. The heading button toggles between collapsed (bar only) and expanded (all
  * cards). The panel can also project `partial` automatically — only needs-input cards visible —
- * when an agent surfaces a new request while the user has the section collapsed. Needs-input
- * and working cards adopt a gradient + icon-circle treatment so each surfaces as actionable at
- * a glance.
+ * when an agent surfaces a new request while the user has the section collapsed. Needs-input and
+ * working cards both adopt a gradient background so each surfaces as actionable at a glance;
+ * every card's rail draws the ONE agent-phase mark (`<gl-agent-mark>`, shared with the Commit
+ * Graph's WIP-row indicator and the agent-sessions tree leaf) — shape and tempo, not just color,
+ * carry the phase, so working/needs-input/idle/ended stay distinguishable from each other.
  */
 @customElement('gl-details-agent-status')
 export class GlDetailsAgentStatus extends LitElement {
 	static override styles = [
-		elementBase,
+		boxSizingBase,
 		metadataBarVarsBase,
 		agentToolStyles,
 		agentPhaseElapsedStyles,
@@ -94,40 +139,18 @@ export class GlDetailsAgentStatus extends LitElement {
 				display: block;
 
 				/* No local agent-phase color overrides — inherits the unified palette from
-		   theme.scss (--gl-agent-working-color / --gl-agent-waiting-color /
-		   --gl-agent-idle-color) so this card, the sidebar leaf, the tooltip, the
-		   status pill, and the WIP file decoration all share one set of phase colors. */
+ theme.scss (--gl-agent-working-color / --gl-agent-waiting-color /
+ --gl-agent-idle-color) so this card, the sidebar leaf, the tooltip, the
+ status pill, and the WIP file decoration all share one set of phase colors. */
 
 				/* Cap tooltips in the agents pane so long content (Bash command strings, agent
-		   prompts) wraps inside a bounded box instead of escaping the narrow webview
-		   panel's right edge. */
+ prompts) wraps inside a bounded box instead of escaping the narrow webview
+ panel's right edge. */
 				--gl-tooltip-max-width: 28rem;
 			}
 
 			:host([hidden]) {
 				display: none;
-			}
-
-			@keyframes gl-agent-pulse {
-				0%,
-				100% {
-					opacity: 1;
-				}
-
-				50% {
-					opacity: 0.45;
-				}
-			}
-
-			@media (prefers-reduced-motion: reduce) {
-				.card--working .card__dot {
-					animation: none;
-				}
-
-				/* Outer-tree rule wins over code-icon's own :host([modifier='spin']) animation. */
-				.card__icon code-icon[modifier='spin'] {
-					animation: none;
-				}
 			}
 
 			/* ---------- Section (heading + cards list) ---------- */
@@ -138,31 +161,31 @@ export class GlDetailsAgentStatus extends LitElement {
 				gap: var(--gl-space-4);
 
 				/* Tight bottom padding (vs. 0.6rem top) avoids a dead gap above the next
-		   section's intrinsic padding. Background inherits from the WIP details panel;
-		   the sticky heading paints its own opaque background to obscure scrolling cards. */
+ section's intrinsic padding. Background inherits from the WIP details panel;
+ the sticky heading paints its own opaque background to obscure scrolling cards. */
 				padding: 0.6rem var(--gl-panel-padding-right, 1rem) 0.3rem var(--gl-panel-padding-left, 1.2rem);
 			}
 
 			/* Divider between this section and the WIP section lives on the split-panel sash
-	   (see .agent-status-split::part(divider) in graph.scss), not as a border here. */
+(see .agent-status-split::part(divider) in graph.scss), not as a border here. */
 			.section[data-expand='expanded'] {
 				padding-bottom: var(--gl-space-8);
 			}
 
 			/* Heading doubles as the collapse toggle AND the at-a-glance phase summary —
-	   chevron + label on the left, dot cluster + counts on the right. The dots and counts
-	   remain visible in every state so the summary still informs at a glance even when
-	   most cards are filtered out.
+chevron + label on the left, dot cluster + counts on the right. The dots and counts
+remain visible in every state so the summary still informs at a glance even when
+most cards are filtered out.
 
-	   Sticky to the top of the scroll container ('.agent-status-split__top') so it stays
-	   visible while the cards list scrolls behind it. Negative horizontal margins +
-	   matching padding extend the heading's background over the section's horizontal
-	   padding so cards don't peek through the sides as they scroll past. Negative top
-	   margin + matching padding-top similarly covers the section's 'padding-top' zone. */
+Sticky to the top of the scroll container ('.agent-status-split__top') so it stays
+visible while the cards list scrolls behind it. Negative horizontal margins +
+matching padding extend the heading's background over the section's horizontal
+padding so cards don't peek through the sides as they scroll past. Negative top
+margin + matching padding-top similarly covers the section's 'padding-top' zone. */
 			.section__heading {
 				position: sticky;
 				top: 0;
-				z-index: 1;
+				z-index: 2;
 				display: flex;
 				gap: var(--gl-space-6);
 				align-items: center;
@@ -179,13 +202,14 @@ export class GlDetailsAgentStatus extends LitElement {
 				letter-spacing: 0.04em;
 
 				/* Match the WIP details panel background (same token the commit-box uses) so the
-		   sticky heading reads as continuous with the surrounding panel instead of as a
-		   tinted metadata-bar strip. */
+ sticky heading reads as continuous with the surrounding panel instead of as a
+ tinted metadata-bar strip. */
 				background-color: var(--vscode-sideBar-background, var(--vscode-editor-background));
 			}
 
 			/* Only the toggle is the button; the resume action is its sibling at the far right. */
-			.section__heading-toggle {
+			.section__heading-toggle,
+			.section__heading-static {
 				display: flex;
 				flex: 1;
 				gap: var(--gl-space-6);
@@ -197,19 +221,23 @@ export class GlDetailsAgentStatus extends LitElement {
 				text-align: left;
 				text-transform: inherit;
 				letter-spacing: inherit;
-				appearance: none;
-				cursor: pointer;
 				background: none;
 				border: none;
 			}
 
+			.section__heading-toggle {
+				appearance: none;
+				cursor: pointer;
+			}
+
 			.section__heading-action {
 				flex: none;
+				color: var(--vscode-foreground);
 			}
 
 			.section__heading-chevron {
 				/* Pin the glyph to a fixed inline-flex square so the codicon's intrinsic em-box
-		   offsets center predictably against the text. */
+ offsets center predictably against the text. */
 				display: inline-flex;
 				flex: none;
 				align-items: center;
@@ -219,13 +247,13 @@ export class GlDetailsAgentStatus extends LitElement {
 				font-size: 1.6rem;
 				line-height: 1;
 
-				/* Inherit so .section__heading:hover brightens chevron + text together. */
+				/* Inherit so .section__heading-toggle:hover brightens chevron + text together. */
 				color: inherit;
 
 				/* Chevron-right for collapsed/partial (rotated via data-expand below); chevron-down
-		   for expanded (no rotation — set in the template). The shared transition animates
-		   the rotation cycle for collapsed↔partial. Default at 0deg in case the attribute
-		   is briefly missing. */
+ for expanded (no rotation — set in the template). The shared transition animates
+ the rotation cycle for collapsed↔partial. Default at 0deg in case the attribute
+ is briefly missing. */
 				transform: rotate(0deg);
 				transition: transform var(--gl-duration-medium) ease;
 			}
@@ -239,8 +267,8 @@ export class GlDetailsAgentStatus extends LitElement {
 			}
 
 			/* No [data-expand='expanded'] rule — expanded uses the chevron-down glyph (set in
-	   the template), so the default 0deg from .section__heading-chevron keeps it
-	   upright without an explicit override. */
+the template), so the default 0deg from .section__heading-chevron keeps it
+upright without an explicit override. */
 
 			@media (prefers-reduced-motion: reduce) {
 				.section__heading-chevron {
@@ -253,7 +281,7 @@ export class GlDetailsAgentStatus extends LitElement {
 				min-width: 0;
 			}
 
-			.section__heading:hover {
+			.section__heading-toggle:hover {
 				color: var(--vscode-foreground);
 			}
 
@@ -264,8 +292,8 @@ export class GlDetailsAgentStatus extends LitElement {
 			}
 
 			/* Branch-sheet variant — the sheet's own .hub already supplies outer padding and
-	   scrolls the whole pane (no inner scroller for the heading to stick within), so the
-	   split-panel-scroller chrome below is wrong here and gets neutralized. */
+scrolls the whole pane (no inner scroller for the heading to stick within), so the
+split-panel-scroller chrome below is wrong here and gets neutralized. */
 			:host([flat]) .section {
 				padding: 0;
 			}
@@ -276,8 +304,8 @@ export class GlDetailsAgentStatus extends LitElement {
 
 			:host([flat]) .section__heading {
 				position: static;
-				margin: 0;
 				padding: 0;
+				margin: 0;
 				background-color: transparent;
 			}
 
@@ -294,6 +322,12 @@ export class GlDetailsAgentStatus extends LitElement {
 				white-space: nowrap;
 			}
 
+			/* In the no-session WIP state, keep the past count at the same subdued emphasis as the
+static Agents label. Live headings retain the normal foreground summary color. */
+			.section__heading-static .section__cluster {
+				color: inherit;
+			}
+
 			.section__cluster-dots {
 				display: inline-flex;
 				align-items: center;
@@ -303,8 +337,8 @@ export class GlDetailsAgentStatus extends LitElement {
 				display: inline-flex;
 				align-items: center;
 				justify-content: center;
-				width: 1rem;
-				height: 1rem;
+				width: 1.4rem;
+				height: 1.4rem;
 				margin-left: -0.4rem;
 				font-size: 0.7em;
 				color: var(--vscode-foreground);
@@ -331,8 +365,8 @@ export class GlDetailsAgentStatus extends LitElement {
 				background-color: var(--gl-agent-idle-color);
 			}
 
-			.section__cluster-dot--completed {
-				background-color: var(--vscode-descriptionForeground);
+			.section__cluster-dot--ended {
+				background-color: var(--gl-agent-ended-color);
 			}
 
 			.section__cluster-dot--overflow {
@@ -358,75 +392,6 @@ export class GlDetailsAgentStatus extends LitElement {
 				display: flex;
 				flex-direction: column;
 				gap: var(--gl-space-4);
-				padding-top: var(--gl-space-4);
-				margin-top: var(--gl-space-4);
-				border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border, var(--vscode-widget-border));
-			}
-
-			.section__past-row {
-				display: flex;
-				gap: var(--gl-space-6);
-
-				/* Top-align so the dot centers on the first line (matching the live cards' idle dots),
-		   not on the whole title+prompt block. */
-				align-items: flex-start;
-
-				/* Cards inset their rail by their 0.3rem left border plus their padding; match it (and their
-		   column gap) so the rails line up down the column even though a past row has no card chrome. */
-				padding-left: calc(0.3rem + var(--gl-space-8));
-
-				/* One step dimmer than .card--idle's 0.85 — reads as "not running" rather than idle. */
-				opacity: 0.7;
-			}
-
-			/* Hollow ring (vs. the live cards' filled .card__dot disc) so a past row reads as
-	   "no process" at a glance, reusing the same idle phase color. Sits in a .card__rail so the
-	   body column lines up with the live cards above it. */
-			.section__past-dot {
-				flex: none;
-				width: 0.8rem;
-				height: 0.8rem;
-				background-color: transparent;
-				border: var(--gl-border-width) solid var(--gl-agent-idle-color);
-				border-radius: 50%;
-			}
-
-			.section__past-body {
-				display: flex;
-				flex: 1;
-				flex-direction: column;
-				gap: var(--gl-space-2);
-				min-width: 0;
-			}
-
-			.section__past-title-row {
-				display: flex;
-				gap: var(--gl-space-6);
-				align-items: center;
-				min-width: 0;
-
-				/* Match the rail's box so the hollow dot centers on the name line. Without a chip in
-		   this row (unlike live cards) the bare text is shorter than the rail, leaving the dot low. */
-				min-height: 1.6em;
-			}
-
-			.section__past-name {
-				flex: 1;
-				min-width: 0;
-				overflow: hidden;
-				text-overflow: ellipsis;
-				font-weight: 600;
-				white-space: nowrap;
-			}
-
-			.section__past-prompt {
-				display: -webkit-box;
-				overflow: hidden;
-				-webkit-line-clamp: 2;
-				font-size: 0.9em;
-				font-style: italic;
-				color: var(--vscode-descriptionForeground);
-				-webkit-box-orient: vertical;
 			}
 
 			.section__past-footer {
@@ -436,17 +401,9 @@ export class GlDetailsAgentStatus extends LitElement {
 				justify-content: flex-end;
 			}
 
-			.section__past-count {
-				margin-right: auto;
-				font-size: 0.85em;
-				color: var(--vscode-descriptionForeground);
-			}
-
 			.section__past-more {
-				--chip-text-transform: none;
 				margin-right: auto;
-				font-size: 0.85em;
-				color: var(--vscode-descriptionForeground);
+				font-size: var(--gl-font-sm);
 			}
 
 			.section__hover {
@@ -456,14 +413,14 @@ export class GlDetailsAgentStatus extends LitElement {
 				min-width: 24rem;
 
 				/* Bound the popover so long detail strings (errors, multi-line prompts) truncate
-		   via ellipsis instead of stretching the popover to the viewport edge. */
+ via ellipsis instead of stretching the popover to the viewport edge. */
 				max-width: min(44rem, 60vw);
 				padding: var(--gl-space-2);
 
 				/* The heading popover slots its content inside .section__heading, so prose here would
-		   inherit that row's uppercase tag treatment while the compact popover — anchored
-		   outside the heading — renders the same text in sentence case. Reset it so both read
-		   alike; .section__hover-phase opts back into uppercase for its tag label. */
+ inherit that row's uppercase tag treatment while the compact popover — anchored
+ outside the heading — renders the same text in sentence case. Reset it so both read
+ alike; .section__hover-phase opts back into uppercase for its tag label. */
 				text-transform: none;
 				letter-spacing: 0;
 			}
@@ -472,7 +429,7 @@ export class GlDetailsAgentStatus extends LitElement {
 				display: grid;
 
 				/* minmax(0, 1fr) lets the column shrink below its min-content size, which is
-		   what allows text-overflow: ellipsis on the name/detail spans to engage. */
+ what allows text-overflow: ellipsis on the name/detail spans to engage. */
 				grid-template-columns: auto minmax(0, 1fr) auto;
 				gap: 0.1rem 0.6rem;
 				align-items: center;
@@ -483,27 +440,28 @@ export class GlDetailsAgentStatus extends LitElement {
 				border-top: var(--gl-border-width) solid var(--gl-metadata-bar-border, var(--vscode-widget-border));
 			}
 
-			.section__hover-dot {
+			/* One row per session, so it draws the shared phase mark rather than a plain dot — the
+same shapes the card rails use. The heading's cluster dots deliberately stay plain: at
+cluster size a row of ringed, pulsing marks reads as noise, and that cluster answers
+"how many, roughly what mix", not per-session state. */
+			gl-agent-mark.section__hover-dot {
 				flex: none;
-				width: 0.7rem;
-				height: 0.7rem;
-				border-radius: 50%;
 			}
 
 			.section__hover-dot--working {
-				background-color: var(--gl-agent-working-color);
+				color: var(--gl-agent-working-color);
 			}
 
 			.section__hover-dot--needs-input {
-				background-color: var(--gl-agent-waiting-color);
+				color: var(--gl-agent-waiting-color);
 			}
 
 			.section__hover-dot--idle {
-				background-color: var(--gl-agent-idle-color);
+				color: var(--gl-agent-idle-color);
 			}
 
-			.section__hover-dot--completed {
-				background-color: var(--vscode-descriptionForeground);
+			.section__hover-dot--ended {
+				color: var(--gl-agent-ended-color);
 			}
 
 			.section__hover-name {
@@ -538,7 +496,7 @@ export class GlDetailsAgentStatus extends LitElement {
 			}
 
 			/* Hover-row tool detail places the shared .agent-tool composite into the row's
-	   second grid cell — visual styling lives in the shared agentToolStyles. */
+second grid cell — visual styling lives in the shared agentToolStyles. */
 			.section__hover-tool {
 				grid-column: 2 / -1;
 			}
@@ -554,10 +512,10 @@ export class GlDetailsAgentStatus extends LitElement {
 			}
 
 			/* ---------- Card ----------
-	   Two-row grid: rail + body on top, action row sits under the body column on bottom.
-	   The actions always sit at the bottom of the card regardless of panel width.
-	   needs-input and working cards adopt the prior banner treatment (gradient bg +
-	   icon-circle in the rail) so each surfaces as actionable on its own. */
+Two-row grid: rail + body on top, action row sits under the body column on bottom.
+The actions always sit at the bottom of the card regardless of panel width.
+needs-input and working cards adopt the prior banner treatment (gradient bg +
+icon-circle in the rail) so each surfaces as actionable on its own. */
 			.card {
 				display: grid;
 				grid-template-rows: auto auto;
@@ -594,30 +552,67 @@ export class GlDetailsAgentStatus extends LitElement {
 				);
 			}
 
+			/* Light hover lift, mirroring list rows: plain cards swap to the list hover background;
+ the gradient variants keep their accent tint but re-base it on the same hover color. */
+			.card:hover {
+				background-color: var(--vscode-list-hoverBackground);
+			}
+
+			.card--needs-input:hover,
+			.card--working:hover {
+				background: linear-gradient(
+					to right,
+					color-mix(in srgb, var(--card-accent) 14%, var(--vscode-list-hoverBackground)),
+					color-mix(in srgb, var(--card-accent) 4%, var(--vscode-list-hoverBackground))
+				);
+			}
+
+			/* Keyboard focus ring — same inset recipe as .card--selected so the two read as one
+ system, and the ring stays inside the card's footprint. */
+			.card:focus-visible {
+				outline: var(--gl-border-width) solid var(--vscode-focusBorder);
+				outline-offset: -1px;
+			}
+
 			.card--idle {
 				--card-accent: var(--gl-agent-idle-color);
 
 				opacity: 0.85;
 			}
 
-			/* Terminal sessions read as done — muted accent + stronger dim than idle so live rows lead. */
-			.card--completed {
-				--card-accent: var(--vscode-descriptionForeground);
+			/* Terminal sessions read as done — muted accent + stronger dim than idle so live rows lead.
+			   They open the past-session sheet on click/Enter/Space (see activatePastRow). */
+			.card--ended {
+				--card-accent: var(--gl-agent-ended-color);
 
+				cursor: pointer;
 				opacity: 0.7;
 			}
 
+			/* A ghost (visited-but-not-current) card/row — same dim idiom as .card--ended, applied
+  on top of whichever phase accent the session currently carries. Combined with the hover
+  list's equivalent row so the two surfaces agree visually. */
+			.card--ghost,
+			.section__hover-row--ghost {
+				opacity: 0.6;
+			}
+
 			/* Highlighted by an external trigger (e.g., sidebar agent leaf click). A subtle 1px
-	   inset outline reads as "you picked this one" without overwhelming the card's
-	   own gradient/accent treatment — the prior halo+border combo was too loud against
-	   needs-input/working cards that already carry a colored gradient. outline-offset
-	   -1px tucks the ring just inside the card border so the card's footprint stays
-	   stable. opacity: 1 reasserts idle cards (which are dimmed by default) on selection.
-	   forced-colors mode substitutes Highlight for the focusBorder token automatically. */
+inset outline reads as "you picked this one" without overwhelming the card's
+own gradient/accent treatment — the prior halo+border combo was too loud against
+needs-input/working cards that already carry a colored gradient. outline-offset
+-1px tucks the ring just inside the card border so the card's footprint stays
+stable. opacity: 1 reasserts idle cards (which are dimmed by default) on selection.
+forced-colors mode substitutes Highlight for the focusBorder token automatically. */
 			.card--selected {
 				outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 				outline-offset: -1px;
 				opacity: 1;
+			}
+
+			/* Live cards open the agent session sheet on click/Enter/Space (see activateCard). */
+			.card--live {
+				cursor: pointer;
 			}
 
 			.card__rail {
@@ -628,36 +623,17 @@ export class GlDetailsAgentStatus extends LitElement {
 				justify-content: center;
 
 				/* Fixed rail width so the body column lines up across cards regardless of which
-		   indicator (icon-circle vs small dot) sits inside. */
+ phase mark sits inside. */
 				width: 2.4rem;
 				min-height: 1.6em;
 			}
 
-			/* Idle cards keep a small dot — the icon-circle treatment is reserved for actionable phases. */
-			.card__dot {
-				flex: none;
-				width: 0.8rem;
-				height: 0.8rem;
-				aspect-ratio: 1;
-				background-color: var(--card-accent);
-				border-radius: 50%;
-			}
-
-			/* Icon-circle for needs-input/working cards. Carries the banner's prior visual weight. */
-			.card__icon {
-				display: inline-flex;
-				flex: none;
-				align-items: center;
-				justify-content: center;
-				width: 2.4rem;
-				height: 2.4rem;
-				font-size: 1.6em;
+			/* The ONE agent-phase mark, shared with the Commit Graph's WIP-row indicator and the
+agent-sessions tree leaf — shape/tempo differ per phase (working/needs-input carry a
+ring + waves, idle is a hollow ring, ended a static filled square), so all four are
+distinguishable in FORM, not just color, and stay so with prefers-reduced-motion: reduce. */
+			.card__rail gl-agent-mark {
 				color: var(--card-accent);
-				background-color: color-mix(in srgb, var(--card-accent) 18%, transparent);
-				border-radius: 50%;
-				transition:
-					color var(--gl-duration-slow) ease,
-					background-color var(--gl-duration-slow) ease;
 			}
 
 			.card__body {
@@ -728,21 +704,19 @@ export class GlDetailsAgentStatus extends LitElement {
 				justify-content: flex-end;
 			}
 
-			/* Unresolvable ask: the caption stacks under the lone Open/Resume Session button rather than
-	   sharing its row, so narrowing the panel can't squeeze the button. */
-			.card__actions--unresolvable {
-				flex-direction: column;
-				gap: var(--gl-space-4);
-				align-items: flex-end;
-			}
-
 			.card__actions-hint {
 				font-size: 0.85em;
 				color: var(--vscode-descriptionForeground);
 			}
 
+			/* Unresolvable ask: the caption shares the Open/Resume button's row and truncates under
+pressure so narrowing the panel squeezes the caption, never the button. */
 			.card__actions--unresolvable .card__actions-hint {
-				text-align: right;
+				flex: 1 1 0;
+				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
 			}
 		`,
 	];
@@ -806,15 +780,28 @@ export class GlDetailsAgentStatus extends LitElement {
 	@property({ type: Boolean, reflect: true })
 	compact = false;
 
-	/** Past (resumable) sessions for the worktree — top few, most-recent first, plus the total
-	 *  count for the "N more past sessions" footer link. Rendered as a `.section__past` list,
-	 *  visible only while {@link expand} is `'expanded'` (past is never urgent enough to
-	 *  auto-surface). */
+	/** WIP-details presentation: always visible, live cards first, with start/history actions. */
+	@property({ type: Boolean, reflect: true })
+	wip = false;
+
+	/** Past (resumable) sessions for the worktree — most-recent first, plus the total discovered
+	 *  count. Every non-compact consumer initially fetches three rows, then appends explicit pages. */
 	@property({ attribute: false })
 	pastSessions?: PastAgentSessionsResult;
 
-	/** The worktree the past sessions belong to — threaded into the "Resume Session…" footer
-	 *  button's `showResumeSessionPicker` command link. */
+	/** Cumulative transcript count requested by the consumer. Kept separate from the returned row
+	 *  count because empty or unreadable transcripts can be skipped while still consuming a page. */
+	@property({ type: Number, attribute: 'past-sessions-limit' })
+	pastSessionsLimit = initialPastAgentSessionLimit;
+
+	/** Whether the consumer is currently fetching the next inline page. */
+	@property({ type: Boolean, attribute: 'past-sessions-loading' })
+	pastSessionsLoading = false;
+
+	/** The worktree the past sessions belong to. Also the worktree scope for ghost
+	 *  detection: `undefined` means this surface has no worktree dimension (e.g. the treemap's
+	 *  compact Activity-toolbar cluster, which spans an entire repo family) — every session is
+	 *  then treated as current and none render as ghosts. See {@link isCurrent}. */
 	@property({ attribute: false })
 	worktreePath?: string;
 
@@ -829,14 +816,18 @@ export class GlDetailsAgentStatus extends LitElement {
 	 *
 	 *  Fields included reflect what `renderCard`, `renderHoverRow`, `tally`, and the heading
 	 *  cluster consume:
-	 *  - `expand`, `selectedSessionId`, `flat`, `compact`, `worktreePath` — all shape the rendered
-	 *    tree (`compact` is reflected via `update()`, which never runs when `shouldUpdate` returns
-	 *    false; `worktreePath` feeds the heading and past-footer resume-picker links).
+	 *  - `expand`, `selectedSessionId`, `flat`, `compact`, `wip`, `worktreePath`, and history paging
+	 *    state — all shape the
+	 *    rendered tree (`compact` and `wip` are reflected via `update()`, which never runs when
+	 *    `shouldUpdate` returns false; `worktreePath` feeds the heading and past-session picker links).
 	 *  - Per session: `id`, `phase`, `status`, `statusDetail` (running-tool surface), `displayName`,
 	 *    `lastPrompt` (card prompt + fallback line), `phaseSince` (ms, drives elapsed labels).
 	 *  - `pendingPermission` — encoded by {@link permissionFingerprint} so every needs-input
 	 *    variant's renderable fields contribute, not just kind/toolName.
-	 *  - `pastSessions.total` plus, per past row, `id`/`displayName`/`lastPrompt`/`lastActivity`.
+	 *  - `worktreePath`/`worktree.name` — drive the ghost (visited-but-not-current) dimming and
+	 *    "now in X" hint on cards and hover rows; a session moving worktrees must repaint even
+	 *    when nothing else about it changed.
+	 *  - `pastSessions.total` plus every field consumed by a past row's render or actions.
 	 *
 	 *  Adding a new rendered field requires extending this fingerprint (or
 	 *  {@link permissionFingerprint}) or the component will silently fail to update when only
@@ -852,18 +843,23 @@ export class GlDetailsAgentStatus extends LitElement {
 			`s${fpField(this.selectedSessionId)}`,
 			`f${this.flat ? 1 : 0}`,
 			`c${this.compact ? 1 : 0}`,
+			`i${this.wip ? 1 : 0}`,
 			`w${fpField(this.worktreePath)}`,
+			`pl${this.pastSessionsLimit}`,
+			`pg${this.pastSessionsLoading ? 1 : 0}`,
 		];
 		const sessions = this.sessions ?? [];
 		for (const s of sessions) {
 			parts.push(
-				`${s.id}|${s.phase}|${fpField(s.status)}|${fpField(s.statusDetail)}|${fpField(s.displayName)}|${fpField(s.lastPrompt)}|${s.phaseSince.getTime()}|${permissionFingerprint(s.pendingPermission)}`,
+				`${s.id}|${s.phase}|${fpField(s.status)}|${fpField(s.statusDetail)}|${fpField(s.displayName)}|${fpField(s.lastPrompt)}|${s.phaseSince}|${permissionFingerprint(s.pendingPermission)}|${fpField(s.worktreePath)}|${fpField(s.worktree?.name)}`,
 			);
 		}
 		const past = this.pastSessions;
-		parts.push(`p${past?.total ?? 0}`);
+		parts.push(`p${past == null && this.wip ? 'unresolved' : (past?.total ?? 0)}`);
 		for (const p of past?.sessions ?? []) {
-			parts.push(`${p.id}|${fpField(p.displayName)}|${fpField(p.lastPrompt)}|${p.lastActivity}`);
+			parts.push(
+				`${p.id}|${p.providerId}|${p.disposition}|${fpField(p.actions.resume?.cwd)}|${p.actions.archive === true ? 1 : 0}|${fpField(p.worktreePath)}|${fpField(p.displayName)}|${fpField(p.lastPrompt)}|${p.lastActivity}`,
+			);
 		}
 		return parts.join('\n');
 	}
@@ -886,7 +882,7 @@ export class GlDetailsAgentStatus extends LitElement {
 		const sessions = this.sessions ?? [];
 		this._lastFingerprint = this.computeFingerprint();
 		if (this._stickyResolver.size > 0) {
-			this._stickyResolver.prune(sessions.map(s => s.id));
+			this._stickyResolver.prune(sessions);
 		}
 	}
 
@@ -908,6 +904,14 @@ export class GlDetailsAgentStatus extends LitElement {
 		}
 	}
 
+	/** Height (px) of the section heading row — this section's incompressible minimum. The graph
+	 *  details panel sums it into the pane's rigid minimum instead of the live section height,
+	 *  which compresses (cards scroll under the sticky heading) as the pane shrinks and would let
+	 *  the minimum chase a drag downward. */
+	get headingHeight(): number {
+		return this.renderRoot?.querySelector<HTMLElement>('.section__heading')?.offsetHeight ?? 0;
+	}
+
 	override render(): unknown {
 		const sessions = this.sessions;
 
@@ -923,25 +927,44 @@ export class GlDetailsAgentStatus extends LitElement {
 		// resume the cached past list goes stale until the next fetch, and would otherwise paint twice.
 		// Consumers that also gate their own layout on the past count reconcile further upstream
 		// (`createPastAgentSessionsResolver`) so their gate and these rows can't disagree.
-		const liveIds = new Set(live.map(s => s.id));
-		const past = this.pastSessions?.sessions.filter(p => !liveIds.has(p.id));
-		if (live.length === 0 && (past?.length ?? 0) === 0) return nothing;
+		const liveIds = new Set(live.map(s => getAgentSessionIdentityKey(s.providerId, s.id)));
+		const past = this.pastSessions?.sessions.filter(
+			p => !liveIds.has(getAgentSessionIdentityKey(p.providerId, p.id)),
+		);
+		if (!this.wip && live.length === 0 && (past?.length ?? 0) === 0) return nothing;
 
-		return this.renderSection(live, this.tally(live), past);
+		// Counts and dots reflect only sessions actually current in this worktree — a ghost
+		// (visited-but-not-current) shouldn't inflate "N working"/"N need input" for a worktree
+		// it merely passed through. `renderSection` still receives the full `live` set so its
+		// cards keep showing ghost rows (dimmed, see `renderCard`).
+		const currentLive = live.filter(s => this.isCurrent(s));
+		return this.renderSection(live, this.tally(currentLive), past);
 	}
 
 	/** Compact render: just the cluster + counts popover, no surrounding heading button or cards.
 	 *  Hover still surfaces the per-session detail via the same shared popover body. */
 	private renderClusterOnly(sessions: AgentSessionState[]): unknown {
-		const counts = this.tally(sessions);
-		const visibleDots = sessions.slice(0, maxClusterDots);
-		const overflow = sessions.length - visibleDots.length;
+		// Counts exclude ghosts — see the matching note in `render()`.
+		const currentSessions = sessions.filter(s => this.isCurrent(s));
+		const counts = this.tally(currentSessions);
+		// LIVE and CURRENT only. The cluster answers "what is happening right now, in this
+		// worktree" — a ghost dot in a five-dot cluster would be indistinguishable from a real one
+		// and would disagree with the count beside it.
+		const clusterSessions = sessions.filter(s => agentPhaseToCategory[s.phase] !== 'ended' && this.isCurrent(s));
+		const visibleDots = clusterSessions.slice(0, maxClusterDots);
+		const overflow = clusterSessions.length - visibleDots.length;
 		// `.section__hover` has no max-height, and active sessions are deliberately uncapped, so a
 		// busy panel can produce a popover taller than the viewport. `auto-size-vertical` clamps and
 		// scrolls it instead of letting it render past the panel edge with no way to reach the bottom.
 		return html`
 			<gl-popover placement="bottom" auto-size-vertical>
-				<span slot="anchor" class="section__cluster" tabindex="0" role="button" aria-label="Agent sessions">
+				<span
+					slot="anchor"
+					class="section__cluster"
+					tabindex="0"
+					role="button"
+					aria-label=${l10n.t('Agent sessions')}
+				>
 					<span class="section__cluster-dots">
 						${visibleDots.map(
 							s =>
@@ -954,7 +977,7 @@ export class GlDetailsAgentStatus extends LitElement {
 								? html`<span
 										class="section__cluster-dot section__cluster-dot--idle section__cluster-dot--overflow"
 									>
-										+${overflow}
+										+${getNumericFormat()(overflow)}
 									</span>`
 								: nothing
 						}
@@ -975,12 +998,11 @@ export class GlDetailsAgentStatus extends LitElement {
 	): unknown {
 		const visibleCats = expandVisibleCategories[this.expand];
 		const visible = sessions.filter(s => visibleCats.has(agentPhaseToCategory[s.phase]));
-		// Past is never urgent — only surfaced once the user has explicitly expanded the section.
-		const showPast = this.expand === 'expanded';
+		const showPastSessions = shouldShowPastSessions((past?.length ?? 0) > 0, this.expand);
 
 		return html`
 			<div class="section" data-expand=${this.expand}>
-				${this.renderSectionHeading(sessions, counts)}
+				${this.renderSectionHeading(sessions, counts, (past?.length ?? 0) > 0)}
 				${
 					visible.length > 0
 						? html`<div id="section__list" class="section__list">
@@ -988,152 +1010,208 @@ export class GlDetailsAgentStatus extends LitElement {
 							</div>`
 						: nothing
 				}
-				${showPast ? this.renderPastSection(past) : nothing}
+				${showPastSessions ? this.renderPastSection(past, visible.length === 0) : nothing}
 			</div>
 		`;
 	}
 
 	/** "Past sessions" list — resumable sessions recovered from the worktree's transcript store,
-	 *  rendered only in `expanded` mode. Each row links its resume chip at `gitlens.agents.resumeSession`
-	 *  (the default extension-if-available-else-terminal resume); the footer's count links into the
-	 *  same searchable picker over the worktree's 100 most-recent sessions as the heading action. */
-	private renderPastSection(past: PastAgentSessionState[] | undefined): unknown {
+	 *  rendered according to {@link shouldShowPastSessions}. Each row links its resume chip at
+	 *  `gitlens.agents.resumeSession` (honors `gitlens.agents.resumeTarget`), and the footer
+	 *  progressively appends another inline page. */
+	private renderPastSection(past: PastAgentSessionState[] | undefined, ownsListId: boolean): unknown {
 		if (!past?.length) return nothing;
 
 		const total = this.pastSessions?.total ?? past.length;
 		return html`
-			<div class="section__past">
-				${past.map(p => this.renderPastRow(p))} ${this.renderPastFooter(total, past.length)}
+			<div id=${ownsListId ? 'section__list' : nothing} class="section__past">
+				${past.map(p => this.renderPastRow(p))} ${this.renderPastFooter(total)}
 			</div>
 		`;
 	}
 
 	private renderPastRow(session: PastAgentSessionState): unknown {
-		const elapsed = formatAgentElapsed(new Date(session.lastActivity));
-		const resumeHref = createCommandLink('gitlens.agents.resumeSession', {
-			sessionId: session.id,
-			cwd: session.cwd,
-		});
-		// Mirrors a live card's `{phase} · {elapsed}`. "Ended" is all we can honestly say — the store
-		// keeps no exit reason, only that nothing is running.
-		const stateContent = html`Ended${
+		const elapsed = formatAgentElapsed(session.lastActivity);
+		const resumeActions = getPastAgentSessionResumeActions(session);
+		const phaseLabel =
+			session.disposition === 'archived' ? l10n.t('Archived') : getAgentPhaseLabel('ended', undefined);
+		const phaseContent = html`${phaseLabel}${
 			elapsed != null ? html` · <span class="agent-phase-elapsed">${elapsed}</span>` : nothing
 		}`;
 
 		return html`
-			<div class="section__past-row" data-session-id=${session.id}>
-				<div class="card__rail"><span class="section__past-dot"></span></div>
-				<div class="section__past-body">
-					<div class="section__past-title-row">
+			<div
+				class="card card--ended"
+				tabindex="0"
+				role="group"
+				aria-label=${session.displayName}
+				data-session-id=${session.id}
+				data-vscode-context=${serializeWebviewItemContext(buildPastAgentSessionContext(session))}
+				@click=${(e: Event) => this.activatePastRow(session, e)}
+				@keydown=${(e: Event) => this.activatePastRow(session, e)}
+			>
+				<div class="card__rail">${this.renderCardRail('ended')}</div>
+				<div class="card__body">
+					<div class="card__title-row">
 						<gl-tooltip content=${session.displayName} placement="bottom">
-							<span class="section__past-name">${session.displayName}</span>
+							<span class="card__name">${session.displayName}</span>
 						</gl-tooltip>
 						${
 							elapsed != null
-								? html`<gl-tooltip content=${`Last active ${elapsed} ago`} placement="bottom">
-										<span class="card__phase">${stateContent}</span>
+								? html`<gl-tooltip
+										content=${l10n.t('Last active {elapsed} ago', { elapsed: elapsed })}
+										placement="bottom"
+									>
+										<span class="card__phase">${phaseContent}</span>
 									</gl-tooltip>`
-								: html`<span class="card__phase">${stateContent}</span>`
+								: html`<span class="card__phase">${phaseContent}</span>`
+						}
+						${resumeActions.map(
+							action => html`<gl-action-chip
+								class="card__open"
+								icon=${action.icon}
+								label=${action.label}
+								overlay="tooltip"
+								href=${createCommandLink(action.command, action.args[0])}
+							></gl-action-chip>`,
+						)}
+						${
+							getAgentSessionArchiveAction(session) != null
+								? html`<gl-action-chip
+										class="card__archive"
+										icon="archive"
+										label=${l10n.t('Archive Session')}
+										overlay="tooltip"
+										@click=${() => this.onPastSessionArchiveClick(session)}
+									></gl-action-chip>`
+								: nothing
 						}
 					</div>
 					${
 						session.lastPrompt
 							? html`<gl-tooltip content=${session.lastPrompt} placement="bottom">
-									<span class="section__past-prompt">${session.lastPrompt}</span>
+									<span class="card__prompt">${session.lastPrompt}</span>
 								</gl-tooltip>`
 							: nothing
 					}
 				</div>
-				<gl-action-chip
-					icon="debug-restart"
-					label="Resume Session"
-					overlay="tooltip"
-					href=${resumeHref}
-				></gl-action-chip>
 			</div>
 		`;
 	}
 
-	/** The count of past sessions the list can't show, linking into the same resume picker as the
-	 *  heading chip. Static (no link) when there's no worktree to scope the picker to. */
-	private renderPastFooter(total: number, shown: number): unknown {
-		if (total <= shown) return nothing;
+	/** Progressive inline paging keeps history browsing and row management in context. The heading's
+	 *  picker action remains the dedicated searchable open/resume surface. */
+	private renderPastFooter(total: number): unknown {
+		const nextLimit = getNextPastAgentSessionsLimit(this.pastSessionsLimit, total);
+		if (nextLimit == null || this.worktreePath == null) return nothing;
 
-		const countText = pluralize('more past session', total - shown);
-		if (this.worktreePath == null) {
-			return html`
-				<div class="section__past-footer">
-					<span class="section__past-count">${countText}</span>
-				</div>
-			`;
-		}
+		const remaining = Math.max(0, total - this.pastSessionsLimit);
 
 		return html`
 			<div class="section__past-footer">
-				<gl-action-chip
+				<gl-button
 					class="section__past-more"
-					icon="history"
-					label="${countText} — Resume Session…"
-					overlay="tooltip"
-					href=${createCommandLink('gitlens.agents.showResumeSessionPicker', {
-						worktreePath: this.worktreePath,
-					})}
-					><span>${countText}…</span></gl-action-chip
+					appearance="secondary"
+					density="compact"
+					?disabled=${this.pastSessionsLoading}
+					@click=${() => this.onPastSessionsMoreClick(nextLimit)}
+					>${
+						this.pastSessionsLoading
+							? l10n.t('Loading…')
+							: l10n.t('Show More ({count})', { count: getNumericFormat()(remaining) })
+					}</gl-button
 				>
 			</div>
 		`;
 	}
 
-	private renderSectionHeading(sessions: AgentSessionState[], counts: Record<AgentSessionCategory, number>): unknown {
+	private renderSectionHeading(
+		sessions: AgentSessionState[],
+		counts: Record<AgentSessionCategory, number>,
+		hasPastSessions: boolean,
+	): unknown {
 		const state = this.expand;
-		const visibleDots = sessions.slice(0, maxClusterDots);
-		const overflow = sessions.length - visibleDots.length;
+		const hasLiveSessions = sessions.some(s => s.phase !== 'ended');
+		const hasSessions = hasLiveSessions || hasPastSessions;
+		// LIVE and CURRENT only — see the matching note in `renderClusterOnly`. Ended sessions are
+		// also excluded: history would swamp the dots and turn the overflow badge into a
+		// four-digit pill. The "N past" figure in the summary beside it is where that count belongs.
+		const clusterSessions = sessions.filter(s => agentPhaseToCategory[s.phase] !== 'ended' && this.isCurrent(s));
+		const visibleDots = clusterSessions.slice(0, maxClusterDots);
+		const overflow = clusterSessions.length - visibleDots.length;
 
 		// The row is a container, not the button: the resume action sits inside it, and a control
 		// nested in a <button> is invalid and unreachable by keyboard.
+		const clusterContent = html`
+			<span class="section__cluster-dots">
+				${visibleDots.map(
+					s =>
+						html`<span
+							class=${`section__cluster-dot section__cluster-dot--${agentPhaseToCategory[s.phase]}`}
+						></span>`,
+				)}
+				${
+					overflow > 0
+						? html`<span
+								class="section__cluster-dot section__cluster-dot--idle section__cluster-dot--overflow"
+							>
+								+${getNumericFormat()(overflow)}
+							</span>`
+						: nothing
+				}
+			</span>
+			<span class="section__cluster-summary">${this.renderCountsSummary(counts)}</span>
+		`;
+		const headingContent = html`
+			<span class="section__heading-label">${l10n.t('Agents')}</span>
+			${
+				sessions.length > 0
+					? html`<gl-popover placement="bottom" auto-size-vertical ?disabled=${state === 'expanded'}>
+							<span slot="anchor" class="section__cluster"> ${clusterContent} </span>
+							${this.renderHoverList(sessions)}
+						</gl-popover>`
+					: html`<span class="section__cluster">${clusterContent}</span>`
+			}
+		`;
+
 		return html`
 			<div class="section__heading">
-				<button
-					type="button"
-					class="section__heading-toggle"
-					aria-controls="section__list"
-					aria-expanded=${state === 'expanded' ? 'true' : 'false'}
-					aria-label=${this.expandAriaLabel(state)}
-					@click=${this.onChevronClick}
-				>
-					<code-icon
-						class="section__heading-chevron"
-						icon=${state === 'expanded' ? 'chevron-down' : 'chevron-right'}
-						data-expand=${state}
-					></code-icon>
-					<span class="section__heading-label">Agents</span>
-					<gl-popover placement="bottom" auto-size-vertical ?disabled=${state === 'expanded'}>
-						<span slot="anchor" class="section__cluster">
-							<span class="section__cluster-dots">
-								${visibleDots.map(
-									s =>
-										html`<span
-											class=${`section__cluster-dot section__cluster-dot--${agentPhaseToCategory[s.phase]}`}
-										></span>`,
-								)}
-								${
-									overflow > 0
-										? html`<span
-												class="section__cluster-dot section__cluster-dot--idle section__cluster-dot--overflow"
-											>
-												+${overflow}
-											</span>`
-										: nothing
-								}
-							</span>
-							<span class="section__cluster-summary">${this.renderCountsSummary(counts)}</span>
-						</span>
-						${this.renderHoverList(sessions)}
-					</gl-popover>
-				</button>
-				${this.renderResumePickerAction()}
+				${
+					this.wip && !hasSessions
+						? html`<div class="section__heading-static">${headingContent}</div>`
+						: html`<button
+								type="button"
+								class="section__heading-toggle"
+								aria-controls="section__list"
+								aria-expanded=${state === 'expanded' ? 'true' : 'false'}
+								aria-label=${this.expandAriaLabel(state)}
+								@click=${this.onChevronClick}
+							>
+								<code-icon
+									class="section__heading-chevron"
+									icon=${state === 'expanded' ? 'chevron-down' : 'chevron-right'}
+									data-expand=${state}
+								></code-icon>
+								${headingContent}
+							</button>`
+				}
+				${this.renderStartAction()} ${this.renderResumePickerAction()}
 			</div>
 		`;
+	}
+
+	private renderStartAction(): unknown {
+		if (!this.wip || this.worktreePath == null) return nothing;
+
+		return html`<gl-action-chip
+			class="section__heading-action"
+			icon="robot"
+			label=${l10n.t('Start Agent Session')}
+			alt-label=${l10n.t('Start Agent Session With…')}
+			overlay="tooltip"
+			href=${createCommandLink('gitlens.startAgentSession', { cwd: this.worktreePath })}
+			alt-href=${createCommandLink('gitlens.startAgentSession', { cwd: this.worktreePath, pick: true })}
+		></gl-action-chip>`;
 	}
 
 	/** Opens the picker over every session the worktree can resume — available whatever the section
@@ -1144,7 +1222,7 @@ export class GlDetailsAgentStatus extends LitElement {
 		return html`<gl-action-chip
 			class="section__heading-action"
 			icon="history"
-			label="Resume Session…"
+			label=${this.wip ? l10n.t('Open or Resume Session…') : l10n.t('Resume Session…')}
 			overlay="tooltip"
 			href=${createCommandLink('gitlens.agents.showResumeSessionPicker', { worktreePath: this.worktreePath })}
 		></gl-action-chip>`;
@@ -1163,30 +1241,57 @@ export class GlDetailsAgentStatus extends LitElement {
 		);
 	};
 
+	private onPastSessionsMoreClick(limit: number): void {
+		this.dispatchEvent(
+			new CustomEvent<PastAgentSessionsMoreRequest>('gl-agent-status-past-sessions-more-request', {
+				bubbles: true,
+				composed: true,
+				detail: { limit: limit },
+			}),
+		);
+	}
+
+	private onPastSessionArchiveClick(session: PastAgentSessionState): void {
+		this.dispatchEvent(
+			new CustomEvent<PastAgentSessionArchiveRequest>('gl-agent-status-past-session-archive-request', {
+				bubbles: true,
+				composed: true,
+				detail: { sessionId: session.id, providerId: session.providerId },
+			}),
+		);
+	}
+
 	private expandAriaLabel(state: ExpandState): string {
 		switch (state) {
 			case 'collapsed':
-				return 'Show all sessions';
+				return l10n.t('Show all sessions');
 			case 'partial':
-				return 'Showing sessions needing input — collapse';
+				return l10n.t('Showing sessions needing input — collapse');
 			case 'expanded':
-				return 'Showing all sessions — collapse';
+				return l10n.t('Showing all sessions — collapse');
 		}
 	}
 
 	private renderCountsSummary(counts: Record<AgentSessionCategory, number>): unknown {
 		const parts: unknown[] = [];
 		if (counts['needs-input'] > 0) {
-			parts.push(html`<strong>${counts['needs-input']} need input</strong>`);
+			parts.push(
+				html`<strong
+					>${l10n.t('{count} need input', {
+						count: getNumericFormat()(counts['needs-input']),
+					})}</strong
+				>`,
+			);
 		}
 		if (counts.working > 0) {
-			parts.push(html`<span>${counts.working} working</span>`);
+			parts.push(html`<span>${l10n.t('{count} working', { count: getNumericFormat()(counts.working) })}</span>`);
 		}
 		if (counts.idle > 0) {
-			parts.push(html`<span>${counts.idle} idle</span>`);
+			parts.push(html`<span>${l10n.t('{count} idle', { count: getNumericFormat()(counts.idle) })}</span>`);
 		}
-		if (counts.completed > 0) {
-			parts.push(html`<span>${counts.completed} completed</span>`);
+		const pastCount = this.wip ? this.pastSessions?.total : counts.ended;
+		if (pastCount != null && (this.wip || pastCount > 0)) {
+			parts.push(html`<span>${l10n.t('{count} past', { count: getNumericFormat()(pastCount) })}</span>`);
 		}
 
 		const out: unknown[] = [];
@@ -1200,36 +1305,39 @@ export class GlDetailsAgentStatus extends LitElement {
 	}
 
 	/** Shared body for both hover popovers (cluster-only and section-heading). Sessions arrive
-	 *  pre-sorted (`sortAgentSessions` upstream) with completed last and most-recent-first within a
-	 *  phase, so slicing the completed tail keeps the freshest completed rows. Active sessions are
+	 *  pre-sorted (`sortAgentSessions` upstream) with ended last and most-recent-first within a
+	 *  phase, so slicing the ended tail keeps the freshest ended rows. Active sessions are
 	 *  never truncated — the hover is the only per-session detail surface while collapsed. */
 	private renderHoverList(sessions: AgentSessionState[]): unknown {
 		const active: AgentSessionState[] = [];
-		const completed: AgentSessionState[] = [];
+		const ended: AgentSessionState[] = [];
 		for (const s of sessions) {
-			if (agentPhaseToCategory[s.phase] === 'completed') {
-				completed.push(s);
+			if (agentPhaseToCategory[s.phase] === 'ended') {
+				ended.push(s);
 			} else {
 				active.push(s);
 			}
 		}
 
-		const shownCompleted = completed.slice(0, maxHoverCompletedRows);
+		const shownEnded = ended.slice(0, maxHoverEndedRows);
 		return html`
 			<div slot="content" class="section__hover">
-				${[...active, ...shownCompleted].map(s => this.renderHoverRow(s))}
-				${this.renderHoverFooter(completed.length - shownCompleted.length)}
+				${[...active, ...shownEnded].map(s => this.renderHoverRow(s))}
+				${this.renderHoverFooter(ended.length - shownEnded.length)}
 			</div>
 		`;
 	}
 
-	/** Count-only overflow line for completed rows hidden by the hover cap. No link: the heading
+	/** Count-only overflow line for ended rows hidden by the hover cap. No link: the heading
 	 *  already has a separate `Resume Session…` picker chip, and compact mode has no `worktreePath`
 	 *  to scope a picker to. */
 	private renderHoverFooter(hidden: number): unknown {
 		if (hidden <= 0) return nothing;
 
-		const countText = pluralize('more completed session', hidden);
+		const countText = formatPlural(
+			l10n.t('{count, plural, one{{count} more past session} other{{count} more past sessions}}'),
+			{ count: hidden },
+		);
 		return html`
 			<div class="section__hover-footer">
 				<span class="section__hover-count">${countText}</span>
@@ -1253,11 +1361,24 @@ export class GlDetailsAgentStatus extends LitElement {
 						awaitingPrefix: 'short',
 						idleFallback: 'lastPrompt',
 					});
+		// A ghost (visited-but-not-current) row still lists here — see `renderCard` for why — but
+		// dims and its name tooltip gains a "now in X" hint pointing at where it actually is.
+		const isGhost = !this.isCurrent(session);
+		const nameTooltip = isGhost
+			? l10n.t('{name} — now in {location}', {
+					name: session.displayName,
+					location: this.ghostLocationLabel(session),
+				})
+			: session.displayName;
 
 		return html`
-			<div class="section__hover-row">
-				<span class=${`section__hover-dot section__hover-dot--${category}`}></span>
-				<gl-tooltip content=${session.displayName} placement="bottom">
+			<div class=${`section__hover-row${isGhost ? ' section__hover-row--ghost' : ''}`}>
+				<gl-agent-mark
+					class=${`section__hover-dot section__hover-dot--${category}`}
+					category=${category}
+					aria-hidden="true"
+				></gl-agent-mark>
+				<gl-tooltip content=${nameTooltip} placement="bottom">
 					<span class="section__hover-name">${session.displayName}</span>
 				</gl-tooltip>
 				<span class=${`section__hover-phase section__hover-phase--${category}`}>
@@ -1291,26 +1412,44 @@ export class GlDetailsAgentStatus extends LitElement {
 		// Phase chip shows how long the session has been in this phase; its tooltip reports the
 		// last time the session actually did something, which is a different clock.
 		const lastActive = formatAgentElapsed(session.lastActivity);
-		const phaseTooltip = lastActive != null ? `Last active ${lastActive} ago` : undefined;
-		const openAction = getAgentSessionOpenAction(session);
-		const openHref = createAgentSessionOpenHref(session);
+		const phaseTooltip =
+			lastActive != null ? l10n.t('Last active {elapsed} ago', { elapsed: lastActive }) : undefined;
+		const openActions = createAgentSessionOpenHrefs(session);
+		const archiveHref = category === 'ended' ? createAgentSessionArchiveHref(session) : undefined;
 		// Resolve actions surface only for an ask this window can actually route. An unresolvable
 		// one (elicitation, or discovered by the poll rather than the hook) still renders its
 		// detail block — the user needs to see what is being asked — but is answered in the
 		// agent's own session, which the title row's open action already reaches.
 		const canResolve = canResolvePermission(category, permission);
 		const isSelected = this.selectedSessionId != null && this.selectedSessionId === session.id;
+		// A ghost (visited-but-not-current) session still gets a card here — this worktree is part
+		// of its history — but dims, and its name tooltip gains a "now in X" hint. Session-id-based
+		// actions (open, resolve permission, archive) stay fully functional: they address the
+		// session wherever it actually is, not this worktree specifically.
+		const isGhost = !this.isCurrent(session);
+		const nameTooltip = isGhost
+			? l10n.t('{name} — now in {location}', {
+					name: session.displayName,
+					location: this.ghostLocationLabel(session),
+				})
+			: session.displayName;
 
 		return html`
 			<div
-				class=${`card card--${category}${isSelected ? ' card--selected' : ''}`}
+				class=${`card card--live card--${category}${isSelected ? ' card--selected' : ''}${isGhost ? ' card--ghost' : ''}`}
+				tabindex="0"
+				role="group"
+				aria-label=${session.displayName}
 				data-session-id=${session.id}
+				data-vscode-context=${serializeWebviewItemContext(buildAgentSessionContext(session, category))}
 				aria-current=${isSelected ? 'true' : nothing}
+				@click=${(e: Event) => this.activateCard(session, e)}
+				@keydown=${(e: Event) => this.activateCard(session, e)}
 			>
 				<div class="card__rail">${this.renderCardRail(category)}</div>
 				<div class="card__body">
 					<div class="card__title-row">
-						<gl-tooltip content=${session.displayName} placement="bottom">
+						<gl-tooltip content=${nameTooltip} placement="bottom">
 							<span class="card__name">${session.displayName}</span>
 						</gl-tooltip>
 						${
@@ -1320,24 +1459,23 @@ export class GlDetailsAgentStatus extends LitElement {
 									</gl-tooltip>`
 								: html`<span class=${`card__phase card__phase--${category}`}>${phaseContent}</span>`
 						}
-						<gl-action-chip
-							class="card__open"
-							icon=${openAction.icon}
-							label=${openAction.label}
-							overlay="tooltip"
-							href=${openHref}
-						></gl-action-chip>
+						${openActions.map(
+							action => html`<gl-action-chip
+								class="card__open"
+								icon=${action.icon}
+								label=${action.label}
+								overlay="tooltip"
+								href=${action.href}
+							></gl-action-chip>`,
+						)}
 						${
-							category === 'completed'
+							archiveHref != null
 								? html`<gl-action-chip
 										class="card__archive"
 										icon="archive"
-										label="Archive Session"
+										label=${l10n.t('Archive Session')}
 										overlay="tooltip"
-										href=${createCommandLink(
-											'gitlens.agents.archiveSession',
-											JSON.stringify(session.id),
-										)}
+										href=${archiveHref}
 									></gl-action-chip>`
 								: nothing
 						}
@@ -1356,16 +1494,88 @@ export class GlDetailsAgentStatus extends LitElement {
 						? html`<div class="card__actions">${this.renderCardActions(session)}</div>`
 						: category === 'needs-input'
 							? html`<div class="card__actions card__actions--unresolvable">
-									<gl-button appearance="secondary" density="compact" href=${openHref}>
-										<code-icon icon=${openAction.icon} slot="prefix"></code-icon>
-										${openAction.label}
+									<span class="card__actions-hint">${l10n.t("Answer in the agent's session")}</span>
+									<gl-button appearance="secondary" density="compact" href=${openActions[0].href}>
+										<code-icon icon=${openActions[0].icon} slot="prefix"></code-icon>
+										${openActions[0].label}
 									</gl-button>
-									<span class="card__actions-hint">Answer in the agent's session</span>
 								</div>`
 							: nothing
 				}
 			</div>
 		`;
+	}
+
+	/** Walks `e.composedPath()` outward from the actual event target looking for the enclosing card
+	 *  (marked by `data-session-id`) or an interactive descendant (link/button/action-chip/copy
+	 *  control) that should absorb the activation itself. Returns `true` when activation should be
+	 *  suppressed. Shared by `activateCard` and `activatePastRow`. */
+	private isCardActivationBlocked(e: Event): boolean {
+		for (const target of e.composedPath()) {
+			if (!(target instanceof HTMLElement)) continue;
+			if (target.dataset.sessionId != null) break;
+
+			const tag = target.tagName.toLowerCase();
+			if (
+				tag === 'a' ||
+				tag === 'button' ||
+				tag === 'gl-button' ||
+				tag === 'gl-action-chip' ||
+				tag === 'gl-copy-container' ||
+				target.hasAttribute('href')
+			) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/** Opens the agent session sheet for a live card click/Enter/Space — but only when the
+	 *  activation didn't originate from one of the card's own interactive descendants (open/archive
+	 *  action chips, resolve buttons, the copy-plan-path control), which already handle themselves.
+	 *  Delegates the interactive-descendant walk to {@link isCardActivationBlocked}. Past-session
+	 *  cards (`renderPastRow`) call `activatePastRow` instead — they aren't in the live snapshot
+	 *  the sheet resolves against. */
+	private activateCard(session: AgentSessionState, e: Event): void {
+		if (e.type === 'keydown') {
+			const key = (e as KeyboardEvent).key;
+			if (key !== 'Enter' && key !== ' ') return;
+		}
+
+		if (this.isCardActivationBlocked(e)) return;
+
+		if (e.type === 'keydown') {
+			e.preventDefault();
+		}
+
+		this.dispatchEvent(
+			new CustomEvent('gl-agent-session-sheet-open', {
+				detail: { sessionId: session.id, providerId: session.providerId },
+				bubbles: true,
+				composed: true,
+			}),
+		);
+	}
+
+	private activatePastRow(session: PastAgentSessionState, e: Event): void {
+		if (e.type === 'keydown') {
+			const key = (e as KeyboardEvent).key;
+			if (key !== 'Enter' && key !== ' ') return;
+		}
+
+		if (this.isCardActivationBlocked(e)) return;
+
+		if (e.type === 'keydown') {
+			e.preventDefault();
+		}
+
+		this.dispatchEvent(
+			new CustomEvent('gl-agent-past-session-sheet-open', {
+				detail: { session: session },
+				bubbles: true,
+				composed: true,
+			}),
+		);
 	}
 
 	/** Detail block for the card body — three mutually exclusive shapes:
@@ -1383,7 +1593,7 @@ export class GlDetailsAgentStatus extends LitElement {
 			// Evict any prior working-phase sticky entry — see {@link createStickyDetailResolver}
 			// for why bypassing `resolveLiveTool` would otherwise leak the pre-permission tool
 			// detail across the permission round-trip.
-			this._stickyResolver.evict(session.id);
+			this._stickyResolver.evict(session);
 			return html`<gl-agent-prompt-detail .permission=${permission}></gl-agent-prompt-detail>`;
 		}
 
@@ -1403,16 +1613,12 @@ export class GlDetailsAgentStatus extends LitElement {
 		</gl-tooltip>`;
 	}
 
-	/** Rail content for the card. needs-input gets a warning glyph; working gets a spinning sync —
-	 *  matches the prior banner icon-circle treatment. Idle keeps the small dot. */
+	/** Rail content for the card — the ONE agent-phase mark, shared with the Commit Graph's
+	 *  WIP-row indicator and the agent-sessions tree leaf. Shape/tempo (not just color) carry the
+	 *  phase: working/needs-input get a ring + waves, idle is a hollow ring, ended a static
+	 *  filled square — so all four stay distinguishable with `prefers-reduced-motion: reduce`. */
 	private renderCardRail(category: AgentSessionCategory): unknown {
-		if (category === 'needs-input') {
-			return html`<span class="card__icon"><code-icon icon="warning"></code-icon></span>`;
-		}
-		if (category === 'working') {
-			return html`<span class="card__icon"><code-icon icon="sync" modifier="spin"></code-icon></span>`;
-		}
-		return html`<span class="card__dot"></span>`;
+		return html`<gl-agent-mark category=${category} aria-hidden="true"></gl-agent-mark>`;
 	}
 
 	/** Renders the needs-input action row. Open is hoisted into the card title row as an action
@@ -1425,10 +1631,12 @@ export class GlDetailsAgentStatus extends LitElement {
 
 		const allowHref = createCommandLink('gitlens.agents.resolvePermission', {
 			sessionId: session.id,
+			providerId: session.providerId,
 			decision: 'allow' as const,
 		});
 		const denyHref = createCommandLink('gitlens.agents.resolvePermission', {
 			sessionId: session.id,
+			providerId: session.providerId,
 			decision: 'deny' as const,
 		});
 		// Always-Allow only applies to regular tool permissions — plan / question / elicitation
@@ -1438,12 +1646,13 @@ export class GlDetailsAgentStatus extends LitElement {
 		const alwaysAllowHref = showAlwaysAllow
 			? createCommandLink('gitlens.agents.resolvePermission', {
 					sessionId: session.id,
+					providerId: session.providerId,
 					decision: 'allow' as const,
 					alwaysAllow: true,
 				})
 			: undefined;
-		const allowLabel = permission.kind === 'plan' ? 'Approve Plan' : 'Allow';
-		const denyLabel = permission.kind === 'plan' ? 'Reject Plan' : 'Deny';
+		const allowLabel = permission.kind === 'plan' ? l10n.t('Approve Plan') : l10n.t('Allow');
+		const denyLabel = permission.kind === 'plan' ? l10n.t('Reject Plan') : l10n.t('Deny');
 
 		// View Plan / Copy Plan affordances live in the prompt-detail composite (as chips in the
 		// caption row), so they don't get duplicated here. This row carries only resolution actions.
@@ -1456,7 +1665,7 @@ export class GlDetailsAgentStatus extends LitElement {
 				showAlwaysAllow && alwaysAllowHref != null
 					? html`<gl-button appearance="secondary" density="compact" href=${alwaysAllowHref}>
 							<code-icon icon="check-all" slot="prefix"></code-icon>
-							Always Allow
+							${l10n.t('Always Allow')}
 						</gl-button>`
 					: nothing
 			}
@@ -1467,8 +1676,26 @@ export class GlDetailsAgentStatus extends LitElement {
 		`;
 	}
 
+	/** Label for a ghost session's actual current location — the worktree path's directory
+	 *  basename, falling back to the provider name if the session has no resolved worktree at all.
+	 *  Deliberately not the worktree's branch-derived display name: branch names repeat across
+	 *  repos ("main" everywhere), so a cross-repo ghost's "now in main" would read as this repo's
+	 *  main worktree. Used in the "now in X" hint on ghost cards/hover rows. */
+	private ghostLocationLabel(session: AgentSessionState): string {
+		return session.worktreePath ? basename(session.worktreePath) : session.providerName;
+	}
+
+	/** Whether `session` counts as "current" for this component's worktree scope. `worktreePath ==
+	 *  null` means this surface has no worktree dimension at all (e.g. the treemap's compact
+	 *  Activity-toolbar cluster, which shows sessions across an entire repo family, not one
+	 *  worktree) — every session counts as current and none render as ghosts. Otherwise defers to
+	 *  {@link isAgentSessionCurrentForWorktree}. */
+	private isCurrent(session: AgentSessionState): boolean {
+		return this.worktreePath == null || isAgentSessionCurrentForWorktree(session, this.worktreePath);
+	}
+
 	private tally(sessions: AgentSessionState[]): Record<AgentSessionCategory, number> {
-		const counts: Record<AgentSessionCategory, number> = { working: 0, 'needs-input': 0, idle: 0, completed: 0 };
+		const counts: Record<AgentSessionCategory, number> = { working: 0, 'needs-input': 0, idle: 0, ended: 0 };
 		for (const s of sessions) {
 			counts[agentPhaseToCategory[s.phase]]++;
 		}

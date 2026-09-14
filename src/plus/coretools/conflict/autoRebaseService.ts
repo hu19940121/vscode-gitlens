@@ -1,8 +1,9 @@
 import type { Disposable, Event } from 'vscode';
-import { CancellationTokenSource, EventEmitter, Uri } from 'vscode';
+import { CancellationTokenSource, EventEmitter, l10n, Uri } from 'vscode';
 import { getAutoRebaseMessageEditor } from '@env/git/messageEditor.js';
 import type { AIModel } from '@gitlens/ai/models/model.js';
 import { PausedOperationAbortError } from '@gitlens/git/errors.js';
+import type { GitPausedOperation } from '@gitlens/git/models/pausedOperationStatus.js';
 import type { RebaseTodoEntry } from '@gitlens/git/models/rebase.js';
 import { uuid } from '@gitlens/utils/crypto.js';
 import { Logger } from '@gitlens/utils/logger.js';
@@ -10,6 +11,7 @@ import { wait } from '@gitlens/utils/promise.js';
 import type { StoredAutoRebaseUndo } from '../../../constants.storage.js';
 import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
+import { getPresentableErrorMessage } from '../../../errors.js';
 import type { GitRepositoryService } from '../../../git/gitRepositoryService.js';
 import { readAndParseRebaseDoneFile } from '../../../git/utils/-webview/rebase.parsing.utils.js';
 import { toAbortSignal } from '../../../system/-webview/cancellation.js';
@@ -32,6 +34,7 @@ export interface AutoRebaseStartOptions {
 	branch?: string;
 	onto?: string;
 	updateRefs?: boolean;
+	autosquash?: boolean;
 	source: Source;
 }
 
@@ -43,12 +46,41 @@ interface ActiveAutoRebase {
 	/** Durable copy of the escalated step's pre-resolution state (survives handoff consumption), so a
 	 *  resume can record the human-resolved step in the summary. Set on escalation, cleared on resume. */
 	escalatedStep?: EscalatedStepSnapshot;
+	/** See {@link AutoRebaseResumeContext.consentStepNumber} — set by explicit takeover/resume, never
+	 *  by a fresh started or pending-handoff run. */
+	consentStep?: number;
 	detachRequested?: boolean;
 	/** An escalated-phase abort is in flight (the session leaves `escalated` only when it lands) */
 	abortingEscalated?: boolean;
 }
 
 const runningPhases = new Set(['starting', 'resolving', 'applying', 'continuing']);
+
+function describeOperationAlreadyInProgress(type: GitPausedOperation): string {
+	switch (type) {
+		case 'cherry-pick':
+			return l10n.t('A cherry-pick is already in progress.');
+		case 'merge':
+			return l10n.t('A merge is already in progress.');
+		case 'rebase':
+			return l10n.t('A rebase is already in progress.');
+		case 'revert':
+			return l10n.t('A revert is already in progress.');
+	}
+}
+
+function describeUndoBlockedByOperation(type: GitPausedOperation): string {
+	switch (type) {
+		case 'cherry-pick':
+			return l10n.t("Can't undo while a cherry-pick is in progress.");
+		case 'merge':
+			return l10n.t("Can't undo while a merge is in progress.");
+		case 'rebase':
+			return l10n.t("Can't undo while a rebase is in progress.");
+		case 'revert':
+			return l10n.t("Can't undo while a revert is in progress.");
+	}
+}
 
 /** A dirty working tree that `undo()` can recover by stashing — the autostash either re-applied
  *  cleanly (`reapplied`) or was left in the stash after a conflicted re-apply (`left-in-stash`) — as
@@ -122,8 +154,8 @@ export class AutoRebaseService implements Disposable {
 		if (existing != null) {
 			throw new Error(
 				existing.type === 'rebase'
-					? 'A rebase is already in progress — use "Continue Automatic Rebase" to automate it.'
-					: `A ${existing.type} is already in progress.`,
+					? l10n.t('A rebase is already in progress — use "Continue with Auto-Rebase" to automate it.')
+					: describeOperationAlreadyInProgress(existing.type),
 			);
 		}
 
@@ -164,6 +196,7 @@ export class AutoRebaseService implements Disposable {
 				branch: options.branch,
 				onto: options.onto,
 				updateRefs: options.updateRefs,
+				autosquash: options.autosquash,
 				// Suppress any message editing headlessly (interactive isn't used, but a
 				// rebase.autosquash config could still trigger message edits)
 				messageEditor: 'true',
@@ -187,10 +220,10 @@ export class AutoRebaseService implements Disposable {
 
 		const status = await svc.pausedOps?.getPausedOperationStatus?.({ force: true });
 		if (status?.type !== 'rebase') {
-			throw new Error('No rebase is in progress.');
+			throw new Error(l10n.t('No rebase is in progress.'));
 		}
 		if (!status.isPaused) {
-			throw new Error('The rebase is not paused.');
+			throw new Error(l10n.t('The rebase is not paused.'));
 		}
 
 		// There's a rebase to take over, so it's worth asking for a model (see `ensureModel`)
@@ -201,6 +234,9 @@ export class AutoRebaseService implements Disposable {
 		// takeover session, so the end-of-run summary spans the whole rebase.
 		const existing = this._sessions.get(svc.path);
 		if (existing?.session.phase === 'escalated') {
+			// The user clicked to take over a paused rebase — that click IS consent to continue past a
+			// non-conflict pause at the step it's currently sitting on.
+			existing.consentStep = status.steps.current.number;
 			return this.resumeEscalatedSession(svc, existing, integration, source, model);
 		}
 
@@ -233,6 +269,7 @@ export class AutoRebaseService implements Disposable {
 			steps: [],
 		};
 		const active = this.trackSession(session, source);
+		active.consentStep = status.steps.current.number;
 
 		// Taking over adopts the rebase, so later pauses auto-open under `openOnPausedRebase: 'auto'`
 		this.container.operationOrigins.markAdopted(svc.path);
@@ -263,13 +300,13 @@ export class AutoRebaseService implements Disposable {
 
 		const status = await svc.pausedOps?.getPausedOperationStatus?.({ force: true });
 		if (status?.type !== 'rebase') {
-			throw new Error('No rebase is in progress.');
+			throw new Error(l10n.t('No rebase is in progress.'));
 		}
 		if (status.hasStarted) {
 			throw new Error(
 				status.isPaused
-					? 'The rebase has already started — use "Continue Automatic Rebase" to automate it.'
-					: 'The rebase has already started.',
+					? l10n.t('The rebase has already started — use "Continue with Auto-Rebase" to automate it.')
+					: l10n.t('The rebase has already started.'),
 			);
 		}
 
@@ -312,7 +349,7 @@ export class AutoRebaseService implements Disposable {
 			// until it pauses or finishes
 			await release();
 
-			session.progressMessage = 'Waiting for the rebase to reach its first conflict…';
+			session.progressMessage = l10n.t('Waiting for the rebase to reach its first conflict…');
 			this.fireChange(session);
 
 			switch (await this.waitForFirstPause(svc, active)) {
@@ -410,7 +447,9 @@ export class AutoRebaseService implements Disposable {
 
 				if (!status.hasStarted) {
 					if (Date.now() - startedAt > AutoRebaseService.handoffStartTimeoutMs) {
-						throw new Error('The rebase never started — its git process may have been interrupted.');
+						throw new Error(
+							l10n.t('The rebase never started — its git process may have been interrupted.'),
+						);
 					}
 				} else {
 					const conflicts = (await svc.status?.getConflictingFiles?.()) ?? [];
@@ -447,13 +486,15 @@ export class AutoRebaseService implements Disposable {
 							// A block this long may be a dead process (an editor that failed to
 							// launch looks identical) — surface the way out without breaking a
 							// genuinely slow edit
-							const hint =
+							setProgress(
 								Date.now() - blockedAt > AutoRebaseService.handoffEditorHintMs
-									? ' If no editor opened, the rebase has stopped — abort from here, or continue it in your terminal.'
-									: '';
-							setProgress(`Waiting for you to edit the commit message…${hint}`);
+									? l10n.t(
+											'Waiting for you to edit the commit message… If no editor opened, the rebase has stopped — abort from here, or continue it in your terminal.',
+										)
+									: l10n.t('Waiting for you to edit the commit message…'),
+							);
 						} else if (stopAction === 'exec') {
-							setProgress('Waiting for the rebase todo’s exec command…');
+							setProgress(l10n.t('Waiting for the rebase todo’s exec command…'));
 						}
 					}
 				}
@@ -560,7 +601,7 @@ export class AutoRebaseService implements Disposable {
 	async canUndo(repoPath: string): Promise<AutoRebaseUndoValidation> {
 		const record = this.getStoredUndo(repoPath);
 		if (record == null) {
-			return { ok: false, reason: 'no-record', message: 'There is no automatic rebase to undo.' };
+			return { ok: false, reason: 'no-record', message: l10n.t('There is no Auto-Rebase to undo.') };
 		}
 		return this.validateUndo(this.container.git.getRepositoryService(repoPath), record);
 	}
@@ -595,7 +636,7 @@ export class AutoRebaseService implements Disposable {
 	): Promise<AutoRebaseUndoResult> {
 		const record = this.getStoredUndo(repoPath);
 		if (record == null) {
-			return { ok: false, reason: 'no-record', message: 'There is no automatic rebase to undo.' };
+			return { ok: false, reason: 'no-record', message: l10n.t('There is no Auto-Rebase to undo.') };
 		}
 
 		const svc = this.container.git.getRepositoryService(repoPath);
@@ -604,7 +645,7 @@ export class AutoRebaseService implements Disposable {
 		// ok/refused telemetry branch.
 		const ops = svc.ops;
 		if (ops == null) {
-			return { ok: false, reason: 'unavailable', message: 'Undo isn’t available in this environment.' };
+			return { ok: false, reason: 'unavailable', message: l10n.t('Undo isn’t available in this environment.') };
 		}
 
 		const validation = await this.validateUndo(svc, record);
@@ -619,7 +660,7 @@ export class AutoRebaseService implements Disposable {
 				case 'stash':
 					if (svc.stash == null) return validation;
 
-					await svc.stash.saveStash('Automatic rebase undo', undefined, { includeUntracked: true });
+					await svc.stash.saveStash(l10n.t('Auto-Rebase undo'), undefined, { includeUntracked: true });
 					// A conflicted autostash application is the post-rebase tree (markers + any manual
 					// fixes) whose diff is relative to the post-rebase tip — popping it back onto the
 					// pre-rebase tip would re-conflict. Leave it stashed; the original autostash entry
@@ -816,6 +857,7 @@ export class AutoRebaseService implements Disposable {
 		const result = await runAutoRebaseLoop(active.session, ports, signal, onLoopChange, {
 			escalatedStep: active.escalatedStep,
 			previousResolutions: priorResolutions,
+			consentStepNumber: active.consentStep,
 		});
 		switch (result.type) {
 			case 'completed':
@@ -825,6 +867,9 @@ export class AutoRebaseService implements Disposable {
 				// step, so drop it rather than retain it for the terminal session's lifetime. A
 				// re-escalation takes the `escalated` branch below and re-sets a fresh snapshot.
 				active.escalatedStep = undefined;
+				// Consent was scoped to the step the run was resumed at — a stale value must never leak
+				// into a later resume that didn't re-set it.
+				active.consentStep = undefined;
 				if (result.type === 'completed') {
 					await this.finalize(svc, active, { fromLoop: true });
 				} else {
@@ -845,9 +890,13 @@ export class AutoRebaseService implements Disposable {
 									filePath: r.filePath,
 									strategy: r.strategy,
 									description: r.description,
+									descriptionKind: r.descriptionKind,
 								})),
 							}
 						: undefined;
+				// Consent was scoped to the step the run was resumed at — a stale value must never leak
+				// into a later resume that didn't re-set it.
+				active.consentStep = undefined;
 				active.session.phase = 'escalated';
 				clearTransientProgress(active.session);
 				this.sendEscalatedEvent(active);
@@ -864,12 +913,14 @@ export class AutoRebaseService implements Disposable {
 		const { session } = active;
 		const headSha = (await svc.revision.resolveRevision('HEAD')).sha;
 
-		// The loop reported completion but the tip is back at the start: the rebase was aborted
-		// externally (`git rebase --abort`) while we were driving it — there is nothing to undo (or
-		// summarize as applied). Gate on `fromLoop` rather than `steps.length` so an abort *before* the
-		// first step is recorded is still caught, without misclassifying `start()`'s "already up to
-		// date" no-op (which reaches finalize directly, never from the loop, also with 0 steps).
-		if (options?.fromLoop && headSha === session.preRun.headSha) {
+		// The loop reported completion but the tip is back at the start — that's ambiguous on its own:
+		// it's just as true of a genuine no-op completion (nothing to rewrite) as it is of an external
+		// `git rebase --abort` that raced us while driving it. Git's own reflog tells the two apart
+		// (`rebase (finish): …` vs `rebase (abort): …`) regardless of whether the SHA moved. Gate on
+		// `fromLoop` rather than `steps.length` so an abort *before* the first step is recorded is still
+		// caught, without misclassifying `start()`'s "already up to date" no-op (which reaches finalize
+		// directly, never from the loop, also with 0 steps).
+		if (options?.fromLoop && headSha === session.preRun.headSha && !(await this.rebaseReflogFinished(svc))) {
 			session.phase = 'aborted';
 			clearTransientProgress(session);
 			this.fireChange(session);
@@ -930,7 +981,7 @@ export class AutoRebaseService implements Disposable {
 		if (active.detachRequested) {
 			session.escalation = {
 				reason: 'stopped',
-				message: 'Automation stopped — the rebase is paused for you to continue manually.',
+				message: l10n.t('Automation stopped — the rebase is paused for you to continue manually.'),
 				// Carried over before `clearTransientProgress` drops `current` — it's the only record of
 				// where the user was left, and both the Resolve panel's run context and the escalation
 				// toast say "step N of M" from it.
@@ -953,12 +1004,13 @@ export class AutoRebaseService implements Disposable {
 				return;
 			}
 
-			// Nothing to abort — the rebase already ended. If HEAD moved past the pre-rebase tip the
-			// run actually finished (a cancel that raced the final successful continue), so finalize
-			// it (summary + undo record) instead of misreporting an unchanged branch. Only when HEAD
-			// is still at the pre-rebase tip is "aborted — branch unchanged" literally true.
+			// Nothing to abort — the rebase already ended, racing our cancel. If HEAD moved, the run
+			// actually finished (a cancel that raced the final successful continue). If HEAD didn't
+			// move, that alone doesn't mean it was aborted — a no-op completion (nothing to rewrite)
+			// looks identical by SHA — so check the reflog too. Either signal routes through finalize
+			// for the summary + undo record instead of misreporting a completed run as cancelled.
 			const headSha = (await svc.revision.resolveRevision('HEAD')).sha;
-			if (headSha !== session.preRun.headSha) {
+			if (headSha !== session.preRun.headSha || (await this.rebaseReflogFinished(svc))) {
 				await this.finalize(svc, active, { fromLoop: true });
 				return;
 			}
@@ -976,7 +1028,7 @@ export class AutoRebaseService implements Disposable {
 		// Terminal, like the loop's completed/cancelled results — drop the escalated step's snapshot
 		// (which can hold large conflicted-file contents) rather than retain it for the session's life.
 		active.escalatedStep = undefined;
-		session.failure = ex instanceof Error ? ex.message : String(ex);
+		session.failure = getPresentableErrorMessage(ex);
 		session.phase = 'failed';
 		clearTransientProgress(session);
 		this.container.telemetry.sendEvent('autoRebase/failed', this.lifecycleData(session), active.source);
@@ -1007,17 +1059,17 @@ export class AutoRebaseService implements Disposable {
 	 */
 	private async ensureAvailable(svc: GitRepositoryService): Promise<ConflictToolsIntegration> {
 		if (!this.container.ai.allowed) {
-			throw new Error('AI features are disabled.');
+			throw new Error(l10n.t('AI features are disabled.'));
 		}
 
 		const integration = await this.getIntegration();
 		if (integration == null || svc.ops == null || svc.pausedOps == null || svc.staging == null) {
-			throw new Error('Automatic rebase is not available in this environment.');
+			throw new Error(l10n.t('Auto-Rebase is not available in this environment.'));
 		}
 
 		const existing = this._sessions.get(svc.path);
 		if (existing != null && runningPhases.has(existing.session.phase)) {
-			throw new Error('An automatic rebase is already running for this repository.');
+			throw new Error(l10n.t('An Auto-Rebase is already running for this repository.'));
 		}
 
 		return integration;
@@ -1040,7 +1092,7 @@ export class AutoRebaseService implements Disposable {
 		if (model == null) {
 			// Dismissing the picker is a refusal to start, handled like the other pre-flight refusals: the
 			// caller surfaces this message and the repository is never touched.
-			throw new Error('Automatic rebase needs an AI model — none was selected.');
+			throw new Error(l10n.t('Auto-Rebase needs an AI model — none was selected.'));
 		}
 
 		return model;
@@ -1064,7 +1116,7 @@ export class AutoRebaseService implements Disposable {
 	private getIntegration(): Promise<ConflictToolsIntegration | undefined> {
 		// Lazily import the node-only conflict-tools integration on demand (browser resolves to a
 		// stub returning `undefined`, so the feature gates off in VS Code Web)
-		this._integration ??= import('@env/coretools/conflict.js').then(m =>
+		this._integration ??= import(/* webpackChunkName: "core-tools" */ '@env/coretools/conflict.js').then(m =>
 			m.createConflictToolsIntegration(this.container),
 		);
 		return this._integration;
@@ -1114,7 +1166,7 @@ export class AutoRebaseService implements Disposable {
 			return {
 				ok: false,
 				reason: 'operation-in-progress',
-				message: `Can't undo while a ${pausedOp.type} is in progress.`,
+				message: describeUndoBlockedByOperation(pausedOp.type),
 			};
 		}
 
@@ -1124,7 +1176,7 @@ export class AutoRebaseService implements Disposable {
 				return {
 					ok: false,
 					reason: 'branch-changed',
-					message: `Can't undo — ${record.branch} is no longer checked out.`,
+					message: l10n.t("Can't undo — {branch} is no longer checked out.", { branch: record.branch }),
 				};
 			}
 		}
@@ -1134,7 +1186,12 @@ export class AutoRebaseService implements Disposable {
 			return {
 				ok: false,
 				reason: 'branch-moved',
-				message: `Can't undo — ${record.branch ?? 'the branch'} has moved since the rebase completed.`,
+				message:
+					record.branch != null
+						? l10n.t("Can't undo — {branch} has moved since the rebase completed.", {
+								branch: record.branch,
+							})
+						: l10n.t("Can't undo — the branch has moved since the rebase completed."),
 			};
 		}
 
@@ -1143,7 +1200,7 @@ export class AutoRebaseService implements Disposable {
 			return {
 				ok: false,
 				reason: 'dirty',
-				message: 'The working tree has changes that would be lost.',
+				message: l10n.t('The working tree has changes that would be lost.'),
 				autostashConflict: record.autostash === 'left-in-stash',
 				// undo() recovers this by stashing (same condition it uses to decide `ifDirty`), so the
 				// summary can still offer Undo — unlike genuine user changes (autostash `none`).
@@ -1152,6 +1209,22 @@ export class AutoRebaseService implements Disposable {
 		}
 
 		return { ok: true };
+	}
+
+	/** Whether git's own record says the rebase actually finished, for the moments HEAD staying at the
+	 *  pre-rebase tip can't tell a genuine no-op completion apart from an external abort — both leave
+	 *  HEAD unmoved, but git tags the reflog entry `rebase (finish): …` or `rebase (abort): …`
+	 *  accordingly regardless. `false` (the conservative default) when reflog is unreadable. */
+	private async rebaseReflogFinished(svc: GitRepositoryService): Promise<boolean> {
+		const git = svc.createUnsafeGit();
+		if (git == null) return false;
+
+		try {
+			const result = await git.run(['reflog', '-1', '--format=%gs', 'HEAD']);
+			return result.stdout.trim().startsWith('rebase (finish)');
+		} catch {
+			return false;
+		}
 	}
 
 	private async listStashMessages(svc: GitRepositoryService): Promise<string[]> {

@@ -47,10 +47,12 @@ export interface GitGraphSubProvider {
 			 */
 			reachabilitySeed?: GraphReachabilityTable;
 			/**
-			 * Prior generation's per-sha stats to CONTINUE (same-repo rebuilds only). Stats are immutable per
-			 * sha, so the deferred stats query recomputes only shas absent from the seed.
+			 * Prior generation's per-sha stats to CONTINUE (same-repo rebuilds only). Reuse requires matching
+			 * ancestry supplied by `ancestrySeed` or `incrementalSeed`; otherwise stats are recomputed.
 			 */
 			rowsStatsSeed?: GitGraphRowsStats;
+			/** Ancestry under which the stats were computed, independent of incremental row eligibility. */
+			ancestrySeed?: Pick<GitGraph, 'shallowBoundary' | 'refTips'>;
 			/**
 			 * R6b incremental head-walk seed. When present (and the gate holds) the Node provider walks only the
 			 * changed head region, stitches the seed's cached tail, and re-derives flags/reachability in memory
@@ -64,6 +66,13 @@ export interface GitGraphSubProvider {
 			 * {@link IncrementalGraphOutcome}.
 			 */
 			onIncrementalResult?: (outcome: IncrementalGraphOutcome) => void;
+			/**
+			 * Set only by {@link GitGraphSession.rebind} — the path the session was bound to before this call.
+			 * Enables the rebind fast path: unchanged tips, HEAD endpoints refetched, flags/reachability
+			 * replayed over the existing window, and every row's `repoPath`-derived decorations re-stamped
+			 * from this path onto `repoPath` (see {@link GraphRowProcessor.restampRow}).
+			 */
+			rebindFromRepoPath?: string;
 		},
 		cancellation?: AbortSignal,
 	): Promise<GitGraph>;
@@ -80,4 +89,16 @@ export interface GitGraphSubProvider {
 		options?: { limit?: number },
 		cancellation?: AbortSignal,
 	): AsyncGenerator<GitGraphSearchProgress, GitGraphSearch, void>;
+	/**
+	 * Counts commits matching `search` without materializing results — used to probe whether a relaxed
+	 * (broadened) variant of a zero-result search would actually find anything, before offering it as a
+	 * calm inline chip. Optional: providers that can't cheaply count (e.g. GitHub) simply omit it, and
+	 * callers treat a missing implementation the same as "no relaxations available" (never an error).
+	 */
+	countSearchResults?(
+		repoPath: string,
+		search: SearchQuery,
+		options?: { maxCount?: number },
+		cancellation?: AbortSignal,
+	): Promise<number>;
 }

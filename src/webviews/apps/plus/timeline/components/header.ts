@@ -1,19 +1,21 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { RepositoryShape } from '../../../../../git/models/repositoryShape.js';
 import type { TimelinePeriod, TimelineScopeType, TimelineSliceBy } from '../../../../plus/timeline/protocol.js';
 import { compactBreadcrumbsConsumerStyles } from '../../../shared/components/breadcrumbs.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/checkbox/checkbox.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/copy-container.js';
 import '../../../shared/components/file-icon/file-icon.js';
 import '../../../shared/components/menu/menu-label.js';
 import '../../../shared/components/menu/menu-popover.js';
-import '../../../shared/components/overlays/popover.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../../shared/components/ref-button.js';
 import '../../../shared/components/ref-name.js';
 import '../../../shared/components/repo-button-group.js';
@@ -24,15 +26,15 @@ import '../../../shared/components/repo-button-group.js';
  *  Exported so the embedded Graph treemap can reuse the same labels for its own period picker —
  *  both viz modes share `graphState.timelinePeriod`, so their pickers stay in lockstep. */
 export const periodLabels: Record<TimelinePeriod, string> = {
-	'7|D': '1 week',
-	'1|M': '1 month',
-	'3|M': '3 months',
-	'6|M': '6 months',
-	'9|M': '9 months',
-	'1|Y': '1 year',
-	'2|Y': '2 years',
-	'4|Y': '4 years',
-	all: 'All time',
+	'7|D': l10n.t('1 week'),
+	'1|M': l10n.t('1 month'),
+	'3|M': l10n.t('3 months'),
+	'6|M': l10n.t('6 months'),
+	'9|M': l10n.t('9 months'),
+	'1|Y': l10n.t('1 year'),
+	'2|Y': l10n.t('2 years'),
+	'4|Y': l10n.t('4 years'),
+	all: l10n.t('All time'),
 };
 
 const dayMs = 24 * 60 * 60 * 1000;
@@ -46,26 +48,26 @@ function formatVisibleSpan(ms: number): string {
 	const days = ms / dayMs;
 	if (days < 1) {
 		const hours = Math.max(1, Math.round(ms / (60 * 60 * 1000)));
-		return hours === 1 ? '1 hour' : `${hours} hours`;
+		return formatPlural(l10n.t('{0, plural, one{{0} hour} other{{0} hours}}'), [hours]);
 	}
 	if (days < 2 * weekDays) {
 		const d = Math.max(1, Math.round(days));
-		return d === 1 ? '1 day' : `${d} days`;
+		return formatPlural(l10n.t('{0, plural, one{{0} day} other{{0} days}}'), [d]);
 	}
 	if (days < 2 * monthDays) {
 		const w = Math.round(days / weekDays);
-		return w === 1 ? '1 week' : `${w} weeks`;
+		return formatPlural(l10n.t('{0, plural, one{{0} week} other{{0} weeks}}'), [w]);
 	}
 
 	const months = days / monthDays;
 	if (months < 24) {
 		const m = Math.max(1, Math.round(months));
-		return m === 1 ? '1 month' : `${m} months`;
+		return formatPlural(l10n.t('{0, plural, one{{0} month} other{{0} months}}'), [m]);
 	}
 
 	const years = months / 12;
 	const rounded = years >= 10 ? Math.round(years) : Number(years.toFixed(1));
-	return rounded === 1 ? '1 year' : `${rounded} years`;
+	return formatPlural(l10n.t('{0, plural, one{{0} year} other{{0} years}}'), [rounded]);
 }
 
 /** Props that fully describe the timeline header's render state. Both the standalone Visual
@@ -110,9 +112,9 @@ export class GlTimelineHeader extends LitElement {
 			}
 
 			/* When embedded inside the Graph webview's Visual History, the surrounding header
-	 * row already supplies horizontal/vertical padding and the visualization-switcher
-	 * sits to our left. Dropping our own margin keeps the two-visualization header
-	 * heights aligned so toggling between Timeline and Treemap doesn't jump the chart. */
+* row already supplies horizontal/vertical padding and the visualization-switcher
+* sits to our left. Dropping our own margin keeps the two-visualization header
+* heights aligned so toggling between Timeline and Treemap doesn't jump the chart. */
 			:host([host='graph']) .header {
 				margin: 0;
 			}
@@ -139,13 +141,13 @@ export class GlTimelineHeader extends LitElement {
 				align-items: center;
 
 				/* Slotted into <gl-breadcrumbs>; the host is display: flex with item orders
-		   at idx * 2. Push to the end of the chain via flex order. */
+ at idx * 2. Push to the end of the chain via flex order. */
 				order: 9999;
 				margin-left: var(--gl-space-4);
 
 				/* Match the breadcrumbs' compact density: smaller font, smaller icons, tighter
-	   button padding. The buttons sit visually adjacent to the crumb chain so they
-	   need to share its size scale or they look like a different control set. */
+button padding. The buttons sit visually adjacent to the crumb chain so they
+need to share its size scale or they look like a different control set. */
 				font-size: var(--gl-font-md);
 				--code-icon-size: 1.3rem;
 			}
@@ -155,14 +157,14 @@ export class GlTimelineHeader extends LitElement {
 				--button-line-height: 1.2;
 
 				/* Match the breadcrumb-item's fixed min-height so icon-only buttons (the Clear
-		   ×) and icon+text buttons (Choose) end up the same height regardless of
-		   content. Without this, the icon-only one is ~1.4px shorter. */
+ ×) and icon+text buttons (Choose) end up the same height regardless of
+ content. Without this, the icon-only one is ~1.4px shorter. */
 				min-height: 1.8rem;
 			}
 
 			/* Style hr inside slotted tooltip content (e.g. gl-ref-button's "Change Reference..."
-	   tooltip in the View Options popover). Browser default hr is a thick beveled line
-	   that looks wrong inside the dark tooltip body. */
+tooltip in the View Options popover). Browser default hr is a thick beveled line
+that looks wrong inside the dark tooltip body. */
 			[slot='tooltip'] hr {
 				margin: var(--gl-space-4) 0;
 				border: none;
@@ -179,8 +181,8 @@ export class GlTimelineHeader extends LitElement {
 			}
 
 			/* Pill renders as a popover-anchor button — strip default <button> chrome so it reads
-	   as the same compact label-with-chevron the static span renders, then add the hover/
-	   focus affordance to advertise interactivity. */
+as the same compact label-with-chevron the static span renders, then add the hover/
+focus affordance to advertise interactivity. */
 			.details__timeframe--button {
 				display: inline-flex;
 				gap: var(--gl-space-2);
@@ -340,7 +342,7 @@ export class GlTimelineHeader extends LitElement {
 	}
 
 	private renderBreadcrumbs() {
-		return html`<gl-breadcrumbs density="compact" label="Visual History scope">
+		return html`<gl-breadcrumbs density="compact" label=${l10n.t('Visual History scope')}>
 			${this.renderRepositoryBreadcrumbItem()}${this.renderBranchBreadcrumbItem()}${this.renderPathItems()}
 			${this.showFolderPicker ? this.renderPathActions() : nothing}
 		</gl-breadcrumbs>`;
@@ -360,7 +362,7 @@ export class GlTimelineHeader extends LitElement {
 			type="repo"
 		>
 			<gl-repo-button-group
-				aria-label="Visualize Repository History"
+				aria-label=${l10n.t('Visualize Repository History')}
 				.connectIcon=${false}
 				.hasMultipleRepositories=${this.repositoryCount > 1}
 				.icon=${false}
@@ -369,7 +371,7 @@ export class GlTimelineHeader extends LitElement {
 				@gl-click=${this.onChangeScope}
 			>
 				<span slot="tooltip">
-					Visualize Repository History
+					${l10n.t('Visualize Repository History')}
 					<hr />
 					${repo.name}
 				</span>
@@ -384,17 +386,17 @@ export class GlTimelineHeader extends LitElement {
 		const showAllBranches = this.showAllBranches;
 		return html`<gl-breadcrumb-item
 			icon="${showAllBranches ? 'git-branch' : getRefIcon(headRef)}"
-			label="${showAllBranches ? 'All Branches' : (headRef?.name ?? 'Branch')}"
+			label="${showAllBranches ? l10n.t('All Branches') : (headRef?.name ?? l10n.t('Branch'))}"
 			priority="4"
 			shrink="100000"
 			type="ref"
 		>
 			<gl-ref-button .ref=${showAllBranches ? undefined : headRef} @click=${this.onChooseHeadRef}>
-				<span slot="empty">All Branches</span>
+				<span slot="empty">${l10n.t('All Branches')}</span>
 				<span slot="tooltip">
-					Change Reference...
+					${l10n.t('Change Reference...')}
 					<hr />
-					${showAllBranches ? 'Showing All Branches' : html`<gl-ref-name icon .ref=${headRef}></gl-ref-name>`}
+					${showAllBranches ? l10n.t('Showing All Branches') : html`<gl-ref-name icon .ref=${headRef}></gl-ref-name>`}
 				</span>
 			</gl-ref-button>
 		</gl-breadcrumb-item>`;
@@ -424,7 +426,7 @@ export class GlTimelineHeader extends LitElement {
 					priority="3"
 					type="${'folder' satisfies TimelineScopeType}"
 					value="${rootPart}"
-					aria-label="Visualize folder history of ${rootPart}"
+					aria-label=${l10n.t('Visualize folder history of {0}', rootPart)}
 					@click=${this.onChangeScope}
 				>
 					${rootPart}
@@ -444,7 +446,7 @@ export class GlTimelineHeader extends LitElement {
 						priority="${segPriority}"
 						type="${'folder' satisfies TimelineScopeType}"
 						value="${segPath}"
-						aria-label="Visualize folder history of ${segPath}"
+						aria-label=${l10n.t('Visualize folder history of {0}', segPath)}
 						@click=${this.onChangeScope}
 					>
 						${part}
@@ -469,7 +471,7 @@ export class GlTimelineHeader extends LitElement {
 				${isFile ? html`<gl-file-icon slot="start" filename="${basePart}"></gl-file-icon>` : nothing}
 				<gl-copy-container
 					tabindex="0"
-					copyLabel="Copy Path&#10;&#10;${path}"
+					copyLabel=${l10n.t('Copy Path\n\n{0}', path)}
 					.content=${path}
 					placement="bottom"
 				>
@@ -495,8 +497,8 @@ export class GlTimelineHeader extends LitElement {
 							appearance="toolbar"
 							density="compact"
 							@click=${this.onClearScope}
-							tooltip="Clear File / Folder Filter"
-							aria-label="Clear File / Folder Filter"
+							tooltip=${l10n.t('Clear File / Folder Filter')}
+							aria-label=${l10n.t('Clear File / Folder Filter')}
 							><code-icon icon="close"></code-icon
 						></gl-button>`
 					: nothing
@@ -505,9 +507,10 @@ export class GlTimelineHeader extends LitElement {
 				appearance="toolbar"
 				density="compact"
 				@click=${this.onChoosePath}
-				tooltip="Choose File or Folder to Visualize..."
-				aria-label="Choose File or Folder to Visualize..."
-				><code-icon slot="prefix" icon="folder-opened"></code-icon>Choose File / Folder...</gl-button
+				tooltip=${l10n.t('Choose File or Folder to Visualize...')}
+				aria-label=${l10n.t('Choose File or Folder to Visualize...')}
+				><code-icon slot="prefix" icon="folder-opened"></code-icon
+				>${l10n.t('Choose File / Folder...')}</gl-button
 			>
 		</span>`;
 	}
@@ -543,7 +546,7 @@ export class GlTimelineHeader extends LitElement {
 				slot="anchor"
 				class="details__timeframe details__timeframe--button"
 				type="button"
-				aria-label="Change default time range"
+				aria-label=${l10n.t('Change default time range')}
 			>
 				${label}<code-icon icon="chevron-down"></code-icon>
 			</button>
@@ -559,11 +562,11 @@ export class GlTimelineHeader extends LitElement {
 
 	private renderConfigPopover() {
 		return html`<gl-popover placement="bottom" trigger="hover focus click">
-			<gl-button slot="anchor" appearance="toolbar" aria-label="Timeline Options">
+			<gl-button slot="anchor" appearance="toolbar" aria-label=${l10n.t('Timeline Options')}>
 				<code-icon icon="settings"></code-icon>
 			</gl-button>
 			<div slot="content" class="config__content">
-				<menu-label>View Options</menu-label>
+				<menu-label>${l10n.t('View Options')}</menu-label>
 				${this.renderConfigHead()} ${this.renderConfigShowAllBranches()} ${this.renderPeriodSelect()}
 			</div>
 		</gl-popover>`;
@@ -579,7 +582,7 @@ export class GlTimelineHeader extends LitElement {
 		const disabled = showAllBranches && this.sliceBy !== 'branch';
 
 		return html`<section>
-			<label for="head" ?disabled=${disabled}>Branch</label>
+			<label for="head" ?disabled=${disabled}>${l10n.t('Branch')}</label>
 			<gl-ref-button
 				name="head"
 				?disabled=${disabled}
@@ -589,9 +592,9 @@ export class GlTimelineHeader extends LitElement {
 				@click=${this.onChooseHeadRef}
 			>
 				<span slot="tooltip">
-					Change Reference...
+					${l10n.t('Change Reference...')}
 					<hr />
-					${showAllBranches ? 'Showing All Branches' : html`<gl-ref-name icon .ref=${headRef}></gl-ref-name>`}
+					${showAllBranches ? l10n.t('Showing All Branches') : html`<gl-ref-name icon .ref=${headRef}></gl-ref-name>`}
 				</span>
 			</gl-ref-button>
 		</section>`;
@@ -601,7 +604,7 @@ export class GlTimelineHeader extends LitElement {
 		if (!this.showAllBranchesSupported) return nothing;
 		return html`<section>
 			<gl-checkbox value="all" .checked=${this.showAllBranches} @gl-change-value=${this.onShowAllBranchesChanged}
-				>View All Branches</gl-checkbox
+				>${l10n.t('View All Branches')}</gl-checkbox
 			>
 		</section>`;
 	}
@@ -610,20 +613,20 @@ export class GlTimelineHeader extends LitElement {
 		const period = this.period;
 		return html`<section>
 			<span class="select-container">
-				<label for="periods">Default time range</label>
+				<label for="periods">${l10n.t('Default time range')}</label>
 				<select class="select" name="periods" .value=${period} @change=${this.onPeriodChanged}>
-					<option value="7|D" ?selected=${period === '7|D'}>1 week</option>
-					<option value="1|M" ?selected=${period === '1|M'}>1 month</option>
-					<option value="3|M" ?selected=${period === '3|M'}>3 months</option>
-					<option value="6|M" ?selected=${period === '6|M'}>6 months</option>
-					<option value="9|M" ?selected=${period === '9|M'}>9 months</option>
-					<option value="1|Y" ?selected=${period === '1|Y'}>1 year</option>
-					<option value="2|Y" ?selected=${period === '2|Y'}>2 years</option>
-					<option value="4|Y" ?selected=${period === '4|Y'}>4 years</option>
-					<option value="all" ?selected=${period === 'all'}>Full history</option>
+					<option value="7|D" ?selected=${period === '7|D'}>${l10n.t('1 week')}</option>
+					<option value="1|M" ?selected=${period === '1|M'}>${l10n.t('1 month')}</option>
+					<option value="3|M" ?selected=${period === '3|M'}>${l10n.t('3 months')}</option>
+					<option value="6|M" ?selected=${period === '6|M'}>${l10n.t('6 months')}</option>
+					<option value="9|M" ?selected=${period === '9|M'}>${l10n.t('9 months')}</option>
+					<option value="1|Y" ?selected=${period === '1|Y'}>${l10n.t('1 year')}</option>
+					<option value="2|Y" ?selected=${period === '2|Y'}>${l10n.t('2 years')}</option>
+					<option value="4|Y" ?selected=${period === '4|Y'}>${l10n.t('4 years')}</option>
+					<option value="all" ?selected=${period === 'all'}>${l10n.t('Full history')}</option>
 				</select>
 			</span>
-			<small class="config__help">Older history loads dynamically as you scroll</small>
+			<small class="config__help">${l10n.t('Older history loads dynamically as you scroll')}</small>
 		</section>`;
 	}
 
@@ -640,8 +643,8 @@ export class GlTimelineHeader extends LitElement {
 					appearance="toolbar"
 					role="switch"
 					aria-checked=${isAuthor ? 'true' : 'false'}
-					aria-label="Slice by Author"
-					tooltip=${disabled ? '' : 'Slice by Author'}
+					aria-label=${l10n.t('Slice by Author')}
+					tooltip=${disabled ? '' : l10n.t('Slice by Author')}
 					?disabled=${disabled}
 					@click=${this.onSliceByAuthor}
 				>
@@ -651,15 +654,15 @@ export class GlTimelineHeader extends LitElement {
 					appearance="toolbar"
 					role="switch"
 					aria-checked=${!isAuthor ? 'true' : 'false'}
-					aria-label="Slice by Branch"
-					tooltip=${disabled ? '' : 'Slice by Branch'}
+					aria-label=${l10n.t('Slice by Branch')}
+					tooltip=${disabled ? '' : l10n.t('Slice by Branch')}
 					?disabled=${disabled}
 					@click=${this.onSliceByBranch}
 				>
 					<code-icon icon="git-branch"></code-icon>
 				</gl-button>
 			</span>
-			<span slot="content">Choose a file or folder to slice by branches</span>
+			<span slot="content">${l10n.t('Choose a file or folder to slice by branches')}</span>
 		</gl-tooltip>`;
 	}
 

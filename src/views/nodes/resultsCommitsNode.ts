@@ -1,4 +1,4 @@
-import { TreeItem, TreeItemCollapsibleState } from 'vscode';
+import { l10n, TreeItem, TreeItemCollapsibleState } from 'vscode';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitRevisionRange } from '@gitlens/git/models/revision.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
@@ -89,7 +89,7 @@ export class ResultsCommitsNodeBase<Type extends TreeViewNodeTypes, View extends
 		const { log } = await this.getCommitsQueryResults();
 		if (!log?.commits.size) {
 			this._onChildrenCompleted?.fulfill();
-			return [new MessageNode(this.view, this, 'No results found')];
+			return [new MessageNode(this.view, this, l10n.t('No results found'))];
 		}
 
 		const getBranchAndTagTips = await this.view.container.git
@@ -274,7 +274,7 @@ export class ResultsCommitsNodeBase<Type extends TreeViewNodeTypes, View extends
 		const { log } = await this.getCommitsQueryResults();
 		if (log == null) return { changes: [], range: range };
 
-		return getChangesForChangelog(this.view.container, range, log);
+		return getChangesForChangelog(this.view.container, range, [...log.commits.values()]);
 	}
 }
 

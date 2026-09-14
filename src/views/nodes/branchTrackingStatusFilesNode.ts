@@ -1,4 +1,4 @@
-import { TreeItem, TreeItemCollapsibleState } from 'vscode';
+import { l10n, TreeItem, TreeItemCollapsibleState } from 'vscode';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitFileWithCommit } from '@gitlens/git/models/file.js';
@@ -6,7 +6,8 @@ import { createRevisionRange } from '@gitlens/git/utils/revision.utils.js';
 import { makeHierarchical } from '@gitlens/utils/array.js';
 import { filter, flatMap, groupByMap, map } from '@gitlens/utils/iterable.js';
 import { joinPaths, normalizePath } from '@gitlens/utils/path.js';
-import { pluralize, sortCompare } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { sortCompare } from '@gitlens/utils/string.js';
 import type { FilesComparison } from '../../git/actions/commit.js';
 import { GitUri } from '../../git/gitUri.js';
 import { getCommitDate } from '../../git/utils/-webview/commit.utils.js';
@@ -50,7 +51,10 @@ export class BranchTrackingStatusFilesNode extends ViewNode<'tracking-status-fil
 			repoPath: this.repoPath,
 			ref1: this.ref1,
 			ref2: this.ref2,
-			title: this.direction === 'ahead' ? `Changes to push to ${this.ref2}` : `Changes to pull from ${this.ref2}`,
+			title:
+				this.direction === 'ahead'
+					? l10n.t('Changes to push to {0}', this.ref2)
+					: l10n.t('Changes to pull from {0}', this.ref2),
 		};
 	}
 
@@ -113,7 +117,7 @@ export class BranchTrackingStatusFilesNode extends ViewNode<'tracking-status-fil
 			.diff.getChangedFilesCount(this.direction === 'behind' ? `${this.ref1}...${this.ref2}` : `${this.ref2}...`);
 		const files = stats?.files ?? 0;
 
-		const label = `${pluralize('file', files)} changed`;
+		const label = formatPlural(l10n.t('{0, plural, one{{0} file changed} other{{0} files changed}}'), [files]);
 		const item = new TreeItem(label, TreeItemCollapsibleState.Collapsed);
 		item.id = this.id;
 		item.contextValue = ContextValues.BranchStatusFiles;

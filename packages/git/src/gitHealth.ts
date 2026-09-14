@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import type {
 	GitHealthSnapshot,
 	GitMaintenanceTask,
@@ -14,8 +15,10 @@ import type {
 export const trackedFilesThreshold = 10_000;
 /** Loose-object estimate at/above which the `loose-objects` maintenance task is worth running. */
 export const looseObjectsThreshold = 5_000;
-/** Pack-file count at/above which the `incremental-repack` maintenance task is worth running. */
-export const packCountThreshold = 20;
+/** Git's default uncovered-pack threshold for the `incremental-repack` auto condition. */
+export const packsOutsideMultiPackIndexThreshold = 10;
+/** Loose refs at/above which packing the files ref backend avoids repeated filesystem traversal. */
+export const looseRefsThreshold = 256;
 /** Total pack bytes at/above which a repo counts as "clearly large" for the banner gate (~1 GiB). */
 export const largePackBytesThreshold = 1024 ** 3;
 /** Rough bytes-per-entry of a git v2 index — turns `.git/index` size into a tracked-file-count proxy. */
@@ -23,8 +26,16 @@ export const approxBytesPerIndexEntry = 80;
 /** Duration (ms) above which a git command is "slow" — mirrors the exec-layer slow-call threshold. */
 export const slowCommandThresholdMs = 2000;
 
-/** Persisted passive-slowness summary per repo (rides the `onSlowCommand` exec hook). */
-export interface GitHealthSlowness {
+/**
+ * Git operation families whose runtime maps to a distinct repository optimization surface.
+ * `history` is a plain walk (`log`/`rev-list`/`blame`); `commitFiles` is a paged log that also
+ * carries per-commit file details (`--numstat` diffs every changed blob), which is slow for a
+ * different reason and drives a different lever.
+ */
+export type GitHealthSlownessCategory = 'worktree' | 'history' | 'refs' | 'objects' | 'commitFiles';
+
+/** Persisted passive-slowness sample for one operation family. */
+export interface GitHealthSlownessSample {
 	/** Number of slow git commands observed for this repo. */
 	readonly count: number;
 	/** Epoch ms of the most recent slow command. */
@@ -33,13 +44,22 @@ export interface GitHealthSlowness {
 	readonly maxDurationMs: number;
 }
 
+/** Per-repo passive-slowness summary, split so recommendations only target the affected operation family. */
+export type GitHealthSlowness = Partial<Record<GitHealthSlownessCategory, GitHealthSlownessSample>>;
+
 export type GitOptimizationTier = 'auto' | 'ask';
 
 /** Coarse duration buckets for maintenance telemetry. */
 export type GitHealthDurationBucket = '<1s' | '1-5s' | '5-15s' | '15-60s' | '>60s';
 
 /** Which measured signal tripped a finding (drives view copy + telemetry buckets). */
-export type GitHealthFindingReason = 'looseObjects' | 'packCount' | 'trackedFiles' | 'largePacks' | 'slowness';
+export type GitHealthFindingReason =
+	| 'looseObjects'
+	| 'looseRefs'
+	| 'packsOutsideMultiPackIndex'
+	| 'trackedFiles'
+	| 'largePacks'
+	| 'worktreeSlowness';
 
 /** A single recommendation: a lever to apply, its tier, and the evidence that triggered it. */
 export interface GitHealthFinding {
@@ -57,15 +77,22 @@ export interface GitHealthFinding {
 
 export interface GitHealthReport {
 	readonly findings: readonly GitHealthFinding[];
+	/** Repository shape that scopes local history, object, and working-tree measurements. */
+	readonly repository: GitHealthSnapshot['repository'];
 	/** Whether the repo is "clearly large" (any working-tree threshold met, or pack bytes ≥ ~1 GiB). */
 	readonly clearlyLarge: boolean;
 	/** Extrapolated loose-object count (from the probe sample). */
 	readonly estimatedLooseObjects: number;
-	/** Extrapolated tracked-file count (from the index-bytes proxy, or exact — see {@link trackedFilesExact}). */
+	/** Loose refs found by the bounded files-backend probe. */
+	readonly looseRefs: { readonly count: number; readonly exact: boolean };
+	/** Repository-size signal from the index; see {@link trackedFilesScope} for how to interpret it. */
 	readonly estimatedTrackedFiles: number;
-	/** `true` when {@link estimatedTrackedFiles} is the exact index-header count rather than the byte-size proxy. */
+	/** `true` when {@link estimatedTrackedFiles} is the exact repository-wide count from a normal index. */
 	readonly trackedFilesExact: boolean;
+	/** Whether the displayed count covers the repository, a sparse working set, or is only a byte-size estimate. */
+	readonly trackedFilesScope: 'repository' | 'sparseWorkingTree' | 'estimate';
 	readonly packCount: number;
+	readonly packsOutsideMultiPackIndex: number | undefined;
 	readonly packBytes: number;
 	readonly commitGraph: {
 		readonly present: boolean;
@@ -108,9 +135,21 @@ export function computeHealthReport(
 		snapshot.looseObjects.objectsInSampledDirs,
 		snapshot.looseObjects.dirsSampled,
 	);
-	// Prefer the exact index-header count over the byte-size proxy whenever it's available.
-	const estimatedTrackedFiles = snapshot.indexEntryCount ?? estimateTrackedFiles(snapshot.indexBytes);
-	const trackedFilesExact = snapshot.indexEntryCount != null;
+	// A normal index header is the exact tracked-file count. A sparse index header is still a useful exact
+	// count of its populated working set, but not of the whole repository. A split index header covers only
+	// the mutable layer and conflict stages duplicate paths, so neither raw count is used.
+	const useIndexEntryCount =
+		snapshot.indexEntryCount != null &&
+		(snapshot.indexEntryCountType === 'full' || snapshot.indexEntryCountType === 'sparse');
+	const estimatedTrackedFiles = useIndexEntryCount
+		? snapshot.indexEntryCount
+		: estimateTrackedFiles(snapshot.indexBytes);
+	const trackedFilesExact = useIndexEntryCount && snapshot.indexEntryCountType === 'full';
+	const trackedFilesScope = trackedFilesExact
+		? 'repository'
+		: useIndexEntryCount && snapshot.indexEntryCountType === 'sparse'
+			? 'sparseWorkingTree'
+			: 'estimate';
 	const largeWorkingTree = estimatedTrackedFiles >= trackedFilesThreshold;
 	const clearlyLarge = largeWorkingTree || snapshot.packBytes >= largePackBytesThreshold;
 
@@ -129,15 +168,37 @@ export function computeHealthReport(
 				action: { kind: 'maintenance', task: 'loose-objects' },
 			});
 		}
-		if (snapshot.packCount >= packCountThreshold) {
+		const incrementalRepackThreshold = snapshot.incrementalRepackAutoThreshold;
+		const incrementalRepackDue =
+			snapshot.multiPackIndexEnabled === true &&
+			snapshot.packsOutsideMultiPackIndex != null &&
+			incrementalRepackThreshold != null &&
+			incrementalRepackThreshold !== 0 &&
+			(incrementalRepackThreshold < 0
+				? snapshot.packCount > 0
+				: snapshot.packsOutsideMultiPackIndex >= incrementalRepackThreshold);
+		if (incrementalRepackDue) {
 			findings.push({
 				tier: 'auto',
-				reason: 'packCount',
-				value: snapshot.packCount,
-				threshold: packCountThreshold,
+				reason: 'packsOutsideMultiPackIndex',
+				value: snapshot.packsOutsideMultiPackIndex,
+				threshold: incrementalRepackThreshold,
 				action: { kind: 'maintenance', task: 'incremental-repack' },
 			});
 		}
+	}
+	if (
+		snapshot.supportsPackRefsMaintenance &&
+		snapshot.repository.refFormat === 'files' &&
+		snapshot.looseRefs.count >= looseRefsThreshold
+	) {
+		findings.push({
+			tier: 'auto',
+			reason: 'looseRefs',
+			value: snapshot.looseRefs.count,
+			threshold: looseRefsThreshold,
+			action: { kind: 'maintenance', task: 'pack-refs' },
+		});
 	}
 
 	// Large-working-tree levers share the same evidence; they differ only in tier and eligibility.
@@ -164,39 +225,63 @@ export function computeHealthReport(
 			// Skip if already on or it previously failed to start for this repo.
 			eligible: !snapshot.config.fsmonitor && !snapshot.fsmonitorNotApplicable,
 		},
-		{ id: 'manyFiles', tier: 'ask', eligible: !snapshot.config.manyFiles },
+		{
+			id: 'manyFiles',
+			tier: 'ask',
+			// `manyFiles` defaults the untracked cache on, so a repo whose filesystem already failed that
+			// probe must not be offered it either — unless the user's own explicit `core.untrackedCache`
+			// setting overrides the default, in which case the probe result is moot.
+			eligible:
+				!snapshot.config.manyFiles &&
+				!(snapshot.untrackedCacheNotApplicable && !snapshot.config.untrackedCacheConfigured),
+		},
+		{
+			id: 'sparseIndex',
+			tier: 'ask',
+			// Sparse-directory entries are safe only in cone mode. Require a normal full index so this
+			// recommendation is based on the repository-wide path count, not a split/conflicted approximation.
+			eligible:
+				snapshot.repository.sparseCheckout === true &&
+				snapshot.repository.sparseCheckoutCone === true &&
+				snapshot.repository.sparseIndex === false &&
+				snapshot.repository.splitIndex === false &&
+				snapshot.indexEntryCountType === 'full',
+		},
 	];
-	if (largeWorkingTree) {
+	const worktreeSlowness = slowness?.worktree;
+	const worktreeSlownessObserved = (worktreeSlowness?.count ?? 0) > 0;
+	if (largeWorkingTree || worktreeSlownessObserved) {
+		const evidence: Pick<GitHealthFinding, 'reason' | 'value' | 'threshold'> = largeWorkingTree
+			? trackedFilesEvidence
+			: {
+					reason: 'worktreeSlowness',
+					value: worktreeSlowness?.maxDurationMs ?? 0,
+					threshold: slowCommandThresholdMs,
+				};
 		for (const lever of workingTreeLevers) {
 			if (!lever.eligible || !supported(lever.id)) continue;
 
 			findings.push({
 				tier: lever.tier,
-				...trackedFilesEvidence,
+				...evidence,
 				action: { kind: 'optimization', id: lever.id },
 			});
 		}
 	}
 
 	// Ask tier — system-scheduled background maintenance. Suggested for a not-yet-registered repo that's
-	// either clearly large OR where passive slowness has been observed (its value is that it also runs
-	// when VS Code is closed, so a chronically slow repo benefits even if it isn't huge on disk).
-	const slownessObserved = (slowness?.count ?? 0) > 0;
+	// clearly large. Passive slowness is deliberately NOT enough: worktree slowness maps to the worktree
+	// levers above, history is already covered by demand commit-graph writes, and ref/object maintenance has
+	// its own measured auto-tier conditions. A generic scheduler recommendation would promise the wrong fix.
 	// `=== false`, not falsy: `undefined` means the registration list couldn't be read, and an unknown state
 	// must never be suggested away — that's how a user's own registration gets silently reclaimed by Undo.
-	if (
-		(clearlyLarge || slownessObserved) &&
-		snapshot.maintenanceRegistered === false &&
-		supported('backgroundMaintenance')
-	) {
+	if (clearlyLarge && snapshot.maintenanceRegistered === false && supported('backgroundMaintenance')) {
 		// Resolve the evidence once so reason/value/threshold can never drift apart. Ordered so each
 		// suggestion argues from its most DISTINCTIVE signal rather than whichever crossed first: a repo
 		// large by both file count and pack bytes would otherwise attach the same tracked-files evidence to
 		// this finding as to the fsmonitor/manyFiles findings, and the view would show two identical meters.
 		let evidence: Pick<GitHealthFinding, 'reason' | 'value' | 'threshold'>;
-		if (!clearlyLarge && slownessObserved) {
-			evidence = { reason: 'slowness', value: slowness?.maxDurationMs ?? 0, threshold: slowCommandThresholdMs };
-		} else if (snapshot.packBytes >= largePackBytesThreshold) {
+		if (snapshot.packBytes >= largePackBytesThreshold) {
 			evidence = { reason: 'largePacks', value: snapshot.packBytes, threshold: largePackBytesThreshold };
 		} else {
 			evidence = trackedFilesEvidence;
@@ -210,11 +295,15 @@ export function computeHealthReport(
 
 	return {
 		findings: findings,
+		repository: snapshot.repository,
 		clearlyLarge: clearlyLarge,
 		estimatedLooseObjects: estimatedLooseObjects,
+		looseRefs: snapshot.looseRefs,
 		estimatedTrackedFiles: estimatedTrackedFiles,
 		trackedFilesExact: trackedFilesExact,
+		trackedFilesScope: trackedFilesScope,
 		packCount: snapshot.packCount,
+		packsOutsideMultiPackIndex: snapshot.packsOutsideMultiPackIndex,
 		packBytes: snapshot.packBytes,
 		commitGraph: snapshot.commitGraph,
 	};
@@ -251,8 +340,9 @@ export interface GitHealthLever {
 
 /** Consequences that reach beyond GitLens, surfaced on the apply action itself. */
 const leverNotes: Partial<Record<GitOptimizationId, string>> = {
-	backgroundMaintenance:
+	backgroundMaintenance: l10n.t(
 		'Adds a task to your operating system’s scheduler. Undo unregisters this repository, but leaves the scheduler itself in place.',
+	),
 };
 
 /**
@@ -275,15 +365,17 @@ export function computeLevers(
 		// `=== true`, not the raw (possibly `undefined`) value — an unreadable registration is handled as its
 		// own status below, and must never fall through to "enabled".
 		backgroundMaintenance: snapshot.maintenanceRegistered === true,
+		sparseIndex: snapshot.repository.sparseIndex === true,
 	};
 	const blocked: Partial<Record<GitOptimizationId, boolean>> = {
 		untrackedCache: snapshot.untrackedCacheNotApplicable,
 		fsmonitor: snapshot.fsmonitorNotApplicable,
+		manyFiles: snapshot.untrackedCacheNotApplicable && !snapshot.config.untrackedCacheConfigured,
 	};
 
 	return capabilities.map<GitHealthLever>(capability => {
 		const id = capability.id;
-		const note = leverNotes[id];
+		const note = capability.note ?? leverNotes[id];
 		// Every optimization lever is ask-tier now — the auto tier only ever runs maintenance tasks.
 		const tier: GitOptimizationTier = 'ask';
 
@@ -299,7 +391,7 @@ export function computeLevers(
 				id: id,
 				status: 'unavailable',
 				tier: tier,
-				reason: "Couldn't read Git's maintenance registration — try reopening the repository",
+				reason: l10n.t("Couldn't read Git's maintenance registration — try reopening the repository"),
 				note: note,
 				checkFailed: true,
 			};
@@ -307,6 +399,59 @@ export function computeLevers(
 		// Then ownership, which is what decides whether Undo is offered at all.
 		if (enabled[id]) {
 			return { id: id, status: snapshot.applied[id] ? 'applied' : 'userEnabled', tier: tier, note: note };
+		}
+		if (id === 'sparseIndex') {
+			if (
+				snapshot.repository.sparseCheckout == null ||
+				snapshot.repository.sparseCheckoutCone == null ||
+				snapshot.repository.sparseIndex == null ||
+				snapshot.repository.splitIndex == null
+			) {
+				return {
+					id: id,
+					status: 'unavailable',
+					tier: tier,
+					reason: l10n.t("Couldn't determine this worktree’s sparse-checkout and index configuration"),
+					note: note,
+					checkFailed: true,
+				};
+			}
+			if (!snapshot.repository.sparseCheckout) {
+				return {
+					id: id,
+					status: 'notApplicable',
+					tier: tier,
+					reason: l10n.t('This worktree is not using sparse checkout.'),
+					note: note,
+				};
+			}
+			if (!snapshot.repository.sparseCheckoutCone) {
+				return {
+					id: id,
+					status: 'notApplicable',
+					tier: tier,
+					reason: l10n.t('Sparse indexes require cone-mode sparse checkout.'),
+					note: note,
+				};
+			}
+			if (snapshot.repository.splitIndex || snapshot.indexEntryCountType === 'split') {
+				return {
+					id: id,
+					status: 'notApplicable',
+					tier: tier,
+					reason: l10n.t('This worktree uses a split index; disable it before enabling a sparse index.'),
+					note: note,
+				};
+			}
+			if (snapshot.indexEntryCountType === 'conflicted') {
+				return {
+					id: id,
+					status: 'notApplicable',
+					tier: tier,
+					reason: l10n.t('Finish the current merge or rebase before enabling a sparse index.'),
+					note: note,
+				};
+			}
 		}
 		// `notApplicable` means GitLens TRIED here and this repo can't use it — the gk marker records that.
 		// `capability.note` is the supported-with-caveat field, not an unavailability reason, so the
@@ -318,8 +463,14 @@ export function computeLevers(
 				tier: tier,
 				reason:
 					id === 'fsmonitor'
-						? 'The file system monitor could not start for this repository.'
-						: 'This file system does not report directory changes reliably, so Git would return incorrect status results.',
+						? l10n.t('The file system monitor could not start for this repository.')
+						: id === 'manyFiles'
+							? l10n.t(
+									'This would enable the untracked cache, but this file system does not report directory changes reliably, so Git would return incorrect status results.',
+								)
+							: l10n.t(
+									'This file system does not report directory changes reliably, so Git would return incorrect status results.',
+								),
 				note: note,
 			};
 		}
@@ -354,11 +505,29 @@ export function getAutoOptimizations(report: GitHealthReport): GitOptimizationId
 }
 
 /**
- * Banner rule: fire only when the report contains an ask-tier fix AND the repo is clearly large OR
- * passive slowness has been observed. Small, fast repos never see it.
+ * Banner rule: fire only when the report contains an ask-tier fix and the repo is clearly large or slow in
+ * the working-tree family. History/ref/object slowness must not advertise unrelated worktree levers.
  */
 export function isBannerEligible(report: GitHealthReport, slowness: GitHealthSlowness | undefined): boolean {
 	const hasAskTierFix = report.findings.some(f => f.tier === 'ask');
-	const slownessObserved = (slowness?.count ?? 0) > 0;
-	return hasAskTierFix && (report.clearlyLarge || slownessObserved);
+	const worktreeSlownessObserved = (slowness?.worktree?.count ?? 0) > 0;
+	return hasAskTierFix && (report.clearlyLarge || worktreeSlownessObserved);
+}
+
+/** Evidence-gated banner state for one repository — undefined when the banner has nothing to say. */
+export interface GitHealthBannerState {
+	/** Show the in-graph banner strip (eligible and not explicitly dismissed). */
+	readonly banner: boolean;
+	/** Show the evidence dot on the Visualizations & Health toggle (eligible, view not visited recently). */
+	readonly indicator: boolean;
+	/** Which evidence family armed it — measured worktree slowness, or repo scale alone. */
+	readonly reason: 'slowness' | 'large';
+	/** Worst observed slow-command duration (ms); present when reason is 'slowness'. */
+	readonly maxDurationMs?: number;
+	/** Tracked-file count evidence; present when reason is 'large'. */
+	readonly trackedFiles?: number;
+	/** Whether trackedFiles is exact (report.trackedFilesScope !== 'estimate'). */
+	readonly trackedFilesExact?: boolean;
+	/** Count of levers the health view will show as "suggested" — keep in sync with its verdict. */
+	readonly suggestedCount: number;
 }

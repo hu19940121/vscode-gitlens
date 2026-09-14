@@ -9,9 +9,26 @@
  * - `optimisticFireAndForget` / `optimisticBatchFireAndForget`: Optimistic signal updates with rollback
  * - `entry`: Type-safe factory for OptimisticEntry
  */
+import { ConnectionClosedError, notify } from '@eamodio/supertalk';
+import type { Notify } from '@eamodio/supertalk';
 import type { Signal } from '@lit-labs/signals';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { Resource } from '../state/resource.js';
+
+/**
+ * True for a Supertalk `ConnectionClosedError` — an in-flight call or promise rejected because
+ * the connection was torn down deliberately (`close()`/`reset()`, e.g. a hard refresh), not by a
+ * real failure. Use to keep expected teardown noise out of the error log.
+ */
+export function isConnectionClosedError(ex: unknown): ex is ConnectionClosedError {
+	return ex instanceof ConnectionClosedError;
+}
+
+/** Shared warn-level logging for the `noop`/`noopUnlessReal` rejection handlers below. */
+function warnRejection(ex: unknown, handlerName: string): void {
+	const msg = ex instanceof Error ? ex.message : 'unknown error';
+	Logger.warn(`RPC call rejected (${handlerName} handler): ${msg}`);
+}
 
 /**
  * Lightweight rejection handler for `.then(onFulfilled, noop)` patterns.
@@ -19,10 +36,9 @@ import type { Resource } from '../state/resource.js';
  * NOT set the shared error signal (use `fireRpc` for that).
  */
 export const noop = (ex?: unknown): void => {
-	if (ex != null) {
-		const msg = ex instanceof Error ? ex.message : 'unknown error';
-		Logger.warn(`RPC call rejected (noop handler): ${msg}`);
-	}
+	if (ex == null || isConnectionClosedError(ex)) return;
+
+	warnRejection(ex, 'noop');
 };
 
 /**
@@ -44,11 +60,25 @@ export function isAbortError(ex: unknown): boolean {
  * that accepts an AbortSignal — otherwise expected cancellations spam the log.
  */
 export const noopUnlessReal = (ex?: unknown): void => {
-	if (ex == null || isAbortError(ex)) return;
+	if (ex == null || isAbortError(ex) || isConnectionClosedError(ex)) return;
 
-	const msg = ex instanceof Error ? ex.message : 'unknown error';
-	Logger.warn(`RPC call rejected (noopUnlessReal handler): ${msg}`);
+	warnRejection(ex, 'noopUnlessReal');
 };
+
+/**
+ * Shared closed-vs-error logging for the fire-and-forget RPC helpers below: a deliberate
+ * connection teardown (`ConnectionClosedError`) logs at debug level, anything else at error
+ * level. `suffix` lets a call site append extra context (e.g. ", rolled back") to both messages.
+ */
+function logRpcFailure(ex: unknown, errorContext?: string, suffix: string = ''): void {
+	if (isConnectionClosedError(ex)) {
+		Logger.debug(
+			`RPC call dropped by deliberate connection teardown${errorContext ? ` (${errorContext})` : ''}${suffix}`,
+		);
+	} else {
+		Logger.error(ex, `RPC call failed${errorContext ? ` (${errorContext})` : ''}${suffix}`);
+	}
+}
 
 /**
  * Per-signal version counter for optimistic rollback safety.
@@ -124,7 +154,7 @@ export function optimisticBatchFireAndForget(
 				r.signal.set(r.previous);
 			}
 		}
-		Logger.error(ex, `RPC call failed${errorContext ? ` (${errorContext})` : ''}, rolled back`);
+		logRpcFailure(ex, errorContext, ', rolled back');
 		errorSignal?.set(ex instanceof Error ? ex.message : 'RPC call failed');
 	});
 }
@@ -192,7 +222,7 @@ export function guardedEnrich<T>(
  */
 export function fireAndForget(promise: Promise<unknown>, errorContext?: string): void {
 	promise.catch((ex: unknown) => {
-		Logger.error(ex, `RPC call failed${errorContext ? ` (${errorContext})` : ''}`);
+		logRpcFailure(ex, errorContext);
 	});
 }
 
@@ -206,7 +236,77 @@ export function fireRpc(
 	errorContext?: string,
 ): void {
 	promise.catch((ex: unknown) => {
-		Logger.error(ex, `RPC call failed${errorContext ? ` (${errorContext})` : ''}`);
+		logRpcFailure(ex, errorContext);
 		errorSignal.set(ex instanceof Error ? ex.message : 'RPC call failed');
 	});
+}
+
+/**
+ * Per-session cache of `notify()` wrappers, keyed on the RESOLVED sub-service proxy identity —
+ * `notify()` only works on a resolved remote proxy (it throws on the thenable that wraps it), and
+ * a reconnect yields a new proxy, which naturally falls out of the `WeakMap` and rebuilds its
+ * notifier. Mirrors the memo pattern in graph-wrapper.ts's `_selectionNotifier`, generalized so
+ * every one-way call site shares one cache instead of hand-rolling its own.
+ */
+class NotifierCache {
+	private readonly cache = new WeakMap<object, unknown>();
+
+	get<T extends object>(resolvedService: T): Notify<T> {
+		let notifier = this.cache.get(resolvedService) as Notify<T> | undefined;
+		if (notifier == null) {
+			try {
+				notifier = notify(resolvedService);
+			} catch {
+				// Not a remote proxy (an in-process service or a test stub) — invoke directly,
+				// discarding the result to keep the one-way shape.
+				notifier = new Proxy(resolvedService, {
+					get: (target, prop) => {
+						const member = (target as Record<PropertyKey, unknown>)[prop];
+						if (typeof member !== 'function') return undefined;
+
+						return (...args: unknown[]): void => void member.apply(target, args);
+					},
+				}) as unknown as Notify<T>;
+			}
+			this.cache.set(resolvedService, notifier);
+		}
+		return notifier;
+	}
+}
+
+const notifierCache = new NotifierCache();
+
+/**
+ * One-way fire-and-forget RPC call via supertalk `notify()`. `service` can be an already-resolved
+ * sub-service proxy or a promise for one (e.g. a `cacheRemoteServices`-cached property, which costs
+ * at most one 'get prop' RPC per session); once resolved, `send` gets its memoized notifier to call
+ * through. The notify write itself never rejects — only the resolution can (e.g. a torn-down
+ * connection), and that's routed through {@link fireAndForget}'s `isConnectionClosedError`-aware
+ * logging, tagged with `errorContext`.
+ *
+ * Do not use this for a call whose result is read, awaited for sequencing, or that passes an
+ * `AbortSignal` — `notify()` never settles, so there's nothing to await and no signal-release hook.
+ */
+export function notifyService<T extends object>(
+	service: T | Promise<T>,
+	errorContext: string,
+	send: (notifier: Notify<T>) => void,
+): void {
+	// An already-resolved service (no thenable surface) sends synchronously — matching the direct
+	// method call this replaces; only unresolved thenables (e.g. cached root properties) defer.
+	if (typeof (service as { then?: unknown }).then !== 'function') {
+		try {
+			send(notifierCache.get(service as T));
+		} catch (ex) {
+			if (!isConnectionClosedError(ex)) {
+				Logger.error(ex, `RPC notify failed${errorContext ? ` (${errorContext})` : ''}`);
+			}
+		}
+		return;
+	}
+
+	fireAndForget(
+		Promise.resolve(service).then(resolved => send(notifierCache.get(resolved))),
+		errorContext,
+	);
 }

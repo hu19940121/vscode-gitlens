@@ -1,7 +1,9 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
+import { boxSizingBase, linkBase } from '@gitlens/components/components/styles/lit/base.css.js';
 import type { SupportedCloudIntegrationIds } from '@gitlens/integrations/constants.js';
 import type {
 	ConnectCloudIntegrationsCommandArgs,
@@ -13,12 +15,13 @@ import type { SubscriptionUpgradeCommandArgs } from '../../../../plus/gk/models/
 import { isSubscriptionTrialOrPaidFromState } from '../../../../plus/gk/utils/subscription.utils.js';
 import { createCommandLink } from '../../../../system/commands.js';
 import type { IntegrationStateInfo } from '../../../rpc/services/types.js';
-import { boxSizingBase, linkBase } from '../../shared/components/styles/lit/base.css.js';
+import type { SubscriptionContextState } from '../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../shared/contexts/subscription.js';
 import type { SettingsActions } from '../actions.js';
 import type { SettingsState } from '../state.js';
 import { settingsStateContext } from '../state.js';
 import '../../shared/components/button.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../shared/components/feature-badge.js';
 import '../../shared/components/skeleton-loader.js';
 
@@ -30,7 +33,7 @@ declare global {
 
 /**
  * The cloud-integrations connection panel — one row per supported integration
- * with its connection state, mirroring the Home view's integrations chip.
+ * with its connection state.
  *
  * These aren't config settings: state comes from the shared integrations and
  * subscription RPC services, and all actions run commands (connect, upgrade,
@@ -144,6 +147,9 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 	@consume({ context: settingsStateContext })
 	private _state!: SettingsState;
 
+	@consume({ context: subscriptionContext, subscribe: true })
+	private _subscription!: SubscriptionContextState;
+
 	@property({ attribute: false })
 	actions?: SettingsActions;
 
@@ -152,32 +158,32 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 	}
 
 	private get isPaidAccount(): boolean {
-		return this._state.subscription.get()?.state === SubscriptionState.Paid;
+		return this._subscription.subscription.get()?.state === SubscriptionState.Paid;
 	}
 
 	private get isProAccount(): boolean {
-		return isSubscriptionTrialOrPaidFromState(this._state.subscription.get()?.state);
+		return isSubscriptionTrialOrPaidFromState(this._subscription.subscription.get()?.state);
 	}
 
 	override render(): unknown {
 		const integrations = this.integrations;
 		// Wait for both services so connection and pro/lock state render together
-		if (integrations == null || this._state.subscription.get() === undefined) {
+		if (integrations == null || this._subscription.subscription.get() === undefined) {
 			// A failed fetch must not skeleton forever — offer a retry
 			const errors = this._state.serviceErrors.get();
-			if (errors.integrations || errors.subscription) {
+			if (errors.integrations) {
 				return html`<div class="error" role="alert">
 					<code-icon icon="error" aria-hidden="true"></code-icon>
-					<span>Couldn’t load integration status.</span>
+					<span>${l10n.t('Couldn’t load integration status.')}</span>
 					<gl-button appearance="secondary" @click=${() => void this.actions?.loadSharedServices()}
-						>Retry</gl-button
+						>${l10n.t('Retry')}</gl-button
 					>
 				</div>`;
 			}
 			return html`<skeleton-loader lines="5"></skeleton-loader>`;
 		}
 
-		const anyConnected = this._state.hasAccount.get() && integrations.some(i => i.connected);
+		const anyConnected = this._subscription.hasAccount.get() && integrations.some(i => i.connected);
 
 		return html`<ul class="rows">
 				${integrations.map(i => this.renderIntegrationRow(i))}
@@ -193,7 +199,7 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 										source: { source: 'settings', detail: 'integrations' },
 									},
 								)}"
-								>Connect Integrations</gl-button
+								>${l10n.t('Connect Integrations')}</gl-button
 							>`
 						: nothing
 				}
@@ -203,7 +209,8 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 						'gitlens.plus.cloudIntegrations.manage',
 						{ source: { source: 'settings', detail: 'integrations' } },
 					)}"
-					><code-icon icon="gear" slot="prefix" aria-hidden="true"></code-icon> Manage Integrations</gl-button
+					><code-icon icon="gear" slot="prefix" aria-hidden="true"></code-icon>
+					${l10n.t('Manage Integrations')}</gl-button
 				>
 				<gl-button
 					appearance="secondary"
@@ -211,7 +218,8 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 						source: 'settings',
 						detail: 'integrations',
 					})}"
-					><code-icon icon="sync" slot="prefix" aria-hidden="true"></code-icon> Synchronize Status</gl-button
+					><code-icon icon="sync" slot="prefix" aria-hidden="true"></code-icon>
+					${l10n.t('Synchronize Status')}</gl-button
 				>
 			</div>`;
 	}
@@ -230,7 +238,7 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 							? html`<gl-feature-badge
 									placement="right"
 									.source=${{ source: 'settings', detail: 'integrations' } as const}
-									.subscription=${this._state.subscription.get()}
+									.subscription=${this._subscription.subscription.get()}
 									cloud
 								></gl-feature-badge>`
 							: nothing
@@ -248,13 +256,16 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 									source: 'settings',
 									detail: 'integrations',
 								})}"
-								tooltip="Unlock ${integration.name} features with GitLens Pro"
-								><code-icon icon="lock" slot="prefix" aria-hidden="true"></code-icon> Unlock with
-								Pro</gl-button
+								tooltip=${l10n.t('Unlock {integration} features with GitLens Pro', {
+									integration: integration.name,
+								})}
+								><code-icon icon="lock" slot="prefix" aria-hidden="true"></code-icon>
+								${l10n.t('Unlock with Pro')}</gl-button
 							>`
 						: integration.connected
 							? html`<span class="row__status"
-										><code-icon icon="check" aria-hidden="true"></code-icon> Connected</span
+										><code-icon icon="check" aria-hidden="true"></code-icon>
+										${l10n.t('Connected')}</span
 									>
 									<gl-button
 										appearance="secondary"
@@ -262,10 +273,10 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 											'gitlens.plus.cloudIntegrations.manage',
 											{ source: { source: 'settings', detail: 'integrations' } },
 										)}"
-										tooltip="Manage ${integration.name}"
-										aria-label="Manage ${integration.name}"
+										tooltip=${l10n.t('Manage {integration}', { integration: integration.name })}
+										aria-label=${l10n.t('Manage {integration}', { integration: integration.name })}
 										><code-icon icon="gear" slot="prefix" aria-hidden="true"></code-icon>
-										Manage</gl-button
+										${l10n.t('Manage')}</gl-button
 									>`
 							: html`<gl-button
 									appearance="secondary"
@@ -276,9 +287,9 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 											source: { source: 'settings', detail: 'integrations' },
 										},
 									)}"
-									tooltip="Connect ${integration.name}"
+									tooltip=${l10n.t('Connect {integration}', { integration: integration.name })}
 									><code-icon icon="plug" slot="prefix" aria-hidden="true"></code-icon>
-									Connect</gl-button
+									${l10n.t('Connect')}</gl-button
 								>`
 				}
 			</span>
@@ -287,8 +298,8 @@ export class GlSettingsIntegrations extends SignalWatcher(LitElement) {
 }
 
 const featureLabels = new Map<string, string>([
-	['prs', 'pull requests'],
-	['issues', 'issues'],
+	['prs', l10n.t('pull requests')],
+	['issues', l10n.t('issues')],
 ]);
 
 /** Mirrors the integrations chip's supports line, e.g. "Supports pull requests and issues". */
@@ -296,9 +307,7 @@ function getIntegrationDetails(integration: IntegrationStateInfo): string {
 	const features = integration.supports.map(feature => featureLabels.get(feature) ?? feature);
 
 	if (features.length === 0) return '';
-	if (features.length === 1) return `Supports ${features[0]}`;
-	if (features.length === 2) return `Supports ${features[0]} and ${features[1]}`;
-
-	const last = features.pop();
-	return `Supports ${features.join(', ')}, and ${last}`;
+	return l10n.t('Supports {features}', {
+		features: new Intl.ListFormat(undefined, { style: 'long', type: 'conjunction' }).format(features),
+	});
 }

@@ -1,8 +1,11 @@
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { live } from 'lit/directives/live.js';
+import { GlElement } from '@gitlens/components/components/element.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { SearchOperators, SearchQuery } from '@gitlens/git/models/search.js';
 import { searchOperatorsToLongFormMap } from '@gitlens/git/models/search.js';
 import {
@@ -13,18 +16,10 @@ import {
 import { filterMap } from '@gitlens/utils/array.js';
 import { fuzzyFilter } from '@gitlens/utils/fuzzy.js';
 import { whitespaceRegex } from '../../../../../constants.js';
-import {
-	ChooseAuthorRequest,
-	ChooseComparisonRequest,
-	ChooseFileRequest,
-	ChooseRefRequest,
-	SearchHistoryDeleteRequest,
-	SearchHistoryGetRequest,
-	SearchHistoryStoreRequest,
-} from '../../../../plus/graph/protocol.js';
-import { ipcContext } from '../../contexts/ipc.js';
+import type { GraphSearchRelaxation } from '../../../../plus/graph/protocol.js';
+import { searchActionsContext } from '../../../plus/graph/search/searchContext.js';
+import { blurActiveElement } from '../../../shared/focus.js';
 import type { CompletionItem, CompletionSelectEvent, GlAutocomplete } from '../autocomplete/autocomplete.js';
-import { GlElement } from '../element.js';
 import type {
 	SearchCompletionCommand,
 	SearchCompletionItem,
@@ -39,8 +34,9 @@ import {
 import '../button.js';
 import '../actions/action-nav.js';
 import '../autocomplete/autocomplete.js';
-import '../code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../copy-container.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 export interface SearchNavigationEventDetail {
 	direction: 'first' | 'previous' | 'next' | 'last';
@@ -49,6 +45,11 @@ export interface SearchNavigationEventDetail {
 export interface SearchModeChangeEventDetail {
 	searchMode: 'normal' | 'filter';
 	useNaturalLanguage: boolean;
+	/** Whether `searchMode` is a deliberate user choice (filter-toggle click, an explicit exit-filter
+	 *  action) rather than a ride-along of the current state (an NL on/off toggle reporting whatever
+	 *  the filter happens to be — possibly an NL-forced value that must never be persisted as the
+	 *  user's preference nor supersede its pending restore). */
+	explicitMode: boolean;
 }
 
 export interface SearchCancelEventDetail {
@@ -183,7 +184,7 @@ export class GlSearchInput extends GlElement {
 			left: 0;
 
 			/* Same tier as the gl-autocomplete dropdown (its display: contents host puts both in
-   this stacking context) — the tie keeps the later-in-DOM autocomplete on top, as before */
+ this stacking context) — the tie keeps the later-in-DOM autocomplete on top, as before */
 			z-index: var(--gl-z-popover);
 			width: 100%;
 			padding: var(--gl-space-4);
@@ -198,6 +199,17 @@ export class GlSearchInput extends GlElement {
 		input[aria-valid='false'] ~ .message {
 			background-color: var(--vscode-inputValidation-errorBackground);
 			border-color: var(--vscode-inputValidation-errorBorder);
+		}
+
+		.message-action {
+			margin-left: var(--gl-space-8);
+			color: var(--vscode-textLink-foreground);
+			text-decoration: underline;
+			cursor: pointer;
+		}
+
+		.message-action:hover {
+			color: var(--vscode-textLink-activeForeground);
 		}
 
 		/* Input highlighting overlay */
@@ -319,8 +331,8 @@ background-color: var(--vscode-menu-background);
 		}
 	`;
 
-	@consume({ context: ipcContext })
-	private readonly _ipc!: typeof ipcContext.__context__;
+	@consume({ context: searchActionsContext, subscribe: true })
+	private readonly _searchActions!: typeof searchActionsContext.__context__;
 
 	@query('input') input!: HTMLInputElement;
 
@@ -334,6 +346,18 @@ background-color: var(--vscode-menu-background);
 	@property({ type: Boolean }) searching = false;
 	@property({ type: Boolean }) hasMoreResults = false;
 	@property({ type: Boolean }) showAutocompleteOnFocus = true;
+	/** Renders `errorMessage` in calm/info styling instead of error/red. */
+	@property({ type: Boolean }) errorCalm = false;
+	/** The active search's pattern failed to compile as regex and matched literally instead. */
+	@property({ type: Boolean }) fallbackActive = false;
+	@property({ type: String }) fallbackDetail = '';
+	/** The settled search used the literal fallback and found nothing. */
+	@property({ type: Boolean }) showFallbackHelper = false;
+	@property({ type: Array }) relaxations: GraphSearchRelaxation[] = [];
+	/** The settled NL search found nothing but has counted relaxation offers — see {@link renderMessage}. */
+	@property({ type: Boolean }) showRelaxationsHelper = false;
+	/** The active error is an unavailable-AI NL failure — offers a "Search as text instead" action. */
+	@property({ type: Boolean }) showSearchAsTextHelper = false;
 	@property({ type: String })
 	get value() {
 		return this._value;
@@ -348,7 +372,9 @@ background-color: var(--vscode-menu-background);
 
 	@state() private errorMessage = '';
 	@state() private processedQuery: string | undefined;
+	@state() private explanation: string | undefined;
 	@state() private _value = '';
+	@state() private repairing = false;
 
 	// Autocomplete state
 	@state() private autocompleteOpen = false;
@@ -369,7 +395,7 @@ background-color: var(--vscode-menu-background);
 	}
 
 	private get label() {
-		return this.filter ? 'Filter' : 'Search';
+		return this.filter ? l10n.t('Filter') : l10n.t('Search');
 	}
 
 	get matchCaseOverride(): boolean {
@@ -385,12 +411,14 @@ background-color: var(--vscode-menu-background);
 
 	private get placeholder() {
 		if (this.naturalLanguage) {
-			return `${this.label} commits using natural language (↑↓ for history), e.g. my commits from last week`;
+			return this.filter
+				? l10n.t('Filter commits using natural language (↑↓ for history), e.g. my commits from last week')
+				: l10n.t('Search commits using natural language (↑↓ for history), e.g. my commits from last week');
 		}
-		return `${this.label} commits (press Enter to search, ↑↓ for history), e.g. @me after:1.week.ago file:*.ts`;
+		return this.filter
+			? l10n.t('Filter commits (press Enter to search, ↑↓ for history), e.g. @me after:1.week.ago file:*.ts')
+			: l10n.t('Search commits (press Enter to search, ↑↓ for history), e.g. @me after:1.week.ago file:*.ts');
 	}
-
-	private repoPath: string | undefined;
 
 	private _searchHistory: SearchQuery[] = [];
 	private searchHistoryPos = -1;
@@ -406,8 +434,8 @@ background-color: var(--vscode-menu-background);
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		void this._ipc
-			.sendRequest(SearchHistoryGetRequest, { repoPath: this.repoPath })
+		void this._searchActions
+			.getHistory()
 			.then(response => (this.searchHistory = response.history))
 			.catch(() => {});
 	}
@@ -474,13 +502,18 @@ background-color: var(--vscode-menu-background);
 		// Clear all search-related UI state
 		this.errorMessage = '';
 		this.processedQuery = undefined;
+		this.explanation = undefined;
 		this.searchHistoryPos = -1;
 		this.originalHistoryState = undefined;
 
 		// Emit cancel to backend - idempotent, safe to always call
 		this.emit('gl-search-cancel', { preserveResults: false });
 
-		// Send empty search immediately to clear results
+		// Send empty search immediately to clear results. Re-assert emptiness first: the cancel
+		// dispatch above runs handlers synchronously, and a handler that imperatively rewrites box
+		// props would otherwise leak into this emission (which re-reads live props) — resurrecting
+		// and re-running the query the user just cleared.
+		this._value = '';
 		this.onSearchChanged(true);
 		this._lastSearch = undefined;
 	}
@@ -509,6 +542,7 @@ background-color: var(--vscode-menu-background);
 			// Input has content - update UI state
 			this.errorMessage = '';
 			this.processedQuery = undefined;
+			this.explanation = undefined;
 			this.canDeleteHistoryItem = false;
 
 			// Reset history position when user types something different
@@ -786,6 +820,8 @@ background-color: var(--vscode-menu-background);
 	 * Handles picker commands (author, ref, file/folder)
 	 */
 	private async handlePickerCommand(command: SearchCompletionCommand) {
+		blurActiveElement();
+
 		const value = this.value;
 		const operator = this.cursorOperator?.operator;
 		if (!operator) return;
@@ -796,11 +832,11 @@ background-color: var(--vscode-menu-background);
 		try {
 			switch (command.command) {
 				case 'pick-author': {
-					const result = await this._ipc.sendRequest(ChooseAuthorRequest, {
-						title: 'Search by Author',
-						placeholder: 'Choose contributors to include commits from',
-						picked: currentValue ? [currentValue] : undefined,
-					});
+					const result = await this._searchActions.chooseAuthor(
+						l10n.t('Search by Author'),
+						l10n.t('Choose contributors to include commits from'),
+						currentValue ? [currentValue] : undefined,
+					);
 
 					if (result.authors?.length) {
 						this.insertPickerValues(result.authors, operator, command.multi ?? false);
@@ -810,13 +846,15 @@ background-color: var(--vscode-menu-background);
 				}
 
 				case 'pick-ref': {
-					const result = await this._ipc.sendRequest(ChooseRefRequest, {
-						title: 'Search by Branch or Tag',
-						placeholder: 'Choose a branch or tag to filter by',
-						allowedAdditionalInput: { range: false, rev: false },
-						include: ['branches', 'tags', 'HEAD'],
-						picked: currentValue || undefined,
-					});
+					const result = await this._searchActions.chooseRef(
+						l10n.t('Search by Branch or Tag'),
+						l10n.t('Choose a branch or tag to filter by'),
+						{
+							allowedAdditionalInput: { range: false, rev: false },
+							include: ['branches', 'tags', 'HEAD'],
+							picked: currentValue || undefined,
+						},
+					);
 
 					if (result?.name) {
 						this.insertPickerValues([result.name], operator, command.multi ?? false);
@@ -826,10 +864,7 @@ background-color: var(--vscode-menu-background);
 				}
 
 				case 'pick-comparison': {
-					const result = await this._ipc.sendRequest(ChooseComparisonRequest, {
-						title: 'Search by Comparison Range',
-						placeholder: 'Choose two refs to compare',
-					});
+					const result = await this._searchActions.chooseComparison(l10n.t('Search by Comparison Range'));
 
 					if (result?.range) {
 						this.insertPickerValues([result.range], operator, false);
@@ -840,12 +875,14 @@ background-color: var(--vscode-menu-background);
 
 				case 'pick-file':
 				case 'pick-folder': {
-					const result = await this._ipc.sendRequest(ChooseFileRequest, {
-						title: command.command === 'pick-file' ? 'Search by File' : 'Search by Folder',
-						type: command.command === 'pick-file' ? 'file' : 'folder',
-						openLabel: 'Add to Search',
-						picked: currentValue ? [currentValue] : undefined,
-					});
+					const result = await this._searchActions.chooseFile(
+						command.command === 'pick-file' ? l10n.t('Search by File') : l10n.t('Search by Folder'),
+						command.command === 'pick-file' ? 'file' : 'folder',
+						{
+							openLabel: l10n.t('Add to Search'),
+							picked: currentValue ? [currentValue] : undefined,
+						},
+					);
 
 					if (result.files?.length) {
 						this.insertPickerValues(result.files, operator, command.multi ?? false);
@@ -950,11 +987,13 @@ background-color: var(--vscode-menu-background);
 
 	/** Opens the author picker and appends `author:<email>` terms to the query. */
 	async pickAuthors(): Promise<void> {
+		blurActiveElement();
+
 		try {
-			const result = await this._ipc.sendRequest(ChooseAuthorRequest, {
-				title: 'Search by Author',
-				placeholder: 'Choose contributors to include commits from',
-			});
+			const result = await this._searchActions.chooseAuthor(
+				l10n.t('Search by Author'),
+				l10n.t('Choose contributors to include commits from'),
+			);
 			this.appendOperatorValues('author:', result.authors ?? []);
 		} catch {
 			this.input.focus();
@@ -963,13 +1002,17 @@ background-color: var(--vscode-menu-background);
 
 	/** Opens the ref picker and appends a `ref:<name>` term to the query. */
 	async pickRefs(): Promise<void> {
+		blurActiveElement();
+
 		try {
-			const result = await this._ipc.sendRequest(ChooseRefRequest, {
-				title: 'Search by Branch or Tag',
-				placeholder: 'Choose a branch or tag to filter by',
-				allowedAdditionalInput: { range: false, rev: false },
-				include: ['branches', 'tags', 'HEAD'],
-			});
+			const result = await this._searchActions.chooseRef(
+				l10n.t('Search by Branch or Tag'),
+				l10n.t('Choose a branch or tag to filter by'),
+				{
+					allowedAdditionalInput: { range: false, rev: false },
+					include: ['branches', 'tags', 'HEAD'],
+				},
+			);
 			this.appendOperatorValues('ref:', result?.name ? [result.name] : []);
 		} catch {
 			this.input.focus();
@@ -978,11 +1021,11 @@ background-color: var(--vscode-menu-background);
 
 	/** Opens the file picker and appends `file:<path>` terms to the query. */
 	async pickFiles(): Promise<void> {
+		blurActiveElement();
+
 		try {
-			const result = await this._ipc.sendRequest(ChooseFileRequest, {
-				title: 'Search by File',
-				type: 'file',
-				openLabel: 'Add to Search',
+			const result = await this._searchActions.chooseFile(l10n.t('Search by File'), 'file', {
+				openLabel: l10n.t('Add to Search'),
 			});
 			this.appendOperatorValues('file:', result.files ?? []);
 		} catch {
@@ -1092,6 +1135,7 @@ background-color: var(--vscode-menu-background);
 		this.emit('gl-search-modechange', {
 			searchMode: this.filter ? 'filter' : 'normal',
 			useNaturalLanguage: this.naturalLanguage,
+			explicitMode: true,
 		});
 		// Don't trigger a new search - just update the mode for future searches
 		// and let the UI update based on the current results
@@ -1105,11 +1149,16 @@ background-color: var(--vscode-menu-background);
 
 	private updateNaturalLanguage(useNaturalLanguage: boolean) {
 		this.processedQuery = undefined;
+		this.explanation = undefined;
 
 		this.naturalLanguage = useNaturalLanguage && this.aiAllowed;
+		// `searchMode` here is a report of the current state, not a choice — this can fire without any
+		// user gesture (`willUpdate` drops NL mode when AI becomes unavailable), and `filter` may hold
+		// an NL-forced value.
 		this.emit('gl-search-modechange', {
 			searchMode: this.filter ? 'filter' : 'normal',
 			useNaturalLanguage: this.naturalLanguage,
+			explicitMode: false,
 		});
 
 		// Update autocomplete to reflect the new mode
@@ -1340,7 +1389,7 @@ background-color: var(--vscode-menu-background);
 		if (errors?.length) return errors[0];
 
 		// If no operations were parsed, the query is effectively empty
-		if (!operations.size) return 'Enter a search value';
+		if (!operations.size) return l10n.t('Enter a search value');
 
 		return undefined;
 	}
@@ -1377,21 +1426,24 @@ background-color: var(--vscode-menu-background);
 		this.errorMessage = errorMessage;
 	}
 
-	async logSearch(search: SearchQuery): Promise<void> {
+	async logSearch(search: SearchQuery, options?: { store?: boolean }): Promise<void> {
 		// Store exactly what user entered/sees (NL form or structured form)
 		let queryToStore;
 		if (search.naturalLanguage) {
 			if (typeof search.naturalLanguage === 'boolean') {
 				queryToStore = search.query;
 				this.processedQuery = undefined;
+				this.explanation = undefined;
 				this.errorMessage = '';
 			} else if (search.naturalLanguage.error) {
 				queryToStore = search.naturalLanguage.query;
 				this.processedQuery = undefined;
+				this.explanation = undefined;
 				this.errorMessage = search.naturalLanguage.error;
 			} else {
 				queryToStore = search.naturalLanguage.query;
 				this.processedQuery = search.naturalLanguage.processedQuery;
+				this.explanation = search.naturalLanguage.explanation;
 				this.errorMessage = '';
 			}
 		} else {
@@ -1402,13 +1454,12 @@ background-color: var(--vscode-menu-background);
 			queryToStore = search.query;
 		}
 
+		if (options?.store === false) return;
+
 		const searchToStore: SearchQuery = { ...search, query: queryToStore };
 
 		try {
-			const response = await this._ipc.sendRequest(SearchHistoryStoreRequest, {
-				repoPath: this.repoPath,
-				search: searchToStore,
-			});
+			const response = await this._searchActions.storeHistory(searchToStore);
 			this.searchHistory = response.history;
 			this.searchHistoryPos = -1;
 		} catch {}
@@ -1416,10 +1467,7 @@ background-color: var(--vscode-menu-background);
 
 	private async deleteHistoryEntry(query: string): Promise<void> {
 		try {
-			const response = await this._ipc.sendRequest(SearchHistoryDeleteRequest, {
-				repoPath: this.repoPath,
-				query: query,
-			});
+			const response = await this._searchActions.deleteHistory(query);
 			this.searchHistory = response.history;
 			// Move to next entry if available, otherwise restore original value
 			if (this.searchHistoryPos >= 0 && this.searchHistoryPos < this.searchHistory.length) {
@@ -1458,16 +1506,25 @@ background-color: var(--vscode-menu-background);
 		// The caller (graph-app.ts) will trigger the search if needed
 	}
 
+	/** Restores only the filter toggle, imperatively — a change-memoized `?filter` binding can't be
+	 *  relied on to undo a forced value. Deliberately narrow: it must never touch the query text,
+	 *  because it runs inside `cancelSearch`'s clear sequence, and writing the old query back there
+	 *  resurrects the text the user just cleared — which the trailing change emission then re-runs
+	 *  as a live search. */
+	setExternalFilter(filter: boolean): void {
+		this.filter = filter;
+	}
+
 	override render(): unknown {
 		return html`<div class="field">
 				<div class="controls controls__start">
-					<action-nav role="toolbar" aria-label="Search mode">
+					<action-nav role="toolbar" aria-label=${l10n.t('Search mode')}>
 						<gl-button
 							appearance="input"
 							role="checkbox"
 							aria-checked="${this.filter}"
-							tooltip="Filter Commits"
-							aria-label="Filter Commits"
+							tooltip=${l10n.t('Filter Commits')}
+							aria-label=${l10n.t('Filter Commits')}
 							@click="${this.handleFilterClick}"
 						>
 							<code-icon icon="list-filter"></code-icon>
@@ -1478,8 +1535,8 @@ background-color: var(--vscode-menu-background);
 										appearance="input"
 										role="checkbox"
 										aria-checked="${this.naturalLanguage}"
-										tooltip="Natural Language Search (AI Preview)"
-										aria-label="Natural Language Search (AI Preview)"
+										tooltip=${l10n.t('Natural Language Search (AI Preview)')}
+										aria-label=${l10n.t('Natural Language Search (AI Preview)')}
 										@click="${this.handleNaturalLanguageClick}"
 									>
 										<code-icon icon="sparkle"></code-icon>
@@ -1506,7 +1563,7 @@ background-color: var(--vscode-menu-background);
 						spellcheck="false"
 						placeholder="${this.placeholder}"
 						.value="${live(this.value ?? '')}"
-						aria-valid="${!this.errorMessage}"
+						aria-valid="${!this.errorMessage || this.errorCalm}"
 						@input="${this.handleInput}"
 						@keydown="${this.handleShortcutKeys}"
 						@keyup="${this.handleKeyup}"
@@ -1515,18 +1572,17 @@ background-color: var(--vscode-menu-background);
 						@blur="${this.handleInputBlur}"
 						@scroll="${this.handleInputScroll}"
 					/>
-					${this.errorMessage ? html`<div class="message">${this.errorMessage}</div>` : nothing}
-					${this.renderAutocomplete()}
+					${this.renderMessage()} ${this.renderAutocomplete()}
 				</div>
 			</div>
 			<div class="controls">
-				<action-nav role="toolbar" aria-label="Search options">
+				<action-nav role="toolbar" aria-label=${l10n.t('Search options')}>
 					${
 						this.value
 							? html`<gl-button
 									appearance="input"
-									tooltip="Clear"
-									aria-label="Clear"
+									tooltip=${l10n.t('Clear')}
+									aria-label=${l10n.t('Clear')}
 									@click="${this.handleClear}"
 								>
 									<code-icon icon="close"></code-icon>
@@ -1623,6 +1679,119 @@ background-color: var(--vscode-menu-background);
 		return this.value;
 	}
 
+	/**
+	 * Renders the search box's message area: the zero-result fallback helper takes priority (it isn't an
+	 * error — the search succeeded, just matched nothing), then the plain error/info message.
+	 */
+	private renderMessage() {
+		if (this.showFallbackHelper) {
+			return html`<div class="message">
+				${l10n.t("No results — pattern isn't valid regex")}
+				<a href="#" class="message-action" @click="${this.handleMatchLiterallyClick}"
+					>${l10n.t('Match literally')}</a
+				>
+				${
+					this.aiAllowed && !this.naturalLanguage
+						? this.repairing
+							? html`<span class="message-action" aria-disabled="true"
+									><code-icon icon="loading" modifier="spin"></code-icon> ${l10n.t('Fixing…')}</span
+								>`
+							: html`<a href="#" class="message-action" @click="${this.handleFixWithAiClick}"
+									>${l10n.t('Fix with AI')}</a
+								>`
+						: nothing
+				}
+			</div>`;
+		}
+
+		if (this.showRelaxationsHelper && this.relaxations.length) {
+			return html`<div class="message">
+				${l10n.t('No matches —')}
+				${this.relaxations
+					.slice(0, 3)
+					.map(
+						relaxation =>
+							html`<a
+								href="#"
+								class="message-action"
+								@click="${(e: Event) => this.handleRelaxationClick(e, relaxation)}"
+								>${formatRelaxationLabel(relaxation)}</a
+							>`,
+					)}
+			</div>`;
+		}
+
+		if (!this.errorMessage) return nothing;
+
+		return html`<div class="message">
+			${this.errorMessage}
+			${
+				this.showSearchAsTextHelper
+					? html`<a href="#" class="message-action" @click="${this.handleSearchAsTextClick}"
+							>${l10n.t('Search as text instead')}</a
+						>`
+					: nothing
+			}
+		</div>`;
+	}
+
+	/** "Match literally" action: flips the regex toggle off through the same handler a user click takes,
+	 *  so the change event and search refresh fire naturally. */
+	private handleMatchLiterallyClick(e: Event) {
+		e.preventDefault();
+		this.handleMatchRegex(e);
+	}
+
+	/** "Search as text instead" action (unavailable-AI NL failure): drops NL mode — and regex matching,
+	 *  visibly, since an English sentence can be VALID regex with the wrong meaning ("yesterday?") — then
+	 *  re-submits the same text as a plain text search. */
+	private handleSearchAsTextClick(e: Event) {
+		e.preventDefault();
+		this.updateNaturalLanguage(false);
+		this.errorMessage = '';
+		if (this.matchRegex) {
+			this.handleMatchRegex(e);
+		} else {
+			this.onSearchChanged(true);
+		}
+	}
+
+	/** "Fix with AI" action (manual zero-result helper): asks the host to repair the pattern, then puts
+	 *  the suggestion into the box as visible, editable text and searches. */
+	private async handleFixWithAiClick(e: Event): Promise<void> {
+		e.preventDefault();
+		if (this.repairing) return;
+
+		this.repairing = true;
+		const requested = this.value;
+		try {
+			const rsp = await this._searchActions.repair(this.value, this.fallbackDetail || undefined);
+			// The user kept typing during the round-trip — leave their in-progress edit alone.
+			if (this.value !== requested) return;
+
+			if (rsp.query) {
+				this.value = rsp.query;
+				this.errorMessage = '';
+				this.onSearchChanged(true);
+			} else if (rsp.error) {
+				this.errorMessage = rsp.error;
+			}
+		} catch {
+			// leave the existing helper row in place
+		} finally {
+			this.repairing = false;
+		}
+	}
+
+	/** A relaxation chip: replaces the search with the counted broader query — visible and editable,
+	 *  NL toggle off — through the same apply path "Fix with AI" uses. */
+	private handleRelaxationClick(e: Event, relaxation: GraphSearchRelaxation) {
+		e.preventDefault();
+		this.updateNaturalLanguage(false);
+		this.value = relaxation.query;
+		this.onSearchChanged(true);
+	}
+
 	private renderAutocomplete() {
 		// Show description if we have items, operator help, or NL mode
 		const hasDescription = Boolean(this.autocompleteItems.length || this.naturalLanguage || this.cursorOperator);
@@ -1630,7 +1799,7 @@ background-color: var(--vscode-menu-background);
 		return html`<gl-autocomplete
 			id="autocomplete-list"
 			.items="${this.autocompleteItems}"
-			?open="${this.autocompleteOpen && hasDescription && !this.errorMessage}"
+			?open="${this.autocompleteOpen && hasDescription && !this.errorMessage && !this.showFallbackHelper}"
 			@gl-autocomplete-select="${this.handleAutocompleteSelect}"
 			@gl-autocomplete-cancel="${this.hideAutocomplete}"
 			@gl-autocomplete-active-change="${() => this.requestUpdate()}"
@@ -1643,8 +1812,7 @@ background-color: var(--vscode-menu-background);
 									? html`${this.cursorOperator.description}${this.renderOperatorExample(this.cursorOperator)}`
 									: this.naturalLanguage
 										? this.renderNaturalLanguageDescription()
-										: html`Combine filters to build powerful searches, e.g.
-												<code>@me after:1.week.ago file:*.ts</code>`
+										: html`${localizedContent(l10n.t('Combine filters to build powerful searches, e.g. {example}'), { example: html`<code>@me after:1.week.ago file:*.ts</code>` })}`
 							}
 						</div>`
 					: nothing
@@ -1661,15 +1829,20 @@ background-color: var(--vscode-menu-background);
 
 	private renderNaturalLanguageDescription() {
 		if (this.searching) {
-			return html`<code-icon icon="loading" modifier="spin"></code-icon> Processing your natural language query...`;
+			return html`<code-icon icon="loading" modifier="spin"></code-icon>
+				${l10n.t('Processing your natural language query...')}`;
 		}
 
 		if (this.processedQuery) {
-			return html`Query: <code>${this.processedQuery}</code>`;
+			return html`<gl-tooltip ?disabled="${!this.explanation}"
+				>${localizedContent(l10n.t('Query: {query}'), { query: html`<code>${this.processedQuery}</code>` })}<span
+					slot="content"
+					>${this.explanation}</span
+				></gl-tooltip
+			>`;
 		}
 
-		return html`Describe what you're looking for and let AI build the query, e.g.
-			<code>my commits from last week</code> or <code>changes to package.json by eamodio last month</code>`;
+		return html`${localizedContent(l10n.t("Describe what you're looking for and let AI build the query, e.g. {example1} or {example2}"), { example1: html`<code>${l10n.t('my commits from last week')}</code>`, example2: html`<code>${l10n.t('changes to package.json by eamodio last month')}</code>` })}`;
 	}
 
 	private renderSearchOptions() {
@@ -1677,7 +1850,7 @@ background-color: var(--vscode-menu-background);
 			return this.value
 				? html`<gl-copy-container
 						appearance="toolbar"
-						copyLabel="Copy Query"
+						copyLabel=${l10n.t('Copy Query')}
 						.content=${this.processedQuery}
 						placement="bottom"
 						?disabled=${!this.processedQuery}
@@ -1686,7 +1859,7 @@ background-color: var(--vscode-menu-background);
 							icon="copy"
 							tabindex="0"
 							role="button"
-							aria-label="Copy Query"
+							aria-label=${l10n.t('Copy Query')}
 							class="copy-icon"
 						></code-icon>
 					</gl-copy-container>`
@@ -1697,12 +1870,8 @@ background-color: var(--vscode-menu-background);
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchCaseOverride}"
-				tooltip="Match Case${
-					this.matchCaseOverride && !this.matchCase ? ' (always on without regular expressions)' : ''
-				}"
-				aria-label="Match Case${
-					this.matchCaseOverride && !this.matchCase ? ' (always on without regular expressions)' : ''
-				}"
+				tooltip=${this.matchCaseOverride && !this.matchCase ? l10n.t('Match Case (always on without regular expressions)') : l10n.t('Match Case')}
+				aria-label=${this.matchCaseOverride && !this.matchCase ? l10n.t('Match Case (always on without regular expressions)') : l10n.t('Match Case')}
 				?disabled="${!this.matchRegex}"
 				@click="${this.handleMatchCase}"
 			>
@@ -1712,12 +1881,8 @@ background-color: var(--vscode-menu-background);
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchWholeWordOverride}"
-				tooltip="Match Whole Word${
-					this.matchWholeWordOverride && !this.matchWholeWord ? ' (requires regular expressions)' : ''
-				}"
-				aria-label="Match Whole Word${
-					this.matchWholeWordOverride && !this.matchWholeWord ? ' (requires regular expressions)' : ''
-				}"
+				tooltip=${this.matchWholeWordOverride && !this.matchWholeWord ? l10n.t('Match Whole Word (requires regular expressions)') : l10n.t('Match Whole Word')}
+				aria-label=${this.matchWholeWordOverride && !this.matchWholeWord ? l10n.t('Match Whole Word (requires regular expressions)') : l10n.t('Match Whole Word')}
 				?disabled="${!this.matchRegex}"
 				@click="${this.handleMatchWholeWord}"
 			>
@@ -1727,8 +1892,17 @@ background-color: var(--vscode-menu-background);
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchRegex}"
-				tooltip="Use Regular Expression"
-				aria-label="Use Regular Expression"
+				variant="${ifDefined(this.fallbackActive ? 'warning' : undefined)}"
+				tooltip="${
+					this.fallbackActive
+						? this.fallbackDetail
+							? l10n.t("Pattern isn't valid regex — matching literally: {detail}", {
+									detail: this.fallbackDetail,
+								})
+							: l10n.t("Pattern isn't valid regex — matching literally")
+						: l10n.t('Use Regular Expression')
+				}"
+				aria-label=${l10n.t('Use Regular Expression')}
 				@click="${this.handleMatchRegex}"
 			>
 				<code-icon icon="regex"></code-icon>
@@ -1737,8 +1911,8 @@ background-color: var(--vscode-menu-background);
 				appearance="input"
 				role="checkbox"
 				aria-checked="${this.matchAll}"
-				tooltip="Match All"
-				aria-label="Match All"
+				tooltip=${l10n.t('Match All')}
+				aria-label=${l10n.t('Match All')}
 				@click="${this.handleMatchAll}"
 			>
 				<code-icon icon="check-all"></code-icon>
@@ -1748,4 +1922,52 @@ background-color: var(--vscode-menu-background);
 
 function isValueCommand(value: SearchCompletionOperatorValue['value']): value is SearchCompletionCommand {
 	return typeof value !== 'string';
+}
+
+function formatRelaxationLabel(relaxation: GraphSearchRelaxation): string {
+	const count = relaxation.count;
+	if (relaxation.kind === 'author') {
+		return relaxation.capped
+			? l10n.t("{count}+ as '{name}'", { count: count, name: relaxation.name })
+			: l10n.t("{count} as '{name}'", { count: count, name: relaxation.name });
+	}
+
+	if (relaxation.kind === 'alternate') {
+		return relaxation.capped ? `${count}+ ${relaxation.query}` : `${count} ${relaxation.query}`;
+	}
+
+	switch (relaxation.filter) {
+		case 'date':
+			return relaxation.capped
+				? l10n.t('{count}+ without the date filter', { count: count })
+				: l10n.t('{count} without the date filter', { count: count });
+		case 'author':
+			return relaxation.capped
+				? l10n.t('{count}+ without the author filter', { count: count })
+				: l10n.t('{count} without the author filter', { count: count });
+		case 'committer':
+			return relaxation.capped
+				? l10n.t('{count}+ without the committer filter', { count: count })
+				: l10n.t('{count} without the committer filter', { count: count });
+		case 'file':
+			return relaxation.capped
+				? l10n.t('{count}+ without the file filter', { count: count })
+				: l10n.t('{count} without the file filter', { count: count });
+		case 'ref':
+			return relaxation.capped
+				? l10n.t('{count}+ across all branches', { count: count })
+				: l10n.t('{count} across all branches', { count: count });
+		case 'change':
+			return relaxation.capped
+				? l10n.t('{count}+ without the change filter', { count: count })
+				: l10n.t('{count} without the change filter', { count: count });
+		case 'message':
+			return relaxation.capped
+				? l10n.t('{count}+ without the message terms', { count: count })
+				: l10n.t('{count} without the message terms', { count: count });
+		case 'message-exclusion':
+			return relaxation.capped
+				? l10n.t('{count}+ without the message exclusion', { count: count })
+				: l10n.t('{count} without the message exclusion', { count: count });
+	}
 }

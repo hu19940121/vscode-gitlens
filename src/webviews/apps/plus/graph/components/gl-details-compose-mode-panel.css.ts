@@ -26,6 +26,36 @@ export const composeModePanelStyles = css`
 		}
 	}
 
+	/* Review idle state */
+
+	.review-idle {
+		display: flex;
+		flex: 1;
+		flex-direction: column;
+		gap: var(--gl-space-10);
+		align-items: center;
+		justify-content: center;
+		min-height: 0;
+		padding: var(--gl-space-24) var(--gl-space-12);
+		text-align: center;
+	}
+
+	.review-idle__scope {
+		display: flex;
+		gap: var(--gl-space-4);
+		align-items: center;
+		font-size: var(--gl-font-base);
+		font-weight: 500;
+		color: var(--vscode-foreground);
+	}
+
+	.review-idle__desc {
+		max-width: 24rem;
+		font-size: var(--gl-font-base);
+		line-height: 1.5;
+		color: var(--vscode-descriptionForeground);
+	}
+
 	.compose-panel {
 		display: flex;
 		flex: 1;
@@ -47,8 +77,8 @@ export const composeModePanelStyles = css`
 		   pair reads as one system (only the hue differs). Shared by the per-commit checkmarks and
 		   the recompose submit so the orange stays identical between them. Fixed rather than
 		   relative-from-token, which drifted the orange much darker. */
-		--gl-compose-commit-accent: oklch(0.6 0.15 150);
-		--gl-compose-recompose-accent: oklch(0.6 0.13 62);
+		--gl-compose-commit-accent: oklch(60% 0.15 150deg);
+		--gl-compose-recompose-accent: oklch(60% 0.13 62deg);
 	}
 
 	.compose-plan__header {
@@ -134,12 +164,12 @@ export const composeModePanelStyles = css`
 	   then the primary action + Discard — a full-width Commit button in commit posture, or the
 	   detached refine input (its own submit + slotted Discard) in refine posture — then the hint. */
 	.compose-plan__actions {
-		container: compose-actions / inline-size;
 		display: flex;
 		flex: none;
 		flex-direction: column;
 		gap: var(--gl-space-8);
 		padding: var(--gl-space-8) var(--gl-space-12) var(--gl-space-10);
+		container: compose-actions / inline-size;
 	}
 
 	.compose-plan__gate {
@@ -235,7 +265,6 @@ export const composeModePanelStyles = css`
 	/* Drop indicator: a bar at the top (insert before) or bottom (insert after) of the target row,
 	   mirroring the rebase editor's reorder cue. */
 	.compose-commit--drag-over::before {
-		content: '';
 		position: absolute;
 		top: 0;
 		right: 0;
@@ -243,6 +272,7 @@ export const composeModePanelStyles = css`
 		z-index: 10;
 		height: 0.2rem;
 		pointer-events: none;
+		content: '';
 		background-color: var(--vscode-focusBorder);
 	}
 
@@ -254,9 +284,9 @@ export const composeModePanelStyles = css`
 	/* File→commit drop target: highlight the whole destination commit row while a file is dragged
 	   over it (distinct from the reorder edge-bar, which marks an insert position between rows). */
 	.compose-commit--file-drop-target {
-		background: var(--vscode-list-dropBackground);
 		outline: var(--gl-border-width) solid var(--vscode-focusBorder);
 		outline-offset: -0.1rem;
+		background: var(--vscode-list-dropBackground);
 	}
 
 	.compose-commit:hover {

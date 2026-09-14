@@ -1,6 +1,6 @@
 import * as assert from 'node:assert';
-import type { AgentSession } from '@gitlens/agents/types.js';
-import { getSessionDisplayName, serializeAgentSession } from '../agentSessionState.js';
+import type { AgentSession, AgentSessionHistoryItem } from '@gitlens/agents/types.js';
+import { getSessionDisplayName, serializeAgentSession, serializePastAgentSession } from '../agentSessionState.js';
 
 function makeSession(overrides: Partial<AgentSession>): AgentSession {
 	return {
@@ -181,11 +181,11 @@ suite('serializeAgentSession', () => {
 	};
 
 	test('backfills commonPath from the resolved worktree when the provider never probed', () => {
-		// Completed sessions read from the CLI's durable store carry a `worktreePath` but no
+		// Ended sessions read from the CLI's durable store carry a `worktreePath` but no
 		// `commonPath` — consumers gate card actions on repo identity, so it must be filled in.
 		const session = makeSession({
-			status: 'completed',
-			phase: 'completed',
+			status: 'ended',
+			phase: 'ended',
 			worktreePath: '/repo/.worktrees/feature-x',
 		});
 		assert.strictEqual(serializeAgentSession(session, worktreeMetadata).commonPath, '/repo');
@@ -203,5 +203,29 @@ suite('serializeAgentSession', () => {
 		// A worktree no open repo owns stays unresolved — the gate correctly refuses to act on it.
 		const session = makeSession({ worktreePath: '/elsewhere/repo' });
 		assert.strictEqual(serializeAgentSession(session, undefined).commonPath, undefined);
+	});
+
+	test('carries a resume action with its targets through', () => {
+		const session = makeSession({ status: 'ended', phase: 'ended' });
+		const actions = { archive: true as const, resume: { cwd: '/w', targets: ['terminal'] as const } };
+		assert.deepStrictEqual(serializeAgentSession(session, undefined, actions).actions, actions);
+	});
+});
+
+suite('serializePastAgentSession', () => {
+	test('keeps the provider identity needed to manage an untracked transcript', () => {
+		const session: AgentSessionHistoryItem = {
+			id: 'session-1',
+			providerId: 'claudeCode',
+			disposition: 'ended',
+			actions: { resume: { cwd: '/repo/worktree', targets: ['terminal'] }, archive: true },
+			lastActivity: new Date(1234),
+			lastPrompt: 'please fix it',
+		};
+
+		const serialized = serializePastAgentSession('claudeCode', session, '/repo/worktree', 'feature');
+
+		assert.strictEqual(serialized.providerId, 'claudeCode');
+		assert.strictEqual(serialized.id, 'session-1');
 	});
 });

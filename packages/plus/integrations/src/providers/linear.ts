@@ -1,3 +1,5 @@
+import type { CollectionMetadata } from '@gitkraken/provider-apis';
+import * as l10n from '@vscode/l10n';
 import type { Account } from '@gitlens/git/models/author.js';
 import type { AutolinkReference, DynamicAutolinkReference } from '@gitlens/git/models/autolink.js';
 import type { Issue, IssueShape } from '@gitlens/git/models/issue.js';
@@ -8,14 +10,34 @@ import { Logger } from '@gitlens/utils/logger.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
+import { toCollectionScopeFailure } from '../collectionMetadata.js';
 import { IssuesCloudHostIntegrationId } from '../constants.js';
+import { IntegrationReadUnavailableError } from '../errors.js';
+import type { AccountWideIssuesResult, IssuesForProjectOptions, SearchMyIssuesOptions } from '../models/issueReads.js';
 import { IssuesIntegration } from '../models/issuesIntegration.js';
-import type { IssueFilter, ProviderIssue } from './models.js';
+import type { ProviderApiCollectionResult, ProviderIssue } from './models.js';
 import { fromProviderIssue, providersMetadata, toIssueShape } from './models.js';
+import { mergeCollectionMetadata } from './utils/providerPaging.js';
 
 const metadata = providersMetadata[IssuesCloudHostIntegrationId.Linear];
 const authProvider = Object.freeze({ id: metadata.id, scopes: metadata.scopes });
 const maxPagesPerRequest = 10;
+/**
+ * The account-wide drain's own backstop, separate from {@link maxPagesPerRequest}.
+ *
+ * Raised to 50 (5,000 issues at the SDK's 100-per-page) because 10 no longer means what it used to. That read
+ * once fanned out over four overlapping relationship queries and merged them, so most of what a page cost was
+ * rows already returned — a low budget capped the waste. It is now a single server-ordered query over an `or`
+ * filter, so every page is 100 issues the caller has not seen, and the same budget just truncates real results
+ * at 1,000.
+ *
+ * Reaching it is reported rather than silent: {@link LinearIntegration.searchProviderMyIssuesWithTruncation}
+ * returns `truncated`, so the facade can say the read was incomplete instead of publishing a capped list as a
+ * whole account. The bound stays — a runaway cursor must not spend requests forever — but it is now set where a
+ * real Linear account is unlikely to reach it rather than where the duplication used to hurt.
+ */
+const maxAccountWidePagesPerRequest = 50;
+const linearImplicitTeamsPageSize = 50;
 
 export interface LinearTeamDescriptor extends IssueResourceDescriptor {
 	avatarUrl: string | undefined;
@@ -53,10 +75,10 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 				url: `${organization.url}/issue/${dashedPrefix}<num>`,
 				alphanumeric: false,
 				ignoreCase: false,
-				title: `Open Issue ${dashedPrefix}<num> on ${organization.name}`,
+				title: l10n.t('Open Issue {0} on {1}', `${dashedPrefix}<num>`, organization.name),
 
 				type: 'issue',
-				description: `${organization.name} Issue ${dashedPrefix}<num>`,
+				description: l10n.t('{0} Issue {1}', organization.name, `${dashedPrefix}<num>`),
 				descriptor: { ...organization },
 			});
 			autolinks.push({
@@ -65,10 +87,10 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 				alphanumeric: false,
 				ignoreCase: false,
 				referenceType: 'branch',
-				title: `Open Issue ${dashedPrefix}<num> on ${organization.name}`,
+				title: l10n.t('Open Issue {0} on {1}', `${dashedPrefix}<num>`, organization.name),
 
 				type: 'issue',
-				description: `${organization.name} Issue ${dashedPrefix}<num>`,
+				description: l10n.t('{0} Issue {1}', organization.name, `${dashedPrefix}<num>`),
 				descriptor: { ...organization },
 			});
 		}
@@ -111,54 +133,176 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		session: ProviderAuthenticationSession,
 		force: boolean = false,
 	): Promise<LinearTeamDescriptor[] | undefined> {
+		return (await this.getTeamsWithMetadata(session, force))?.values;
+	}
+
+	private async getTeamsWithMetadata(
+		session: ProviderAuthenticationSession,
+		force: boolean = false,
+	): Promise<ProviderApiCollectionResult<LinearTeamDescriptor> | undefined> {
 		const { accessToken } = session;
 		this._teams ??= new Map<string, LinearTeamDescriptor[] | undefined>();
 
 		const cachedResources = this._teams.get(accessToken);
+		if (cachedResources != null && !force) return { values: cachedResources };
 
-		if (cachedResources == null || force) {
-			const api = await this.getProvidersApi();
-			const teams = await api.getLinearTeamsForCurrentUser(toTokenWithInfo(this.id, session));
-			const descriptors: LinearTeamDescriptor[] | undefined = teams?.map(t => ({
-				id: t.id,
-				key: t.key,
-				name: t.name,
-				avatarUrl: t.iconUrl,
-			}));
-			if (descriptors) {
-				this._teams.set(accessToken, descriptors);
-			}
+		const api = await this.getProvidersApi();
+		const teams = await api.getLinearTeamsForCurrentUser(toTokenWithInfo(this.id, session));
+		const descriptors: LinearTeamDescriptor[] | undefined = teams?.map(t => ({
+			id: t.id,
+			key: t.key,
+			name: t.name,
+			avatarUrl: t.iconUrl,
+		}));
+		if (descriptors == null) return undefined;
+
+		// provider-apis currently requests Linear's teams connection without pageInfo or a cursor. Linear's
+		// implicit page size is 50, so exactly a full page cannot prove there is no team 51. Preserve the useful
+		// prefix, but mark it unknown and leave it uncached so the next read retries instead of treating it as
+		// authoritative. Once provider-apis exposes a paged primitive, replace this fail-closed guard with a drain.
+		if (descriptors.length >= linearImplicitTeamsPageSize) {
+			return { values: descriptors, metadata: { completeness: 'unknown' } };
 		}
 
-		return this._teams.get(accessToken);
+		this._teams.set(accessToken, descriptors);
+		return { values: descriptors };
 	}
 
-	protected override getProviderResourcesForUser(
-		_session: ProviderAuthenticationSession,
+	protected override async getProviderResourcesForUser(
+		session: ProviderAuthenticationSession,
 	): Promise<ResourceDescriptor[] | undefined> {
-		throw new Error('Method not implemented.');
+		const organization = await this.getOrganization(session);
+		return organization != null ? [organization] : undefined;
 	}
 	protected override getProviderProjectsForResources(
-		_session: ProviderAuthenticationSession,
+		session: ProviderAuthenticationSession,
 		_resources: ResourceDescriptor[],
 	): Promise<ResourceDescriptor[] | undefined> {
-		throw new Error('Method not implemented.');
+		return this.getTeams(session);
+	}
+	protected override async getProviderProjectsForResourcesWithMetadata(
+		session: ProviderAuthenticationSession,
+		_resources: ResourceDescriptor[],
+	): Promise<ProviderApiCollectionResult<ResourceDescriptor>> {
+		return (await this.getTeamsWithMetadata(session)) ?? { values: [] };
 	}
 	readonly authProvider: IntegrationAuthenticationProviderDescriptor = authProvider;
 
-	protected override getProviderAccountForResource(
-		_session: ProviderAuthenticationSession,
+	protected override async getProviderAccountForResource(
+		session: ProviderAuthenticationSession,
 		_resource: ResourceDescriptor,
 	): Promise<Account | undefined> {
-		throw new Error('Method not implemented.');
+		const api = await this.getProvidersApi();
+		// Linear's viewer isn't a ProviderAccount (no username/avatar), so build the Account manually
+		// (Trello-style) from the fields the viewer query returns.
+		const user = await api.getLinearCurrentUser(toTokenWithInfo(this.id, session));
+		if (user == null) return undefined;
+
+		return {
+			provider: this,
+			id: user.id,
+			name: user.name ?? user.displayName ?? undefined,
+			username: user.displayName ?? undefined,
+			email: user.email ?? undefined,
+			avatarUrl: undefined,
+		};
 	}
 
-	protected override getProviderIssuesForProject(
-		_session: ProviderAuthenticationSession,
-		_project: ResourceDescriptor,
-		_options?: { user?: string; filters?: IssueFilter[] },
+	protected override async getProviderIssuesForProject(
+		session: ProviderAuthenticationSession,
+		project: ResourceDescriptor,
+		options?: IssuesForProjectOptions,
 	): Promise<IssueShape[] | undefined> {
-		throw new Error('Method not implemented.');
+		return (await this.getProviderIssuesForProjectWithTruncation(session, project, options))?.values;
+	}
+
+	protected override async getProviderIssuesForProjectWithTruncation(
+		session: ProviderAuthenticationSession,
+		project: ResourceDescriptor,
+		options?: IssuesForProjectOptions,
+	): Promise<{ values: IssueShape[]; truncated: boolean; metadata?: CollectionMetadata } | undefined> {
+		if (!isIssueResourceDescriptor(project)) return undefined;
+
+		const api = await this.getProvidersApi();
+		// `getProviderProjectsForResources` returns Linear teams, so `project.id` is a team id here. Drain the
+		// team's issues (Linear pages by cursor); bounded by maxPagesPerRequest as a backstop. `truncated` is
+		// set when that backstop stopped the drain with more pages still available.
+		let cursor: string | undefined;
+		let hasMore: boolean;
+		let requestCount = 0;
+		let truncated = false;
+		let collectionMetadata: CollectionMetadata | undefined;
+		const issues: IssueShape[] = [];
+		do {
+			let result: Awaited<ReturnType<typeof api.getLinearIssues>>;
+			try {
+				result = await api.getLinearIssues(
+					toTokenWithInfo(this.id, session),
+					{ teams: [project.id] },
+					{ cursor: cursor, sort: options?.sort },
+				);
+			} catch (ex) {
+				// A page failure after the first page leaves the already-drained prefix intact; record the
+				// failure at the project scope instead of re-throwing and discarding the prefix. If nothing was
+				// fetched yet, preserve the original throw behavior so the caller sees a hard error.
+				if (issues.length === 0) throw ex;
+
+				truncated = true;
+				collectionMetadata = mergeCollectionMetadata(collectionMetadata, {
+					completeness: 'partial',
+					failures: [toCollectionScopeFailure({ providerId: this.id, projectId: project.id }, ex)],
+				});
+				break;
+			}
+			requestCount += 1;
+			hasMore = result.paging?.more ?? false;
+			const nextCursor = result.paging?.cursor;
+			for (const issue of result.values) {
+				const shape = toIssueShape(issue, this);
+				if (shape != null) {
+					issues.push(shape);
+				}
+			}
+			// The provider claims more but returns no advancing cursor: we can't continue without re-reading the
+			// same page, so the drain is incomplete — flag it rather than silently stopping.
+			if (hasMore && (nextCursor == null || nextCursor === cursor)) {
+				truncated = true;
+				break;
+			}
+
+			cursor = nextCursor;
+			// More pages remain but we've hit the backstop: the drain is incomplete.
+			if (hasMore && requestCount >= maxPagesPerRequest) {
+				truncated = true;
+			}
+		} while (requestCount < maxPagesPerRequest && hasMore);
+
+		// Linear's issue list has no server-side author/assignee filter, so scope to the current user
+		// client-side when a user was requested (the assignee filter is what "my issues" means here).
+		// Match on the viewer's stable id, not the passed display name: Linear's `name` (full name) and
+		// `displayName` (nickname) are distinct fields, and assignees are normalized with `.name` = the full
+		// name while the caller's `user` is the displayName — so a name string can miss. The assignee `.id`
+		// is the Linear user id, which is unambiguous.
+		if (options?.user != null) {
+			const viewerId = (await api.getLinearCurrentUser(toTokenWithInfo(this.id, session)))?.id;
+			// If the viewer can't be resolved we can't scope to "my issues" — returning the unfiltered team
+			// issues would leak everyone else's, and returning [] is indistinguishable from "no issues assigned
+			// to me". Throw so the facade (getIssuesForProjectResult → runCaptured) surfaces a warning +
+			// fetchFailed the caller can act on, instead of a silent empty.
+			if (viewerId == null) {
+				throw new IntegrationReadUnavailableError(
+					metadata.name,
+					'could not resolve the current user to scope issues to',
+				);
+			}
+			return {
+				values: issues.filter(issue => issue.assignees?.some(a => a.id === viewerId)),
+				truncated: truncated,
+				metadata: collectionMetadata,
+			};
+		}
+
+		return { values: issues, truncated: truncated, metadata: collectionMetadata };
 	}
 
 	override get id(): IssuesCloudHostIntegrationId.Linear {
@@ -178,14 +322,45 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		resources?: ResourceDescriptor[],
 		cancellation?: AbortSignal,
 	): Promise<IssueShape[] | undefined> {
+		return (await this.searchProviderMyIssuesWithTruncation(session, resources, cancellation))?.values;
+	}
+
+	/**
+	 * Account-wide "my issues" for Linear, drained to exhaustion and reporting whether it got there.
+	 *
+	 * The SDK read is one server-ordered query over an `or` filter across the four relationships (assigned,
+	 * created, named in an issue's content, named in a comment), so each page is 100 issues the caller has not
+	 * seen and the pages are ordered as one sequence. Draining it is therefore just following the cursor.
+	 *
+	 * Overridden rather than left to the base default because that default hardcodes `truncated: false`, and a
+	 * bounded drain that stops early is exactly the case a caller must be able to see. Three things end the
+	 * drain, and only one of them is completion:
+	 *
+	 * - the provider says there is no next page — complete;
+	 * - the backstop is reached — `truncated`, because issues beyond it exist and were not read;
+	 * - the provider claims a next page but hands back a cursor that does not advance — also `truncated`, since
+	 *   the read cannot continue and the remainder is unreachable rather than absent.
+	 *
+	 * Cancellation is deliberately NOT truncation: the caller asked for the read to stop, so the partial list is
+	 * what it asked for, and flagging it would surface an incompleteness warning for a user action.
+	 */
+	protected override async searchProviderMyIssuesWithTruncation(
+		session: ProviderAuthenticationSession,
+		resources?: ResourceDescriptor[],
+		cancellation?: AbortSignal,
+		options?: SearchMyIssuesOptions,
+	): Promise<AccountWideIssuesResult | undefined> {
 		if (resources != null) {
 			return undefined;
 		}
 
 		const api = await this.getProvidersApi();
 		let cursor = undefined;
-		let hasMore: boolean;
+		// Starts false so an immediate cancellation, which leaves the loop before the first response, reads as
+		// "no more pages known" rather than as an unfinished drain.
+		let hasMore = false;
 		let requestCount = 0;
+		let truncated = false;
 		const issues = [];
 		try {
 			do {
@@ -195,25 +370,47 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 
 				const result = await api.getIssuesForCurrentUser(toTokenWithInfo(this.id, session), {
 					cursor: cursor,
+					sort: options?.sort,
 				});
 				requestCount += 1;
 				hasMore = result.paging?.more ?? false;
-				cursor = result.paging?.cursor;
+				const nextCursor = result.paging?.cursor;
+
+				// Keep this page before deciding whether to continue: the request is already paid for, so
+				// dropping its rows would lose real results to save nothing.
 				const formattedIssues = result.values
 					.map(issue => toIssueShape(issue, this))
 					.filter((result): result is IssueShape => result != null);
 				if (formattedIssues.length > 0) {
 					issues.push(...formattedIssues);
 				}
-			} while (requestCount < maxPagesPerRequest && hasMore);
+
+				// The provider claims more but hands back no advancing cursor: continuing would re-read the page
+				// just returned. `ProvidersApi.getPagedResult` already normalizes this into `more: false`, so
+				// this is a backstop for if that ever stops holding rather than a case seen today -- but the rest
+				// of the account is unreachable either way, which is what `truncated` says.
+				if (hasMore && (nextCursor == null || nextCursor === cursor)) {
+					truncated = true;
+					break;
+				}
+
+				cursor = nextCursor;
+			} while (requestCount < maxAccountWidePagesPerRequest && hasMore);
+
+			// Ran out of budget with pages still to come.
+			if (hasMore && requestCount >= maxAccountWidePagesPerRequest) {
+				truncated = true;
+			}
 		} catch (ex) {
 			if (issues.length === 0) {
 				throw ex;
 			}
 
+			// Kept what was already fetched, so the list is real but short of the account.
+			truncated = true;
 			Logger.error(ex, 'searchProviderMyIssues');
 		}
-		return issues;
+		return { values: issues, truncated: truncated };
 	}
 	protected override async getProviderLinkedIssueOrPullRequest(
 		session: ProviderAuthenticationSession,

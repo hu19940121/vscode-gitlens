@@ -1,18 +1,22 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing, svg } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { keyed } from 'lit/directives/keyed.js';
+import { focusOutlineButton } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase, scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { Source } from '../../../../constants.telemetry.js';
 import type { SubscriptionLoginCommandArgs } from '../../../../plus/gk/models/subscription.js';
 import { createCommandLink } from '../../../../system/commands.js';
 import type { GraphShowAction } from '../../../plus/graph/protocol.js';
-import { boxSizingBase, scrollableBase } from '../../shared/components/styles/lit/base.css.js';
+import { emitTelemetrySentEvent } from '../../shared/telemetry.js';
 import { graphStateContext } from './context.js';
 import { getIntentSourceDetail, intentCopyByAction } from './intentCopy.js';
 import '../../shared/components/button.js';
 import '../../shared/components/card/card.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../shared/components/feature-badge.js';
 import '../../shared/components/gitlens-logo-circle.js';
 
@@ -27,37 +31,41 @@ type ProStripSlide = { name: string; description: string; vignette: () => unknow
 
 const proStripSlides: ProStripSlide[] = [
 	{
-		name: 'Commit Graph',
-		description:
+		name: l10n.t('Commit Graph'),
+		description: l10n.t(
 			'Where your development and agentic workflows come together — run your entire Git lifecycle from one view.',
+		),
 		vignette: renderGraphVignette,
 	},
 	{
-		name: 'Agents & Worktrees',
-		description:
+		name: l10n.t('Agents & Worktrees'),
+		description: l10n.t(
 			'Launch, monitor, and interact with coding agents — parallelized across worktrees, without the chaos.',
+		),
 		vignette: renderWorktreesVignette,
 	},
 	{
-		name: 'AI Compose & Review',
-		description: 'Bring order from chaos — clean, review-ready commits and severity-tagged reviews.',
+		name: l10n.t('AI Compose & Review'),
+		description: l10n.t('Bring order from chaos — clean, review-ready commits and severity-tagged reviews.'),
 		vignette: renderAiVignette,
 	},
 	{
-		name: 'AI Rebase & Resolve',
-		description:
+		name: l10n.t('AI Rebase & Resolve'),
+		description: l10n.t(
 			'Guided, AI-assisted rebase and conflict resolution — see both sides, take the right changes, and finish the merge faster.',
+		),
 		vignette: renderResolveVignette,
 	},
 	{
-		name: 'Launchpad',
-		description: 'Know what needs your attention — PRs, issues, and blockers, prioritized in one view.',
+		name: l10n.t('Launchpad'),
+		description: l10n.t('Know what needs your attention — PRs, issues, and blockers, prioritized in one view.'),
 		vignette: renderLaunchpadVignette,
 	},
 	{
-		name: 'Visualizations',
-		description:
-			'Analyze how your code evolves — Visual History, hotspots, and Files, Commits, and Agent Activity treemaps.',
+		name: l10n.t('Visualizations & Health'),
+		description: l10n.t(
+			'Analyze how your code evolves — Visual History, hotspots, and treemaps — plus Repository Health tune-ups that keep git fast.',
+		),
 		vignette: renderVizVignette,
 	},
 ];
@@ -304,12 +312,35 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			:host {
 				--link-foreground: var(--vscode-textLink-foreground);
 				--link-foreground-active: var(--vscode-textLink-activeForeground);
+				--lp-frame-bg: #121212;
+				--lp-frame-stroke: #363636;
+				--lp-shell-bg: #2a2a2c;
+				--lp-dot-fill: #d9d9d9;
+				--lp-row: #808080;
+				--lp-purple: #aa5bf5;
+				--lp-green: #00a02e;
+
+				/* Pro strip vignettes: dark/light exports differing only in these colors, same as the
+   layout illustrations below. */
+				--strip-panel-1: #16181e;
+				--strip-panel-2: #0e1015;
+				--strip-inset: #171a21;
+				--strip-inset-border: #2c2d33;
+				--strip-node-fill: #0f1116;
+				--strip-node-core: #e3efff;
+				--strip-skeleton: #fff;
+				--strip-edge-light: rgb(255 255 255 / 5%);
+				--strip-text-blue: #b4d0ff;
+				--strip-text-cyan: #9fdcff;
+				--strip-text-green: #6fe07c;
+				--strip-text-amber: #e3b341;
+				--strip-text-red: #ff8f87;
 			}
 
 			/* No justify-content here on purpose: .content centers itself with margin-block: auto (which
-			   yields the free space back to flex-start on overflow, so the top stays scrollable). A
-			   justify-content: center would re-center the overflow once those auto margins zero out,
-			   clipping the top of tall content in short viewports. */
+  yields the free space back to flex-start on overflow, so the top stays scrollable). A
+  justify-content: center would re-center the overflow once those auto margins zero out,
+  clipping the top of tall content in short viewports. */
 			.container {
 				display: flex;
 				flex-direction: column;
@@ -332,8 +363,8 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			}
 
 			/* Slim, subtly-tinted notice pinned to the top of the sign-in screen for users upgrading
-			   from before v19 (the Commit Graph's move to an account-gated home). flex: none keeps it
-			   at its natural size at the top while .content's auto margins take the remaining space. */
+  from before v19 (the Commit Graph's move to an account-gated home). flex: none keeps it
+  at its natural size at the top while .content's auto margins take the remaining space. */
 			.upgrade-banner {
 				display: flex;
 				flex: none;
@@ -476,6 +507,26 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 				animation: gl-fade-up var(--gl-duration-x-slow) var(--gl-ease-out) 300ms both;
 			}
 
+			.intro-video {
+				display: block;
+				inline-size: 100%;
+				margin-block-start: var(--gl-space-40);
+				animation: gl-fade-up var(--gl-duration-x-slow) var(--gl-ease-out) 300ms both;
+			}
+
+			.intro-video:focus-visible {
+				${focusOutlineButton}
+				border-radius: var(--gl-radius-sm);
+			}
+
+			.intro-video__thumbnail {
+				display: block;
+				inline-size: 100%;
+				/* Reserve the box before the image decodes — otherwise the centered gate shifts on load */
+				aspect-ratio: 450 / 239;
+				border-radius: var(--gl-radius-sm);
+			}
+
 			.walkthrough {
 				--button-gap: var(--gl-space-4);
 
@@ -485,7 +536,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 
 			.setup {
 				/* The component's card surface defaults derive from the sidebar background; re-derive it
-				   here since this screen sits on the editor background instead. */
+   here since this screen sits on the editor background instead. */
 				--gl-card-background: color-mix(
 					in lab,
 					var(--vscode-editor-background) 100%,
@@ -625,37 +676,11 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			}
 
 			/* Designed illustrations ship as dark/light exports differing only in these colors — one
-			   markup, themed via custom properties (host body carries the vscode-* theme class) */
-			:host {
-				--lp-frame-bg: #121212;
-				--lp-frame-stroke: #363636;
-				--lp-shell-bg: #2a2a2c;
-				--lp-dot-fill: #d9d9d9;
-				--lp-row: #808080;
-				--lp-purple: #aa5bf5;
-				--lp-green: #00a02e;
-
-				/* Pro strip vignettes: dark/light exports differing only in these colors, same as the
-				   layout illustrations above. */
-				--strip-panel-1: #16181e;
-				--strip-panel-2: #0e1015;
-				--strip-inset: #171a21;
-				--strip-inset-border: #2c2d33;
-				--strip-node-fill: #0f1116;
-				--strip-node-core: #e3efff;
-				--strip-skeleton: #ffffff;
-				--strip-edge-light: rgba(255, 255, 255, 0.05);
-				--strip-text-blue: #b4d0ff;
-				--strip-text-cyan: #9fdcff;
-				--strip-text-green: #6fe07c;
-				--strip-text-amber: #e3b341;
-				--strip-text-red: #ff8f87;
-			}
-
+  markup, themed via custom properties (host body carries the vscode-* theme class). */
 			:host-context(.vscode-light),
 			:host-context(.vscode-high-contrast-light) {
 				--lp-frame-bg: #fefefe;
-				--lp-frame-stroke: #dddddd;
+				--lp-frame-stroke: #ddd;
 				--lp-shell-bg: #e3e3e3;
 				--lp-dot-fill: #9c9c9c;
 				--lp-row: #b4b4b4;
@@ -664,12 +689,12 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 
 				--strip-panel-1: #f7f7fa;
 				--strip-panel-2: #ececf1;
-				--strip-inset: #ffffff;
+				--strip-inset: #fff;
 				--strip-inset-border: #d9dade;
 				--strip-node-fill: #f2f2f6;
 				--strip-node-core: #1f4f9e;
-				--strip-skeleton: #000000;
-				--strip-edge-light: rgba(0, 0, 0, 0.05);
+				--strip-skeleton: #000;
+				--strip-edge-light: rgb(0 0 0 / 5%);
 				--strip-text-blue: #2b5cb8;
 				--strip-text-cyan: #0969a2;
 				--strip-text-green: #1a7f37;
@@ -679,7 +704,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 
 			.pro-strip {
 				/* Scales continuously with viewport height (like the fluid width) — full size above
-				   ~670px, easing down to the floor before the compact tier hides the strip. */
+   ~670px, easing down to the floor before the compact tier hides the strip. */
 				--strip-vignette-size: clamp(12rem, 30vh, 20rem);
 
 				display: flex;
@@ -779,7 +804,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 
 			.pro-strip__tab[aria-pressed='true']::before {
 				position: absolute;
-				inset: auto 0 0 0;
+				inset: auto 0 0;
 				block-size: 0.2rem;
 				content: '';
 				background: color-mix(in lab, var(--vscode-editor-background) 100%, var(--vscode-foreground) 14%);
@@ -790,8 +815,8 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 				position: absolute;
 				inset-block-end: 0;
 				inset-inline-start: 0;
-				block-size: 0.2rem;
 				inline-size: 100%;
+				block-size: 0.2rem;
 				content: '';
 				background: var(--gl-gradient-brand);
 				border-radius: var(--gl-radius-xs);
@@ -897,16 +922,16 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			}
 
 			/* Compact tier for short viewports (e.g. the default bottom-panel height ~265px), where the
-			   comfortable spacing pushes the sign-in actions below the fold. A media query (not a container
-			   query) is intentional: this screen fills the webview viewport and the host is the scroll
-			   surface, so 'container-type: size' would change scroll ownership. */
+  comfortable spacing pushes the sign-in actions below the fold. A media query (not a container
+  query) is intentional: this screen fills the webview viewport and the host is the scroll
+  surface, so 'container-type: size' would change scroll ownership. */
 			@media (height <= 360px) {
 				:host {
 					padding-block: var(--gl-space-12);
 				}
 
 				/* The fill-mode animation carries the 1.22 upscale, so switching to the plain keyframes is
-				   what actually drops it; the static transform only applies under reduced motion. */
+   what actually drops it; the static transform only applies under reduced motion. */
 				.logo {
 					margin-block: 0 var(--gl-space-6);
 					transform: none;
@@ -935,7 +960,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 				}
 
 				/* No room for a marketing strip at this tier — the sign-in actions themselves are
-				   already tight against the fold. */
+   already tight against the fold. */
 				.pro-strip {
 					display: none;
 				}
@@ -952,7 +977,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 				}
 
 				/* Fluid width with the artwork's own aspect ratio — a fixed height would make the
-				   'slice' fitting crop-zoom as the ratio drifts from the 200:88 viewBox. */
+   'slice' fitting crop-zoom as the ratio drifts from the 200:88 viewBox. */
 				.pro-strip__vignette {
 					inline-size: 100%;
 					max-width: var(--strip-vignette-size);
@@ -1012,6 +1037,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 				.waiting,
 				.sync-status,
 				.learn-more,
+				.intro-video,
 				.walkthrough,
 				.setup,
 				.layout,
@@ -1024,7 +1050,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 				}
 
 				/* Static full-width fill — the animated progress read is motion, but the active
-				   indicator itself must survive. */
+   indicator itself must survive. */
 				.pro-strip__tab[aria-pressed='true']::after {
 					transform: none;
 					animation: none;
@@ -1033,7 +1059,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 		`,
 	];
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	graphState!: typeof graphStateContext.__context__;
 
 	/** The task that brought the user here (parked by the app while gated) — selects the
@@ -1087,7 +1113,13 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 	// behavior, so a plain field avoids an unnecessary re-render on every hover.
 	private _stripPaused = false;
 	private _lastScreen: 'signin' | 'verify' | 'welcome' | undefined;
+	private _signInShownReported = false;
 	private _lastFocusKey: string | undefined;
+
+	/** A/B (intro-video): the sign-in screen shows the intro-video thumbnail instead of the Pro strip + Learn More */
+	private get introVideo(): boolean {
+		return this.graphState.signInGateVariant === 'intro-video';
+	}
 
 	override disconnectedCallback(): void {
 		super.disconnectedCallback?.();
@@ -1124,13 +1156,29 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 		}
 		this._lastScreen = screen;
 
-		if (screen === 'signin' && this._stripInterval == null) {
+		if (screen === 'signin' && !this.introVideo && this._stripInterval == null) {
 			this.startStripTimer();
+		} else if (this.introVideo && this._stripInterval != null) {
+			// The variant can flip in place (e.g. a trust grant) — stop the strip timer once the strip
+			// leaves the tree
+			this.clearStripTimer();
 		}
 	}
 
 	protected override updated(changedProperties: Map<PropertyKey, unknown>): void {
 		super.updated(changedProperties);
+
+		// `signInGateVariant` is resolved exactly on gate-rendering paths (`unassigned` when
+		// cohort-less) — requiring it keeps Restricted-Mode renders out of the funnel and defers the
+		// impression to the push that carries the cohort; a `subscription` check can't do either
+		const variant = this.graphState.signInGateVariant;
+		if (this.screen === 'signin' && variant != null && !this._signInShownReported) {
+			this._signInShownReported = true;
+			emitTelemetrySentEvent<'graph/signin/shown'>(this, {
+				name: 'graph/signin/shown',
+				data: { variant: variant },
+			});
+		}
 
 		// Keep focus on the primary control whenever the visible view changes — the initial mount, the
 		// sign-in <-> verify switches, and the actions <-> "waiting" swap each remove the focused
@@ -1183,32 +1231,43 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 					this.upgradedFromPreV19
 						? html`<div class="upgrade-banner" role="note">
 								<code-icon icon="info"></code-icon>
-								<span>The all-new Commit Graph has moved here, replacing the Home view.</span>
+								<span
+									>${l10n.t('The all-new Commit Graph has moved here, replacing the Home view.')}</span
+								>
 							</div>`
 						: nothing
 				}
 				<div class="content">
 					<gitlens-logo-circle class="logo"></gitlens-logo-circle>
-					<h1 class="heading">${copy?.heading ?? 'Sign In to GitLens'}</h1>
+					<h1 class="heading">${copy?.heading ?? l10n.t('Sign In to GitLens')}</h1>
 					<p class="body">
 						${
 							copy?.body ??
-							html`Supercharge Git and stay in control of
-								<span class="nowrap">AI-assisted</span> development by connecting coding agents,
-								worktrees, commits, and reviews directly into the Git workflow.`
+							localizedContent(
+								l10n.t({
+									message:
+										'Supercharge Git and stay in control of {aiAssisted} development by connecting coding agents, worktrees, commits, and reviews directly into the Git workflow.',
+									comment: ['{aiAssisted} is the styled phrase “AI-assisted”, kept on one line.'],
+								}),
+								{ aiAssisted: html`<span class="nowrap">${l10n.t('AI-assisted')}</span>` },
+							)
 						}
 					</p>
 					${this.waiting ? this.renderWaiting() : this.renderSignInActions()}
-					<gl-button
-						class="learn-more"
-						appearance="link"
-						href=${createCommandLink('gitlens.showWelcomeView', { mode: 'main' })}
-					>
-						<code-icon slot="prefix" icon="book"></code-icon>
-						Learn More
-					</gl-button>
+					${
+						this.introVideo
+							? this.renderIntroVideo()
+							: html`<gl-button
+									class="learn-more"
+									appearance="link"
+									href=${createCommandLink('gitlens.showWelcomeView', { mode: 'main' })}
+								>
+									<code-icon slot="prefix" icon="book"></code-icon>
+									${l10n.t('Learn More')}
+								</gl-button>`
+					}
 				</div>
-				${this.renderProStrip()}
+				${this.introVideo ? nothing : this.renderProStrip()}
 			</div>
 		`;
 	}
@@ -1220,7 +1279,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			<div
 				class="pro-strip"
 				role="region"
-				aria-label="GitLens Pro features"
+				aria-label=${l10n.t('GitLens Pro features')}
 				@mouseenter=${this.onStripPauseOn}
 				@mouseleave=${this.onStripPauseOff}
 				@focusin=${this.onStripPauseOn}
@@ -1278,6 +1337,31 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 		`;
 	}
 
+	/** A/B variant: the marketplace intro-video thumbnail in place of the Pro strip and Learn More link. */
+	private renderIntroVideo(): unknown {
+		return html`
+			<a
+				class="intro-video"
+				href="https://www.youtube.com/watch?v=7cy4_M0lH6k"
+				aria-label=${l10n.t('Watch the GitLens Getting Started video')}
+				@click=${this.onIntroVideoClicked}
+			>
+				<img
+					class="intro-video__thumbnail"
+					src="${this.graphState.webroot ?? ''}/media/get-started-video.webp"
+					alt=""
+				/>
+			</a>
+		`;
+	}
+
+	private onIntroVideoClicked(): void {
+		emitTelemetrySentEvent<'graph/signin/introVideo/clicked'>(this, {
+			name: 'graph/signin/introVideo/clicked',
+			data: {},
+		});
+	}
+
 	private renderSignInActions(): unknown {
 		return html`
 			<div class="actions">
@@ -1288,7 +1372,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 						openAccountView: false,
 					})}
 					@click=${this.onStart}
-					>Create Free Account</gl-button
+					>${l10n.t('Create Free Account')}</gl-button
 				>
 				<gl-button
 					full
@@ -1298,7 +1382,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 						openAccountView: false,
 					})}
 					@click=${this.onStart}
-					>Sign In</gl-button
+					>${l10n.t('Sign In')}</gl-button
 				>
 			</div>
 		`;
@@ -1309,9 +1393,9 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			<div class="waiting">
 				<code-icon icon="sync" modifier="spin"></code-icon>
 				<div class="waiting__status" role="status" aria-live="polite">
-					Waiting for sign-in to complete in your browser&hellip;
+					${l10n.t('Waiting for sign-in to complete in your browser…')}
 				</div>
-				<button type="button" class="cancel" @click=${this.onCancel}>Cancel</button>
+				<button type="button" class="cancel" @click=${this.onCancel}>${l10n.t('Cancel')}</button>
 			</div>
 		`;
 	}
@@ -1321,10 +1405,9 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 			<div class="container scrollable">
 				<div class="content">
 					<code-icon class="icon-accent" icon="mail" .size=${28}></code-icon>
-					<h1 class="heading">Verify your email</h1>
+					<h1 class="heading">${l10n.t('Verify your email')}</h1>
 					<p class="body">
-						We sent a verification link to your email. Click it to activate your account, then synchronize
-						to continue.
+						${l10n.t('We sent a verification link to your email. Click it to activate your account, then synchronize to continue.')}
 					</p>
 					<div class="actions">
 						<gl-button
@@ -1332,7 +1415,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 							href=${createCommandLink<Source>('gitlens.plus.resendVerification', src)}
 							?disabled=${this.cooldown > 0}
 							@click=${this.onResend}
-							>${this.cooldown > 0 ? `Email Sent · ${this.cooldown}s` : 'Resend Email'}</gl-button
+							>${this.cooldown > 0 ? l10n.t('Email Sent · {seconds}s', { seconds: this.cooldown }) : l10n.t('Resend Email')}</gl-button
 						>
 						<gl-button
 							full
@@ -1341,13 +1424,13 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 							@click=${this.onSync}
 						>
 							<code-icon slot="prefix" icon="sync" modifier=${this.syncing ? 'spin' : ''}></code-icon>
-							Synchronize Status
+							${l10n.t('Synchronize Status')}
 						</gl-button>
 					</div>
 					${
 						this.syncChecked && !this.syncing
 							? html`<p class="sync-status" role="status">
-									Not verified yet &mdash; check your inbox for the link.
+									${l10n.t('Not verified yet — check your inbox for the link.')}
 								</p>`
 							: nothing
 					}
@@ -1365,25 +1448,30 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 						this.liveSignIn
 							? html`<p class="success" role="status">
 									<code-icon icon="pass-filled"></code-icon>
-									You're signed in
+									${l10n.t("You're signed in")}
 								</p>`
 							: nothing
 					}
-					<h1 class="heading">Welcome to the Commit Graph</h1>
+					<h1 class="heading">${l10n.t('Welcome to the Commit Graph')}</h1>
 					<p class="body">
-						Where your development and agentic workflows come
-						together${!this.showLayoutOptions && !this.upgradedFromPreV19 ? html` &mdash; visualize branches and commits, manage parallel work and agents, and run your entire Git workflow from one view.` : '.'}
+						${
+							!this.showLayoutOptions && !this.upgradedFromPreV19
+								? l10n.t(
+										'Where your development and agentic workflows come together — visualize branches and commits, manage parallel work and agents, and run your entire Git workflow from one view.',
+									)
+								: l10n.t('Where your development and agentic workflows come together.')
+						}
 					</p>
 					${this.showLayoutOptions ? this.renderLayoutOptions() : nothing}
 					<div class="setup">
-						<h2 class="setup__label">Set up your workflow</h2>
+						<h2 class="setup__label">${l10n.t('Set up your workflow')}</h2>
 						<gl-card class="setup__card" href=${createCommandLink('gitlens.showSettingsPage!ai')}>
 							<div class="setup-card">
 								<code-icon class="setup-card__icon" icon="sparkle"></code-icon>
 								<div class="setup-card__content">
-									<span class="setup-card__title">Set up AI</span>
+									<span class="setup-card__title">${l10n.t('Set up AI')}</span>
 									<span class="setup-card__hint"
-										>Compose commits, review changes, and resolve conflicts with AI</span
+										>${l10n.t('Compose commits, review changes, and resolve conflicts with AI')}</span
 									>
 								</div>
 								<code-icon class="setup-card__chevron" icon="chevron-right"></code-icon>
@@ -1393,9 +1481,9 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 							<div class="setup-card">
 								<code-icon class="setup-card__icon" icon="robot"></code-icon>
 								<div class="setup-card__content">
-									<span class="setup-card__title">Set up Agents</span>
+									<span class="setup-card__title">${l10n.t('Set up Agents')}</span>
 									<span class="setup-card__hint"
-										>Choose your default coding agent and install the GitKraken MCP</span
+										>${l10n.t('Choose your default coding agent and install the GitKraken MCP')}</span
 									>
 								</div>
 								<code-icon class="setup-card__chevron" icon="chevron-right"></code-icon>
@@ -1405,9 +1493,9 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 							<div class="setup-card">
 								<code-icon class="setup-card__icon" icon="plug"></code-icon>
 								<div class="setup-card__content">
-									<span class="setup-card__title">Connect Integrations</span>
+									<span class="setup-card__title">${l10n.t('Connect Integrations')}</span>
 									<span class="setup-card__hint"
-										>See and act on PRs and issues from GitHub, Jira, and more</span
+										>${l10n.t('See and act on PRs and issues from GitHub, Jira, and more')}</span
 									>
 								</div>
 								<code-icon class="setup-card__chevron" icon="chevron-right"></code-icon>
@@ -1415,7 +1503,9 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 						</gl-card>
 					</div>
 					<div class="actions actions--last">
-						<gl-button full class="continue" @click=${this.onContinue}>Continue to Commit Graph</gl-button>
+						<gl-button full class="continue" @click=${this.onContinue}
+							>${l10n.t('Continue to Commit Graph')}</gl-button
+						>
 					</div>
 				</div>
 			</div>
@@ -1425,7 +1515,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 	private renderLayoutOptions(): unknown {
 		return html`
 			<div class="layout">
-				<h2 class="layout__question">Would you like to change the Graph location?</h2>
+				<h2 class="layout__question">${l10n.t('Would you like to change the Graph location?')}</h2>
 				<div class="layout__options">
 					<button
 						type="button"
@@ -1435,7 +1525,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 					>
 						${this.renderSidebarIllustration()}
 						<span class="layout__option-text">
-							<span class="layout__option-label">Side Bar</span>
+							<span class="layout__option-label">${l10n.t('Side Bar')}</span>
 						</span>
 					</button>
 					<button
@@ -1446,7 +1536,7 @@ export class GlGraphAccessAccount extends SignalWatcher(LitElement) {
 					>
 						${this.renderPanelIllustration()}
 						<span class="layout__option-text">
-							<span class="layout__option-label">Bottom Panel</span>
+							<span class="layout__option-label">${l10n.t('Bottom Panel')}</span>
 						</span>
 					</button>
 				</div>

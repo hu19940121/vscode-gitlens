@@ -127,7 +127,7 @@ export const urls = Object.freeze({
 	graph: `https://gitkraken.com/solutions/commit-graph?${utm}`,
 	launchpad: `https://gitkraken.com/solutions/launchpad?${utm}`,
 	platform: `https://gitkraken.com/devex?${utm}`,
-	pricing: `https://gitkraken.com/gitlens/pricing?${utm}`,
+	pricing: `https://gitkraken.com/pricing?${utm}`,
 	proFeatures: `https://gitkraken.com/gitlens/pro-features?${utm}`,
 	security: `https://help.gitkraken.com/gitlens/security?${utm}`,
 	workspaces: `https://gitkraken.com/solutions/workspaces?${utm}`,
@@ -138,17 +138,20 @@ export const urls = Object.freeze({
 	browserExtension: `https://gitkraken.com/browser-extension?${utm}`,
 	desktop: `https://gitkraken.com/git-client?${utm}`,
 
-	githubNewIssue: `https://github.com/gitkraken/vscode-gitlens/issues/new/choose?${utm}`,
-	githubDiscussions: `https://github.com/gitkraken/vscode-gitlens/discussions/?${utm}`,
+	githubIssues: 'https://github.com/gitkraken/vscode-gitlens/issues',
+	githubNewIssue: 'https://github.com/gitkraken/vscode-gitlens/issues/new/choose',
+	/** The bug-report issue form; append `description`, `gitlens`, and `vscode` params to prefill its fields. */
+	githubNewBugIssue: 'https://github.com/gitkraken/vscode-gitlens/issues/new?template=bug_report.yml',
+	/** The feature-request issue form; append a `description` param to prefill its field. */
+	githubNewFeatureIssue: 'https://github.com/gitkraken/vscode-gitlens/issues/new?template=feature_request.yml',
+	githubDiscussions: 'https://github.com/gitkraken/vscode-gitlens/discussions/',
 	helpCenter: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}`,
-	helpCenterHome: `https://help.gitkraken.com/gitlens/home-view/?${utm}`,
 	helpCenterMCP: `https://help.gitkraken.com/mcp/mcp-getting-started/?${utm}`,
 	releaseNotes: `https://help.gitkraken.com/gitlens/gitlens-release-notes-current/?${utm}`,
 	helpCenterAiHooks: `https://help.gitkraken.com/cli/cli-home/?${utm}#how-to-uninstall-gitkraken-cli-ai-hooks`,
 
 	acceleratePrReviews: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#accelerate-pr-reviews`,
 	communityVsPro: `https://help.gitkraken.com/gitlens/gitlens-community-vs-gitlens-pro/?${utm}`,
-	homeView: `https://help.gitkraken.com/gitlens/home-view/?${utm}&utm_campaign=walkthrough`,
 	interactiveCodeHistory: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#interactive-code-history`,
 	startIntegrations: `https://help.gitkraken.com/gitlens/gitlens-start-here/?${utm}#improve-workflows-with-integrations`,
 	aiFeatures: `https://help.gitkraken.com/gitlens/gl-gk-ai/?${utm}`,
@@ -160,12 +163,4 @@ export const urls = Object.freeze({
 	welcomeTrialReactivationEligible: `https://help.gitkraken.com/gitlens/gitlens-community-vs-gitlens-pro/?${utm}`,
 });
 
-export type WalkthroughSteps =
-	| 'welcome-in-trial'
-	| 'welcome-paid'
-	| 'welcome-in-trial-expired-eligible'
-	| 'welcome-in-trial-expired'
-	| 'get-started-community'
-	| 'visualize-code-history'
-	| 'accelerate-pr-reviews'
-	| 'improve-workflows-with-integrations';
+export type WalkthroughSteps = 'get-started';

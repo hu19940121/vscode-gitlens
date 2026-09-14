@@ -1,11 +1,19 @@
 import ProviderApis from '@gitkraken/provider-apis';
-import type { GitPullRequestState } from '@gitkraken/provider-apis';
+import type {
+	CollectionMetadata,
+	GitPullRequestState,
+	GraphQLError,
+	GraphQLErrors,
+	TrelloBoard,
+	TrelloList,
+} from '@gitkraken/provider-apis';
 import type { PullRequest, PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
 import { base64 } from '@gitlens/utils/base64.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { TokenOptInfo, TokenWithInfo } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
+import { isIncompleteCollection } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import {
 	GitCloudHostIntegrationId,
@@ -15,9 +23,11 @@ import {
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
+	isRateLimitResponse,
 	RequestClientError,
 	RequestNotFoundError,
-	RequestRateLimitError,
+	toError,
+	toRateLimitError,
 } from '../errors.js';
 import type {
 	GetIssueFn,
@@ -29,10 +39,13 @@ import type {
 	GetPullRequestsOptions,
 	GetReposOptions,
 	IssueFilter,
+	IssueSorting,
 	PageInfo,
 	PagingInput,
 	PagingMode,
 	ProviderAccount,
+	ProviderApiCollectionResult,
+	ProviderApiPagedResult,
 	ProviderAzureProject,
 	ProviderAzureResource,
 	ProviderBitbucketResource,
@@ -55,8 +68,13 @@ import type {
 	Providers,
 	PullRequestFilter,
 } from './models.js';
-import { providersMetadata } from './models.js';
-import { collectProviderPagedResult } from './utils/providerPaging.js';
+import { isRepoIdsInput, providersMetadata } from './models.js';
+import {
+	collectProviderPagedResult,
+	mergeCollectionMetadata,
+	parsePageCursor,
+	toPageCursor,
+} from './utils/providerPaging.js';
 
 // `@gitkraken/provider-apis` is published as CommonJS with its factory on the `default` export.
 // How that surfaces depends on the consuming bundler's CJS->ESM interop: esbuild yields the
@@ -66,8 +84,141 @@ type ProviderApisFactory = typeof ProviderApis;
 const createProviderApis: ProviderApisFactory =
 	(ProviderApis as ProviderApisFactory & { default?: ProviderApisFactory }).default ?? ProviderApis;
 
+// Both GitHub and GitLab `getRepo` throw a missing-repo error whose message is exactly
+// `Repository <x> not found`. Anchoring to that shape (rather than a loose `not found` substring) keeps
+// the message fallbacks from misclassifying unrelated GraphQL/transport failures as a confident negative.
+const repoNotFoundMessage = /^Repository .+ not found$/i;
+
+// Duck-typed rather than `ex instanceof GraphQLErrors`, because importing the class as a value makes this
+// module unloadable from plain Node ESM consumers: `@gitkraken/provider-apis` is CommonJS and declares its
+// exports through getters, which Node's `cjs-module-lexer` cannot see, so the only named exports it can
+// synthesize are `default` and `module.exports`. Bundled hosts (webpack/esbuild) bind the named export
+// fine, but the published package keeps third-party deps external, so the named import survives into
+// consumers and breaks linking there. The SDK's constructor always assigns `graphQLErrors` (defaulting to
+// `[]`) and it is the only SDK error carrying that field, so the shape check is unambiguous.
+function isGraphQLErrors(ex: unknown): ex is GraphQLErrors {
+	return ex instanceof Error && Array.isArray((ex as Partial<GraphQLErrors>).graphQLErrors);
+}
+
+// `handleProviderError` classifies not-found by HTTP status (404/410/422), which only works for the
+// REST `getRepo` clients (Bitbucket, Bitbucket Server, Azure DevOps). GitHub and GitLab `getRepo` are
+// GraphQL: a missing repo comes back as HTTP 200 with a null node, and the SDK throws an unclassified
+// error with no `response.status`, so it would otherwise fall through to the generic error bucket. This
+// detects the SDK's not-found shapes so `getRepo` can rethrow them as `RequestNotFoundError`, keeping the
+// facade's by-type mapping intact.
+function isGraphQLRepoNotFoundError(ex: unknown): boolean {
+	// GitHub throws `GraphQLErrors`. The SDK reports the null repository node with the same
+	// `Repository <x> not found` message regardless of the underlying cause, so a `FORBIDDEN` or
+	// `RATE_LIMITED` GraphQL error would also surface with that message. Trust the structured error type
+	// when entries are present (only `NOT_FOUND` is a real not-found), and fall back to the repo-specific
+	// message only when there are no entries to disambiguate (a bare null node).
+	if (isGraphQLErrors(ex)) {
+		const errors = ex.graphQLErrors;
+		// Scope NOT_FOUND to the `repository` field: `getRepo`'s query only selects that node today, but
+		// were it to grow other selections that can emit NOT_FOUND, an unscoped check would misclassify
+		// them. Tolerate a missing `path` so we degrade to the current behavior if the SDK stops populating
+		// it, rather than silently regressing to `error`.
+		if (errors?.length) {
+			return errors.some(
+				(e: GraphQLError) => e.type === 'NOT_FOUND' && (e.path == null || e.path.includes('repository')),
+			);
+		}
+		return repoNotFoundMessage.test(ex.message);
+	}
+
+	// GitLab's `getRepo` throws a plain Error; match its not-found message specifically so unrelated
+	// bare Errors (network/parse failures) still reach the generic error bucket.
+	return ex instanceof Error && repoNotFoundMessage.test(ex.message);
+}
+
+const trelloBaseUrl = 'https://api.trello.com';
+
+/**
+ * Jira computes an issue's available transitions per issue, from the workflow and the reader's permissions, so a
+ * list read at a page size of 100 pays for 100 of those in both server work and response payload. Nothing in this
+ * package reads `statusTransitions` off a list — only the singular `getIssue` path exposes them, and it always
+ * expands them — so every list read opts out. Revisit the day a list row offers a status change straight off it.
+ */
+const jiraListIncludeTransitions = false;
+
+type TrelloMemberResponse = {
+	id: string;
+	username?: string | null;
+	fullName?: string | null;
+	avatarHash?: string | null;
+	avatarUrl?: string | null;
+};
+
+type TrelloCardResponse = {
+	id: string;
+	idShort: number;
+	name: string;
+	url: string;
+	dateLastActivity: string;
+	idList?: string | null;
+	badges?: {
+		comments?: number | null;
+		votes?: number | null;
+	};
+	members?: TrelloMemberResponse[];
+	labels?: Array<{ color: string | null; id: string; name: string }>;
+};
+
+function getTrelloAuthHeaders(appKey: string, token: string): Record<string, string> {
+	return {
+		Authorization: `OAuth oauth_consumer_key="${appKey}", oauth_token="${token}"`,
+	};
+}
+
+function getTrelloMemberAvatarUrl(member: TrelloMemberResponse): string | null {
+	if (member.avatarUrl != null) return member.avatarUrl;
+	if (member.avatarHash == null) return null;
+
+	return `https://trello-members.s3.amazonaws.com/${member.id}/${member.avatarHash}/50.png`;
+}
+
+function fromTrelloCard(
+	card: TrelloCardResponse,
+	trelloBoardListsById: Record<string, { name: string }>,
+): ProviderIssue {
+	const createdDate = new Date(1000 * parseInt(card.id.substring(0, 8), 16));
+	const list = card.idList != null ? trelloBoardListsById[card.idList] : undefined;
+
+	return {
+		id: card.id,
+		commentCount: card.badges?.comments ?? null,
+		number: String(card.idShort),
+		title: card.name,
+		url: card.url,
+		closedDate: null,
+		createdDate: new Date(createdDate.toISOString()),
+		author: null,
+		updatedDate: new Date(card.dateLastActivity),
+		assignees: (card.members ?? []).map(member => ({
+			id: member.id,
+			username: member.username ?? null,
+			name: member.fullName ?? null,
+			email: null,
+			avatarUrl: getTrelloMemberAvatarUrl(member),
+			url: null,
+		})),
+		description: null,
+		state: list != null ? { id: card.idList!, name: list.name, color: null } : null,
+		type: null,
+		repository: null,
+		upvoteCount: card.badges?.votes ?? null,
+		labels: (card.labels ?? []).map(label => ({
+			color: label.color,
+			description: null,
+			id: label.id,
+			name: label.name,
+		})),
+	};
+}
+
 export class ProvidersApi {
 	private readonly providers: Providers;
+	private readonly request: ProviderRequestFunction;
 
 	constructor(private readonly authenticationService: IntegrationAuthenticationService) {
 		const http = authenticationService.ctx.http;
@@ -86,11 +237,13 @@ export class ProvidersApi {
 
 			return parseFetchResponseForApi<T>(response);
 		};
+		this.request = customFetch;
 		const providerApis = createProviderApis({ request: customFetch });
 		this.providers = {
 			[GitCloudHostIntegrationId.GitHub]: {
 				...providersMetadata[GitCloudHostIntegrationId.GitHub],
 				provider: providerApis.github,
+				getRepoFn: providerApis.github.getRepo.bind(providerApis.github),
 				getCurrentUserFn: providerApis.github.getCurrentUser.bind(providerApis.github),
 				getPullRequestsForReposFn: providerApis.github.getPullRequestsForRepos.bind(
 					providerApis.github,
@@ -103,10 +256,12 @@ export class ProvidersApi {
 				) as GetIssuesForReposFn,
 				getOrgsForCurrentUserFn: providerApis.github.getOrgsForCurrentUser.bind(providerApis.github),
 				getReposForOrgFn: providerApis.github.getReposForOrg.bind(providerApis.github),
+				getReposForCurrentUserFn: providerApis.github.getReposForCurrentUser.bind(providerApis.github),
 			},
 			[GitSelfManagedHostIntegrationId.CloudGitHubEnterprise]: {
 				...providersMetadata[GitSelfManagedHostIntegrationId.CloudGitHubEnterprise],
 				provider: providerApis.github,
+				getRepoFn: providerApis.github.getRepo.bind(providerApis.github),
 				getCurrentUserFn: providerApis.github.getCurrentUser.bind(providerApis.github),
 				getPullRequestsForReposFn: providerApis.github.getPullRequestsForRepos.bind(
 					providerApis.github,
@@ -119,6 +274,7 @@ export class ProvidersApi {
 				) as GetIssuesForReposFn,
 				getOrgsForCurrentUserFn: providerApis.github.getOrgsForCurrentUser.bind(providerApis.github),
 				getReposForOrgFn: providerApis.github.getReposForOrg.bind(providerApis.github),
+				getReposForCurrentUserFn: providerApis.github.getReposForCurrentUser.bind(providerApis.github),
 			},
 			[GitCloudHostIntegrationId.GitLab]: {
 				...providersMetadata[GitCloudHostIntegrationId.GitLab],
@@ -132,11 +288,15 @@ export class ProvidersApi {
 				getPullRequestsForUserFn: providerApis.gitlab.getPullRequestsAssociatedWithUser.bind(
 					providerApis.gitlab,
 				) as GetPullRequestsForUserFn,
+				getGitLabPullRequestsForUserAssociationFn: providerApis.gitlab.getPullRequestsForUser.bind(
+					providerApis.gitlab,
+				),
 				getIssueFn: providerApis.gitlab.getIssue.bind(providerApis.gitlab) as GetIssueFn,
 				getIssuesForReposFn: providerApis.gitlab.getIssuesForRepos.bind(
 					providerApis.gitlab,
 				) as GetIssuesForReposFn,
 				getIssuesForRepoFn: providerApis.gitlab.getIssuesForRepo.bind(providerApis.gitlab),
+				getIssuesForCurrentUserFn: providerApis.gitlab.getIssuesForCurrentUser.bind(providerApis.gitlab),
 				mergePullRequestFn: providerApis.gitlab.mergePullRequest.bind(providerApis.gitlab),
 				getGroupsForCurrentUserFn: providerApis.gitlab.getGroupsForCurrentUser.bind(providerApis.gitlab),
 				getReposForCurrentUserFn: providerApis.gitlab.getReposForCurrentUser.bind(providerApis.gitlab),
@@ -144,6 +304,7 @@ export class ProvidersApi {
 			[GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted]: {
 				...providersMetadata[GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted],
 				provider: providerApis.gitlab,
+				getRepoFn: providerApis.gitlab.getRepo.bind(providerApis.gitlab),
 				getCurrentUserFn: providerApis.gitlab.getCurrentUser.bind(providerApis.gitlab),
 				getPullRequestsForReposFn: providerApis.gitlab.getPullRequestsForRepos.bind(
 					providerApis.gitlab,
@@ -152,11 +313,15 @@ export class ProvidersApi {
 				getPullRequestsForUserFn: providerApis.gitlab.getPullRequestsAssociatedWithUser.bind(
 					providerApis.gitlab,
 				) as GetPullRequestsForUserFn,
+				getGitLabPullRequestsForUserAssociationFn: providerApis.gitlab.getPullRequestsForUser.bind(
+					providerApis.gitlab,
+				),
 				getIssueFn: providerApis.gitlab.getIssue.bind(providerApis.gitlab) as GetIssueFn,
 				getIssuesForReposFn: providerApis.gitlab.getIssuesForRepos.bind(
 					providerApis.gitlab,
 				) as GetIssuesForReposFn,
 				getIssuesForRepoFn: providerApis.gitlab.getIssuesForRepo.bind(providerApis.gitlab),
+				getIssuesForCurrentUserFn: providerApis.gitlab.getIssuesForCurrentUser.bind(providerApis.gitlab),
 				mergePullRequestFn: providerApis.gitlab.mergePullRequest.bind(providerApis.gitlab),
 				getGroupsForCurrentUserFn: providerApis.gitlab.getGroupsForCurrentUser.bind(providerApis.gitlab),
 				getReposForCurrentUserFn: providerApis.gitlab.getReposForCurrentUser.bind(providerApis.gitlab),
@@ -164,6 +329,7 @@ export class ProvidersApi {
 			[GitCloudHostIntegrationId.Bitbucket]: {
 				...providersMetadata[GitCloudHostIntegrationId.Bitbucket],
 				provider: providerApis.bitbucket,
+				getRepoFn: providerApis.bitbucket.getRepo.bind(providerApis.bitbucket),
 				getCurrentUserFn: providerApis.bitbucket.getCurrentUser.bind(providerApis.bitbucket),
 				getBitbucketResourcesForCurrentUserFn: providerApis.bitbucket.getWorkspacesForCurrentUser.bind(
 					providerApis.bitbucket,
@@ -211,6 +377,9 @@ export class ProvidersApi {
 				getPullRequestsForAzureProjectsFn: providerApis.azureDevOps.getPullRequestsForProjects.bind(
 					providerApis.azureDevOps,
 				),
+				getPullRequestsForAzureProjectFn: providerApis.azureDevOps.getPullRequestsForProject.bind(
+					providerApis.azureDevOps,
+				),
 				getIssuesForAzureProjectFn: providerApis.azureDevOps.getIssuesForAzureProject.bind(
 					providerApis.azureDevOps,
 				),
@@ -240,6 +409,9 @@ export class ProvidersApi {
 				getPullRequestsForAzureProjectsFn: providerApis.azureDevOps.getPullRequestsForProjects.bind(
 					providerApis.azureDevOps,
 				),
+				getPullRequestsForAzureProjectFn: providerApis.azureDevOps.getPullRequestsForProject.bind(
+					providerApis.azureDevOps,
+				),
 				getIssuesForAzureProjectFn: providerApis.azureDevOps.getIssuesForAzureProject.bind(
 					providerApis.azureDevOps,
 				),
@@ -256,6 +428,7 @@ export class ProvidersApi {
 					providerApis.jira,
 				),
 				getJiraProjectsForResourcesFn: providerApis.jira.getJiraProjectsForResources.bind(providerApis.jira),
+				getJiraProjectsForResourceFn: providerApis.jira.getJiraProjectsForResource.bind(providerApis.jira),
 				getIssueFn: providerApis.jira.getIssue.bind(providerApis.jira) as GetIssueFn,
 				getIssuesForProjectFn: providerApis.jira.getIssuesForProject.bind(providerApis.jira),
 				getIssuesForResourceForCurrentUserFn: providerApis.jira.getIssuesForResourceForCurrentUser.bind(
@@ -269,10 +442,18 @@ export class ProvidersApi {
 				getIssuesForCurrentUserFn: providerApis.linear.getIssuesForCurrentUser.bind(providerApis.linear),
 				getLinearOrganizationFn: providerApis.linear.getLinearOrganization.bind(providerApis.linear),
 				getLinearTeamsForCurrentUserFn: providerApis.linear.getTeamsForCurrentUser.bind(providerApis.linear),
+				getLinearIssuesFn: providerApis.linear.getIssues.bind(providerApis.linear),
+				getLinearCurrentUserFn: providerApis.linear.getCurrentUser.bind(providerApis.linear),
 			},
 			[IssuesCloudHostIntegrationId.Trello]: {
 				...providersMetadata[IssuesCloudHostIntegrationId.Trello],
 				provider: providerApis.trello,
+				getTrelloCurrentUserFn: providerApis.trello.getCurrentUser.bind(providerApis.trello),
+				getTrelloBoardsForCurrentUserFn: providerApis.trello.getBoardsForCurrentUser.bind(providerApis.trello),
+				getTrelloListsForBoardFn: providerApis.trello.getListsForTrelloBoard.bind(providerApis.trello),
+				getTrelloAccountForIdFn: providerApis.trello.getAccountForId.bind(providerApis.trello),
+				getTrelloIssuesForBoardFn: providerApis.trello.getIssuesForBoard.bind(providerApis.trello),
+				getTrelloLabelsForBoardFn: providerApis.trello.getLabelsForBoard.bind(providerApis.trello),
 			},
 		};
 	}
@@ -307,12 +488,9 @@ export class ProvidersApi {
 		);
 	}
 
-	isRepoIdsInput(input: any): input is (string | number)[] {
-		return (
-			input != null &&
-			Array.isArray(input) &&
-			input.every((id: any) => typeof id === 'string' || typeof id === 'number')
-		);
+	/** See {@link isRepoIdsInput}, which owns the rule; kept as a method because callers reach it through the api. */
+	isRepoIdsInput(input: unknown): input is (string | number)[] {
+		return isRepoIdsInput(input);
 	}
 
 	private async getProviderToken<T extends IntegrationIds>(
@@ -343,9 +521,8 @@ export class ProvidersApi {
 		return base64(`PAT:${oauthToken}`);
 	}
 
-	private async ensureProviderTokenAndFunction<T extends IntegrationIds>(
+	private async ensureProviderToken<T extends IntegrationIds>(
 		tokenOptInfo: TokenOptInfo<T>,
-		providerFn: keyof ProviderInfo,
 	): Promise<{ provider: ProviderInfo; tokenWithInfo: TokenWithInfo<T> }> {
 		const providerId = tokenOptInfo.providerId;
 		const provider = this.providers[providerId];
@@ -367,6 +544,16 @@ export class ProvidersApi {
 			throw new Error(`Not connected to provider ${providerId}`);
 		}
 
+		return { provider: provider, tokenWithInfo: tokenWithInfo };
+	}
+
+	private async ensureProviderTokenAndFunction<T extends IntegrationIds>(
+		tokenOptInfo: TokenOptInfo<T>,
+		providerFn: keyof ProviderInfo,
+	): Promise<{ provider: ProviderInfo; tokenWithInfo: TokenWithInfo<T> }> {
+		const { provider, tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+		const providerId = tokenOptInfo.providerId;
+
 		if (provider[providerFn] == null) {
 			throw new Error(`Provider with id ${providerId} does not support function: ${providerFn}`);
 		}
@@ -383,44 +570,29 @@ export class ProvidersApi {
 		}
 
 		if (error?.response?.status != null) {
-			switch (error.response.status) {
+			const status: number = error.response.status;
+			switch (status) {
 				case 404: // Not found
 				case 410: // Gone
 				case 422: // Unprocessable Entity
 					throw new RequestNotFoundError(error);
+				case 429: // Too Many Requests
+					throw toRateLimitError(error, token);
 				case 401: // Unauthorized
-					if (error.message?.includes('rate limit')) {
-						let resetAt: number | undefined;
-
-						const reset = error.response?.headers?.['x-ratelimit-reset'];
-						if (reset != null) {
-							resetAt = parseInt(reset, 10);
-							if (Number.isNaN(resetAt)) {
-								resetAt = undefined;
-							}
-						}
-
-						throw new RequestRateLimitError(error, token, resetAt);
-					}
-					throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, error);
 				case 403: // Forbidden
-					throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, error);
-				case 429: {
-					// Too Many Requests
-					let resetAt: number | undefined;
-
-					const reset = error.response.headers?.['x-ratelimit-reset'];
-					if (reset != null) {
-						resetAt = parseInt(reset, 10);
-						if (Number.isNaN(resetAt)) {
-							resetAt = undefined;
-						}
+					// A throttled request arrives on both statuses depending on the host (see
+					// `isRateLimitResponse`); 403 previously skipped the check, so every provider going through the
+					// SDK reported a rate limit as `auth` and asked the user to reconnect a healthy account.
+					if (isRateLimitResponse({ status: status, message: error.message })) {
+						throw toRateLimitError(error, token);
 					}
-
-					throw new RequestRateLimitError(error, token, resetAt);
-				}
+					throw new AuthenticationError(
+						tokenInfo,
+						status === 401 ? AuthenticationErrorReason.Unauthorized : AuthenticationErrorReason.Forbidden,
+						error,
+					);
 				default:
-					if (error.response.status >= 400 && error.response.status < 500) {
+					if (status >= 400 && status < 500) {
 						throw new RequestClientError(error);
 					}
 			}
@@ -435,13 +607,13 @@ export class ProvidersApi {
 			| ((
 					input: any,
 					options?: { token?: string; isPAT?: boolean; baseUrl?: string },
-			  ) => Promise<{ data: NonNullable<T>[]; pageInfo?: PageInfo }>)
+			  ) => Promise<{ data: NonNullable<T>[]; pageInfo?: PageInfo; metadata?: CollectionMetadata }>)
 			| undefined,
 		tokenWithInfo: TokenWithInfo,
 		cursor: string = '{}',
 		isPAT: boolean = false,
 		baseUrl?: string,
-	): Promise<PagedResult<T>> {
+	): Promise<ProviderApiPagedResult<T>> {
 		let cursorInfo;
 		try {
 			cursorInfo = JSON.parse(cursor);
@@ -482,7 +654,15 @@ export class ProvidersApi {
 				baseUrl: baseUrl,
 			});
 			if (result == null) {
-				return { values: [] };
+				const continuationWasRequested =
+					(cursor != null && cursor !== '{}') || (requestedPage != null && requestedPage > 1);
+				return continuationWasRequested
+					? {
+							values: [],
+							paging: { cursor: '{}', more: false, truncated: true },
+							metadata: { completeness: 'partial' },
+						}
+					: { values: [] };
 			}
 
 			const pageInfo = result.pageInfo;
@@ -494,12 +674,25 @@ export class ProvidersApi {
 			} else if (pageInfo?.nextPage != null) {
 				nextCursor = JSON.stringify({ value: pageInfo.nextPage, type: 'page' });
 			}
+			const continuationBroken = hasMore && (nextCursor === '{}' || nextCursor === cursor);
+			const normalizedMetadata = mergeCollectionMetadata(
+				result.metadata,
+				continuationBroken ? { completeness: 'partial' } : undefined,
+			);
+
+			// SDK collection completeness is independent from provider-native pagination: a result can expose a
+			// real next page (`more`) and still have a failed sibling scope (`partial`/`unknown`). Surface the
+			// latter as `truncated` so consumers treat the page as incomplete. Absent metadata (old providers,
+			// test doubles) leaves `truncated` unset for backward compatibility. Shares the incompleteness
+			// predicate with the facade assessment so one metadata object can't be truncated there and whole here.
+			const truncated = isIncompleteCollection(normalizedMetadata) ? true : undefined;
 
 			return {
 				values: result.data,
 				paging: {
 					cursor: nextCursor,
-					more: hasMore,
+					more: hasMore && !continuationBroken,
+					truncated: truncated,
 					// Numbered-page metadata; left undefined by cursor-based providers (which don't report a
 					// currentPage), so we never echo the requested page for a provider that ignored it.
 					page: pageInfo?.currentPage ?? undefined,
@@ -508,9 +701,10 @@ export class ProvidersApi {
 					totalPages: pageInfo?.totalPages ?? undefined,
 					totalCount: pageInfo?.totalCount ?? undefined,
 				},
+				metadata: normalizedMetadata,
 			};
 		} catch (e) {
-			return this.handleProviderError<PagedResult<T>>(tokenWithInfo, e);
+			return this.handleProviderError<ProviderApiPagedResult<T>>(tokenWithInfo, e);
 		}
 	}
 
@@ -522,7 +716,12 @@ export class ProvidersApi {
 		options?: { isPAT?: boolean; baseUrl?: string },
 	): Promise<ProviderRepository | undefined> {
 		const providerId = tokenOptInfo.providerId;
-		if (providerId === GitCloudHostIntegrationId.AzureDevOps && project != null) {
+		const isAzureDevOps =
+			providerId === GitCloudHostIntegrationId.AzureDevOps ||
+			providerId === GitSelfManagedHostIntegrationId.AzureDevOpsServer;
+		if (isAzureDevOps) {
+			if (project == null) return undefined;
+
 			const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 				tokenOptInfo,
 				'getRepoOfProjectFn',
@@ -536,6 +735,7 @@ export class ProvidersApi {
 				);
 				return result?.data;
 			} catch (e) {
+				if (isGraphQLRepoNotFoundError(e)) throw new RequestNotFoundError(toError(e));
 				return this.handleProviderError<ProviderRepository>(tokenWithInfo, e);
 			}
 		} else {
@@ -549,6 +749,7 @@ export class ProvidersApi {
 				);
 				return result?.data;
 			} catch (e) {
+				if (isGraphQLRepoNotFoundError(e)) throw new RequestNotFoundError(toError(e));
 				return this.handleProviderError<ProviderRepository>(tokenWithInfo, e);
 			}
 		}
@@ -665,6 +866,48 @@ export class ProvidersApi {
 		}
 	}
 
+	/**
+	 * Reads issues scoped to Linear teams/projects/labels (Linear's issue-list filter). One page per call —
+	 * follow `paging.cursor`. Linear's `getIssues` has no author/assignee filter, so per-user scoping is
+	 * applied client-side by the caller.
+	 */
+	async getLinearIssues(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Linear>,
+		input: { teams?: string[]; projects?: string[]; labels?: string[] },
+		options?: PagingInput & {
+			/** See {@link GetIssuesOptions.sort}. Linear expresses `created`/`updated`, descending only. */
+			sort?: IssueSorting;
+		},
+	): Promise<PagedResult<ProviderIssue>> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getLinearIssuesFn',
+		);
+		return this.getPagedResult<ProviderIssue>(
+			{ ...input, ...options },
+			provider.getLinearIssuesFn,
+			tokenWithInfo,
+			options?.cursor ?? undefined,
+		);
+	}
+
+	/** Resolves Linear's current user (viewer). The viewer query returns only id/name/email/displayName. */
+	async getLinearCurrentUser(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Linear>,
+	): Promise<{ id: string; name?: string | null; email?: string | null; displayName?: string | null } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getLinearCurrentUserFn',
+		);
+		const token = tokenWithInfo.accessToken;
+
+		try {
+			return (await provider.getLinearCurrentUserFn?.({ token: token }))?.data;
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
 	async getAzureResourcesForUser(
 		tokenOptInfo: TokenWithInfo<
 			GitCloudHostIntegrationId.AzureDevOps | GitSelfManagedHostIntegrationId.AzureDevOpsServer
@@ -692,26 +935,58 @@ export class ProvidersApi {
 
 	async getBitbucketResourcesForCurrentUser(
 		tokenOptInfo: TokenWithInfo<GitCloudHostIntegrationId.Bitbucket>,
-	): Promise<ProviderBitbucketResource[] | undefined> {
+	): Promise<ProviderApiPagedResult<ProviderBitbucketResource> | undefined> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getBitbucketResourcesForCurrentUserFn',
 		);
 		const token = tokenWithInfo.accessToken;
 
-		try {
-			return (await provider.getBitbucketResourcesForCurrentUserFn?.({}, { token: token }))?.data;
-		} catch (e) {
-			return this.handleProviderError<ProviderBitbucketResource[] | undefined>(tokenWithInfo, e);
-		}
+		// Drain every workspace page (numbered): the SDK returns 50 per page, and a user in more than one page
+		// of workspaces would otherwise silently lose the rest (with them, their orgs/PRs). A scoped drain keeps
+		// a successful prefix plus structured failure metadata when a later page fails.
+		const result = await collectProviderPagedResult(
+			async cursor => {
+				try {
+					const page = parsePageCursor(cursor);
+					const response = await provider.getBitbucketResourcesForCurrentUserFn?.(
+						{ page: page },
+						{ token: token },
+					);
+					if (response == null) return undefined;
+
+					const hasMore = response.pageInfo?.hasNextPage === true;
+					const nextPage = response.pageInfo?.nextPage;
+					return {
+						values: response.data,
+						paging: {
+							more: hasMore,
+							cursor: hasMore && nextPage != null ? toPageCursor(nextPage) : '{}',
+						},
+					};
+				} catch (ex) {
+					return this.handleProviderError<ProviderApiPagedResult<ProviderBitbucketResource>>(
+						tokenWithInfo,
+						ex,
+					);
+				}
+			},
+			20,
+			{ providerId: tokenWithInfo.providerId },
+		);
+		return {
+			values: result.values,
+			paging: { cursor: '{}', more: false, ...(result.truncated ? { truncated: true } : {}) },
+			...(result.metadata != null ? { metadata: result.metadata } : {}),
+		};
 	}
 
 	async getBitbucketPullRequestsAuthoredByUserForWorkspace(
 		tokenOptInfo: TokenWithInfo<GitCloudHostIntegrationId.Bitbucket>,
 		userId: string,
 		workspaceSlug: string,
-		options?: { states?: GitPullRequestState[] },
-	): Promise<ProviderPullRequest[] | undefined> {
+		options?: { states?: GitPullRequestState[]; page?: number },
+	): Promise<{ data: ProviderPullRequest[]; hasMore: boolean; nextPage: number | null } | undefined> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getBitbucketPullRequestsAuthoredByUserForWorkspaceFn',
@@ -719,12 +994,12 @@ export class ProvidersApi {
 		const token = tokenWithInfo.accessToken;
 
 		try {
-			return (
-				await provider.getBitbucketPullRequestsAuthoredByUserForWorkspaceFn?.(
-					{ userId: userId, workspaceSlug: workspaceSlug, states: options?.states },
-					{ token: token },
-				)
-			)?.data;
+			const result = await provider.getBitbucketPullRequestsAuthoredByUserForWorkspaceFn?.(
+				{ userId: userId, workspaceSlug: workspaceSlug, states: options?.states, page: options?.page },
+				{ token: token },
+			);
+			if (result == null) return undefined;
+			return { data: result.data, hasMore: result.pageInfo.hasNextPage, nextPage: result.pageInfo.nextPage };
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -733,20 +1008,20 @@ export class ProvidersApi {
 	async getBitbucketServerPullRequestsForCurrentUser(
 		tokenOptInfo: TokenWithInfo<GitSelfManagedHostIntegrationId.BitbucketServer>,
 		baseUrl: string,
-		options?: { states?: GitPullRequestState[] },
-	): Promise<ProviderPullRequest[] | undefined> {
+		options?: { states?: GitPullRequestState[]; page?: number },
+	): Promise<{ data: ProviderPullRequest[]; hasMore: boolean; nextPage: number | null } | undefined> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getBitbucketServerPullRequestsForCurrentUserFn',
 		);
 		const token = tokenWithInfo.accessToken;
 		try {
-			return (
-				await provider.getBitbucketServerPullRequestsForCurrentUserFn?.(
-					{ states: options?.states },
-					{ token: token, baseUrl: baseUrl },
-				)
-			)?.data;
+			const result = await provider.getBitbucketServerPullRequestsForCurrentUserFn?.(
+				{ states: options?.states, page: options?.page },
+				{ token: token, baseUrl: baseUrl },
+			);
+			if (result == null) return undefined;
+			return { data: result.data, hasMore: result.pageInfo.hasNextPage, nextPage: result.pageInfo.nextPage };
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -755,7 +1030,7 @@ export class ProvidersApi {
 	async getJiraProjectsForResources(
 		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Jira>,
 		resourceIds: string[],
-	): Promise<ProviderJiraProject[] | undefined> {
+	): Promise<ProviderApiCollectionResult<ProviderJiraProject>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getJiraProjectsForResourcesFn',
@@ -763,11 +1038,34 @@ export class ProvidersApi {
 		const token = tokenWithInfo.accessToken;
 
 		try {
-			return (await provider.getJiraProjectsForResourcesFn?.({ resourceIds: resourceIds }, { token: token }))
-				?.data;
+			const result = await provider.getJiraProjectsForResourcesFn?.(
+				{ resourceIds: resourceIds },
+				{ token: token },
+			);
+			// Preserve the SDK's per-resource completeness/failures instead of collapsing to a bare array, so the
+			// Jira integration can cache only proven-successful resources and warn on the failed ones.
+			return { values: result?.data ?? [], metadata: result?.metadata };
 		} catch (e) {
-			return this.handleProviderError<ProviderJiraProject[] | undefined>(tokenWithInfo, e);
+			return this.handleProviderError<ProviderApiCollectionResult<ProviderJiraProject>>(tokenWithInfo, e);
 		}
+	}
+
+	async getJiraProjectsForResource(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Jira>,
+		resourceId: string,
+		options?: { cursor?: string },
+	): Promise<ProviderApiPagedResult<ProviderJiraProject>> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraProjectsForResourceFn',
+		);
+
+		return this.getPagedResult(
+			{ resourceId: resourceId },
+			provider.getJiraProjectsForResourceFn,
+			tokenWithInfo,
+			options?.cursor,
+		);
 	}
 
 	async getAzureProjectsForResource(
@@ -836,19 +1134,26 @@ export class ProvidersApi {
 
 		// Drain all pages so a user in many orgs doesn't lose everything past the first page, while
 		// surfacing `truncated` when the defensive backstop stops before the listing is exhausted.
-		const result = await collectProviderPagedResult(cursor =>
-			this.getPagedResult<ProviderGitHubOrganization>(
-				{},
-				provider.getOrgsForCurrentUserFn,
-				tokenWithInfo,
-				cursor,
-				options?.isPAT,
-				options?.baseUrl,
-			),
+		const result = await collectProviderPagedResult(
+			cursor =>
+				this.getPagedResult<ProviderGitHubOrganization>(
+					{},
+					provider.getOrgsForCurrentUserFn,
+					tokenWithInfo,
+					cursor,
+					options?.isPAT,
+					options?.baseUrl,
+				),
+			20,
+			{ providerId: tokenWithInfo.providerId },
 		);
 		// This method drains internally and takes no cursor, so a backstop cursor isn't resumable by
 		// callers — keep only the truncation signal rather than exposing a misleading `paging`.
-		return { values: result.values, ...(result.truncated ? { truncated: true } : {}) };
+		return {
+			values: result.values,
+			...(result.truncated ? { truncated: true } : {}),
+			...(result.metadata != null ? { metadata: result.metadata } : {}),
+		};
 	}
 
 	async getReposForOrg(
@@ -892,9 +1197,17 @@ export class ProvidersApi {
 
 	async getReposForCurrentUser(
 		tokenOptInfo: TokenWithInfo<
-			GitCloudHostIntegrationId.GitLab | GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted
+			| GitCloudHostIntegrationId.GitHub
+			| GitSelfManagedHostIntegrationId.CloudGitHubEnterprise
+			| GitCloudHostIntegrationId.GitLab
+			| GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted
 		>,
-		options?: GetReposOptions & { isPAT?: boolean; baseUrl?: string },
+		options?: GetReposOptions & {
+			/** GitHub `/user/repos` affiliation filter; ignored by GitLab's membership read. */
+			affiliations?: ('owner' | 'collaborator' | 'organization_member')[];
+			isPAT?: boolean;
+			baseUrl?: string;
+		},
 	): Promise<PagedResult<ProviderRepository>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
@@ -902,7 +1215,7 @@ export class ProvidersApi {
 		);
 
 		return this.getPagedResult<ProviderRepository>(
-			{},
+			options?.affiliations != null ? { affiliations: options.affiliations } : {},
 			provider.getReposForCurrentUserFn,
 			tokenWithInfo,
 			options?.cursor,
@@ -924,26 +1237,33 @@ export class ProvidersApi {
 
 		// Drain all pages so a user in many groups doesn't lose everything past the first page, while
 		// surfacing `truncated` when the defensive backstop stops before the listing is exhausted.
-		const result = await collectProviderPagedResult(cursor =>
-			this.getPagedResult<ProviderGitLabGroup>(
-				{ topLevelOnly: options?.topLevelOnly },
-				provider.getGroupsForCurrentUserFn,
-				tokenWithInfo,
-				cursor,
-				options?.isPAT,
-				options?.baseUrl,
-			),
+		const result = await collectProviderPagedResult(
+			cursor =>
+				this.getPagedResult<ProviderGitLabGroup>(
+					{ topLevelOnly: options?.topLevelOnly },
+					provider.getGroupsForCurrentUserFn,
+					tokenWithInfo,
+					cursor,
+					options?.isPAT,
+					options?.baseUrl,
+				),
+			20,
+			{ providerId: tokenWithInfo.providerId },
 		);
 		// This method drains internally and takes no cursor, so a backstop cursor isn't resumable by
 		// callers — keep only the truncation signal rather than exposing a misleading `paging`.
-		return { values: result.values, ...(result.truncated ? { truncated: true } : {}) };
+		return {
+			values: result.values,
+			...(result.truncated ? { truncated: true } : {}),
+			...(result.metadata != null ? { metadata: result.metadata } : {}),
+		};
 	}
 
 	async getPullRequestsForRepos(
 		tokenOptInfo: TokenOptInfo,
 		reposOrIds: ProviderReposInput,
 		options?: GetPullRequestsOptions & { isPAT?: boolean; baseUrl?: string },
-	): Promise<PagedResult<ProviderPullRequest>> {
+	): Promise<ProviderApiPagedResult<ProviderPullRequest>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getPullRequestsForReposFn',
@@ -966,7 +1286,7 @@ export class ProvidersApi {
 		tokenOptInfo: TokenOptInfo,
 		repo: ProviderRepoInput,
 		options?: GetPullRequestsOptions & { isPAT?: boolean; baseUrl?: string },
-	): Promise<PagedResult<ProviderPullRequest>> {
+	): Promise<ProviderApiPagedResult<ProviderPullRequest>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getPullRequestsForRepoFn',
@@ -986,17 +1306,17 @@ export class ProvidersApi {
 		tokenWithInfo: TokenWithInfo<GitCloudHostIntegrationId.Bitbucket>,
 		userId: string,
 		options?: { isPAT?: boolean } & GetPullRequestsForUserOptions,
-	): Promise<PagedResult<ProviderPullRequest>>;
+	): Promise<ProviderApiPagedResult<ProviderPullRequest>>;
 	async getPullRequestsForUser(
 		tokenWithInfo: TokenWithInfo<Exclude<IntegrationIds, GitCloudHostIntegrationId.Bitbucket>>,
 		username: string,
 		options?: { isPAT?: boolean } & GetPullRequestsForUserOptions,
-	): Promise<PagedResult<ProviderPullRequest>>;
+	): Promise<ProviderApiPagedResult<ProviderPullRequest>>;
 	async getPullRequestsForUser(
 		tokenOptInfo: TokenWithInfo,
 		usernameOrId: string,
 		options?: { isPAT?: boolean } & GetPullRequestsForUserOptions,
-	): Promise<PagedResult<ProviderPullRequest>> {
+	): Promise<ProviderApiPagedResult<ProviderPullRequest>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getPullRequestsForUserFn',
@@ -1017,6 +1337,40 @@ export class ProvidersApi {
 		);
 	}
 
+	async getGitLabPullRequestsForUserAssociation(
+		tokenOptInfo: TokenWithInfo<
+			GitCloudHostIntegrationId.GitLab | GitSelfManagedHostIntegrationId.CloudGitLabSelfHosted
+		>,
+		username: string,
+		association: 'assigned' | 'authored' | 'reviewRequested',
+		options?: {
+			isPAT?: boolean;
+			baseUrl?: string;
+			states?: GitPullRequestState[];
+			cursor?: string;
+			pageSize?: number;
+		},
+	): Promise<ProviderApiPagedResult<ProviderPullRequest>> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getGitLabPullRequestsForUserAssociationFn',
+		);
+
+		return this.getPagedResult(
+			{
+				username: username,
+				association: association,
+				states: options?.states,
+				pageSize: options?.pageSize,
+			},
+			provider.getGitLabPullRequestsForUserAssociationFn,
+			tokenWithInfo,
+			options?.cursor,
+			options?.isPAT,
+			options?.baseUrl,
+		);
+	}
+
 	async getPullRequestsForAzureProjects(
 		tokenOptInfo: TokenWithInfo<
 			GitCloudHostIntegrationId.AzureDevOps | GitSelfManagedHostIntegrationId.AzureDevOpsServer
@@ -1025,11 +1379,13 @@ export class ProvidersApi {
 		options?: {
 			authorLogin?: string;
 			assigneeLogins?: string[];
+			reviewerId?: string;
 			states?: GitPullRequestState[];
+			repo?: ProviderRepoInput;
 			isPAT?: boolean;
 			baseUrl?: string;
 		},
-	): Promise<ProviderPullRequest[] | undefined> {
+	): Promise<ProviderApiCollectionResult<ProviderPullRequest>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getPullRequestsForAzureProjectsFn',
@@ -1040,14 +1396,77 @@ export class ProvidersApi {
 		const azureToken = options?.isPAT ? token : this.getAzurePATForOAuthToken(token);
 
 		try {
-			return (
-				await provider.getPullRequestsForAzureProjectsFn?.(
-					{ projects: projects, ...options },
-					{ token: azureToken, isPAT: options?.isPAT, baseUrl: options?.baseUrl },
-				)
-			)?.data;
+			const result = await provider.getPullRequestsForAzureProjectsFn?.(
+				{
+					projects: projects,
+					authorLogin: options?.authorLogin,
+					assigneeLogins: options?.assigneeLogins,
+					reviewerId: options?.reviewerId,
+					states: options?.states,
+					repo: options?.repo,
+				},
+				// `azureToken` is always a PAT here (the raw token when `isPAT`, otherwise a PAT derived from
+				// the OAuth token), so it must be sent as a PAT regardless of the incoming `options?.isPAT`.
+				{ token: azureToken, isPAT: true, baseUrl: options?.baseUrl },
+			);
+			// The SDK's multi-project aggregate preserves successful projects and reports failed/incomplete ones
+			// through `metadata` (it has no `pageInfo`); keep it so the account-wide drain can warn on the failed
+			// projects and set `fetchFailed` instead of publishing a partial Azure read as complete.
+			return { values: result?.data ?? [], metadata: result?.metadata };
 		} catch (e) {
-			return this.handleProviderError<ProviderPullRequest[]>(tokenWithInfo, e);
+			return this.handleProviderError<ProviderApiCollectionResult<ProviderPullRequest>>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * Single Azure project PR read, paginated by number. Unlike {@link getPullRequestsForAzureProjects} (which
+	 * aggregates across projects and exposes no paging), this returns one page plus whether more remain, so a
+	 * caller can drain a project fully.
+	 */
+	async getPullRequestsForAzureProject(
+		tokenOptInfo: TokenWithInfo<
+			GitCloudHostIntegrationId.AzureDevOps | GitSelfManagedHostIntegrationId.AzureDevOpsServer
+		>,
+		project: { namespace: string; project: string },
+		options?: {
+			authorLogin?: string;
+			assigneeLogins?: string[];
+			reviewerId?: string;
+			states?: GitPullRequestState[];
+			repo?: ProviderRepoInput;
+			page?: number;
+			isPAT?: boolean;
+			baseUrl?: string;
+		},
+	): Promise<{ data: ProviderPullRequest[]; hasMore: boolean; nextPage: number | null } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getPullRequestsForAzureProjectFn',
+		);
+		const token = tokenWithInfo.accessToken;
+		// Azure only supports PAT for this call
+		const azureToken = options?.isPAT ? token : this.getAzurePATForOAuthToken(token);
+
+		try {
+			const result = await provider.getPullRequestsForAzureProjectFn?.(
+				{
+					namespace: project.namespace,
+					project: project.project,
+					authorLogin: options?.authorLogin,
+					assigneeLogins: options?.assigneeLogins,
+					reviewerId: options?.reviewerId,
+					states: options?.states,
+					repo: options?.repo,
+					page: options?.page,
+				},
+				// `azureToken` is always a PAT here (already PAT-formatted when `isPAT`, otherwise derived from
+				// the OAuth token), so it must be sent as a PAT regardless of the incoming `options?.isPAT`.
+				{ token: azureToken, isPAT: true, baseUrl: options?.baseUrl },
+			);
+			if (result == null) return undefined;
+			return { data: result.data, hasMore: result.pageInfo.hasNextPage, nextPage: result.pageInfo.nextPage };
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
 		}
 	}
 
@@ -1144,14 +1563,36 @@ export class ProvidersApi {
 
 	async getIssuesForCurrentUser(
 		tokenOptInfo: TokenWithInfo,
-		options?: PagingInput & { isPAT?: boolean; baseUrl?: string },
+		options?: PagingInput & {
+			// Forwarded to the provider fn (GitLab's account-wide REST read); Linear ignores them.
+			scope?: 'assigned_to_me' | 'all';
+			assigneeUsername?: string;
+			/**
+			 * Narrows to issues authored by this user. Honored as of `@gitkraken/provider-apis` 0.54.0
+			 * (`author_username`); it composes with `assigneeUsername` as AND, so a caller wanting the UNION of the
+			 * two relationships must read each separately (see GitLab's account-wide issue read).
+			 */
+			authorUsername?: string;
+			pageSize?: number;
+			/** See {@link GetIssuesOptions.sort}. Forwarded to the provider fn; ordering is translated in the SDK. */
+			sort?: IssueSorting;
+			isPAT?: boolean;
+			baseUrl?: string;
+		},
 	): Promise<PagedResult<ProviderIssue>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getIssuesForCurrentUserFn',
 		);
 		return this.getPagedResult<ProviderIssue>(
-			options,
+			{
+				scope: options?.scope,
+				assigneeUsername: options?.assigneeUsername,
+				authorUsername: options?.authorUsername,
+				page: options?.page,
+				pageSize: options?.pageSize,
+				sort: options?.sort,
+			},
 			provider.getIssuesForCurrentUserFn,
 			tokenWithInfo,
 			options?.cursor ?? undefined,
@@ -1197,7 +1638,12 @@ export class ProvidersApi {
 
 		try {
 			const result = await provider.getIssuesForProjectFn?.(
-				{ projectKey: project, resourceId: resourceId, ...options },
+				{
+					projectKey: project,
+					resourceId: resourceId,
+					...options,
+					includeTransitions: jiraListIncludeTransitions,
+				},
 				{ token: token },
 			);
 
@@ -1207,10 +1653,174 @@ export class ProvidersApi {
 		}
 	}
 
+	/**
+	 * Single page of {@link getIssuesForProject} that preserves the SDK's `pageInfo` so a caller can drain
+	 * every page (the plain {@link getIssuesForProject} discards it, silently capping at the first page).
+	 * `nextCursor` is the raw provider cursor (Jira offset / nextPageToken) fed back verbatim as `options.cursor`.
+	 */
+	async getIssuesForProjectPaged(
+		tokenOptInfo: TokenWithInfo,
+		project: string,
+		resourceId: string,
+		options?: GetIssuesOptions,
+	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getIssuesForProjectFn',
+		);
+		const token = tokenWithInfo.accessToken;
+
+		try {
+			const result = await provider.getIssuesForProjectFn?.(
+				{
+					projectKey: project,
+					resourceId: resourceId,
+					...options,
+					includeTransitions: jiraListIncludeTransitions,
+				},
+				{ token: token },
+			);
+			if (result == null) return undefined;
+			return {
+				data: result.data,
+				hasMore: result.pageInfo?.hasNextPage ?? false,
+				nextCursor: result.pageInfo?.endCursor ?? undefined,
+			};
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	async getTrelloCard(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Trello>,
+		appKey: string,
+		cardId: string,
+		options?: { trelloBoardListsById?: Record<string, { name: string }> },
+	): Promise<ProviderIssue | undefined> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+
+		try {
+			const result = await this.request<TrelloCardResponse>({
+				url: `${trelloBaseUrl}/1/cards/${encodeURIComponent(cardId)}?members=true`,
+				headers: getTrelloAuthHeaders(appKey, tokenWithInfo.accessToken),
+			});
+
+			return fromTrelloCard(result.body, options?.trelloBoardListsById ?? {});
+		} catch (e) {
+			try {
+				return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
+			} catch (ex) {
+				if (RequestNotFoundError.is(ex)) return undefined;
+				throw ex;
+			}
+		}
+	}
+
+	// Trello reads. The Trello client is keyed by an `appKey` (the Trello app key from the cloud token exchange)
+	// paired with the OAuth token, so each wrapper threads `appKey` through alongside `tokenWithInfo`.
+	async getTrelloCurrentUser(
+		tokenOptInfo: TokenWithInfo,
+		appKey: string,
+	): Promise<
+		{ id: string; name: string; email: string; username: string; url: string; avatarUrl: string | null } | undefined
+	> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getTrelloCurrentUserFn',
+		);
+		try {
+			const result = await provider.getTrelloCurrentUserFn?.(
+				{ appKey: appKey },
+				{ token: tokenWithInfo.accessToken },
+			);
+			return result?.data;
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	async getTrelloBoardsForCurrentUser(
+		tokenOptInfo: TokenWithInfo,
+		appKey: string,
+	): Promise<TrelloBoard[] | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getTrelloBoardsForCurrentUserFn',
+		);
+		try {
+			const result = await provider.getTrelloBoardsForCurrentUserFn?.(
+				{ appKey: appKey },
+				{ token: tokenWithInfo.accessToken },
+			);
+			return result?.data;
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	async getTrelloListsForBoard(
+		tokenOptInfo: TokenWithInfo,
+		appKey: string,
+		boardId: string,
+	): Promise<TrelloList[] | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getTrelloListsForBoardFn',
+		);
+		try {
+			const result = await provider.getTrelloListsForBoardFn?.(
+				{ appKey: appKey, boardId: boardId },
+				{ token: tokenWithInfo.accessToken },
+			);
+			return result?.data;
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	async getTrelloIssuesForBoard(
+		tokenOptInfo: TokenWithInfo,
+		appKey: string,
+		boardId: string,
+		options?: {
+			assigneeLogins?: string[];
+			trelloBoardListsById?: Record<string, { name: string }>;
+			/** See {@link GetIssuesOptions.sort}. Trello expresses only `updated`, in either direction. */
+			sort?: IssueSorting;
+		},
+	): Promise<ProviderApiCollectionResult<ProviderIssue>> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getTrelloIssuesForBoardFn',
+		);
+		try {
+			const result = await provider.getTrelloIssuesForBoardFn?.(
+				{ appKey: appKey, boardId: boardId, ...options },
+				{ token: tokenWithInfo.accessToken },
+			);
+			// Trello's search caps results and reports the cap through `metadata.completeness` (never a cursor).
+			// Preserve it so the integration can signal a terminal truncation rather than a fake next page.
+			return { values: result?.data ?? [], metadata: result?.metadata };
+		} catch (e) {
+			return this.handleProviderError<ProviderApiCollectionResult<ProviderIssue>>(tokenWithInfo, e);
+		}
+	}
+
 	async getIssuesForResourceForCurrentUser(
 		tokenOptInfo: TokenWithInfo,
 		resourceId: string,
-		options?: { cursor?: string; isPAT?: boolean; baseUrl?: string },
+		options?: {
+			cursor?: string;
+			/**
+			 * See {@link GetIssuesOptions.sort}. Forwarded for the same reason as every sibling issue read, even
+			 * though nothing reaches this one with a sort today: `IssuesIntegration.searchProviderMyIssues` is the
+			 * only caller and takes no options. A wrapper that accepted the SDK's input and silently dropped one
+			 * field of it would give whoever adds that option no ordering and no error.
+			 */
+			sort?: IssueSorting;
+			isPAT?: boolean;
+			baseUrl?: string;
+		},
 	): Promise<PagedResult<ProviderIssue>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
@@ -1218,7 +1828,7 @@ export class ProvidersApi {
 		);
 
 		return this.getPagedResult<ProviderIssue>(
-			{ resourceId: resourceId },
+			{ resourceId: resourceId, sort: options?.sort, includeTransitions: jiraListIncludeTransitions },
 			provider.getIssuesForResourceForCurrentUserFn,
 			tokenWithInfo,
 			options?.cursor,
@@ -1277,10 +1887,37 @@ async function parseFetchResponseForApi<T>(response: Response): Promise<Provider
 
 	// throw an error if the response is not ok
 	if (!response.ok) {
-		const error = new Error(response.statusText);
+		const status = `(${response.status})${response.statusText ? ` ${response.statusText}` : ''}.`;
+		const detail = getProviderResponseBodyMessage(body);
+		const error = new Error(detail != null ? `${status} ${detail}` : status);
 		Object.assign(error, { response: result });
 		throw error;
 	}
 
 	return result;
+}
+
+const maxProviderErrorBodyLength = 500;
+
+/** Extracts the useful provider prose from an already-parsed SDK response body. */
+function getProviderResponseBodyMessage(body: unknown): string | undefined {
+	let message: string | undefined;
+	if (typeof body === 'string') {
+		message = body;
+	} else if (body != null && typeof body === 'object') {
+		const { message: direct, error } = body as { message?: unknown; error?: unknown };
+		if (typeof direct === 'string') {
+			message = direct;
+		} else if (typeof error === 'string') {
+			message = error;
+		} else if (error != null && typeof error === 'object') {
+			const nested = (error as { message?: unknown }).message;
+			if (typeof nested === 'string') {
+				message = nested;
+			}
+		}
+	}
+
+	message = message?.trim();
+	return message ? message.slice(0, maxProviderErrorBodyLength) : undefined;
 }

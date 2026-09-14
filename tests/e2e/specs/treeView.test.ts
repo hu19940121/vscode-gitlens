@@ -10,7 +10,13 @@ import * as process from 'node:process';
 import type { FrameLocator } from '@playwright/test';
 import type { VSCodeInstance } from '../baseTest.js';
 import { test as base, createTmpDir, DefaultTimeout, expect, GitFixture, MaxTimeout } from '../baseTest.js';
-import { scrollDetailsToFileTree, waitForGraphRowsRendered, widenSideBarForGraph } from '../graphHelpers.js';
+import {
+	ensureGraphDetailsPanelOpen,
+	graphDetailsRegion,
+	scrollDetailsToFileTree,
+	waitForGraphRowsRendered,
+	widenSideBarForGraph,
+} from '../graphHelpers.js';
 
 // Build a repo with enough commits and files to exercise the tree thoroughly
 const test = base.extend({
@@ -77,9 +83,10 @@ async function openGraphWithPro(vscode: VSCodeInstance): Promise<{
 
 	return {
 		graphWebview: graphWebview!,
-		dispose: () => {
-			sim[Symbol.dispose]();
-			return Promise.resolve();
+		// Awaits the real teardown: the sync disposer drops its promise, which let the next test start
+		// while the simulated subscription was still being torn down.
+		dispose: async () => {
+			await sim[Symbol.asyncDispose]();
 		},
 	};
 }
@@ -120,10 +127,12 @@ async function selectCommitByMessage(graphWebview: FrameLocator, messageText: st
 }
 
 async function waitForDetailsLoaded(graphWebview: FrameLocator): Promise<void> {
-	const commitDetails = graphWebview.locator('gl-details-commit-panel').first();
-	const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-	const comparePanel = graphWebview.locator('gl-details-multicommit-panel').first();
-	await expect(commitDetails.or(wipDetails).or(comparePanel)).toBeVisible({ timeout: 30000 });
+	// The panel starts CLOSED — `graph-app` reads `graphState.details?.visible ?? false`, and the graph
+	// header labels its toggle `Show Details Panel` on a fresh profile — so the details region is mounted
+	// with content but has no visible box, and waiting for it to appear on its own can only time out.
+	// Expand it first (the shared helper retries the toggle, which the header can replace mid-reconcile),
+	// which then gates on the same region this function used to wait for.
+	await ensureGraphDetailsPanelOpen(graphWebview, 30000);
 }
 
 async function waitForTreeItems(graphWebview: FrameLocator): Promise<void> {
@@ -260,8 +269,7 @@ test.describe('Tree View - Model Updates', () => {
 
 		await wipButton.click();
 
-		const wipDetails = graphWebview.locator('gl-details-wip-panel').first();
-		await expect(wipDetails).toBeVisible({ timeout: 15000 });
+		await expect(graphDetailsRegion(graphWebview, 'wip')).toBeVisible({ timeout: 15000 });
 
 		// Now switch to a regular commit
 		await selectCommitByMessage(graphWebview, 'Add greeting module');
@@ -271,5 +279,25 @@ test.describe('Tree View - Model Updates', () => {
 		// Tree should show the commit's file, not WIP files
 		const greetingItem = graphWebview.locator('gl-tree-view gl-tree-item').filter({ hasText: 'greeting.ts' });
 		await expect(greetingItem.first()).toBeVisible({ timeout: MaxTimeout });
+	});
+
+	test('should break default file tooltips at any character without changing externally anchored tooltips', async () => {
+		await selectCommitByMessage(graphWebview, 'Add greeting module');
+		await waitForDetailsLoaded(graphWebview);
+		await waitForTreeItems(graphWebview);
+
+		const fileTree = graphWebview.locator('gl-details-commit-panel gl-file-tree-pane gl-tree-view').first();
+		const fileItem = fileTree.getByRole('treeitem').filter({ hasText: 'greeting.ts' }).first();
+		await fileItem.hover();
+
+		const tooltip = fileTree.locator('gl-popover.hover-popover .hover-content');
+		await expect(tooltip).toBeVisible({ timeout: DefaultTimeout });
+		await expect(tooltip).toHaveCSS('word-break', 'break-all');
+
+		await fileTree.evaluate(element => {
+			(element as HTMLElement & { tooltipAnchorRight: boolean }).tooltipAnchorRight = true;
+		});
+		await expect(tooltip).toHaveCSS('word-break', 'normal');
+		await expect(tooltip).toHaveCSS('overflow-wrap', 'anywhere');
 	});
 });

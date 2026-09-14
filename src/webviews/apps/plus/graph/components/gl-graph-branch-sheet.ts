@@ -1,21 +1,23 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { getBranchId } from '@gitlens/git/utils/branch.utils.js';
+import { remoteRefIcon } from '@gitlens/components/components/icons/providerIcons.js';
+import { dispatchContextMenuAt } from '@gitlens/utils/dom.js';
+import { getBranchId } from '@gitlens/utils/gitRefs.js';
 import { serializeWebviewItemContext } from '../../../../../system/webview.js';
-import type { GraphItemContext, GraphScopeBranch, State } from '../../../../plus/graph/protocol.js';
-import { UpdateRefsVisibilityCommand } from '../../../../plus/graph/protocol.js';
-import type { AiModelInfo } from '../../../../rpc/services/types.js';
+import type { GraphExcludedRef, GraphItemContext, GraphScopeBranch } from '../../../../plus/graph/protocol.js';
+import type { AiModelInfo, OrgSettings } from '../../../../rpc/services/types.js';
+import { notifyService } from '../../../shared/actions/rpc.js';
 import { renderDetailsMaximizeChip } from '../../../shared/components/details-header/details-maximize-chip.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
-import { dispatchContextMenuAt } from '../../../shared/dom.js';
-import { graphStateContext } from '../context.js';
+import { graphServicesContext, graphStateContext } from '../context.js';
 import { getSelectedRepoPath } from '../utils/repository.utils.js';
 import {
 	branchSheetContextRef,
+	findRemoteRefHostingProvider,
 	findRowHead,
 	findWildcardRemoteExclude,
 	parseBranchSheetContext,
@@ -28,10 +30,10 @@ import type { ResolvedServices } from './detailsActions.js';
 import type { BranchSheetRef } from './gl-graph-branch-sheet-pane.js';
 import { SheetWrapper } from './sheetWrapper.js';
 import './gl-graph-branch-sheet-pane.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/chips/action-chip.js';
 import '../../../shared/components/overlays/detail-sheet.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 /**
  * Branch/tag sheet chrome — owns the `gl-detail-sheet` (title, kebab, Pin/Hide/Open-on-Remote/Focus/
@@ -57,7 +59,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 			}
 
 			/* Branch sheet header identity — icon + (remote-qualified) name + a ref-kind badge, slotted
-			   into gl-detail-sheet's title slot in place of the plain sheet-title string. */
+  into gl-detail-sheet's title slot in place of the plain sheet-title string. */
 			.branch-sheet-title {
 				display: flex;
 				gap: 0.6rem;
@@ -65,20 +67,43 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 				min-width: 0;
 			}
 
-			.branch-sheet-title--head {
+			/* Remote shares the local-branch color on purpose — the kind badge carries the distinction;
+  the remote scroll-marker token is a rail fill, too dark to read as text. */
+			.branch-sheet-title--head,
+			.branch-sheet-title--remote {
 				color: var(--gl-branch-color, var(--vscode-gitlens-graphScrollMarkerLocalBranchesColor, inherit));
 			}
 
-			.branch-sheet-title--remote {
-				color: var(--vscode-gitlens-graphScrollMarkerRemoteBranchesColor, inherit);
+			/* Tags keep their gold kind hue, but the scroll-marker token is a dim rail fill that can't be
+  lifted to a vivid text color by mixing — dark themes use the palette's vivid gold (the
+  light-theme marker default) outright; light themes darken the token toward the foreground
+  instead, since the vivid gold is unreadable on light backgrounds. Theme gate mirrors
+  gl-graph-scope-popover: body theme class via :host-context, prefers-color-scheme fallback. */
+			.branch-sheet-title--tag {
+				color: #d2a379;
 			}
 
-			.branch-sheet-title--tag {
-				color: var(--vscode-gitlens-graphScrollMarkerTagsColor, inherit);
+			:host-context(.vscode-light) .branch-sheet-title--tag,
+			:host-context(.vscode-high-contrast-light) .branch-sheet-title--tag {
+				color: color-mix(
+					in srgb,
+					var(--vscode-gitlens-graphScrollMarkerTagsColor) 50%,
+					var(--vscode-sideBar-foreground, var(--vscode-foreground))
+				);
+			}
+
+			@media (prefers-color-scheme: light) {
+				.branch-sheet-title--tag {
+					color: color-mix(
+						in srgb,
+						var(--vscode-gitlens-graphScrollMarkerTagsColor) 50%,
+						var(--vscode-sideBar-foreground, var(--vscode-foreground))
+					);
+				}
 			}
 
 			/* The tooltip host is display: contents, so the name span itself is the flex item —
-			   shrinkable but not growing, keeping the kebab directly after the name's end. */
+  shrinkable but not growing, keeping the kebab directly after the name's end. */
 			.branch-sheet-title__name-tooltip {
 				min-width: 0;
 			}
@@ -92,7 +117,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 			}
 
 			/* The ref-kind color belongs to the identity (icon + name) only — the chips are chrome, so
-			   they take the header's own foreground like the right-side actions do. */
+  they take the header's own foreground like the right-side actions do. */
 			.branch-sheet-title__kebab,
 			.branch-sheet-title__action {
 				flex: none;
@@ -104,11 +129,11 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private _graphState?: typeof graphStateContext.__context__;
 
-	@consume({ context: ipcContext })
-	private _ipc?: typeof ipcContext.__context__;
+	@consume({ context: graphServicesContext, subscribe: true })
+	private _services?: typeof graphServicesContext.__context__;
 
 	/** The ref this sheet is scoped to (name/refType/remote/sha/context). */
 	@property({ attribute: false })
@@ -145,7 +170,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 	aiModel?: AiModelInfo;
 
 	@property({ attribute: false })
-	orgSettings?: State['orgSettings'];
+	orgSettings?: OrgSettings;
 
 	@property({ type: Boolean, attribute: 'show-maximize' })
 	showMaximize = false;
@@ -161,8 +186,20 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 		// Remote-qualify the title the same way the pane does ("origin/main", not "main") — `ref.name`
 		// alone is the bare branch name shared with its local tracking counterpart.
 		const title = ref.refType === 'remote' && ref.remote != null ? `${ref.remote}/${ref.name}` : ref.name;
-		const kind = ref.refType === 'tag' ? 'Tag' : ref.refType === 'remote' ? 'Remote Branch' : 'Branch';
-		const icon = ref.refType === 'tag' ? 'tag' : 'git-branch';
+		const kind =
+			ref.refType === 'tag'
+				? l10n.t('Tag')
+				: ref.refType === 'remote'
+					? l10n.t('Remote Branch')
+					: l10n.t('Branch');
+		// Remote refs lead with their hosting-provider glicon (`cloud` when unknown or the ref's row
+		// hasn't paged in), matching the graph pill's own leading glyph vocabulary.
+		const icon =
+			ref.refType === 'tag'
+				? 'tag'
+				: ref.refType === 'remote'
+					? remoteRefIcon(findRemoteRefHostingProvider(ref, this._graphState?.rows))
+					: 'git-branch';
 		// Live-resolved from the loaded row the same way the graph's own ref pills build theirs — carries every
 		// flag (+tracking/+remote/+worktree/+current/+pinned/…), not just pin, so the kebab menu and the chips
 		// below track publish/upstream/pin changes made while this sheet stays open. Falls back to the open-time
@@ -196,7 +233,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 			esc-managed
 			aria-label=${kind}
 			sheet-title=${title}
-			close-label="Close"
+			close-label=${l10n.t('Close')}
 			@gl-detail-sheet-close=${this.handleInnerClose}
 		>
 			<span slot="title" class="branch-sheet-title branch-sheet-title--${titleModifier}">
@@ -209,7 +246,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 						? html`<gl-action-chip
 								class="branch-sheet-title__kebab"
 								icon="kebab-vertical"
-								label=${ref.refType === 'tag' ? 'Show Tag Actions' : 'Show Branch Actions'}
+								label=${ref.refType === 'tag' ? l10n.t('Show Tag Actions') : l10n.t('Show Branch Actions')}
 								overlay="tooltip"
 								data-vscode-context=${kebabContext}
 								@click=${this.handleKebabClick}
@@ -224,7 +261,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 					? html`<gl-action-chip
 							slot="actions"
 							icon=${isPinned ? 'pinned' : 'pin'}
-							label=${isPinned ? 'Unpin Branch from Edge' : 'Pin Branch to Edge'}
+							label=${isPinned ? l10n.t('Unpin Branch from Edge') : l10n.t('Pin Branch to Edge')}
 							overlay="tooltip"
 							href=${this._webview.createCommandLink<GraphItemContext>(
 								isPinned ? 'gitlens.graph.unpinBranchFromEdge' : 'gitlens.graph.pinBranchToEdge',
@@ -301,7 +338,7 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 		return html`<gl-action-chip
 			slot="actions"
 			icon="target"
-			label="Focus on Branch"
+			label=${l10n.t('Focus on Branch')}
 			overlay="tooltip"
 			@click=${() => this.handleFocus(ref)}
 		></gl-action-chip>`;
@@ -327,15 +364,28 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 		const directHidden = this._graphState?.excludeRefs?.[excluded.id] != null;
 		const wildcardHidden = wildcard != null && !wildcard.except?.includes(excluded.id);
 		const hidden = directHidden || wildcardHidden;
-		const label = `${hidden ? 'Show' : 'Hide'} ${ref.refType === 'tag' ? 'Tag' : 'Branch'}`;
+		const label = hidden
+			? ref.refType === 'tag'
+				? l10n.t('Show Tag')
+				: l10n.t('Show Branch')
+			: ref.refType === 'tag'
+				? l10n.t('Hide Tag')
+				: l10n.t('Hide Branch');
 
 		return html`<gl-action-chip
 			slot="actions"
 			icon=${hidden ? 'eye' : 'eye-closed'}
 			label=${label}
 			overlay="tooltip"
-			@click=${() => this._ipc?.sendCommand(UpdateRefsVisibilityCommand, { refs: [excluded], visible: hidden })}
+			@click=${() => this.toggleRefVisibility(excluded, hidden)}
 		></gl-action-chip>`;
+	}
+
+	private toggleRefVisibility(ref: GraphExcludedRef, visible: boolean): void {
+		const services = this._services;
+		if (services == null) return;
+
+		notifyService(services.filters, 'filters/refs', svc => svc.setRefsVisibility([ref], visible));
 	}
 
 	/** The sheet's Open on Remote chip — only for a ref that actually exists on a remote. A remote ref
@@ -359,9 +409,9 @@ export class GlGraphBranchSheet extends SheetWrapper(SignalWatcher(LitElement)) 
 		return html`<gl-action-chip
 			class="branch-sheet-title__action"
 			icon="globe"
-			label="Open Branch on Remote"
+			label=${l10n.t('Open Branch on Remote')}
 			alt-icon="copy"
-			alt-label="Copy Remote Branch URL"
+			alt-label=${l10n.t('Copy Remote Branch URL')}
 			overlay="tooltip"
 			href=${this._webview.createCommandLink<GraphItemContext>('gitlens.graph.openBranchOnRemote', context)}
 			alt-href=${this._webview.createCommandLink<GraphItemContext>('gitlens.graph.copyRemoteBranchUrl', context)}

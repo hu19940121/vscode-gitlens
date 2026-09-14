@@ -1,13 +1,17 @@
 import './settings.scss';
-import type { Remote } from '@eamodio/supertalk';
+import type { Remote, Subscription } from '@eamodio/supertalk';
+import { subscribe } from '@eamodio/supertalk';
 import { ContextProvider, provide } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { html, nothing } from 'lit';
-import { customElement, property, query } from 'lit/decorators.js';
+import { customElement, query } from 'lit/decorators.js';
 import { isMac } from '@env/platform.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { SettingsServices } from '../../settings/settingsService.js';
 import { SignalWatcherWebviewApp } from '../shared/appBase.js';
 import { createDefaultSubscriptionContextState, subscriptionContext } from '../shared/contexts/subscription.js';
 import { setDefaultDateLocales } from '../shared/date.js';
+import { subscribeAll } from '../shared/events/subscriptions.js';
 import { getHost } from '../shared/host/context.js';
 import { RpcController } from '../shared/rpc/rpcController.js';
 import { SettingsActions } from './actions.js';
@@ -17,7 +21,7 @@ import { createSettingsState, settingsStateContext } from './state.js';
 import './components/settings-detail.js';
 import './components/settings-nav.js';
 import '../shared/components/button.js';
-import '../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../shared/components/gitlens-logo-circle.js';
 import '../shared/components/gl-error-banner.js';
 import '../shared/components/segmented/segmented.js';
@@ -37,9 +41,6 @@ function navSnap({ pos, size }: { pos: number; size: number }): number {
 export class GlSettingsApp extends SignalWatcherWebviewApp {
 	static override styles = [settingsAppStyles];
 
-	@property({ type: String, noAccessor: true })
-	private context!: string;
-
 	@query('#search')
 	private _search?: HTMLInputElement;
 
@@ -50,7 +51,7 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	private _state: SettingsState = createSettingsState(this._host.storage);
 
 	/**
-	 * Subscription context for `gl-account-chip` (Account section) and the nav's avatar. Seeded with
+	 * Subscription context for `gl-settings-account` (Account section) and the nav's avatar. Seeded with
 	 * defaults, then swapped to the host-side RemoteSignals in `_onRpcReady` (same bridge as Graph/Home),
 	 * so account/avatar state stays live without copying through the settings state signals.
 	 */
@@ -60,10 +61,14 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	});
 
 	private _actions?: SettingsActions;
-	private _unsubscribes: (() => void)[] = [];
+	/**
+	 * RPC event subscription — released at disconnect (before the actions its subscriber captured
+	 * are disposed) and recreated per ready against the new session's actions.
+	 */
+	private _eventsSubscription?: Subscription;
 	private _stopAutoPersist?: () => void;
 
-	private _rpc = new RpcController<SettingsServices>(this, {
+	protected override readonly _rpc = new RpcController<SettingsServices>(this, {
 		rpcOptions: {
 			webviewId: () => this._webview?.webviewId,
 			webviewInstanceId: () => this._webview?.webviewInstanceId,
@@ -76,9 +81,7 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	override connectedCallback(): void {
 		super.connectedCallback?.();
 
-		const context = this.context;
-		this.context = undefined!;
-		this.initWebviewContext(context);
+		this.consumeContext();
 
 		window.addEventListener('keydown', this.handleGlobalKeyDown);
 	}
@@ -86,10 +89,12 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 	override disconnectedCallback(): void {
 		window.removeEventListener('keydown', this.handleGlobalKeyDown);
 
-		for (const unsubscribe of this._unsubscribes) {
-			unsubscribe();
-		}
-		this._unsubscribes = [];
+		// Unsubscribe BEFORE the actions/state below are disposed: the retained handle would
+		// otherwise re-issue its subscriber — which closes over those disposed objects — on the
+		// next handshake, ahead of `_onRpcReady`'s replacement. A fresh subscription is created
+		// per ready anyway, so nothing is lost by releasing this one here.
+		this._eventsSubscription?.unsubscribe();
+		this._eventsSubscription = undefined;
 
 		this._stopAutoPersist?.();
 		this._stopAutoPersist = undefined;
@@ -97,8 +102,10 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 		this._actions?.dispose();
 		this._actions = undefined;
 
+		// `resetAll()` only — `dispose()` is permanent teardown (it clears the signal
+		// registrations), and this element can reconnect during startup churn; a disposed state
+		// group would make the next session's `startAutoPersist()` watch nothing.
 		this._state.resetAll();
-		this._state.dispose();
 
 		super.disconnectedCallback?.();
 	}
@@ -107,30 +114,33 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 		const s = this._state;
 
 		try {
-			const [settings, subscription, integrations, ai, agents, walkthrough] = await Promise.all([
-				services.settings,
-				services.subscription,
-				services.integrations,
-				services.ai,
-				services.agents,
-				services.walkthrough,
-			]);
+			const [settings, subscription] = await Promise.all([services.settings, services.subscription]);
+
+			// Subscription changes invalidate the promo cache (`gl-feature-badge`).
+			this._promos.connect(this._rpc.connection!);
 
 			const actions = new SettingsActions(s, services, settings);
 			this._actions = actions;
 
 			// Swap the subscription context to the host-side RemoteSignals directly (no copy), exactly as
-			// Graph/Home do — this feeds `gl-account-chip` and the nav's avatar. Supertalk proxy properties
+			// Graph/Home do — this feeds `gl-settings-account` and the nav's avatar. Supertalk proxy properties
 			// are thenable at runtime.
 			/* eslint-disable @typescript-eslint/await-thenable -- Supertalk proxy properties are thenable at runtime */
-			const [subscriptionSignal, orgSettingsSignal, avatarSignal, hasAccountSignal, orgCountSignal] =
-				await Promise.all([
-					subscription.subscriptionState,
-					subscription.orgSettingsState,
-					subscription.avatarState,
-					subscription.hasAccountState,
-					subscription.organizationsCountState,
-				]);
+			const [
+				subscriptionSignal,
+				orgSettingsSignal,
+				avatarSignal,
+				hasAccountSignal,
+				orgCountSignal,
+				aiUsageSignal,
+			] = await Promise.all([
+				subscription.subscriptionState,
+				subscription.orgSettingsState,
+				subscription.avatarState,
+				subscription.hasAccountState,
+				subscription.organizationsCountState,
+				subscription.aiUsageState,
+			]);
 			/* eslint-enable @typescript-eslint/await-thenable */
 			this._subscriptionCtx.setValue(
 				{
@@ -139,55 +149,68 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 					avatar: avatarSignal,
 					hasAccount: hasAccountSignal,
 					organizationsCount: orgCountSignal,
+					aiUsage: aiUsageSignal,
 				},
 				true,
 			);
 
 			this._stopAutoPersist = s.startAutoPersist();
 
-			// Subscribe to events FIRST so changes during the initial fetch aren't missed
-			const unsubConfig = await settings.onConfigChanged(snapshot => {
-				setDefaultDateLocales(snapshot.config.defaultDateLocale);
-				s.config.set(snapshot.config);
-				s.customSettings.set(snapshot.customSettings);
-			});
-			const unsubAnchor = await settings.onAnchorRequested(e => {
-				actions.openAnchor(e.anchor);
-			});
-			// Shared-service events feeding the Cloud Integrations & AI panels (and the Autolinks banner)
-			const unsubSubscription = await subscription.onSubscriptionChanged(sub => {
-				s.subscription.set(sub);
-			});
-			const unsubIntegrations = await integrations.onIntegrationsChanged(data => {
-				s.cloudIntegrations.set(data.integrations);
-			});
-			const unsubAiModel = await ai.onModelChanged(() => {
-				// Fires for scope-only changes too (the payload is always the global model), so
-				// route through `refreshAiModels()` to re-read both it and the scoped list rather
-				// than setting `s.aiModel` from a payload that may not reflect what changed.
-				void actions.refreshAiModels();
-			});
-			const unsubAiState = await ai.onStateChanged(state => {
-				s.aiState.set(state);
-			});
-			// Get Started walkthrough steps' live progress
-			const unsubWalkthrough = await walkthrough.onProgressChanged(progress => {
-				s.walkthrough.set(progress);
-			});
-			const unsubAgents = await agents.onAgentsChanged(list => {
-				s.agents.set(list);
-			});
+			// Subscribe to events FIRST so changes during the initial fetch aren't missed — synchronous:
+			// `subscribe()` buffers the wire subscribe until the connection's handshake completes.
+			// Recreated per ready (not `??=`): the subscriber closes over this session's state/actions —
+			// see the equivalent note in commitDetails.ts.
+			this._eventsSubscription?.unsubscribe();
+			this._eventsSubscription = subscribe<SettingsServices>(this._rpc.connection!, async remoteServices => {
+				const [settings, integrations, ai, agents, walkthrough] = await Promise.all([
+					remoteServices.settings,
+					remoteServices.integrations,
+					remoteServices.ai,
+					remoteServices.agents,
+					remoteServices.walkthrough,
+				]);
 
-			this._unsubscribes.push(
-				unsubConfig,
-				unsubAnchor,
-				unsubSubscription,
-				unsubIntegrations,
-				unsubAiModel,
-				unsubAiState,
-				unsubAgents,
-				unsubWalkthrough,
-			);
+				return subscribeAll([
+					() =>
+						settings.onConfigChanged(snapshot => {
+							setDefaultDateLocales(snapshot.config.defaultDateLocale);
+							s.config.set(snapshot.config);
+							s.customSettings.set(snapshot.customSettings);
+						}),
+					() =>
+						settings.onAnchorRequested(e => {
+							actions.openAnchor(e.anchor);
+						}),
+					// Shared-service events feeding the Cloud Integrations & AI panels (and the Autolinks banner)
+					() =>
+						integrations.onIntegrationsChanged(data => {
+							s.cloudIntegrations.set(data.integrations);
+						}),
+					() =>
+						ai.onModelChanged(() => {
+							// Fires for scope-only changes too (the payload is always the global model), so
+							// route through `refreshAiModels()` to re-read both it and the scoped list rather
+							// than setting `s.aiModel` from a payload that may not reflect what changed.
+							void actions.refreshAiModels();
+						}),
+					() =>
+						ai.onStateChanged(state => {
+							s.aiState.set(state);
+						}),
+					// Get Started walkthrough steps' live progress
+					() =>
+						walkthrough.onProgressChanged(progress => {
+							s.walkthrough.set(progress);
+						}),
+					() =>
+						agents.onAgentsChanged(list => {
+							s.agents.set(list);
+						}),
+				]);
+			});
+			// Wait for the subscriptions to land before the initial fetch below, preserving the
+			// subscribe-before-fetch guarantee (`ready` settles once, so reconnects don't re-wait).
+			await this._eventsSubscription.ready;
 
 			const context = await settings.getInitialContext();
 			setDefaultDateLocales(context.config.defaultDateLocale);
@@ -264,14 +287,16 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 				<header class="header">
 					<div class="header__brand">
 						<gitlens-logo-circle aria-hidden="true"></gitlens-logo-circle>
-						<h1 class="header__title">GitLens Settings</h1>
+						<h1 class="header__title">${l10n.t('GitLens Settings')}</h1>
 						${
 							s.version.get()
 								? html`<a
 										class="header__version"
 										href="https://github.com/gitkraken/vscode-gitlens/blob/main/CHANGELOG.md"
-										aria-label="GitLens ${s.version.get()} — open the CHANGELOG"
-										title="Open the CHANGELOG"
+										aria-label=${l10n.t('GitLens {version} — open the CHANGELOG', {
+											version: s.version.get(),
+										})}
+										title=${l10n.t('Open the CHANGELOG')}
 										>v${s.version.get()}</a
 									>`
 								: nothing
@@ -282,8 +307,10 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 						<input
 							id="search"
 							type="search"
-							placeholder="Search settings (try a name like gitlens.currentLine.format)"
-							aria-label="Search settings"
+							placeholder=${l10n.t('Search settings (try a name like {setting})', {
+								setting: 'gitlens.currentLine.format',
+							})}
+							aria-label=${l10n.t('Search settings')}
 							spellcheck="false"
 							.value=${s.query.get()}
 							?disabled=${s.loading.get()}
@@ -295,8 +322,8 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 								? html`<gl-button
 										class="header__search-clear"
 										appearance="input"
-										tooltip="Clear"
-										aria-label="Clear search"
+										tooltip=${l10n.t('Clear')}
+										aria-label=${l10n.t('Clear search')}
 										@click=${this.handleSearchClear}
 									>
 										<code-icon icon="close"></code-icon>
@@ -307,9 +334,9 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 					${
 						scopes.length > 1
 							? html`<div class="header__scope">
-									<span id="scope-label">Save for</span>
+									<span id="scope-label">${l10n.t('Save for')}</span>
 									<gl-segmented-control
-										label="Save settings for"
+										label=${l10n.t('Save settings for')}
 										.options=${scopes.map(([value, label]) => ({ value: value, label: label }))}
 										.value=${s.scope.get()}
 										@gl-change-value=${(e: Event) =>
@@ -329,9 +356,15 @@ export class GlSettingsApp extends SignalWatcherWebviewApp {
 							? html`<div class="body body--error" role="alert">
 									<code-icon icon="error" aria-hidden="true"></code-icon>
 									<span>
-										GitLens Settings couldn’t load — ${s.error.get()}.
-										<a href="command:workbench.action.reloadWindow">Reload the window</a> to try
-										again.
+										${localizedContent(
+											l10n.t('GitLens Settings couldn’t load — {error}. {reload} to try again.'),
+											{
+												error: s.error.get()!,
+												reload: html`<a href="command:workbench.action.reloadWindow"
+													>${l10n.t('Reload the window')}</a
+												>`,
+											},
+										)}
 									</span>
 								</div>`
 							: html`<div class="body body--loading">

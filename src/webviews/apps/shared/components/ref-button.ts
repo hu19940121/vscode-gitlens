@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
@@ -15,9 +16,9 @@ export class GlRefButton extends LitElement {
 				--font-weight: normal;
 
 				/* Use grid to force the min-content contribution of this host to 0,
-			   then apply a configurable floor at icon + chevron + padding.
-		   Without grid minmax(0, 1fr), the host's min-content resolves to
-		   the full label width due to white-space: nowrap inside. */
+  then apply a configurable floor at icon + chevron + padding.
+ Without grid minmax(0, 1fr), the host's min-content resolves to
+ the full label width due to white-space: nowrap inside. */
 				display: grid;
 				grid-template-columns: minmax(0, 1fr);
 				min-width: var(--gl-ref-button-min-width, 3.6rem);
@@ -34,6 +35,11 @@ export class GlRefButton extends LitElement {
 		`,
 		pickerIconStyles,
 	];
+
+	/** Forwarded onto the inner `gl-button`'s focusable control — see `GlButton.ariaLabel`. Overrides the
+	 *  default accessible name (otherwise derived from the visible label / tooltip slot content). */
+	@property({ type: String, attribute: 'aria-label' })
+	override ariaLabel: string | null = null;
 
 	@property({ type: Boolean, reflect: true })
 	disabled = false;
@@ -59,10 +65,11 @@ export class GlRefButton extends LitElement {
 			appearance="toolbar"
 			href=${ifDefined(this.href)}
 			?disabled=${this.disabled}
+			aria-label=${ifDefined(this.ariaLabel ?? undefined)}
 			truncate
 			>${
 				this.ref == null
-					? html`<slot name="empty">&lt;missing&gt;</slot>`
+					? html`<slot name="empty">${l10n.t('<missing>')}</slot>`
 					: html`<gl-ref-name
 							part="label"
 							?icon=${this.icon}

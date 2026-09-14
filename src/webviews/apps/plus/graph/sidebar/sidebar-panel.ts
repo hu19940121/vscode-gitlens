@@ -1,18 +1,25 @@
+import { createWipRowId } from '@gitkraken/commit-graph/wip/identity.js';
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { URI } from 'vscode-uri';
-import { getBranchId } from '@gitlens/git/utils/branch.utils.js';
+import { getAltKeySymbol } from '@env/platform.js';
+import { scrollableBase, subPanelEnterStyles } from '@gitlens/components/components/styles/lit/base.css.js';
+import { ModifierKeysController } from '@gitlens/components/controllers/modifierKeys.js';
 import type { SupportedCloudIntegrationIds } from '@gitlens/integrations/constants.js';
 import type { HierarchicalItem } from '@gitlens/utils/array.js';
 import { makeHierarchical } from '@gitlens/utils/array.js';
 import { fromNow } from '@gitlens/utils/date.js';
 import { debounce } from '@gitlens/utils/debounce.js';
+import { getBranchId } from '@gitlens/utils/gitRefs.js';
 import { basename } from '@gitlens/utils/path.js';
 import type { AgentSessionState } from '../../../../../agents/models/agentSessionState.js';
 import type { GlCommands } from '../../../../../constants.commands.js';
+import type { WebviewTelemetryEvents } from '../../../../../constants.telemetry.js';
 import { launchpadGroupLabelMap } from '../../../../../plus/launchpad/models/launchpad.js';
+import { createCommandLink } from '../../../../../system/commands.js';
 import type { WebviewItemContext } from '../../../../../system/webview.js';
 import { serializeWebviewItemContext, withWebviewItemFlag } from '../../../../../system/webview.js';
 import { sidebarItemActions } from '../../../../plus/graph/graphSidebarActionTelemetry.js';
@@ -28,7 +35,6 @@ import type {
 	GraphSidebarTag,
 	GraphSidebarWorktree,
 } from '../../../../plus/graph/protocol.js';
-import { createWipRowId } from '../../../../plus/graph/protocol.js';
 import {
 	branchTooltip,
 	pullRequestMergesTooltip,
@@ -41,11 +47,14 @@ import {
 } from '../../../../plus/graph/sidebarTooltips.js';
 import {
 	agentPhaseToCategory,
+	buildAgentSessionContext,
 	canResolvePermission,
 	describeAgentSession,
-	getAgentSessionOpenAction,
+	filterAgentSessionsForFamily,
+	getAgentSessionArchiveAction,
+	getAgentSessionOpenActions,
 } from '../../../shared/agentUtils.js';
-import { scrollableBase, subPanelEnterStyles } from '../../../shared/components/styles/lit/base.css.js';
+import { shouldShowKeplerBanner } from '../../../shared/components/keplerBanner.utils.js';
 import type {
 	TreeItemAction,
 	TreeItemActionDetail,
@@ -55,8 +64,14 @@ import type {
 	TreeModel,
 	TreeModelFlat,
 } from '../../../shared/components/tree/base.js';
+import type { AIContextState } from '../../../shared/contexts/ai.js';
+import { aiContext } from '../../../shared/contexts/ai.js';
+import type { OnboardingState } from '../../../shared/contexts/onboarding.js';
+import { onboardingContext } from '../../../shared/contexts/onboarding.js';
 import { ContextMenuProxyController } from '../../../shared/controllers/context-menu-proxy.js';
+import type { TelemetrySendEventParams } from '../../../shared/telemetry.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
+import { panelErrorStyles } from '../components/shared-panel.css.js';
 import type { AppState } from '../context.js';
 import { graphStateContext } from '../context.js';
 import {
@@ -64,11 +79,15 @@ import {
 	getLaunchpadItemGroup,
 	getLaunchpadItemGrouping,
 } from '../utils/overviewActions.utils.js';
+import { applyWorktreeGestureOutcome, isHomeWorktree, resolveWorktreeGesture } from '../utils/rebind.utils.js';
 import { getSelectedRepoPath } from '../utils/repository.utils.js';
+import type { AgentsPanelEmptyState } from './agentsEmptyState.utils.js';
+import { resolveAgentsEmptyState } from './agentsEmptyState.utils.js';
 import type { FocusRefActionArgs } from './branchActions.utils.js';
 import {
 	branchTreeIcon,
 	createFocusRefAction,
+	createWorktreeScopeAction,
 	focusRefActionId,
 	getBranchLeafActions,
 	isHiddenByRemoteWebviewItem,
@@ -80,6 +99,7 @@ import { getPullRequestLeafActions } from './pullRequestActions.utils.js';
 import {
 	getPullRequestNumberFromQuery,
 	parsePullRequestFilterTerms,
+	searchPullRequest,
 	withSearchedPullRequest,
 } from './pullRequestFilter.utils.js';
 import type { PullRequestStackEntry } from './pullRequestStacks.utils.js';
@@ -89,16 +109,17 @@ import type { SidebarActions } from './sidebarState.js';
 import { resolveSelectedTag } from './sidebarTelemetry.utils.js';
 import '../components/gl-graph-coachmark.js';
 import '../overview/graph-overview.js';
-import '../../../shared/components/commit/commit-stats.js';
-import '../../../shared/components/commit/wip-stats.js';
+import '@gitlens/components/components/commitStats.js';
+import '@gitlens/components/components/wipStats.js';
 import '../../../shared/components/markdown/markdown.js';
 import './agent-tooltip.js';
 import './pr-tooltip.js';
 import './worktree-tooltip.js';
 import '../../../shared/components/actions/action-nav.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/agents-banner.js';
+import '../../../shared/components/kepler-banner.js';
 import '../../../shared/components/progress.js';
 import '../../../shared/components/tree/tree-view.js';
 
@@ -116,74 +137,190 @@ interface PanelConfig {
 
 const panelConfig: Record<GraphSidebarPanel, PanelConfig> = {
 	overview: {
-		title: 'Overview',
+		title: l10n.t('Overview'),
 		actions: [
-			{ icon: 'add', tooltip: 'Create Worktree...', command: 'gitlens.views.title.createWorktree' },
+			{ icon: 'add', tooltip: l10n.t('Create Worktree...'), command: 'gitlens.views.title.createWorktree' },
 			{
 				icon: 'issues',
-				tooltip: 'Start Work',
+				tooltip: l10n.t('Start Work'),
 				command: 'gitlens.startWork',
 				args: [{ source: 'graph-sidebar' }],
 			},
 		],
 	},
 	agents: {
-		title: 'Agents',
+		title: l10n.t('Agents'),
 		actions: [
 			{
 				icon: 'issues',
-				tooltip: 'Start Work with Agent...',
+				tooltip: l10n.t('Start Work with Agent...'),
 				command: 'gitlens.startWork',
 				args: [{ source: 'graph-sidebar', showOpenInAgent: 'agent' }],
 			},
 			{
 				icon: 'git-pull-request',
-				tooltip: 'Start PR Review with Agent...',
+				tooltip: l10n.t('Start PR Review with Agent...'),
 				command: 'gitlens.startReview',
 				args: [{ source: 'graph-sidebar', showOpenInAgent: 'agent' }],
 			},
 			{
 				icon: 'gear',
-				tooltip: 'Manage Agents',
+				tooltip: l10n.t('Manage Agents'),
 				command: 'gitlens.showSettingsPage!agents',
 			},
 		],
 	},
 	worktrees: {
-		title: 'Worktrees',
-		actions: [{ icon: 'add', tooltip: 'Create Worktree...', command: 'gitlens.views.title.createWorktree' }],
+		title: l10n.t('Worktrees'),
+		actions: [
+			{ icon: 'add', tooltip: l10n.t('Create Worktree...'), command: 'gitlens.views.title.createWorktree' },
+		],
 	},
 	branches: {
-		title: 'Branches',
+		title: l10n.t('Branches'),
 		actions: [
-			{ icon: 'gl-switch', tooltip: 'Switch to Branch...', command: 'gitlens.switchToAnotherBranch:views' },
-			{ icon: 'add', tooltip: 'Create Branch...', command: 'gitlens.views.title.createBranch' },
+			{
+				icon: 'gl-switch',
+				tooltip: l10n.t('Switch to Branch...'),
+				command: 'gitlens.switchToAnotherBranch:views',
+			},
+			{ icon: 'add', tooltip: l10n.t('Create Branch...'), command: 'gitlens.views.title.createBranch' },
 		],
 	},
 	pullRequests: {
-		title: 'Pull Requests',
+		title: l10n.t('Pull Requests'),
 		actions: [
 			{
 				icon: 'git-pull-request-create',
-				tooltip: 'Create Pull Request...',
+				tooltip: l10n.t('Create Pull Request...'),
 				command: 'gitlens.createPullRequest:graph',
 			},
 		],
 	},
 	remotes: {
-		title: 'Remotes',
-		actions: [{ icon: 'add', tooltip: 'Add Remote...', command: 'gitlens.views.addRemote' }],
+		title: l10n.t('Remotes'),
+		actions: [{ icon: 'add', tooltip: l10n.t('Add Remote...'), command: 'gitlens.views.addRemote' }],
 	},
 	stashes: {
-		title: 'Stashes',
+		title: l10n.t('Stashes'),
 		actions: [
-			{ icon: 'gl-stash-save', tooltip: 'Stash All Changes...', command: 'gitlens.stashSave:views' },
-			{ icon: 'gl-stash-pop', tooltip: 'Apply / Pop Stash...', command: 'gitlens.stashesApply:views' },
+			{ icon: 'gl-stash-save', tooltip: l10n.t('Stash All Changes...'), command: 'gitlens.stashSave:views' },
+			{ icon: 'gl-stash-pop', tooltip: l10n.t('Apply / Pop Stash...'), command: 'gitlens.stashesApply:views' },
 		],
 	},
 	tags: {
-		title: 'Tags',
-		actions: [{ icon: 'add', tooltip: 'Create Tag...', command: 'gitlens.views.title.createTag' }],
+		title: l10n.t('Tags'),
+		actions: [{ icon: 'add', tooltip: l10n.t('Create Tag...'), command: 'gitlens.views.title.createTag' }],
+	},
+};
+
+/** Panels whose header actions emit a `<panel>/headerAction` event — every sidebar panel but overview. */
+type SidebarHeaderActionPanel = Exclude<GraphSidebarPanel, 'overview'>;
+
+/** Maps each panel's header commands to their prebuilt telemetry params. Each row is keyed and
+ *  payload-checked against that panel's entry in `TelemetryEvents`, so an unknown command id or an
+ *  action outside the panel's `headerAction` shape fails to compile. */
+const headerActions: {
+	readonly [P in SidebarHeaderActionPanel]: Partial<
+		Record<GlCommands, TelemetrySendEventParams<`graph/${P}/headerAction`>>
+	>;
+} = {
+	agents: {
+		'gitlens.startWork': { name: 'graph/agents/headerAction', data: { action: 'startWork' } },
+		'gitlens.startReview': { name: 'graph/agents/headerAction', data: { action: 'startReview' } },
+	},
+	worktrees: {
+		'gitlens.views.title.createWorktree': {
+			name: 'graph/worktrees/headerAction',
+			data: { action: 'createWorktree' },
+		},
+	},
+	branches: {
+		'gitlens.switchToAnotherBranch:views': {
+			name: 'graph/branches/headerAction',
+			data: { action: 'switchToBranch' },
+		},
+		'gitlens.views.title.createBranch': { name: 'graph/branches/headerAction', data: { action: 'createBranch' } },
+	},
+	pullRequests: {
+		'gitlens.createPullRequest:graph': {
+			name: 'graph/pullRequests/headerAction',
+			data: { action: 'createPullRequest' },
+		},
+	},
+	remotes: {
+		'gitlens.views.addRemote': { name: 'graph/remotes/headerAction', data: { action: 'addRemote' } },
+	},
+	stashes: {
+		'gitlens.stashSave:views': { name: 'graph/stashes/headerAction', data: { action: 'stashAll' } },
+		'gitlens.stashesApply:views': { name: 'graph/stashes/headerAction', data: { action: 'applyStash' } },
+	},
+	tags: {
+		'gitlens.views.title.createTag': { name: 'graph/tags/headerAction', data: { action: 'createTag' } },
+	},
+};
+
+/** Tree-backed panels whose filter input emits a debounced `<panel>/filtered` event. */
+type SidebarFilteredPanel = Exclude<GraphSidebarPanel, 'agents' | 'overview'>;
+
+/** Panels whose tree items emit inline `<item>Action` events — every sidebar panel but agents and overview. */
+type SidebarItemActionPanel = Exclude<GraphSidebarPanel, 'agents' | 'overview'>;
+
+/** The `graph/<panel>/<item>Action` event name for each panel. Kept as a literal map (rather than
+ *  derived from the panel name) so each value is checked to be a real telemetry event. */
+const itemActionEventNames = {
+	worktrees: 'graph/worktrees/worktreeAction',
+	branches: 'graph/branches/branchAction',
+	pullRequests: 'graph/pullRequests/pullRequestAction',
+	remotes: 'graph/remotes/remoteAction',
+	stashes: 'graph/stashes/stashAction',
+	tags: 'graph/tags/tagAction',
+} as const satisfies Record<SidebarItemActionPanel, keyof WebviewTelemetryEvents>;
+
+/** Builds each panel's inline item-action telemetry params, resolving commands through the shared
+ *  `sidebarItemActions` table; per-panel because each resolves against its own slice of that table.
+ *  Returns undefined when the command has no mapped action for the panel. */
+const treeItemActionParams: {
+	readonly [P in SidebarItemActionPanel]: (
+		command: GlCommands,
+		alt: boolean,
+	) => TelemetrySendEventParams<(typeof itemActionEventNames)[P]> | undefined;
+} = {
+	worktrees: (command, alt) => {
+		const action = sidebarItemActions.worktree[command];
+		return action == null
+			? undefined
+			: { name: 'graph/worktrees/worktreeAction', data: { action: action, alt: alt, location: 'inline' } };
+	},
+	branches: (command, alt) => {
+		const action = sidebarItemActions.branch[command];
+		return action == null
+			? undefined
+			: { name: 'graph/branches/branchAction', data: { action: action, alt: alt, location: 'inline' } };
+	},
+	pullRequests: (command, alt) => {
+		const action = sidebarItemActions.pullRequest[command];
+		return action == null
+			? undefined
+			: { name: 'graph/pullRequests/pullRequestAction', data: { action: action, alt: alt, location: 'inline' } };
+	},
+	remotes: (command, alt) => {
+		const action = sidebarItemActions.remote[command];
+		return action == null
+			? undefined
+			: { name: 'graph/remotes/remoteAction', data: { action: action, alt: alt, location: 'inline' } };
+	},
+	stashes: (command, alt) => {
+		const action = sidebarItemActions.stash[command];
+		return action == null
+			? undefined
+			: { name: 'graph/stashes/stashAction', data: { action: action, alt: alt, location: 'inline' } };
+	},
+	tags: (command, alt) => {
+		const action = sidebarItemActions.tag[command];
+		return action == null
+			? undefined
+			: { name: 'graph/tags/tagAction', data: { action: action, alt: alt, location: 'inline' } };
 	},
 };
 
@@ -194,6 +331,14 @@ export interface GraphSidebarPanelSelectEventDetail {
 	 *  pane, and scroll it into view alongside the WIP row selection. Absent on non-agent leaves
 	 *  (branches, tags, stashes, …). */
 	sessionId?: string;
+	/** Display name of the clicked row's ref (branch/tag/stash), for jump-failure feedback. */
+	name?: string;
+	/** Whether the row carries the Focus inline action — a double-click on it scopes the graph, so
+	 *  the select handler holds navigation briefly to see if one lands. */
+	canFocus?: boolean;
+	/** Whether this select also dispatched a scope — the app positions after the scope's restructure
+	 *  instead of immediately. */
+	scoped?: boolean;
 }
 
 export type GraphSidebarTogglePinnedEventDetail = void;
@@ -210,6 +355,16 @@ export interface SidebarItemScope {
  *  branches pointing at the same commit, so telemetry resolves the clicked branch by name
  *  (the name itself is not emitted). */
 type SidebarItemContext = [sha: string | undefined, scope?: SidebarItemScope, sessionId?: string, name?: string];
+
+/** Builds a {@link SidebarItemContext} from named fields — the tuple's optional middle slots are
+ *  meaningless for most panels, and hand-counting `undefined` placeholders to reach a later slot
+ *  invites a silent transposition (several slots share `string | undefined`). */
+function sidebarItemContext(
+	sha: string | undefined,
+	options?: { scope?: SidebarItemScope; sessionId?: string; name?: string },
+): SidebarItemContext {
+	return [sha, options?.scope, options?.sessionId, options?.name];
+}
 
 interface LeafProps {
 	label: string;
@@ -239,7 +394,7 @@ function trackingDecorations(
 	return [
 		{
 			type: 'tracking',
-			label: 'tracking',
+			label: l10n.t('Tracking'),
 			ahead: ahead,
 			behind: behind,
 			missingUpstream: missingUpstream,
@@ -255,7 +410,7 @@ function trackingDecorations(
 const pinnedToEdgeDecoration: TreeItemDecoration = {
 	type: 'icon',
 	icon: 'pinned',
-	label: 'Pinned to Edge',
+	label: l10n.t('Pinned to Edge'),
 	position: 'after',
 	muted: true,
 };
@@ -264,7 +419,7 @@ const pinnedToEdgeDecoration: TreeItemDecoration = {
 const currentBranchDecoration: TreeItemDecoration = {
 	type: 'icon',
 	icon: 'check',
-	label: 'Current Branch',
+	label: l10n.t('Current Branch'),
 	position: 'after',
 	muted: true,
 };
@@ -274,7 +429,7 @@ const currentBranchDecoration: TreeItemDecoration = {
 const defaultRemoteDecoration: TreeItemDecoration = {
 	type: 'icon',
 	icon: 'check',
-	label: 'Default Remote',
+	label: l10n.t('Default Remote'),
 	position: 'after',
 	muted: true,
 };
@@ -284,7 +439,7 @@ const defaultRemoteDecoration: TreeItemDecoration = {
 const hiddenDecoration: TreeItemDecoration = {
 	type: 'icon',
 	icon: 'eye-closed',
-	label: 'Hidden',
+	label: l10n.t('Hidden'),
 	position: 'after',
 	muted: true,
 };
@@ -293,6 +448,11 @@ function formatWorktreeDescription(w: GraphSidebarWorktree): string | undefined 
 	if (w.upstream == null) return undefined;
 	return `\u21C6 ${w.upstream}`;
 }
+
+/** The model a panel shows before its first payload lands. Shared (not a fresh `[]` per render) so the
+ *  tree-view's model setter identity check short-circuits — otherwise every re-render while loading
+ *  re-flattens and re-renders the tree for the same nothing. */
+const emptyTreeModel: TreeModel<SidebarItemContext>[] = [];
 
 function leafToTreeModel(leaf: LeafProps, path: string, level: number): TreeModel<SidebarItemContext> {
 	return {
@@ -319,6 +479,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	static override styles = [
 		scrollableBase,
 		subPanelEnterStyles,
+		panelErrorStyles,
 		css`
 			@keyframes panel-enter {
 				from {
@@ -344,15 +505,15 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			}
 
 			/* Play enter animations only when the parent signals the user-visible moment —
-	   the element is always mounted (inside the split-panel's start slot) so an
-	   unconditional animation would fire at 0 width where the user can't see it.
-	     [opening]   — sidebar went from hidden to visible (slide in from -8px X)
-	     [switching] — active panel changed while visible (slide in from 4px Y, matches
-	                   the sub-panel-enter used by review/compose/compare panes)
-	   The animation runs on the inner .panel — NOT the :host — so the host's solid
-	   background-color stays put and blocks the graph behind it during the animation
-	   (in overlay mode the host floats over the graph; an opacity/translate on the host
-	   would expose the graph through fade or at the gap left by the translate). */
+the element is always mounted (inside the split-panel's start slot) so an
+unconditional animation would fire at 0 width where the user can't see it.
+  [opening]   — sidebar went from hidden to visible (slide in from -8px X)
+  [switching] — active panel changed while visible (slide in from 4px Y, matches
+                the sub-panel-enter used by review/compose/compare panes)
+The animation runs on the inner .panel — NOT the :host — so the host's solid
+background-color stays put and blocks the graph behind it during the animation
+(in overlay mode the host floats over the graph; an opacity/translate on the host
+would expose the graph through fade or at the gap left by the translate). */
 			:host([opening]) .panel {
 				animation: panel-enter var(--gl-duration-medium) var(--gl-ease-out);
 			}
@@ -363,8 +524,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 			@media (prefers-reduced-motion: reduce) {
 				/* Near-zero duration, NOT animation:none, so the animationend event still
-		   fires — the internal handler depends on it to remove the opening / switching
-		   attribute. animation:none dispatches no event, so the attribute would stick. */
+ fires — the internal handler depends on it to remove the opening / switching
+ attribute. animation:none dispatches no event, so the attribute would stick. */
 				:host([opening]) .panel,
 				:host([switching]) .panel {
 					animation-duration: 0.01ms;
@@ -396,14 +557,14 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			}
 
 			/* Flex row so the coach mark's popover/lightbulb ride inline instead of breaking the
-			   line (a block element inside the inline span would wrap the header to two lines);
-			   the inner text span carries the ellipsis. */
+  line (a block element inside the inline span would wrap the header to two lines);
+  the inner text span carries the ellipsis. */
 			.header-title {
-				flex: 1;
-				min-width: 0;
 				display: flex;
-				align-items: center;
+				flex: 1;
 				gap: 0.4rem;
+				align-items: center;
+				min-width: 0;
 			}
 
 			.header-title__text {
@@ -431,8 +592,42 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			}
 
 			gl-tree-view {
-				height: 100%;
+				flex: 1;
+				min-height: 0;
 				--gitlens-gutter-width: 0.8rem;
+			}
+
+			/* Stacks the refresh-failure strip above the tree. The tree takes the rest and keeps its own
+  scroll clip (min-height: 0), so a strip appearing never spills the list past the panel. */
+			.tree-stack {
+				display: flex;
+				flex-direction: column;
+				height: 100%;
+				overflow: hidden;
+			}
+
+			/* The list below is still the last good data, so this reports the failed refresh without
+  taking the panel over — error accents, no fill that would out-weigh the rows. */
+			.error-strip {
+				display: flex;
+				flex: none;
+				gap: var(--gl-space-6);
+				align-items: center;
+				padding: var(--gl-space-4) var(--gl-space-6);
+				font-size: var(--gl-font-sm);
+				color: var(--vscode-descriptionForeground);
+				border-bottom: var(--gl-border-width) solid
+					var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
+			}
+
+			.error-strip__icon {
+				flex: none;
+				color: var(--vscode-errorForeground);
+			}
+
+			.error-strip__message {
+				flex: 1;
+				min-width: 0;
 			}
 
 			.loading {
@@ -508,7 +703,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				align-items: center;
 			}
 
-			.agents-banner {
+			.agents-banner,
+			.kepler-banner {
 				flex: none;
 				padding: 0 var(--gl-space-4) var(--gl-space-4);
 			}
@@ -546,15 +742,25 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	@consume({ context: sidebarActionsContext, subscribe: true })
 	private _actions!: SidebarActions;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private readonly _state!: AppState;
 
+	@consume({ context: aiContext })
+	private readonly _ai?: AIContextState;
+
+	@consume({ context: onboardingContext, subscribe: true })
+	private readonly _onboarding?: OnboardingState;
+
 	/** Memo for `buildTreeModel`. Renders fire on every filter/expansion change, so without this
-	 *  the tree model is rebuilt for an unchanged `data` reference. Reset on key change. */
+	 *  the tree model is rebuilt for an unchanged `data` reference. Reset on key change — which includes
+	 *  the live worktree perspective, since the worktrees panel paints the scoped row from it (see
+	 *  `renderTreeContent`, where it's read outside this cache). */
 	private _treeModelCache?: {
 		data: DidGetSidebarDataParams;
 		dateFormat: string | null | undefined;
 		searchedPr: GraphSidebarPullRequest | undefined;
+		scopedWorktreePath: string | undefined;
+		homeRepositoryPath: string | undefined;
 		model: TreeModel<SidebarItemContext>[];
 	};
 
@@ -569,48 +775,39 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	private _prSearchData: DidGetSidebarDataParams | undefined;
 	@state() private _prSearchState: 'idle' | 'searching' | 'notFound' = 'idle';
 
+	/** Mirrors `<gl-graph-overview>`'s in-flight `GetOverviewRequest` state (bubbled via
+	 *  `gl-graph-overview-loading-change`) into the header's `progress-indicator` — the overview panel
+	 *  fetches its own data outside the sidebar's resource/IPC fetch loop, so `renderHeader` can't read
+	 *  a resource's `loading` signal for it the way every other panel does. */
+	@state() private _overviewLoading = false;
+
 	private readonly _contextMenuProxy = new ContextMenuProxyController(this);
 
-	private _pendingFocus = false;
+	/** Drives the Start Agent Session button's alt-aware tooltip (same idiom as the graph header). */
+	private readonly _modifiers = new ModifierKeysController(this);
+
+	/** The panel a `focusFilter()` call is still owed, when it arrived before that panel had rendered.
+	 *  Panel-scoped rather than a bare flag: a latch left over from a panel the user has since switched
+	 *  away from must never fire, or a much-later render steals focus into the wrong panel's filter. */
+	private _pendingFocusPanel: GraphSidebarPanel | undefined;
 	private _agentsFilterActive = false;
 
-	/** Whether `graph/worktrees/shown` has been fired for the current worktrees activation. Reset
-	 *  on disconnect and on `activePanel` change so switching away and back emits a fresh event
+	/** Panels whose `<panel>/shown` telemetry has fired for the current activation. Reset on
+	 *  disconnect and on `activePanel` change so switching away and back emits a fresh event
 	 *  while re-renders from data mutations (e.g. WIP pushes) do not. */
-	private _worktreesShownEmitted = false;
-	/** Same guard as `_worktreesShownEmitted`, for `graph/stashes/shown`. */
-	private _stashesShownEmitted = false;
-	/** Same guard as `_worktreesShownEmitted`, for `graph/tags/shown`. */
-	private _tagsShownEmitted = false;
-	/** Same guard as `_worktreesShownEmitted`, for `graph/pullRequests/shown`. */
-	private _pullRequestsShownEmitted = false;
-
-	/** Same as `_worktreesShownEmitted`, for the remotes panel. */
-	private _remotesShownEmitted = false;
+	private readonly _shownEmitted = new Set<'worktrees' | 'remotes' | 'stashes' | 'tags' | 'pullRequests'>();
 
 	// Tracks that the branches panel was just shown and its `shown` telemetry is still owed —
 	// emitted once the switch-triggered fetch settles (see maybeEmitBranchesShownTelemetry).
 	private _branchesShownPending = false;
 
-	// The raw `gl-tree-filter-changed` event fires on every keystroke (only the tree's filter
-	// apply is debounced), so debounce the telemetry to emit once per settled query.
-	private readonly emitBranchesFilteredTelemetryDebounced = debounce(() => {
-		if (this.activePanel !== 'branches') return;
-
-		const filterText = this._actions.filterText;
-		emitTelemetrySentEvent<'graph/branches/filtered'>(this, {
-			name: 'graph/branches/filtered',
-			data: {
-				hasFilter: filterText.length > 0,
-				'filter.length': filterText.length,
-				'branches.count': this.getBranchesCount(),
-			},
-		});
-	}, 500);
+	// Tracks that the agents panel was just shown and its `shown` telemetry is still owed — emitted
+	// once the first agents push lands (see maybeEmitAgentsShownTelemetry).
+	private _agentsShownPending = false;
 
 	focusFilter(): void {
 		if (this.activePanel == null || this.activePanel === 'overview') {
-			this._pendingFocus = false;
+			this._pendingFocusPanel = undefined;
 			return;
 		}
 
@@ -618,14 +815,32 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			'gl-tree-view',
 		);
 		if (treeView == null) {
-			// Tree-view isn't rendered yet (data still loading). Retry when it appears.
-			this._pendingFocus = true;
+			// A treeless empty state stands in for the tree — focus its action instead of latching a
+			// retry that a later render (e.g. sessions arriving) would turn into a focus steal. No
+			// button there (the unsupported state) leaves focus where the user put it.
+			const empty = this.shadowRoot?.querySelector('.empty');
+			if (empty != null) {
+				this._pendingFocusPanel = undefined;
+				empty.querySelector<HTMLElement>('gl-button')?.focus();
+				return;
+			}
+
+			// Asked before this panel rendered at all. Retry once it does — see `updated`.
+			this._pendingFocusPanel = this.activePanel;
 			return;
 		}
 
-		this._pendingFocus = false;
+		this._pendingFocusPanel = undefined;
 		const ready = treeView.updateComplete ?? Promise.resolve();
 		void Promise.resolve(ready).then(() => treeView.focus());
+	}
+
+	/** The pull-requests empty state currently standing in for the tree, if any. */
+	private get treelessEmptyState(): GraphSidebarPullRequestsEmptyState | undefined {
+		if (this.activePanel !== 'pullRequests') return undefined;
+
+		const data = this._actions?.state.panels.pullRequests.value.get();
+		return data?.panel === 'pullRequests' && data.items.length === 0 ? data.emptyState : undefined;
 	}
 
 	override firstUpdated(_changedProperties: Map<PropertyKey, unknown>): void {
@@ -636,17 +851,11 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	override disconnectedCallback(): void {
-		this.emitWorktreesFilteredTelemetryDebounced.cancel();
-		this.emitBranchesFilteredTelemetryDebounced.cancel();
-		this.emitRemotesFilteredTelemetryDebounced.cancel();
-		this.emitStashesFilteredTelemetryDebounced.cancel();
-		this.emitTagsFilteredTelemetryDebounced.cancel();
-		this.emitPullRequestsFilteredTelemetryDebounced.cancel();
-		this._worktreesShownEmitted = false;
-		this._remotesShownEmitted = false;
-		this._stashesShownEmitted = false;
-		this._tagsShownEmitted = false;
-		this._pullRequestsShownEmitted = false;
+		this.emitFilteredTelemetryDebounced.cancel();
+		this._shownEmitted.clear();
+		// Drop any owed focus — a request made before this panel was torn down has no claim on the
+		// filter of whatever renders next.
+		this._pendingFocusPanel = undefined;
 		super.disconnectedCallback?.();
 	}
 
@@ -662,21 +871,23 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// Visibility has to sync on its OWN transition, not inside the `activePanel` guard below: collapsing
 		// and re-expanding never changes `activePanel` (the sidebar signal merges key-by-key, so the panel
 		// selection survives), so a write nested in that guard would go stale in both directions — never set
-		// on a live collapse, and stuck `false` after a reload-while-collapsed is re-expanded. A stale value
-		// only mis-reports `displayed` (enrichment computed for a collapsed panel, or pills missing until the
-		// next fetch); it cannot stale or blank the panel's data, which is never gated on it.
+		// on a live collapse, and stuck `false` after a reload-while-collapsed is re-expanded. The value gates
+		// the boot fetch and `invalidateAll`'s refetch (a hidden sidebar fetches nothing; `refreshOnReveal`
+		// loads it on open), so a stale `false` would show a loading state on reveal and then fresh rows,
+		// and a stale `true` costs a fetch nobody sees — neither leaves a visible panel stale.
 		if (changedProperties.has('open') && this._actions != null) {
 			this._actions.sidebarShowing = this.open;
+			// Collapsing answers the focus request: the panel is off screen and inert, so an owed focus
+			// would only pull the caret into something the user can't see.
+			if (!this.open) {
+				this._pendingFocusPanel = undefined;
+			}
 		}
 
 		if (changedProperties.has('activePanel') && this._actions != null) {
 			// Reset the shown guards so switching away and back emits a fresh impression
 			// while intra-activation re-renders (WIP pushes, refresh) do not.
-			this._worktreesShownEmitted = false;
-			this._remotesShownEmitted = false;
-			this._stashesShownEmitted = false;
-			this._tagsShownEmitted = false;
-			this._pullRequestsShownEmitted = false;
+			this._shownEmitted.clear();
 
 			// Cancel any pending filtered emits — filterText is shared across panels, so a trailing
 			// callback after a switch would report against the wrong (now-inactive) panel.
@@ -687,12 +898,13 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			this._prSearchData = undefined;
 			this._prSearchState = 'idle';
 
-			this.emitWorktreesFilteredTelemetryDebounced.cancel();
-			this.emitBranchesFilteredTelemetryDebounced.cancel();
-			this.emitRemotesFilteredTelemetryDebounced.cancel();
-			this.emitStashesFilteredTelemetryDebounced.cancel();
-			this.emitTagsFilteredTelemetryDebounced.cancel();
-			this.emitPullRequestsFilteredTelemetryDebounced.cancel();
+			// The overview panel's `<gl-graph-overview>` is destroyed on switch-away (a structurally
+			// different render branch) — an in-flight request's `finally` fires on the orphaned instance
+			// and can't bubble its "done" event up to us, so reset here rather than risk a stuck header
+			// progress bar the next time the panel is shown.
+			this._overviewLoading = false;
+
+			this.emitFilteredTelemetryDebounced.cancel();
 
 			// Keep the actions module in sync so invalidateAll can refetch. Also seeds `sidebarShowing` on
 			// the boot update, where `activePanel` transitions undefined→restored but `open` may not change.
@@ -713,9 +925,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				this._actions.fetchPanel(this.activePanel);
 			}
 
-			if (this.activePanel === 'agents') {
-				this.emitAgentsShownTelemetry();
-			}
+			this._agentsShownPending = this.activePanel === 'agents';
 
 			// Defer the `shown` event until the branches data actually resolves (see
 			// maybeEmitBranchesShownTelemetry). Emitting synchronously here would drop the
@@ -740,17 +950,24 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	override updated(_changedProperties: Map<PropertyKey, unknown>): void {
-		// Reveal: warm the per-worktree enrichment the host suppressed while this was collapsed (it gates on
-		// the `displayed` flag we send with each request). The panel's own data never went stale — fetches
-		// are never gated client-side — so this exists only to fill in the pills. Unconditional, so each
-		// reveal costs one small fetch plus a fan-out trigger; `computeWorktreeChanges` coalesces to one
-		// running + one trailing run, which bounds rapid collapse/expand cycling.
+		// Reveal: load the active panel. A collapsed sidebar fetches nothing (the boot fetch and
+		// `invalidateAll` both skip it, and `invalidateAll` resets its panels), so this is what fills it in —
+		// and when the data survived, what warms the per-worktree enrichment the host suppressed via the
+		// `displayed` flag while collapsed. Unconditional, so each reveal costs one fetch plus a fan-out
+		// trigger; `computeWorktreeChanges` coalesces to one running + one trailing run, which bounds rapid
+		// collapse/expand cycling.
 		if (_changedProperties.has('open') && this.open && this._actions != null) {
 			this._actions.refreshOnReveal();
 		}
 
-		if (this._pendingFocus) {
-			this.focusFilter();
+		// Retry an owed focus, but only for the panel it was asked for — a switch since then retires it
+		// rather than handing the caret to a panel the user never asked to search.
+		if (this._pendingFocusPanel != null) {
+			if (this._pendingFocusPanel === this.activePanel) {
+				this.focusFilter();
+			} else {
+				this._pendingFocusPanel = undefined;
+			}
 		}
 
 		// Emit `shown` from the settled lifecycle (not render(), which Lit expects side-effect-free).
@@ -759,6 +976,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// refresh(), filter/expansion changes) do not re-emit.
 		this.emitWorktreesShownTelemetry();
 		this.emitRemotesShownTelemetry();
+		this.maybeEmitAgentsShownTelemetry();
 		this.maybeEmitBranchesShownTelemetry();
 		this.emitStashesShownTelemetry();
 		this.emitTagsShownTelemetry();
@@ -766,7 +984,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	private emitWorktreesShownTelemetry(): void {
-		if (this._worktreesShownEmitted || this.activePanel !== 'worktrees') return;
+		if (this._shownEmitted.has('worktrees') || this.activePanel !== 'worktrees') return;
 
 		const resource = this._actions?.state.panels.worktrees;
 		// Wait for a successful fetch (mirrors maybeEmitBranchesShownTelemetry): on reactivation
@@ -779,8 +997,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const data = resource.value.get();
 		if (data?.panel !== 'worktrees') return;
 
-		this._worktreesShownEmitted = true;
-		emitTelemetrySentEvent<'graph/worktrees/shown'>(this, {
+		this._shownEmitted.add('worktrees');
+		emitTelemetrySentEvent(this, {
 			name: 'graph/worktrees/shown',
 			data: {
 				layout: data.layout ?? 'list',
@@ -790,7 +1008,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	private emitStashesShownTelemetry(): void {
-		if (this._stashesShownEmitted || this.activePanel !== 'stashes') return;
+		if (this._shownEmitted.has('stashes') || this.activePanel !== 'stashes') return;
 
 		const resource = this._actions?.state.panels.stashes;
 		// Wait for a successful fetch (mirrors emitWorktreesShownTelemetry): on reactivation the
@@ -801,8 +1019,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const data = resource.value.get();
 		if (data?.panel !== 'stashes') return;
 
-		this._stashesShownEmitted = true;
-		emitTelemetrySentEvent<'graph/stashes/shown'>(this, {
+		this._shownEmitted.add('stashes');
+		emitTelemetrySentEvent(this, {
 			name: 'graph/stashes/shown',
 			data: {
 				'stashes.count': data.items.length,
@@ -824,14 +1042,14 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const pr = withSearchedPullRequest(data.items, this.prSearchResult).find(p => `pr:${p.number}` === path);
 		if (pr == null) return;
 
-		emitTelemetrySentEvent<'graph/pullRequests/pullRequestSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/pullRequests/pullRequestSelected',
 			data: { reachable: pr.focus != null, draft: pr.isDraft ?? false },
 		});
 	}
 
 	private emitPullRequestsShownTelemetry(): void {
-		if (this._pullRequestsShownEmitted || this.activePanel !== 'pullRequests') return;
+		if (this._shownEmitted.has('pullRequests') || this.activePanel !== 'pullRequests') return;
 
 		const resource = this._actions?.state.panels.pullRequests;
 		// Same wait-for-success rule as the other panels: on reactivation the resource still holds the
@@ -841,8 +1059,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const data = resource.value.get();
 		if (data?.panel !== 'pullRequests') return;
 
-		this._pullRequestsShownEmitted = true;
-		emitTelemetrySentEvent<'graph/pullRequests/shown'>(this, {
+		this._shownEmitted.add('pullRequests');
+		emitTelemetrySentEvent(this, {
 			name: 'graph/pullRequests/shown',
 			data: {
 				'pullRequests.count': data.items.length,
@@ -854,7 +1072,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	private emitTagsShownTelemetry(): void {
-		if (this._tagsShownEmitted || this.activePanel !== 'tags') return;
+		if (this._shownEmitted.has('tags') || this.activePanel !== 'tags') return;
 
 		const resource = this._actions?.state.panels.tags;
 		// Wait for a successful fetch (mirrors emitWorktreesShownTelemetry): on reactivation the
@@ -865,8 +1083,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const data = resource.value.get();
 		if (data?.panel !== 'tags') return;
 
-		this._tagsShownEmitted = true;
-		emitTelemetrySentEvent<'graph/tags/shown'>(this, {
+		this._shownEmitted.add('tags');
+		emitTelemetrySentEvent(this, {
 			name: 'graph/tags/shown',
 			data: {
 				layout: data.layout ?? 'list',
@@ -883,9 +1101,11 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 		if (this.activePanel === 'overview') {
 			return html`<div class="panel">
-				${this.renderHeader(config, false)}
+				${this.renderHeader(config, this._overviewLoading)}
 				<div class="content">
-					<gl-graph-overview></gl-graph-overview>
+					<gl-graph-overview
+						@gl-graph-overview-loading-change=${this.handleOverviewLoadingChange}
+					></gl-graph-overview>
 				</div>
 			</div>`;
 		}
@@ -894,49 +1114,79 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// reactive notifications. Synthesize a `DidGetSidebarDataParams`-shaped value so the standard
 		// tree-view rendering flow (filter box + leaves) takes over.
 		if (this.activePanel === 'agents') {
-			const sessions = this._state.agentSessions ?? [];
-			const showCompleted = this._state.sidebar?.showCompletedAgentSessions ?? false;
+			const graphAnchor = this.resolveGraphAnchorContext();
+			const familyWorktreePaths =
+				this._state.worktreePaths != null ? new Set(this._state.worktreePaths) : undefined;
+			const sessions = filterAgentSessionsForFamily(
+				this._state.agentSessions,
+				graphAnchor?.family,
+				familyWorktreePaths,
+			);
+			const showPast = this._state.sidebar?.showPastAgentSessions ?? false;
 			const data: DidGetSidebarDataParams = {
 				panel: 'agents',
-				items: showCompleted ? sessions : sessions.filter(s => s.phase !== 'completed'),
+				items: showPast ? sessions : sessions.filter(s => s.phase !== 'ended'),
 				layout: this._actions.agentsLayout.get(),
 			};
-			// The banner is keyed to the unfiltered total — it means "no sessions at all", not "all hidden".
+			// The banner is keyed to the family-filtered total — it means "no sessions for this repo's
+			// family", not "all hidden" by the past-sessions toggle.
+			const bannerVisible = this.isAgentsBannerVisible(sessions.length === 0);
+			const emptyState = this.resolveAgentsEmptyState(sessions.length, bannerVisible);
+			const emptyText =
+				sessions.length > 0
+					? 'No current agent sessions'
+					: emptyState?.type === 'no-sessions'
+						? 'No agent sessions for this repository'
+						: 'No agent sessions';
+			// The Connect Agents banner and the Kepler banner are allowed to stack — that's intended, not
+			// an oversight. When both are visible, Connect Agents (the hook-setup CTA) stays on top and
+			// Kepler sits below it.
+			const keplerBannerVisible = shouldShowKeplerBanner({
+				progress: this._onboarding?.walkthroughProgress.get(),
+				onboardingOptedOut: this._onboarding?.onboardingOptedOut.get(),
+				orgDisabledAi: this._ai?.state.get().orgEnabled === false,
+			});
 			return html`<div class="panel">
-				${this.renderHeader(config, false)} ${this.renderAgentsBanner(sessions.length === 0)}
-				<div class="content">${this.renderTreeContent(config, data)}</div>
+				${this.renderHeader(config, false)} ${bannerVisible ? this.renderAgentsBanner() : nothing}
+				${keplerBannerVisible ? this.renderKeplerBanner() : nothing}
+				<div class="content">
+					${
+						emptyState?.type === 'connect'
+							? this.renderAgentsEmptyState(emptyState.reason)
+							: this.renderTreeContent(config, data, undefined, emptyText)
+					}
+				</div>
 			</div>`;
 		}
 
 		const resource = this._actions?.state.panels[this.activePanel];
 		const data = resource?.value.get();
-		const hasError = resource?.error.get() != null;
+		const error = resource?.error.get();
 		const isLoading = resource?.loading.get() ?? false;
 
-		// The pull-requests panel is empty for reasons the host can name — nothing connected, nothing
-		// connectable, a lookup that couldn't answer, or a host that can't be asked. Those replace the
-		// (blank) tree entirely.
-		const emptyState = data?.panel === 'pullRequests' && data.items.length === 0 ? data.emptyState : undefined;
+		// The pull-requests panel is empty for settled reasons the host can name — nothing connected, nothing
+		// connectable, or a host that can't be asked. Those replace the (blank) tree entirely; retryable
+		// failures reject through the Resource and stay inside the tree like every other panel.
+		const emptyState = this.treelessEmptyState;
 		// ...which takes the filter box with it, so there's no way left to name a pull request to search for —
 		// and a search that did somehow succeed would render nothing, since the empty state stands in for the
 		// tree the result would have joined.
 		const suppressSearchFallback = emptyState != null;
 
+		// Everything else keeps the tree — loading and failures are reported inside it, so the filter box,
+		// the typed filter text and the panel's shape survive a reload that hasn't landed or has failed.
+		// A failure with data still in hand is a failed *refresh*: the list stays, the strip says so.
 		return html`<div class="panel">
 			${this.renderHeader(config, isLoading)}
 			<div class="content">
 				${
-					hasError
-						? html`<div class="empty">Failed to load data</div>`
-						: emptyState != null
-							? this.renderPullRequestsEmptyState(emptyState)
-							: data != null
-								? this.renderTreeContent(config, data)
-								: this.renderSkeleton()
+					emptyState != null
+						? this.renderPullRequestsEmptyState(emptyState)
+						: this.renderTreeContent(config, data, error)
 				}
 			</div>
 			${/* Sibling of `.content`, not inside it — `.content` clips at 100% height around the tree. */ ''}
-			${data != null && !hasError && !suppressSearchFallback ? this.renderPullRequestSearchFallback(data) : nothing}
+			${data != null && !suppressSearchFallback ? this.renderPullRequestSearchFallback(data) : nothing}
 		</div>`;
 	}
 
@@ -958,18 +1208,6 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				"Connect an integration — including self-managed hosts — to see this repository's pull requests and act on them without leaving the graph.",
 				'Connect an Integration...',
 			);
-		}
-
-		// Connected, but the lookup reported a failure — an expired token or a dropped connection. Say that,
-		// because an empty list here would claim the repository has no open pull requests. Retries go through
-		// the header's own handler so this refresh is counted like every other one.
-		if (emptyState.reason === 'unavailable') {
-			return html`<div class="empty empty--connect">
-				<span>Unable to load this repository's pull requests.</span>
-				<gl-button appearance="secondary" density="compact" @click=${this.handleRefresh}
-					><code-icon icon="refresh" slot="prefix"></code-icon> Try Again</gl-button
-				>
-			</div>`;
 		}
 
 		// Connected and reachable, but the host has no repo-scoped pull request query GitLens can issue —
@@ -1009,9 +1247,13 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		]);
 	}
 
+	private readonly handleOverviewLoadingChange = (e: CustomEvent<{ loading: boolean }>): void => {
+		this._overviewLoading = e.detail.loading;
+	};
+
 	private renderHeader(config: PanelConfig, isLoading: boolean) {
 		const pinned = this._state.config?.sidebarPinned ?? false;
-		const pinTooltip = pinned ? 'Unpin Side Bar' : 'Pin Side Bar';
+		const pinTooltip = pinned ? l10n.t('Unpin Side Bar') : l10n.t('Pin Side Bar');
 		const pinIcon = pinned ? 'pinned' : 'pin';
 		return html`<div class="header">
 			<span class="header-title"
@@ -1030,7 +1272,28 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 						: nothing
 				}</span
 			>
-			<action-nav class="header-actions" role="toolbar" aria-label="${config.title} actions">
+			<action-nav class="header-actions" role="toolbar" aria-label=${l10n.t('{0} actions', config.title)}>
+				${
+					// One button for the pair — Alt swaps in the picker variant (the graph header's alt idiom).
+					this.activePanel === 'agents'
+						? html`<gl-button
+								appearance="toolbar"
+								density="compact"
+								tooltip=${
+									this._modifiers.altKey
+										? l10n.t('Start Agent Session With...')
+										: l10n.t(
+												'Start Agent Session...\n[{0}] Start Agent Session With...',
+												getAltKeySymbol(),
+											)
+								}
+								aria-label=${l10n.t('Start Agent Session')}
+								@click=${this.handleStartAgentSession}
+								@keydown=${this.handleStartAgentSessionKeydown}
+								><code-icon icon="robot"></code-icon
+							></gl-button>`
+						: nothing
+				}
 				${config.actions?.map(
 					a =>
 						html`<gl-button
@@ -1041,7 +1304,11 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 							><code-icon icon="${a.icon}"></code-icon
 						></gl-button>`,
 				)}
-				<gl-button appearance="toolbar" density="compact" tooltip="Refresh" @click=${this.handleRefresh}
+				<gl-button
+					appearance="toolbar"
+					density="compact"
+					tooltip=${l10n.t('Refresh')}
+					@click=${this.handleRefresh}
 					><code-icon icon="refresh"></code-icon
 				></gl-button>
 				<gl-button
@@ -1057,16 +1324,23 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		</div>`;
 	}
 
-	private renderAgentsBanner(listIsEmpty: boolean): unknown {
+	/** The Connect Your AI Agents banner's visibility gate — shared between rendering it and the
+	 *  empty-state resolution, which must not repeat the banner's pitch below it. */
+	private isAgentsBannerVisible(listIsEmpty: boolean): boolean {
 		// Only pitch the install when there are no sessions to act on — once the list has agents,
 		// the banner becomes noise above their tree.
-		if (!listIsEmpty) return nothing;
+		if (!listIsEmpty) return false;
 		// Only pitch the install when there's something to install — `canInstallHooks` flips
 		// false the moment every detected agent has hooks installed (or none support hooks).
-		if (!(this._state.canInstallHooks ?? false)) return nothing;
+		if (!(this._state.canInstallHooks ?? false)) return false;
 		// Respect the same dismissal as the graph-overview banner — `agentsBannerCollapsed` is true
 		// when the user dismissed it via the onboarding service.
-		if (this._state.agentsBannerCollapsed ?? true) return nothing;
+		if (this._state.agentsBannerCollapsed ?? true) return false;
+
+		return true;
+	}
+
+	private renderAgentsBanner(): unknown {
 		return html`<div class="agents-banner">
 			<gl-agents-banner
 				source="graph-sidebar-agents"
@@ -1077,99 +1351,248 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		</div>`;
 	}
 
-	private renderTreeContent(config: (typeof panelConfig)[GraphSidebarPanel], data: DidGetSidebarDataParams): unknown {
-		const cache = this._treeModelCache;
+	private renderKeplerBanner(): unknown {
+		return html`<div class="kepler-banner">
+			<gl-kepler-banner source="graph-sidebar" layout="responsive"></gl-kepler-banner>
+		</div>`;
+	}
+
+	/** Reads the panel's hooks/session state into {@link resolveAgentsEmptyState} — kept as a thin
+	 *  wrapper so the decision itself stays a pure, tested function. */
+	private resolveAgentsEmptyState(sessionCount: number, bannerVisible: boolean): AgentsPanelEmptyState | undefined {
+		return resolveAgentsEmptyState({
+			hooksAgents: this._state.hooksAgents,
+			sessionCount: sessionCount,
+			bannerVisible: bannerVisible,
+		});
+	}
+
+	/** Stands in for the agents tree when no agent is connected — a bare empty list would hide that
+	 *  connecting one is what's missing. */
+	private renderAgentsEmptyState(reason: 'agents-undetected' | 'agents-unconnected'): unknown {
+		const message =
+			reason === 'agents-undetected'
+				? l10n.t(
+						'GitLens shows sessions from supported agent CLIs. Install one and connect it to see its sessions here.',
+					)
+				: l10n.t(
+						'Connect your AI agents to GitLens to see their sessions here and follow their work in the graph.',
+					);
+
+		const connectable = this.connectableDefaultAgent;
+
+		return html`<div class="empty empty--connect">
+			<span>${message}</span>
+			${
+				connectable != null
+					? html`<gl-button appearance="secondary" density="compact" @click=${this.handleConnectAgents}
+							><code-icon icon="plug" slot="prefix"></code-icon
+							>${l10n.t('Connect {0}...', connectable.label)}</gl-button
+						>`
+					: html`<gl-button
+							appearance="secondary"
+							density="compact"
+							href=${createCommandLink('gitlens.showSettingsPage!agents')}
+							><code-icon icon="gear" slot="prefix"></code-icon>${l10n.t('Manage Agents...')}</gl-button
+						>`
+			}
+		</div>`;
+	}
+
+	/** The default agent when the connect button can actually connect it: a CLI agent, detected and
+	 *  hooks-capable, with hooks not yet installed. */
+	private get connectableDefaultAgent(): { id: string; label: string } | undefined {
+		const defaultAgent = this._ai?.state.get().defaultAgent;
+		if (defaultAgent == null || !defaultAgent.id.startsWith('cli:')) return undefined;
+
+		const name = defaultAgent.id.slice(4);
+		const connectable = this._state.hooksAgents?.some(a => a.id === name && !a.installed) ?? false;
+		return connectable ? defaultAgent : undefined;
+	}
+
+	/** Connect ${agent} = open the Agents settings page and install that agent's hooks right away,
+	 *  so the page lands on the operation's progress. */
+	private handleConnectAgents() {
+		this._actions?.executeAction('gitlens.showSettingsPage!agents');
+
+		const agent = this.connectableDefaultAgent;
+		if (agent == null) return;
+
+		this._actions?.executeAction('gitlens.agents.installHooksForAgent', undefined, [
+			{ agentId: agent.id, source: 'graph-sidebar' },
+		]);
+	}
+
+	/** Renders the panel's tree, with `data` still absent while the first fetch is in flight or has
+	 *  failed — the chrome comes up with the panel and the loading/error body rides the tree's `empty`
+	 *  slot, so the filter box and the typed filter text never blink out from under the user. `error`
+	 *  alongside data is a failed *refresh*: the last good rows stay and a strip reports the failure. */
+	private renderTreeContent(
+		config: (typeof panelConfig)[GraphSidebarPanel],
+		data: DidGetSidebarDataParams | undefined,
+		error?: string,
+		emptyText?: string,
+	): unknown {
+		// Read UNCONDITIONALLY, ahead of the memo: `buildTreeModel` derives the scoped row's marker and its
+		// "Unscope Worktree" label from this, so a cache HIT would never read the signal — leaving
+		// `SignalWatcher` unsubscribed from it and the memo blind to the change. A REFUSED scope/unscope
+		// moves the perspective with no sidebar refetch behind it, so the row would keep the old state.
+		const scopedWorktreePath = this._state.worktreePerspective?.path;
+		// Same trap: `buildTreeModel` bakes `isHome` into each worktree row's scope-action payload, and the
+		// signal can land after the first sidebar data with no refetch behind it (cold open).
+		const homeRepositoryPath = this._state.homeRepositoryPath;
+
 		let model: TreeModel<SidebarItemContext>[];
-		if (cache?.data === data && cache.dateFormat === this.dateFormat && cache.searchedPr === this.prSearchResult) {
-			model = cache.model;
+		if (data == null) {
+			model = emptyTreeModel;
 		} else {
-			model = this.buildTreeModel(data);
-			this._treeModelCache = {
-				data: data,
-				dateFormat: this.dateFormat,
-				searchedPr: this.prSearchResult,
-				model: model,
-			};
+			const cache = this._treeModelCache;
+			if (
+				cache?.data === data &&
+				cache.dateFormat === this.dateFormat &&
+				cache.searchedPr === this.prSearchResult &&
+				cache.scopedWorktreePath === scopedWorktreePath &&
+				cache.homeRepositoryPath === homeRepositoryPath
+			) {
+				model = cache.model;
+			} else {
+				model = this.buildTreeModel(data);
+				this._treeModelCache = {
+					data: data,
+					dateFormat: this.dateFormat,
+					searchedPr: this.prSearchResult,
+					scopedWorktreePath: scopedWorktreePath,
+					homeRepositoryPath: homeRepositoryPath,
+					model: model,
+				};
+			}
+
+			// Automatically track/restore tree expansion state per panel.
+			// On first build (set empty): seed the set from the model's natural defaults.
+			// On subsequent builds: override the model's expansion with the remembered set.
+			if (this.activePanel != null) {
+				const paths = this._actions.expandedPaths[this.activePanel];
+				applyOrSeedExpansion(model, paths);
+			}
 		}
 
-		// Automatically track/restore tree expansion state per panel.
-		// On first build (set empty): seed the set from the model's natural defaults.
-		// On subsequent builds: override the model's expansion with the remembered set.
-		if (this.activePanel != null) {
-			const paths = this._actions.expandedPaths[this.activePanel];
-			applyOrSeedExpansion(model, paths);
-		}
-
+		// Every filter action below reads a field off the payload, so each is held back until there's a
+		// payload to read — a toggle rendered against a guessed value would lie about the state it shows.
 		const hasLayout =
-			this.activePanel === 'worktrees' ||
-			this.activePanel === 'branches' ||
-			this.activePanel === 'remotes' ||
-			this.activePanel === 'tags' ||
-			this.activePanel === 'agents';
-		const currentLayout = data.layout;
-		const showRemoteBranches = data.panel === 'branches' ? (data.showRemoteBranches ?? false) : undefined;
-		const showCompletedAgentSessions =
-			data.panel === 'agents' ? (this._state.sidebar?.showCompletedAgentSessions ?? false) : undefined;
+			data != null &&
+			(this.activePanel === 'worktrees' ||
+				this.activePanel === 'branches' ||
+				this.activePanel === 'remotes' ||
+				this.activePanel === 'tags' ||
+				this.activePanel === 'agents');
+		const currentLayout = data?.layout;
+		const showRemoteBranches = data?.panel === 'branches' ? (data.showRemoteBranches ?? false) : undefined;
+		const showPastAgentSessions =
+			data?.panel === 'agents' ? (this._state.sidebar?.showPastAgentSessions ?? false) : undefined;
 
 		const isPullRequests = this.activePanel === 'pullRequests';
 
-		return html`<gl-tree-view
-			focused-path=${this._actions.selectedPath[this.activePanel!] ?? nothing}
-			.model=${model}
-			.filterTermsParser=${isPullRequests ? parsePullRequestFilterTerms : undefined}
-			filterable
-			tooltip-anchor-right
-			filter-text=${this._actions.filterText || nothing}
-			?search-box-filter=${this._state.sidebar?.searchBoxFilter ?? true}
-			filter-placeholder="Filter ${config.title.toLowerCase()}..."
-			aria-label="${config.title}"
-			@gl-tree-filter-changed=${this.handleFilterChanged}
-			@gl-tree-search-box-filter-changed=${this.handleSearchBoxFilterChanged}
-			@gl-tree-generated-item-selected=${this.handleTreeItemSelected}
-			@gl-tree-generated-item-action-clicked=${this.handleTreeItemAction}
-			@gl-tree-expansion-changed=${this.handleTreeExpansionChanged}
-			>${
-				showRemoteBranches != null
-					? html`<gl-button
-							slot="filter-actions"
-							appearance="toolbar"
-							density="compact"
-							role="checkbox"
-							aria-checked=${showRemoteBranches ? 'true' : 'false'}
-							tooltip="${showRemoteBranches ? 'Hide Remote Branches' : 'Show Remote Branches'}"
-							aria-label="Show Remote Branches"
-							@click=${this.handleToggleShowRemoteBranches}
-							><code-icon icon="${showRemoteBranches ? 'gl-remote-filled' : 'gl-remote'}"></code-icon
-						></gl-button>`
-					: nothing
-			}${
-				showCompletedAgentSessions != null
-					? html`<gl-button
-							slot="filter-actions"
-							appearance="toolbar"
-							density="compact"
-							role="checkbox"
-							aria-checked=${showCompletedAgentSessions ? 'true' : 'false'}
-							tooltip="${showCompletedAgentSessions ? 'Hide Completed Sessions' : 'Show Completed Sessions'}"
-							aria-label="Show Completed Sessions"
-							@click=${this.handleToggleShowCompletedAgentSessions}
-							><code-icon icon="${showCompletedAgentSessions ? 'pass-filled' : 'pass'}"></code-icon
-						></gl-button>`
-					: nothing
-			}${
-				hasLayout
-					? html`<gl-button
-							slot="filter-actions"
-							appearance="toolbar"
-							density="compact"
-							tooltip="${currentLayout === 'tree' ? 'View as List' : 'View as Tree'}"
-							@click=${this.handleToggleLayout}
-							><code-icon icon="${currentLayout === 'tree' ? 'list-flat' : 'list-tree'}"></code-icon
-						></gl-button>`
-					: nothing
-			}</gl-tree-view
-		>`;
+		return html`<div class="tree-stack">
+			${data != null && error != null ? this.renderErrorStrip(config) : nothing}
+			<gl-tree-view
+				focused-path=${this._actions.selectedPath[this.activePanel!] ?? nothing}
+				.model=${model}
+				empty-text=${emptyText ?? nothing}
+				?has-empty-content=${data == null}
+				.filterTermsParser=${isPullRequests ? parsePullRequestFilterTerms : undefined}
+				filterable
+				tooltip-anchor-right
+				filter-text=${this._actions.filterText || nothing}
+				?search-box-filter=${this._state.sidebar?.searchBoxFilter ?? true}
+				filter-placeholder=${l10n.t('Filter {0}...', config.title.toLowerCase())}
+				aria-label=${config.title}
+				@gl-tree-filter-changed=${this.handleFilterChanged}
+				@gl-tree-search-box-filter-changed=${this.handleSearchBoxFilterChanged}
+				@gl-tree-generated-item-selected=${this.handleTreeItemSelected}
+				@gl-tree-generated-item-action-clicked=${this.handleTreeItemAction}
+				@gl-tree-expansion-changed=${this.handleTreeExpansionChanged}
+				>${
+					showRemoteBranches != null
+						? html`<gl-button
+								slot="filter-actions"
+								appearance="toolbar"
+								density="compact"
+								role="checkbox"
+								aria-checked=${showRemoteBranches ? 'true' : 'false'}
+								tooltip=${showRemoteBranches ? l10n.t('Hide Remote Branches') : l10n.t('Show Remote Branches')}
+								aria-label=${l10n.t('Show Remote Branches')}
+								@click=${this.handleToggleShowRemoteBranches}
+								><code-icon icon="${showRemoteBranches ? 'gl-remote-filled' : 'gl-remote'}"></code-icon
+							></gl-button>`
+						: nothing
+				}${
+					showPastAgentSessions != null
+						? html`<gl-button
+								slot="filter-actions"
+								appearance="toolbar"
+								density="compact"
+								role="checkbox"
+								aria-checked=${showPastAgentSessions ? 'true' : 'false'}
+								tooltip=${showPastAgentSessions ? l10n.t('Hide Past Sessions') : l10n.t('Show Past Sessions')}
+								aria-label=${l10n.t('Show Past Sessions')}
+								@click=${this.handleToggleShowPastAgentSessions}
+								><code-icon icon="history"></code-icon
+							></gl-button>`
+						: nothing
+				}${
+					hasLayout
+						? html`<gl-button
+								slot="filter-actions"
+								appearance="toolbar"
+								density="compact"
+								tooltip=${currentLayout === 'tree' ? l10n.t('View as List') : l10n.t('View as Tree')}
+								@click=${this.handleToggleLayout}
+								><code-icon icon="${currentLayout === 'tree' ? 'list-flat' : 'list-tree'}"></code-icon
+							></gl-button>`
+						: nothing
+				}${
+					// The tree's body while there's nothing to list yet — the chrome above stays put either way.
+					data == null ? (error != null ? this.renderTreeError(config) : this.renderSkeleton()) : nothing
+				}</gl-tree-view
+			>
+		</div>`;
 	}
+
+	/** Stands in for the rows on a first load that failed — nothing to fall back on, so the panel says
+	 *  what it couldn't do and offers the retry. */
+	private renderTreeError(config: (typeof panelConfig)[GraphSidebarPanel]): unknown {
+		return html`<div slot="empty" class="panel-error" role="alert">
+			<div class="panel-error__header">
+				<code-icon class="panel-error__icon" icon="error"></code-icon>
+				<span class="panel-error__title">${l10n.t('Unable to load {0}', config.title.toLowerCase())}</span>
+			</div>
+			<div class="panel-error__actions">
+				<gl-button appearance="secondary" density="compact" @click=${this.handleRetry}
+					><code-icon icon="refresh" slot="prefix"></code-icon>${l10n.t('Try Again')}</gl-button
+				>
+			</div>
+		</div>`;
+	}
+
+	/** A reload failed while the panel still holds its last good rows. Those rows stay listed — this only
+	 *  says they're no longer known to be current, and offers the retry. */
+	private renderErrorStrip(config: (typeof panelConfig)[GraphSidebarPanel]): unknown {
+		return html`<div class="error-strip" role="alert">
+			<code-icon class="error-strip__icon" icon="warning"></code-icon>
+			<span class="error-strip__message">${l10n.t('Unable to refresh {0}', config.title.toLowerCase())}</span>
+			<gl-button appearance="secondary" density="compact" @click=${this.handleRetry}
+				>${l10n.t('Try Again')}</gl-button
+			>
+		</div>`;
+	}
+
+	/** Re-runs the failed fetch without discarding what the panel holds — unlike the header's Refresh,
+	 *  which resets the panel to blank on its way to the host. */
+	private handleRetry = (): void => {
+		if (this.activePanel == null) return;
+
+		this._actions?.retry(this.activePanel);
+	};
 
 	/**
 	 * Offer to fetch a pull request the loaded list doesn't hold. This panel lists only *open* pull
@@ -1189,19 +1612,21 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 		if (this._prSearchState === 'searching') {
 			return html`<div class="search-fallback">
-				<code-icon icon="loading" modifier="spin"></code-icon> Searching for #${number}…
+				<code-icon icon="loading" modifier="spin"></code-icon>${l10n.t('Searching for #{0}…', number)}
 			</div>`;
 		}
 		if (this._prSearchState === 'notFound') {
-			return html`<div class="search-fallback">No pull request #${number} in this repository</div>`;
+			return html`<div class="search-fallback">
+				${l10n.t('No pull request #{0} in this repository', number)}
+			</div>`;
 		}
 
 		return html`<div class="search-fallback">
-			<span>Not in open pull requests</span>
+			<span>${l10n.t('Not in open pull requests')}</span>
 			<gl-button
 				appearance="toolbar"
 				density="compact"
-				tooltip="Search for #${number}"
+				tooltip=${l10n.t('Search for #{0}', number)}
 				@click=${this.handleSearchPullRequest}
 			>
 				<code-icon icon="search"></code-icon>
@@ -1218,22 +1643,23 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 		this._prSearchState = 'searching';
 		try {
-			const pr = await this._actions.findPullRequest(number);
-			// The query may have moved on while the request was in flight; a stale result would silently
-			// inject a pull request the user is no longer asking about.
-			if (getPullRequestNumberFromQuery(this._actions.filterText) !== number) return;
+			const result = await searchPullRequest(number, {
+				getQuery: () => this._actions.filterText,
+				find: n => this._actions.findPullRequest(n),
+			});
+			if (result.kind === 'superseded') return;
 
-			emitTelemetrySentEvent<'graph/pullRequests/searched'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/pullRequests/searched',
-				data: { found: pr != null },
+				data: { found: result.kind === 'found' },
 			});
 
-			if (pr == null) {
+			if (result.kind === 'not-found') {
 				this._prSearchState = 'notFound';
 				return;
 			}
 
-			this._prSearchResult = pr;
+			this._prSearchResult = result.pr;
 			this._prSearchRepoId = this._state.selectedRepository;
 			this._prSearchState = 'idle';
 		} catch {
@@ -1241,9 +1667,10 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		}
 	};
 
+	/** Rides the tree's `empty` slot, so the rows shimmer in the tree's own body while its filter box and
+	 *  header stay put. 7 rows; per-row widths are positional (`:nth-child` in component CSS). */
 	private renderSkeleton(): unknown {
-		// 7 rows; per-row widths are positional (`:nth-child` in component CSS).
-		return html`<div class="loading">
+		return html`<div slot="empty" class="loading" aria-busy="true" aria-live="polite">
 			${Array.from(
 				{ length: 7 },
 				() => html`
@@ -1305,10 +1732,14 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 						icon: 'archive',
 						description: parts.length > 0 ? parts.join(', ') : undefined,
 						checkable: false,
-						context: [s.sha] as SidebarItemContext,
+						context: sidebarItemContext(s.sha, { name: s.name }),
 						actions: [
-							{ icon: 'gl-stash-pop', label: 'Apply / Pop Stash...', action: 'gitlens.stashApply:graph' },
-							{ icon: 'trash', label: 'Delete Stash...', action: 'gitlens.stashDelete:graph' },
+							{
+								icon: 'gl-stash-pop',
+								label: l10n.t('Apply / Pop Stash...'),
+								action: 'gitlens.stashApply:graph',
+							},
+							{ icon: 'trash', label: l10n.t('Delete Stash...'), action: 'gitlens.stashDelete:graph' },
 						],
 						contextData: s.context != null ? serializeWebviewItemContext(s.context) : undefined,
 					};
@@ -1355,7 +1786,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			icon: branchTreeIcon(b),
 			description: b.date != null ? fromNow(b.date) : undefined,
 			muted: hidden,
-			context: [b.sha, undefined, undefined, b.name] as SidebarItemContext,
+			context: sidebarItemContext(b.sha, { name: b.name }),
 			// Pin before check so the checkmark closes the row — it's the more permanent of the two states,
 			// and keeping it outermost stops it shifting when a pin comes and goes.
 			decorations: [
@@ -1384,7 +1815,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// The count states what GitHub reports, not how many rows are below — a paged-off layer still
 		// merges when the stack merges, so under-reporting it would understate the blast radius.
 		const loaded = entry.members.length;
-		const count = loaded < entry.size ? `${loaded} of ${entry.size} PRs` : `${entry.size} PRs`;
+		const count =
+			loaded < entry.size ? l10n.t('{0} of {1} PRs', loaded, entry.size) : l10n.t('{0} PRs', entry.size);
 
 		// Focus the whole stack: the BASE layer is focal — it's the one whose merge target really is the
 		// trunk, so its spine runs the full depth of the stack — and the layers above ride along as
@@ -1395,7 +1827,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const base = entry.members.at(-1);
 		if (loaded === entry.size && entry.members.every(m => m.focus != null) && base?.focus != null) {
 			actions.push(
-				createFocusRefAction('Focus on Stack', {
+				createFocusRefAction(l10n.t('Focus on Stack'), {
 					...base.focus,
 					additional: entry.members
 						.slice(0, -1)
@@ -1410,7 +1842,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			expanded: true,
 			path: `stack:${entry.number}`,
 			level: 1,
-			label: `Stack #${entry.number}`,
+			label: l10n.t('Stack #{0}', entry.number),
 			description: `→ ${entry.baseRef}`,
 			icon: 'layers',
 			checkable: false,
@@ -1432,7 +1864,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// fetch and then scopes. Same action either way, so the row doesn't explain the difference.
 		if (pr.focus != null) {
 			actions.push(
-				createFocusRefAction('Focus on Pull Request', {
+				createFocusRefAction(l10n.t('Focus on Pull Request'), {
 					...pr.focus,
 					origin: { kind: 'pullRequest', number: pr.number },
 				}),
@@ -1440,7 +1872,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		} else if (pr.state === 'opened' && pr.headBranch && pr.headUrl) {
 			actions.push({
 				icon: 'target',
-				label: 'Focus on Pull Request',
+				label: l10n.t('Focus on Pull Request'),
 				action: 'gitlens.focusPullRequest:graph',
 			});
 		}
@@ -1514,7 +1946,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 							{
 								type: 'icon' as const,
 								icon: 'repo-forked',
-								label: `From a fork (${pr.headOwner})`,
+								label: l10n.t('From a fork ({0})', pr.headOwner),
 								position: 'before' as const,
 								muted: true,
 							},
@@ -1527,7 +1959,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					? [
 							{
 								type: 'stack' as const,
-								label: `Layer ${pr.stack.position} of ${pr.stack.size}`,
+								label: l10n.t('Layer {0} of {1}', pr.stack.position, pr.stack.size),
 								position: 'before' as const,
 								layer: pr.stack.position,
 								size: pr.stack.size,
@@ -1540,7 +1972,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					? [{ type: 'icon' as const, icon: groupIcon, label: groupLabel ?? '', kind: decorationKind }]
 					: []),
 			] satisfies TreeItemDecoration[],
-			context: [pr.headSha] as SidebarItemContext,
+			context: sidebarItemContext(pr.headSha),
 			contextValue: pr.context,
 			actions: actions,
 		};
@@ -1556,11 +1988,11 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			icon: 'tag',
 			description: t.message,
 			muted: hidden,
-			context: [t.sha] as SidebarItemContext,
+			context: sidebarItemContext(t.sha, { name: t.name }),
 			decorations: hidden ? [hiddenDecoration] : undefined,
 			actions: [
-				{ icon: 'gl-switch', label: 'Switch to Tag...', action: 'gitlens.graph.switchToTag' },
-				...(hidden ? [{ icon: 'eye', label: 'Show Tag', action: 'gitlens.graph.showTag' }] : []),
+				{ icon: 'gl-switch', label: l10n.t('Switch to Tag...'), action: 'gitlens.graph.switchToTag' },
+				...(hidden ? [{ icon: 'eye', label: l10n.t('Show Tag'), action: 'gitlens.graph.showTag' }] : []),
 			],
 			contextValue: t.context,
 		};
@@ -1568,26 +2000,29 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 	private toWorktreeLeaf(w: GraphSidebarWorktree, isTree: boolean): LeafProps {
 		const branchName = w.branch ?? w.name;
+		// Whether the Commit Graph is CURRENTLY perspectived onto this exact worktree — same comparison
+		// `focusRef` uses to detect a live perspective to close.
+		const isScoped = this._state.worktreePerspective?.path === w.uri;
 
 		const actions: TreeItemAction[] = [];
 		if (w.tracking?.behind) {
 			actions.push({
 				icon: 'repo-pull',
-				label: 'Pull',
+				label: l10n.t('Pull'),
 				action: 'gitlens.graph.pull',
 				altIcon: 'repo-fetch',
-				altLabel: 'Fetch',
+				altLabel: l10n.t('Fetch'),
 				altAction: 'gitlens.fetch:graph',
 			});
 		} else if (w.tracking?.ahead) {
-			actions.push({ icon: 'repo-push', label: 'Push', action: 'gitlens.graph.push' });
+			actions.push({ icon: 'repo-push', label: l10n.t('Push'), action: 'gitlens.graph.push' });
 		} else if (w.upstream) {
 			actions.push({
 				icon: 'repo-fetch',
-				label: 'Fetch',
+				label: l10n.t('Fetch'),
 				action: 'gitlens.fetch:graph',
 				altIcon: 'repo-pull',
-				altLabel: 'Pull',
+				altLabel: l10n.t('Pull'),
 				altAction: 'gitlens.graph.pull',
 			});
 		}
@@ -1595,23 +2030,33 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		if (!w.opened) {
 			actions.push({
 				icon: 'empty-window',
-				label: 'Open Worktree in New Window...',
+				label: l10n.t('Open Worktree in New Window...'),
 				action: 'gitlens.openWorktreeInNewWindow:graph',
 				altIcon: 'window',
-				altLabel: 'Open Worktree...',
+				altLabel: l10n.t('Open Worktree...'),
 				altAction: 'gitlens.openWorktree:graph',
 			});
 		}
 
-		// Always last, same as the branch and remote-branch leaves. A bare or detached worktree has
-		// no branch to focus.
+		// Always last, same as the branch and remote-branch leaves. A bare or detached worktree has no
+		// branch to focus. ONE dual-verb action: main click Scopes to the worktree (+ focuses per
+		// `graph.scopeBehavior`), Alt+click is the ordinary branch Focus — the same alt-affordance pattern
+		// as the tracking action above. The row's own double-click picks between them per
+		// `graph.doubleClickWorktreeAction` (see `handleTreeItemSelected`).
 		if (w.branch != null) {
-			actions.push(createFocusRefAction('Focus on Worktree', { branchName: w.branch, upstreamName: w.upstream }));
+			actions.push(
+				createWorktreeScopeAction({
+					branchName: w.branch,
+					upstreamName: w.upstream,
+					worktreePath: w.uri,
+					isHome: isHomeWorktree(w.uri, this._state.homeRepositoryPath),
+					isScoped: isScoped,
+				}),
+			);
 		}
 
-		// Place the WIP pill before the tracking arrows so the row reads `[wip][↑↓][active][lock]`,
-		// matching the overview card's left-to-right ordering. Bare worktrees never have a working
-		// tree of their own (`hasChanges` stays undefined) and stay pill-less.
+		// The clean/dirty pill, anchored RIGHT-MOST in the decoration run — see the `decorations` array
+		// below for the order. Bare worktrees have no working tree of their own and stay pill-less.
 		// Clean/dirty only — the badge renders a pencil/check from `hasChanges` and draws no numbers. The
 		// breakdown lives in the row tooltip, fetched on hover.
 		const wipDecoration: TreeItemDecoration[] =
@@ -1619,7 +2064,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				? [
 						{
 							type: 'wip',
-							label: w.hasChanges ? 'Working tree has changes' : 'No changes',
+							label: w.hasChanges ? l10n.t('Working tree has changes') : l10n.t('No changes'),
 							hasChanges: w.hasChanges,
 						},
 					]
@@ -1647,13 +2092,35 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			tooltip: tooltip,
 			icon: w.branch != null ? { type: 'branch', status: w.status, hasChanges: w.hasChanges } : 'git-commit',
 			description: formatWorktreeDescription(w),
-			context: [w.wipSha] as SidebarItemContext,
+			context: sidebarItemContext(w.wipSha, { name: branchName }),
+			// Trailing decorations, left to right: [scope] [lock] [pinned] [active] [↑↓] [clean/dirty].
+			// Array order IS the rendered order — every entry lands in the `decorations-after` slot.
+			// The clean/dirty pill is the one marker essentially every row carries, so anchoring it
+			// RIGHT-MOST keeps it column-aligned down the panel, while the markers that come and go per row
+			// (scope, lock) sit at the LEFT where their absence shifts nothing. Do NOT move the pill to the
+			// front or the scope marker to `'before'`.
 			decorations: [
-				...wipDecoration,
-				...(trackingDecorations(w.tracking) ?? []),
+				// Marks the row the graph is currently scoped to, reusing the graph header's scoped-yellow
+				// vocabulary. Left-most of the two per-row state markers: it's the one the user is actively
+				// toggling, so it reads as this row's live state rather than a property.
+				...(isScoped
+					? [
+							{
+								type: 'icon' as const,
+								// Same `gl-scope` glyph the Scope ACTION uses (`createWorktreeScopeAction`), so
+								// the state and the verb that produced it read as one thing.
+								icon: 'gl-scope',
+								label: l10n.t('Scoped'),
+								kind: 'scoped' as const,
+								position: 'after' as const,
+							},
+						]
+					: []),
+				...(w.locked ? [{ type: 'icon' as const, icon: 'lock', label: l10n.t('Locked'), muted: true }] : []),
 				...(w.pinned ? [pinnedToEdgeDecoration] : []),
-				...(w.opened ? [{ type: 'icon' as const, icon: 'check', label: 'Active', muted: true }] : []),
-				...(w.locked ? [{ type: 'icon' as const, icon: 'lock', label: 'Locked', muted: true }] : []),
+				...(w.opened ? [{ type: 'icon' as const, icon: 'check', label: l10n.t('Active'), muted: true }] : []),
+				...(trackingDecorations(w.tracking) ?? []),
+				...wipDecoration,
 			],
 			actions: actions,
 			// `+working` is appended client-side once the async hasChanges check resolves —
@@ -1701,16 +2168,26 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		};
 	}
 
-	private toAgentLeaf(session: AgentSessionState, anchor: { wipSha?: string; scope?: SidebarItemScope }): LeafProps {
+	private toAgentLeaf(
+		session: AgentSessionState,
+		anchor: { wipSha?: string; scope?: SidebarItemScope },
+		ghost?: { currentLabel: string },
+	): LeafProps {
 		const category = agentPhaseToCategory[session.phase];
 		// Description = the describeSession line for needs-input / working (`Awaiting: tool` /
 		// `Running tool`), which falls back to the last prompt for everything else. The
 		// "Last active …" fallback is intentionally excluded — elapsed time is already surfaced
 		// in the tooltip, no need to repeat it.
-		const description = describeAgentSession(session, category, {
-			awaitingPrefix: 'short',
-			idleFallback: 'lastPrompt',
-		});
+		// A ghost row (session visited this worktree in the past, no longer current) states where
+		// the session actually lives now instead of the normal status line — the row's own group
+		// already tells the viewer this isn't the session's current location.
+		const description =
+			ghost != null
+				? l10n.t('now in {0}', ghost.currentLabel)
+				: describeAgentSession(session, category, {
+						awaitingPrefix: 'short',
+						idleFallback: 'lastPrompt',
+					});
 
 		// `anchor.wipSha`/`anchor.scope` are pre-computed in `buildAgentTree` — all sessions in a
 		// group share workspace + worktree, so they share the same anchor. Avoids recomputing the
@@ -1727,8 +2204,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			permission.kind === 'tool' &&
 			permission.suggestions != null &&
 			permission.suggestions.length > 0;
-		const allowLabel = canResolve && permission.kind === 'plan' ? 'Approve Plan' : 'Allow';
-		const denyLabel = canResolve && permission.kind === 'plan' ? 'Reject Plan' : 'Deny';
+		const allowLabel = canResolve && permission.kind === 'plan' ? l10n.t('Approve Plan') : l10n.t('Allow');
+		const denyLabel = canResolve && permission.kind === 'plan' ? l10n.t('Reject Plan') : l10n.t('Deny');
 
 		const actions: TreeItemAction[] = [];
 		if (canResolve) {
@@ -1736,13 +2213,20 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				icon: 'check',
 				label: allowLabel,
 				action: 'gitlens.agents.resolvePermission',
-				arguments: [{ sessionId: session.id, decision: 'allow' as const }],
+				arguments: [{ sessionId: session.id, providerId: session.providerId, decision: 'allow' as const }],
 				...(showAlwaysAllow
 					? {
 							altIcon: 'check-all',
-							altLabel: 'Always Allow',
+							altLabel: l10n.t('Always Allow'),
 							altAction: 'gitlens.agents.resolvePermission',
-							altArguments: [{ sessionId: session.id, decision: 'allow' as const, alwaysAllow: true }],
+							altArguments: [
+								{
+									sessionId: session.id,
+									providerId: session.providerId,
+									decision: 'allow' as const,
+									alwaysAllow: true,
+								},
+							],
 						}
 					: {}),
 			});
@@ -1750,7 +2234,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				icon: 'x',
 				label: denyLabel,
 				action: 'gitlens.agents.resolvePermission',
-				arguments: [{ sessionId: session.id, decision: 'deny' as const }],
+				arguments: [{ sessionId: session.id, providerId: session.providerId, decision: 'deny' as const }],
 			});
 		}
 		// Not gated on `canResolve` — opening the plan file is local, so it stays available even for
@@ -1759,41 +2243,50 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		if (category === 'needs-input' && permission?.kind === 'plan' && permission.planFilePath != null) {
 			actions.push({
 				icon: 'tasklist',
-				label: 'View Plan',
+				label: l10n.t('View Plan'),
 				action: 'gitlens.agents.openPlanFile',
 				arguments: [permission.planFilePath],
 			});
 		}
-		const openAction = getAgentSessionOpenAction(session);
-		actions.push({
-			icon: openAction.icon,
-			label: openAction.label,
-			action: openAction.command,
-			arguments: openAction.args,
-		});
-		// Archive is offered only on terminal (completed) sessions — a live one would have to be
-		// killed first, so it stays out of the action row for anything still running.
-		if (category === 'completed') {
+		for (const openAction of getAgentSessionOpenActions(session)) {
 			actions.push({
-				icon: 'archive',
-				label: 'Archive Session',
-				action: 'gitlens.agents.archiveSession',
-				arguments: [session.id],
+				icon: openAction.icon,
+				label: openAction.label,
+				action: openAction.command,
+				arguments: openAction.args,
 			});
 		}
+		// Archive is offered only on terminal (ended) sessions — a live one would have to be
+		// killed first, so it stays out of the action row for anything still running.
+		if (category === 'ended') {
+			const archiveAction = getAgentSessionArchiveAction(session);
+			if (archiveAction != null) {
+				actions.push({
+					icon: 'archive',
+					label: archiveAction.label,
+					action: archiveAction.command,
+					arguments: archiveAction.args,
+				});
+			}
+		}
 
-		// Phase status is conveyed by the leaf's agent icon (glyph + `--gl-agent-*` color) and the
-		// tooltip — no redundant text decoration.
+		// Phase status is conveyed by the leaf's agent mark (shape + `--gl-agent-*` color) and the
+		// tooltip — no redundant text decoration. The provider travels with the icon so the leaf can
+		// draw its logomark and overlay the phase mark on it.
 		return {
 			label: session.displayName,
-			tooltip: html`<gl-agent-tooltip .sessionId=${session.id}></gl-agent-tooltip>`,
+			tooltip: html`<gl-agent-tooltip
+				.sessionId=${session.id}
+				.providerId=${session.providerId}
+			></gl-agent-tooltip>`,
 			filterText: `${session.displayName} ${session.lastPrompt ?? ''}`.trim(),
-			icon: { type: 'agent', phase: session.phase },
+			icon: { type: 'agent', phase: session.phase, provider: session.providerId },
 			description: description,
-			// Completed sessions are done history — dim the whole row so they read as distinct from
-			// the still-live idle/stale sessions they share the Inactive grouping with.
-			muted: category === 'completed',
-			context: [sha, scope, session.id] as SidebarItemContext,
+			// Ended sessions are done history, and ghost rows are a "was here" echo — both dim the
+			// whole row so they read as distinct from the session's real, current-location row.
+			muted: ghost != null || category === 'ended',
+			context: sidebarItemContext(sha, { scope: scope, sessionId: session.id }),
+			contextValue: buildAgentSessionContext(session, category),
 			actions: actions,
 		};
 	}
@@ -1804,11 +2297,24 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	 *  display without restarting the agent), falling back to the worktree directory basename or
 	 *  `Unattached` for sessions with no worktree. Group order preserves the input's actionability
 	 *  sort (needs-input → working → idle) by tracking each group's first appearance index in the
-	 *  source list. */
+	 *  source list.
+	 *
+	 *  `items` can include a session currently in a FOREIGN repo that merely visited this family
+	 *  (the upstream family filter admits those too) — such a session gets no real group here, only
+	 *  a ghost under whichever of its visited worktrees belong to this family. See `belongsToFamily`
+	 *  below. */
 	private buildAgentTree(items: readonly AgentSessionState[]): TreeModel<SidebarItemContext>[] {
 		if (items.length === 0) return [];
 
 		const graphAnchor = this.resolveGraphAnchorContext();
+		// The upstream family filter (`filterAgentSessionsForFamily`, at the panel's render call
+		// site) already admits a session whose CURRENT worktree is a foreign repo it merely
+		// VISITED this family from — `items` here isn't family-pure. Both passes below re-test
+		// against the same family so a foreign current worktree never gets a real group (only
+		// ghosts), and a foreign visited path never gets a ghost-only group at all.
+		const familyWorktreePaths = this._state.worktreePaths != null ? new Set(this._state.worktreePaths) : undefined;
+		const belongsToFamily = (path: string): boolean =>
+			path === graphAnchor?.family || (familyWorktreePaths?.has(path) ?? false);
 
 		interface Group {
 			key: string;
@@ -1818,12 +2324,27 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			type: 'worktree' | 'folder';
 			anchor: { wipSha?: string; scope?: SidebarItemScope };
 			sessions: AgentSessionState[];
+			// Ghost rows for sessions whose CURRENT group is elsewhere but that have visited this
+			// worktree in the past (`session.visitedWorktreePaths`). Kept separate from `sessions`
+			// so the ghost/real split survives into the `children` map below.
+			ghostSessions: AgentSessionState[];
 		}
 
 		// Key by `worktreePath`; fall back to `workspacePath` so sessions in a non-repo workspace
 		// folder still cluster together. Empty-string key groups truly unattached sessions.
 		const groups = new Map<string, Group>();
 		items.forEach((session, index) => {
+			// A session's CURRENT worktree must belong to THIS family to get a normal row — otherwise
+			// it renders here ONLY as a ghost (second pass), and its real (foreign) location gets no
+			// group in this panel at all. Sessions with no resolved `worktreePath` keep their existing
+			// ungated "Unattached" placement: the upstream family filter is what decided they belong
+			// here (via `commonPath` or a visited path), there's no worktree identity to re-test.
+			if (session.worktreePath != null) {
+				const isFamilyCurrent =
+					session.commonPath === graphAnchor?.family || belongsToFamily(session.worktreePath);
+				if (!isFamilyCurrent) return;
+			}
+
 			const key = session.worktreePath ?? session.workspacePath ?? '';
 			let group = groups.get(key);
 			if (group == null) {
@@ -1836,24 +2357,70 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 						(session.worktreePath
 							? basename(session.worktreePath)
 							: session.cwd
-								? `Unattached (${basename(session.cwd)})`
-								: 'Unattached'),
+								? l10n.t('Unattached ({0})', basename(session.cwd))
+								: l10n.t('Unattached')),
 					type: session.worktreePath != null ? 'worktree' : 'folder',
 					// Sessions in a group share the same worktree → share the same anchor.
 					anchor: this.resolveAgentAnchor(session, graphAnchor),
 					sessions: [],
+					ghostSessions: [],
 				};
 				groups.set(key, group);
 			}
 			group.sessions.push(session);
 		});
 
+		// Second pass: for every worktree a session has visited besides its current one, add a
+		// ghost row to that (possibly ghost-only) group. A ghost's anchor is resolved from the
+		// SESSION's own current worktree in `children` below, not from the ghost group's key — the
+		// row says "this session was here", not "act on it here". A visited path outside THIS
+		// family never gets a group here at all — otherwise a session that once visited a foreign
+		// repo would spawn that repo's worktree group inside this panel.
+		for (const session of items) {
+			const currentKey = session.worktreePath ?? session.workspacePath ?? '';
+			for (const visited of session.visitedWorktreePaths ?? []) {
+				if (visited === currentKey) continue;
+				if (!belongsToFamily(visited)) continue;
+
+				let group = groups.get(visited);
+				if (group == null) {
+					group = {
+						key: visited,
+						worktreePath: visited,
+						firstIndex: items.length, // ghost-only groups sort after all real groups
+						name: basename(visited),
+						type: 'worktree',
+						anchor: {},
+						sessions: [],
+						ghostSessions: [],
+					};
+					groups.set(visited, group);
+				}
+				group.ghostSessions.push(session);
+			}
+		}
+
 		return [...groups.values()]
 			.sort((a, b) => a.firstIndex - b.firstIndex)
 			.map(group => {
-				const children = group.sessions.map(s =>
-					leafToTreeModel(this.toAgentLeaf(s, group.anchor), `agent:${s.id}`, 2),
-				);
+				const children = [
+					...group.sessions.map(s => leafToTreeModel(this.toAgentLeaf(s, group.anchor), `agent:${s.id}`, 2)),
+					// Ghosts resolve their anchor from the session's OWN current worktree, not this
+					// group's — clicking a ghost jumps to the session's real (current) row, never to
+					// a synthetic sha in the worktree it merely used to visit.
+					...group.ghostSessions.map(s => {
+						const currentAnchor = this.resolveAgentAnchor(s, graphAnchor);
+						// Directory basename, not the worktree's branch-derived display name — branch
+						// names repeat across repos ("main" everywhere), so a cross-repo ghost's "now
+						// in main" would read as OUR main worktree.
+						const currentLabel = s.worktreePath ? basename(s.worktreePath) : s.providerName;
+						return leafToTreeModel(
+							this.toAgentLeaf(s, currentAnchor, { currentLabel: currentLabel }),
+							`agent:${s.id}@${group.key}`,
+							2,
+						);
+					}),
+				];
 
 				// Description hints at the physical worktree directory when its basename differs
 				// from the display name (e.g. a worktree at `feature-x/` checked out on a branch
@@ -1868,7 +2435,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 						? [
 								{
 									icon: 'terminal',
-									label: 'Open in Integrated Terminal',
+									label: l10n.t('Open in Integrated Terminal'),
 									action: 'gitlens.openInIntegratedTerminal:graph',
 								},
 							]
@@ -1891,7 +2458,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					icon: group.type === 'worktree' ? { type: 'branch' as const, worktree: true } : 'folder',
 					description: description !== group.name ? description : undefined,
 					checkable: false,
-					context: [group.anchor.wipSha, group.anchor.scope] as SidebarItemContext,
+					context: sidebarItemContext(group.anchor.wipSha, { scope: group.anchor.scope }),
 					contextData: contextData,
 					children: children,
 					actions: actions,
@@ -1922,7 +2489,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					// The un-hide chip goes last so it takes the row's right edge when present.
 					const actions: TreeItemAction[] = [
 						createFocusRefAction(
-							'Focus on Branch',
+							l10n.t('Focus on Branch'),
 							b.localBranch != null
 								? { branchName: b.localBranch, upstreamName: `${r.name}/${b.name}` }
 								: { branchName: `${r.name}/${b.name}`, remote: true },
@@ -1935,7 +2502,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					if (hidden) {
 						actions.push({
 							icon: 'eye',
-							label: 'Show Remote Branch',
+							label: l10n.t('Show Remote Branch'),
 							action: 'gitlens.graph.showRemoteBranch',
 						});
 					}
@@ -1945,7 +2512,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 						filterText: isTree ? b.name : undefined,
 						tooltip: `$(git-branch) \`${r.name}/${b.name}\``,
 						icon: 'git-branch',
-						context: [b.sha] as SidebarItemContext,
+						context: sidebarItemContext(b.sha, { name: `${r.name}/${b.name}` }),
 						muted: hidden,
 						decorations: [
 							...(b.pinned ? [pinnedToEdgeDecoration] : []),
@@ -1963,27 +2530,27 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			const hidden = isHiddenWebviewItem(r.context?.webviewItem);
 
 			const actions: TreeItemAction[] = [
-				{ icon: 'repo-fetch', label: 'Fetch', action: 'gitlens.fetchRemote:graph' },
+				{ icon: 'repo-fetch', label: l10n.t('Fetch'), action: 'gitlens.fetchRemote:graph' },
 			];
 			// Connect is worth surfacing inline — it unlocks enrichment. Disconnect is not: rarely wanted,
 			// destructive-feeling next to Fetch, and still available on the context menu.
 			if (r.connected === false) {
 				actions.push({
 					icon: 'plug',
-					label: 'Connect Remote Integration',
+					label: l10n.t('Connect Remote Integration'),
 					action: 'gitlens.connectRemoteProvider:graph',
 				});
 			}
 			actions.push({
 				icon: 'globe',
-				label: 'Open on Remote',
+				label: l10n.t('Open on Remote'),
 				action: 'gitlens.openRepoOnRemote:graph',
 				altIcon: 'copy',
-				altLabel: 'Copy Remote URL',
+				altLabel: l10n.t('Copy Remote URL'),
 				altAction: 'gitlens.copyRemoteRepositoryUrl:graph',
 			});
 			if (hidden) {
-				actions.push({ icon: 'eye', label: 'Show Remote', action: 'gitlens.graph.showRemote' });
+				actions.push({ icon: 'eye', label: l10n.t('Show Remote'), action: 'gitlens.graph.showRemote' });
 			}
 
 			return {
@@ -2075,7 +2642,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			const hasFilter = e.detail.length > 0;
 			if (hasFilter !== this._agentsFilterActive) {
 				this._agentsFilterActive = hasFilter;
-				emitTelemetrySentEvent<'graph/agents/filtered'>(this, {
+				emitTelemetrySentEvent(this, {
 					name: 'graph/agents/filtered',
 					data: {
 						hasFilter: hasFilter,
@@ -2084,30 +2651,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					},
 				});
 			}
-		}
-
-		if (this.activePanel === 'worktrees') {
-			this.emitWorktreesFilteredTelemetryDebounced();
-		}
-
-		if (this.activePanel === 'branches') {
-			this.emitBranchesFilteredTelemetryDebounced();
-		}
-
-		if (this.activePanel === 'remotes') {
-			this.emitRemotesFilteredTelemetryDebounced();
-		}
-
-		if (this.activePanel === 'stashes') {
-			this.emitStashesFilteredTelemetryDebounced();
-		}
-
-		if (this.activePanel === 'pullRequests') {
-			this.emitPullRequestsFilteredTelemetryDebounced();
-		}
-
-		if (this.activePanel === 'tags') {
-			this.emitTagsFilteredTelemetryDebounced();
+		} else {
+			this.emitFilteredTelemetryDebounced();
 		}
 	};
 
@@ -2122,19 +2667,18 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		);
 	};
 
-	private handleToggleShowCompletedAgentSessions = () => {
-		const enabled = !(this._state.sidebar?.showCompletedAgentSessions ?? false);
-		emitTelemetrySentEvent<'graph/agents/showCompletedToggled'>(this, {
-			name: 'graph/agents/showCompletedToggled',
+	private handleToggleShowPastAgentSessions = () => {
+		const enabled = !(this._state.sidebar?.showPastAgentSessions ?? false);
+		emitTelemetrySentEvent(this, {
+			name: 'graph/agents/showEndedToggled',
 			data: {
 				enabled: enabled,
-				'sessions.completed.count': (this._state.agentSessions ?? []).filter(s => s.phase === 'completed')
-					.length,
+				'sessions.ended.count': (this._state.agentSessions ?? []).filter(s => s.phase === 'ended').length,
 			},
 		});
-		this._state.sidebar = { showCompletedAgentSessions: enabled };
+		this._state.sidebar = { showPastAgentSessions: enabled };
 		this.dispatchEvent(
-			new CustomEvent<boolean>('gl-graph-sidebar-show-completed-agents-change', {
+			new CustomEvent<boolean>('gl-graph-sidebar-show-past-agents-change', {
 				detail: enabled,
 				bubbles: true,
 				composed: true,
@@ -2143,88 +2687,10 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	};
 
 	private handleAction(command: GlCommands, args?: unknown[]) {
-		if (this.activePanel === 'agents') {
-			const action =
-				command === 'gitlens.startWork'
-					? 'startWork'
-					: command === 'gitlens.startReview'
-						? 'startReview'
-						: undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/agents/headerAction'>(this, {
-					name: 'graph/agents/headerAction',
-					data: { action: action },
-				});
-			}
-		}
-
-		if (this.activePanel === 'worktrees') {
-			const action = command === 'gitlens.views.title.createWorktree' ? 'createWorktree' : undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/worktrees/headerAction'>(this, {
-					name: 'graph/worktrees/headerAction',
-					data: { action: action },
-				});
-			}
-		}
-
-		if (this.activePanel === 'branches') {
-			const action =
-				command === 'gitlens.switchToAnotherBranch:views'
-					? 'switchToBranch'
-					: command === 'gitlens.views.title.createBranch'
-						? 'createBranch'
-						: undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/branches/headerAction'>(this, {
-					name: 'graph/branches/headerAction',
-					data: { action: action },
-				});
-			}
-		}
-
-		if (this.activePanel === 'remotes') {
-			const action = command === 'gitlens.views.addRemote' ? 'addRemote' : undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/remotes/headerAction'>(this, {
-					name: 'graph/remotes/headerAction',
-					data: { action: action },
-				});
-			}
-		}
-
-		if (this.activePanel === 'stashes') {
-			const action =
-				command === 'gitlens.stashSave:views'
-					? 'stashAll'
-					: command === 'gitlens.stashesApply:views'
-						? 'applyStash'
-						: undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/stashes/headerAction'>(this, {
-					name: 'graph/stashes/headerAction',
-					data: { action: action },
-				});
-			}
-		}
-
-		if (this.activePanel === 'pullRequests') {
-			const action = command === 'gitlens.createPullRequest:graph' ? 'createPullRequest' : undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/pullRequests/headerAction'>(this, {
-					name: 'graph/pullRequests/headerAction',
-					data: { action: action },
-				});
-			}
-		}
-
-		if (this.activePanel === 'tags') {
-			const action = command === 'gitlens.views.title.createTag' ? 'createTag' : undefined;
-			if (action != null) {
-				emitTelemetrySentEvent<'graph/tags/headerAction'>(this, {
-					name: 'graph/tags/headerAction',
-					data: { action: action },
-				});
+		if (this.activePanel != null && this.activePanel !== 'overview') {
+			const params = headerActions[this.activePanel][command];
+			if (params != null) {
+				emitTelemetrySentEvent(this, params);
 			}
 		}
 
@@ -2251,7 +2717,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		this._actions.toggleLayout(this.activePanel);
 
 		if (this.activePanel === 'agents') {
-			emitTelemetrySentEvent<'graph/agents/layoutToggled'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/agents/layoutToggled',
 				data: {
 					layout: this._actions.agentsLayout.get(),
@@ -2261,7 +2727,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		}
 
 		if (this.activePanel === 'worktrees') {
-			emitTelemetrySentEvent<'graph/worktrees/layoutToggled'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/worktrees/layoutToggled',
 				data: {
 					layout: worktreesNewLayout,
@@ -2273,7 +2739,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// Only report the branches toggle when the current layout is known — predicting off
 		// undefined data would misreport 'tree'.
 		if (this.activePanel === 'branches' && branchesData?.layout != null) {
-			emitTelemetrySentEvent<'graph/branches/layoutToggled'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/branches/layoutToggled',
 				data: {
 					layout: branchesData.layout === 'tree' ? 'list' : 'tree',
@@ -2284,7 +2750,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 		// Same reasoning for remotes — only report when the current layout is known.
 		if (this.activePanel === 'remotes' && remotesData?.layout != null) {
-			emitTelemetrySentEvent<'graph/remotes/layoutToggled'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/remotes/layoutToggled',
 				data: {
 					layout: remotesData.layout === 'tree' ? 'list' : 'tree',
@@ -2294,7 +2760,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		}
 
 		if (this.activePanel === 'tags') {
-			emitTelemetrySentEvent<'graph/tags/layoutToggled'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/tags/layoutToggled',
 				data: {
 					layout: tagsNewLayout,
@@ -2310,7 +2776,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		// Same reasoning as the layout toggle — the service update is async, so invert the current
 		// value to report the state we're moving to. Only report when it's known.
 		if (data?.panel === 'branches' && data.showRemoteBranches != null) {
-			emitTelemetrySentEvent<'graph/branches/showRemoteBranchesToggled'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/branches/showRemoteBranchesToggled',
 				data: {
 					enabled: !data.showRemoteBranches,
@@ -2320,6 +2786,29 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		}
 
 		this._actions.toggleShowRemoteBranches();
+	}
+
+	private handleStartAgentSession(e: MouseEvent) {
+		this.startAgentSession(e.altKey);
+	}
+
+	private handleStartAgentSessionKeydown(e: KeyboardEvent) {
+		if (!e.altKey || (e.key !== 'Enter' && e.code !== 'Space')) return;
+
+		e.preventDefault();
+		e.stopPropagation();
+		this.startAgentSession(true);
+	}
+
+	private startAgentSession(pick: boolean) {
+		emitTelemetrySentEvent(this, {
+			name: 'graph/agents/headerAction',
+			data: { action: pick ? 'startAgentSessionWith' : 'startAgentSession' },
+		});
+
+		this._actions?.executeAction('gitlens.startAgentSession', undefined, [
+			{ cwd: this.resolveGraphAnchorContext()?.repoPath, pick: pick },
+		]);
 	}
 
 	private handleRefresh() {
@@ -2332,54 +2821,10 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 			return;
 		}
 
-		if (this.activePanel === 'agents') {
-			emitTelemetrySentEvent<'graph/agents/headerAction'>(this, {
-				name: 'graph/agents/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
-
-		if (this.activePanel === 'worktrees') {
-			emitTelemetrySentEvent<'graph/worktrees/headerAction'>(this, {
-				name: 'graph/worktrees/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
-
-		if (this.activePanel === 'branches') {
-			emitTelemetrySentEvent<'graph/branches/headerAction'>(this, {
-				name: 'graph/branches/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
-
-		if (this.activePanel === 'remotes') {
-			emitTelemetrySentEvent<'graph/remotes/headerAction'>(this, {
-				name: 'graph/remotes/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
-
-		if (this.activePanel === 'stashes') {
-			emitTelemetrySentEvent<'graph/stashes/headerAction'>(this, {
-				name: 'graph/stashes/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
-
-		if (this.activePanel === 'tags') {
-			emitTelemetrySentEvent<'graph/tags/headerAction'>(this, {
-				name: 'graph/tags/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
-
-		if (this.activePanel === 'pullRequests') {
-			emitTelemetrySentEvent<'graph/pullRequests/headerAction'>(this, {
-				name: 'graph/pullRequests/headerAction',
-				data: { action: 'refresh' },
-			});
-		}
+		emitTelemetrySentEvent(this, {
+			name: `graph/${this.activePanel}/headerAction`,
+			data: { action: 'refresh' },
+		});
 
 		this._actions?.refresh(this.activePanel);
 	}
@@ -2400,67 +2845,76 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const command = (useAlt ? action.altAction! : action.action) as GlCommands;
 		const args = useAlt ? action.altArguments : action.arguments;
 
-		// Focus is view state, not a host command — handle it here, before the per-panel action
+		// Focus/Scope are view state, not a host command — handle here, before the per-panel action
 		// telemetry (which resolves command ids against the sidebar action tables and would find
-		// nothing to map). Scope changes report themselves via `graph/scope/changed|cleared`.
-		if (action.action === focusRefActionId) {
-			this.focusRef(action.arguments?.[0] as FocusRefActionArgs | undefined);
+		// nothing to map). `focusRef` emits its own telemetry for the worktree-scope case; a plain
+		// branch focus reports itself via `graph/scope/changed|cleared`.
+		const isFocusRefGesture = useAlt ? action.altAction === focusRefActionId : action.action === focusRefActionId;
+		if (isFocusRefGesture) {
+			this.focusRef(args?.[0] as FocusRefActionArgs | undefined, 'inline');
 			return;
 		}
 
 		if (this.activePanel === 'agents') {
 			this.emitAgentsTreeItemActionTelemetry(command, args);
-		}
-
-		if (this.activePanel === 'worktrees') {
-			this.emitWorktreesTreeItemActionTelemetry(command, useAlt);
-		}
-
-		if (this.activePanel === 'branches') {
-			this.emitBranchesTreeItemActionTelemetry(command, useAlt);
-		}
-
-		if (this.activePanel === 'remotes') {
-			this.emitRemotesTreeItemActionTelemetry(command, useAlt);
-		}
-
-		if (this.activePanel === 'stashes') {
-			this.emitStashesTreeItemActionTelemetry(command, useAlt);
-		}
-
-		if (this.activePanel === 'tags') {
-			this.emitTagsTreeItemActionTelemetry(command, useAlt);
-		}
-
-		if (this.activePanel === 'pullRequests') {
-			this.emitPullRequestsTreeItemActionTelemetry(command, useAlt);
+		} else if (this.activePanel != null && this.activePanel !== 'overview') {
+			this.emitTreeItemActionTelemetry(this.activePanel, command, useAlt);
 		}
 
 		this._actions?.executeAction(command, node.contextData as string | undefined, args);
 	}
 
-	/** Focuses (scopes) the graph onto the action's branch, or unfocuses when that branch is already
-	 *  the live scope. Mirrors the header's jump-to-ref button: a scope on any OTHER branch retargets
-	 *  rather than clearing. Identity by `branchRef` — the one scope field the anchor resolver never
-	 *  rewrites, and the only one that separates a local branch from a same-named remote one. */
-	private focusRef(args: FocusRefActionArgs | undefined): void {
+	/**
+	 * Focuses (scopes) the graph onto the action's branch, or unfocuses when that branch is already
+	 * the live scope. Mirrors the header's jump-to-ref button: a scope on any OTHER branch retargets
+	 * rather than clearing. Identity by `branchRef` — the one scope field the anchor resolver never
+	 * rewrites, and the only one that separates a local branch from a same-named remote one.
+	 *
+	 * Doubles as the worktree row's "Scope to Worktree" handler when `args.origin.kind === 'worktree'`:
+	 * sets the PERSPECTIVE synchronously, reports the scope-in gesture via `graph/worktrees/worktreeAction`
+	 * telemetry, then focuses the branch too only when `graph.scopeBehavior` is `'scopeAndFocus'`. Only the
+	 * scope-IN direction is reported, matching the tree-item table's "this action ran" semantics — an
+	 * un-scope isn't a new invocation of the Scope action.
+	 *
+	 * The toggle-off exit identifies the row by `args.worktreePath`, present on BOTH dual-verb payloads,
+	 * but only the SCOPE verb may act on a live perspective — which is why `args.verb` is threaded through
+	 * rather than inferred from `args.origin`. See `resolveWorktreeGesture`'s `perspectiveExit`.
+	 *
+	 * `location` is threaded from the caller rather than assumed: `'inline'` for both the button click and
+	 * the row's own double-click, since neither is the host's right-click context menu.
+	 */
+	private focusRef(args: FocusRefActionArgs | undefined, location: 'inline' | 'contextMenu'): void {
 		if (args == null) return;
 
 		// Same repo-path resolution the scope path itself uses (`scopeToBranchByName`), so the ref
 		// built here matches the one already published on the scope.
 		const repoPath = getSelectedRepoPath(this._state);
-		const scope = this._state.scope;
-		// Same target means same ORIGIN too — focusing a stack over its plain-focused base (or vice versa)
-		// is a re-focus that changes the scope's shape, not a toggle of the same one.
-		const sameOrigin = scope?.origin?.kind === args.origin?.kind && scope?.origin?.number === args.origin?.number;
-		if (
-			repoPath != null &&
-			sameOrigin &&
-			scope?.branchRef === getBranchId(repoPath, args.remote ?? false, args.branchName)
-		) {
-			this._state.clearScope();
-			return;
+		// No `targetRowId`: a sidebar click is not a gesture ON a graph row, so the rebind must not yank the
+		// user's viewport — see `GraphApp.followRowAfterRebind` for the other side of that distinction.
+		const outcome = resolveWorktreeGesture({
+			branchRef: repoPath != null ? getBranchId(repoPath, args.remote ?? false, args.branchName) : undefined,
+			origin: args.origin,
+			// Which of the row's dual verbs was clicked (main vs Alt) — only Scope may close a live
+			// perspective here; an explicit "Focus on Branch" is focus-only.
+			verb: args.verb,
+			worktreePath: args.worktreePath,
+			scope: this._state.scope,
+			perspectivePath: this._state.worktreePerspective?.path,
+			homeRepositoryPath: this._state.homeRepositoryPath,
+			scopeBehaviorIncludesFocus: this._state.config?.scopeBehavior !== 'scope',
+		});
+
+		if (outcome.perspective === 'set' && outcome.perspectivePath != null) {
+			emitTelemetrySentEvent(this, {
+				name: 'graph/worktrees/worktreeAction',
+				data: { action: 'scopeToWorktree', alt: false, location: location },
+			});
 		}
+		// Set SYNCHRONOUSLY, before the focus dispatch below — the header tint + pill must reflect the
+		// worktree instantly, not after the dispatched event's anchor IPC settles.
+		applyWorktreeGestureOutcome(this._state, outcome, args.branchName);
+
+		if (!outcome.focus) return;
 
 		this.dispatchEvent(
 			new CustomEvent<
@@ -2470,7 +2924,9 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 					origin?: FocusRefActionArgs['origin'];
 				}
 			>('gl-graph-scope-to-branch', {
-				detail: { ...args, source: 'sidebar' },
+				// `outcome.origin`, not `args.origin` — a go-home gesture drops it so the focus that
+				// follows is genuinely plain (no worktree toggle identity for a later focus to mismatch).
+				detail: { ...args, origin: outcome.origin, source: 'sidebar' },
 				bubbles: true,
 				composed: true,
 			}),
@@ -2480,6 +2936,27 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	private handleTreeItemSelected(
 		e: CustomEvent<TreeItemSelectionDetail & { context?: SidebarItemContext; node?: { path?: string } }>,
 	) {
+		// A double-click is the row's Focus action: scope (or unscope) the graph to the row's branch,
+		// same toggle semantics as the inline target chip. Rows without a Focus action — tags, stashes,
+		// group/header rows, unborn branches — have nothing to focus and fall through to nothing.
+		// The two single-click events preceding a dblclick already did selection, so return here
+		// rather than re-running telemetry/navigation a third time.
+		if (e.detail.dblClick) {
+			const node = e.detail.node as TreeModelFlat | undefined;
+			const focus = node?.actions?.find(a => a.action === focusRefActionId);
+			if (focus != null) {
+				// Only a worktree row's dual-verb action carries an ALT payload (plain branch Focus), so an
+				// ordinary branch row falls through to the primary payload regardless of the setting.
+				const useAlt = this._state.config?.doubleClickWorktreeAction === 'focus' && focus.altArguments != null;
+				this.focusRef(
+					(useAlt ? focus.altArguments : focus.arguments)?.[0] as FocusRefActionArgs | undefined,
+					'inline',
+				);
+			}
+
+			return;
+		}
+
 		if (this.activePanel != null && e.detail.node?.path != null) {
 			this._actions.selectedPath[this.activePanel] = e.detail.node.path;
 		}
@@ -2558,7 +3035,16 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 		this.dispatchEvent(
 			new CustomEvent<GraphSidebarPanelSelectEventDetail>('gl-graph-sidebar-panel-select', {
-				detail: { sha: sha, sessionId: sessionId },
+				detail: {
+					sha: sha,
+					sessionId: sessionId,
+					name: context?.[3],
+					canFocus:
+						(e.detail.node as TreeModelFlat | undefined)?.actions?.some(
+							a => a.action === focusRefActionId,
+						) === true,
+					scoped: scope != null,
+				},
 				bubbles: true,
 				composed: true,
 			}),
@@ -2587,7 +3073,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 	}
 
 	private emitRemotesShownTelemetry(): void {
-		if (this._remotesShownEmitted || this.activePanel !== 'remotes') return;
+		if (this._shownEmitted.has('remotes') || this.activePanel !== 'remotes') return;
 
 		// Wait for a successful fetch (mirrors emitWorktreesShownTelemetry): on reactivation the
 		// resource still holds the previous visit's value while the switch-triggered fetch is in
@@ -2598,8 +3084,8 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const data = resource.value.get();
 		if (data?.panel !== 'remotes') return;
 
-		this._remotesShownEmitted = true;
-		emitTelemetrySentEvent<'graph/remotes/shown'>(this, {
+		this._shownEmitted.add('remotes');
+		emitTelemetrySentEvent(this, {
 			name: 'graph/remotes/shown',
 			data: {
 				layout: data.layout ?? 'list',
@@ -2610,35 +3096,52 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		});
 	}
 
+	private maybeEmitAgentsShownTelemetry(): void {
+		if (!this._agentsShownPending || this.activePanel !== 'agents') return;
+		if (this._state.canInstallHooks == null) return;
+
+		this._agentsShownPending = false;
+		this.emitAgentsShownTelemetry();
+	}
+
 	private emitAgentsShownTelemetry(): void {
-		// Point-in-time snapshot: fired on the `activePanel → 'agents'` transition only. Sessions
-		// arrive asynchronously on `_state.agentSessions` (see `render`), so on first open the counts
-		// below may all read 0, and later arrivals don't re-fire this event. `agentSessions` is a
-		// signal initialized to `[]`, so "not yet loaded" and "loaded but empty" are indistinguishable
-		// here — treat the counts as "what was visible at open", not a settled total. Also no re-fire
-		// when the panel is re-revealed without an `activePanel` change: display-mode round trips
-		// (graph → kanban/visualizations → graph) hide/show the split but preserve the value, and
-		// rail re-clicks that set the same panel don't transition. Close/reopen does re-fire
-		// (`hideSidebar` clears `activePanel`).
-		const sessions = this._state.agentSessions ?? [];
+		// Deferred to the first agents push (see maybeEmitAgentsShownTelemetry), so the hooks and
+		// emptyState properties are settled. Session counts arrive on their own subscription and stay
+		// a point-in-time snapshot — later arrivals don't re-fire this event. No re-fire without an
+		// `activePanel` transition (display-mode round trips, rail re-clicks); close/reopen re-fires.
+		const graphAnchor = this.resolveGraphAnchorContext();
+		const familyWorktreePaths = this._state.worktreePaths != null ? new Set(this._state.worktreePaths) : undefined;
+		const sessions = filterAgentSessionsForFamily(
+			this._state.agentSessions,
+			graphAnchor?.family,
+			familyWorktreePaths,
+		);
 		let working = 0;
 		let needsInput = 0;
 		let idle = 0;
-		let completed = 0;
+		let ended = 0;
 		for (const s of sessions) {
 			const category = agentPhaseToCategory[s.phase];
 			if (category === 'working') {
 				working++;
 			} else if (category === 'needs-input') {
 				needsInput++;
-			} else if (category === 'completed') {
-				completed++;
+			} else if (category === 'ended') {
+				ended++;
 			} else {
 				idle++;
 			}
 		}
 
-		emitTelemetrySentEvent<'graph/agents/shown'>(this, {
+		// Mirrors the render path's resolution so the event reports the state the user actually saw.
+		const hooksAgents = this._state.hooksAgents;
+		const installedCount = hooksAgents?.filter(a => a.installed).length ?? 0;
+		const emptyState = this.resolveAgentsEmptyState(
+			sessions.length,
+			this.isAgentsBannerVisible(sessions.length === 0),
+		);
+
+		emitTelemetrySentEvent(this, {
 			name: 'graph/agents/shown',
 			data: {
 				layout: this._actions.agentsLayout.get(),
@@ -2646,7 +3149,12 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 				'sessions.working.count': working,
 				'sessions.needsInput.count': needsInput,
 				'sessions.idle.count': idle,
-				'sessions.completed.count': completed,
+				'sessions.ended.count': ended,
+				// Settled by the deferral above; still undefined when the agents feature is unavailable.
+				'hooks.agentsCount': hooksAgents?.length,
+				'hooks.agentsInstalledCount': hooksAgents == null ? undefined : installedCount,
+				'emptyState.shown': emptyState?.type === 'connect',
+				'emptyState.reason': emptyState?.type === 'connect' ? emptyState.reason : undefined,
 			},
 		});
 	}
@@ -2684,7 +3192,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const data = this._actions?.state.panels.branches?.value.get();
 		if (data?.panel !== 'branches') return;
 
-		emitTelemetrySentEvent<'graph/branches/shown'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/branches/shown',
 			data: {
 				layout: data.layout ?? 'list',
@@ -2698,48 +3206,10 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		return data?.panel === 'worktrees' ? data.items.length : 0;
 	}
 
-	private readonly emitWorktreesFilteredTelemetryDebounced = debounce(() => {
-		const filterText = this._actions.filterText;
-		emitTelemetrySentEvent<'graph/worktrees/filtered'>(this, {
-			name: 'graph/worktrees/filtered',
-			data: {
-				hasFilter: filterText.length > 0,
-				'filter.length': filterText.length,
-				'worktrees.count': this.getWorktreesCount(),
-			},
-		});
-	}, 500);
-
-	private readonly emitRemotesFilteredTelemetryDebounced = debounce(() => {
-		if (this.activePanel !== 'remotes') return;
-
-		const filterText = this._actions.filterText;
-		emitTelemetrySentEvent<'graph/remotes/filtered'>(this, {
-			name: 'graph/remotes/filtered',
-			data: {
-				hasFilter: filterText.length > 0,
-				'filter.length': filterText.length,
-				'remotes.count': this.getRemotesCount(),
-			},
-		});
-	}, 500);
-
 	private getStashesCount(): number {
 		const data = this._actions?.state.panels.stashes?.value.get();
 		return data?.panel === 'stashes' ? data.items.length : 0;
 	}
-
-	private readonly emitStashesFilteredTelemetryDebounced = debounce(() => {
-		const filterText = this._actions.filterText;
-		emitTelemetrySentEvent<'graph/stashes/filtered'>(this, {
-			name: 'graph/stashes/filtered',
-			data: {
-				hasFilter: filterText.length > 0,
-				'filter.length': filterText.length,
-				'stashes.count': this.getStashesCount(),
-			},
-		});
-	}, 500);
 
 	private getTagsCount(): number {
 		const data = this._actions?.state.panels.tags?.value.get();
@@ -2751,30 +3221,62 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		return data?.panel === 'pullRequests' ? data.items.length : 0;
 	}
 
-	private readonly emitPullRequestsFilteredTelemetryDebounced = debounce(() => {
-		const filterText = this._actions.filterText;
-		emitTelemetrySentEvent<'graph/pullRequests/filtered'>(this, {
-			name: 'graph/pullRequests/filtered',
-			data: {
-				hasFilter: filterText.length > 0,
-				'filter.length': filterText.length,
-				// Distinguishes "paste a PR URL" from browsing by text — they're different behaviours
-				// sharing one box, and only the former can reach the lookup fallback.
-				byIdentity: getPullRequestNumberFromQuery(filterText) != null,
-				'pullRequests.count': this.getPullRequestsCount(),
-			},
-		});
-	}, 500);
+	/** Builds each tree-backed panel's `<panel>/filtered` payload off the shared filter text.
+	 *  Per-panel because the count source differs (and pull requests add their identity flag);
+	 *  the surrounding debounce/active-panel pipeline is shared — see
+	 *  `emitFilteredTelemetryDebounced`. */
+	private readonly filteredTelemetryBuilders: {
+		[P in SidebarFilteredPanel]: (filterText: string) => WebviewTelemetryEvents[`graph/${P}/filtered`];
+	} = {
+		worktrees: filterText => ({
+			hasFilter: filterText.length > 0,
+			'filter.length': filterText.length,
+			'worktrees.count': this.getWorktreesCount(),
+		}),
+		branches: filterText => ({
+			hasFilter: filterText.length > 0,
+			'filter.length': filterText.length,
+			'branches.count': this.getBranchesCount(),
+		}),
+		pullRequests: filterText => ({
+			hasFilter: filterText.length > 0,
+			'filter.length': filterText.length,
+			// Distinguishes "paste a PR URL" from browsing by text — they're different behaviours
+			// sharing one box, and only the former can reach the lookup fallback.
+			byIdentity: getPullRequestNumberFromQuery(filterText) != null,
+			'pullRequests.count': this.getPullRequestsCount(),
+		}),
+		remotes: filterText => ({
+			hasFilter: filterText.length > 0,
+			'filter.length': filterText.length,
+			'remotes.count': this.getRemotesCount(),
+		}),
+		stashes: filterText => ({
+			hasFilter: filterText.length > 0,
+			'filter.length': filterText.length,
+			'stashes.count': this.getStashesCount(),
+		}),
+		tags: filterText => ({
+			hasFilter: filterText.length > 0,
+			'filter.length': filterText.length,
+			'tags.count': this.getTagsCount(),
+		}),
+	};
 
-	private readonly emitTagsFilteredTelemetryDebounced = debounce(() => {
-		const filterText = this._actions.filterText;
-		emitTelemetrySentEvent<'graph/tags/filtered'>(this, {
-			name: 'graph/tags/filtered',
-			data: {
-				hasFilter: filterText.length > 0,
-				'filter.length': filterText.length,
-				'tags.count': this.getTagsCount(),
-			},
+	// The raw `gl-tree-filter-changed` event fires on every keystroke (only the tree's filter
+	// apply is debounced), so debounce the telemetry to emit once per settled query. Each panel
+	// previously armed its own timer; they could never overlap (arming is gated on the active
+	// panel and switches cancel), so a single shared timer preserves the emit frequency while
+	// giving every panel the active-panel guard only two of them had.
+	private readonly emitFilteredTelemetryDebounced = debounce(() => {
+		const panel = this.activePanel;
+		// Only report while the panel is still active — a trailing callback after a switch would
+		// otherwise attribute the settled query to the wrong (now-inactive) panel.
+		if (panel == null || panel === 'overview' || panel === 'agents') return;
+
+		emitTelemetrySentEvent(this, {
+			name: `graph/${panel}/filtered`,
+			data: this.filteredTelemetryBuilders[panel](this._actions.filterText),
 		});
 	}, 500);
 
@@ -2785,7 +3287,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const worktree = data.items.find(w => w.wipSha === wipSha);
 		if (worktree == null) return;
 
-		emitTelemetrySentEvent<'graph/worktrees/worktreeSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/worktrees/worktreeSelected',
 			data: {
 				isActive: worktree.opened,
@@ -2802,7 +3304,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const branch = name != null ? this.getBranchesData()?.find(b => b.name === name) : undefined;
 		if (branch == null) return;
 
-		emitTelemetrySentEvent<'graph/branches/branchSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/branches/branchSelected',
 			data: {
 				isCurrent: branch.current,
@@ -2823,7 +3325,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const graphAnchor = this.resolveGraphAnchorContext();
 		const sameRepo = graphAnchor != null && session.commonPath === graphAnchor.family;
 
-		emitTelemetrySentEvent<'graph/agents/sessionSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/agents/sessionSelected',
 			data: {
 				'session.phase': session.phase,
@@ -2837,11 +3339,17 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 
 	private emitAgentsTreeItemActionTelemetry(command: string, args: unknown[] | undefined): void {
 		if (command === 'gitlens.agents.resolvePermission') {
-			const arg = args?.[0] as { sessionId?: string; decision?: string; alwaysAllow?: boolean } | undefined;
+			const arg = args?.[0] as
+				| { sessionId?: string; providerId?: string; decision?: string; alwaysAllow?: boolean }
+				| undefined;
 			const session =
-				arg?.sessionId != null ? this._state.agentSessions?.find(s => s.id === arg.sessionId) : undefined;
+				arg?.sessionId != null
+					? this._state.agentSessions?.find(
+							s => s.id === arg.sessionId && (arg.providerId == null || s.providerId === arg.providerId),
+						)
+					: undefined;
 
-			emitTelemetrySentEvent<'graph/agents/permissionResolved'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/agents/permissionResolved',
 				data: {
 					decision: (arg?.decision as 'allow' | 'deny') ?? 'allow',
@@ -2864,41 +3372,11 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		}
 
 		if (action != null) {
-			emitTelemetrySentEvent<'graph/agents/sessionAction'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/agents/sessionAction',
 				data: { action: action },
 			});
 		}
-	}
-
-	private emitWorktreesTreeItemActionTelemetry(command: GlCommands, alt: boolean): void {
-		const action = sidebarItemActions.worktree[command];
-		if (action == null) return;
-
-		emitTelemetrySentEvent<'graph/worktrees/worktreeAction'>(this, {
-			name: 'graph/worktrees/worktreeAction',
-			data: { action: action, alt: alt, location: 'inline' },
-		});
-	}
-
-	private emitBranchesTreeItemActionTelemetry(command: GlCommands, alt: boolean): void {
-		const action = sidebarItemActions.branch[command];
-		if (action == null) return;
-
-		emitTelemetrySentEvent<'graph/branches/branchAction'>(this, {
-			name: 'graph/branches/branchAction',
-			data: { action: action, alt: alt, location: 'inline' },
-		});
-	}
-
-	private emitRemotesTreeItemActionTelemetry(command: GlCommands, alt: boolean): void {
-		const action = sidebarItemActions.remote[command];
-		if (action == null) return;
-
-		emitTelemetrySentEvent<'graph/remotes/remoteAction'>(this, {
-			name: 'graph/remotes/remoteAction',
-			data: { action: action, alt: alt, location: 'inline' },
-		});
 	}
 
 	private emitStashesSelectedTelemetry(sha: string): void {
@@ -2908,7 +3386,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const stash = data.items.find(s => s.sha === sha);
 		if (stash == null) return;
 
-		emitTelemetrySentEvent<'graph/stashes/stashSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/stashes/stashSelected',
 			data: {
 				hasStashOnRef: stash.stashOnRef != null,
@@ -2925,7 +3403,7 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		const tag = resolveSelectedTag(data.items, sha, path);
 		if (tag == null) return;
 
-		emitTelemetrySentEvent<'graph/tags/tagSelected'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/tags/tagSelected',
 			data: {
 				annotated: tag.annotated,
@@ -2933,34 +3411,13 @@ export class GlGraphSidebarPanel extends SignalWatcher(LitElement) {
 		});
 	}
 
-	private emitStashesTreeItemActionTelemetry(command: GlCommands, alt: boolean): void {
-		const action = sidebarItemActions.stash[command];
-		if (action == null) return;
-
-		emitTelemetrySentEvent<'graph/stashes/stashAction'>(this, {
-			name: 'graph/stashes/stashAction',
-			data: { action: action, alt: alt, location: 'inline' },
-		});
-	}
-
-	private emitPullRequestsTreeItemActionTelemetry(command: GlCommands, alt: boolean): void {
-		const action = sidebarItemActions.pullRequest[command];
-		if (action == null) return;
-
-		emitTelemetrySentEvent<'graph/pullRequests/pullRequestAction'>(this, {
-			name: 'graph/pullRequests/pullRequestAction',
-			data: { action: action, alt: alt, location: 'inline' },
-		});
-	}
-
-	private emitTagsTreeItemActionTelemetry(command: GlCommands, alt: boolean): void {
-		const action = sidebarItemActions.tag[command];
-		if (action == null) return;
-
-		emitTelemetrySentEvent<'graph/tags/tagAction'>(this, {
-			name: 'graph/tags/tagAction',
-			data: { action: action, alt: alt, location: 'inline' },
-		});
+	/** Emits the inline item-action telemetry for the active panel, resolving the command against
+	 *  that panel's slice of the shared `sidebarItemActions` table (see `treeItemActionParams`). */
+	private emitTreeItemActionTelemetry(panel: SidebarItemActionPanel, command: GlCommands, alt: boolean): void {
+		const params = treeItemActionParams[panel](command, alt);
+		if (params != null) {
+			emitTelemetrySentEvent(this, params);
+		}
 	}
 }
 

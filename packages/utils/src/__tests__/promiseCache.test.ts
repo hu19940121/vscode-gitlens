@@ -462,6 +462,40 @@ suite('PromiseCache Test Suite', () => {
 		});
 	});
 
+	suite('evictWhen', () => {
+		test('evicts after an async retention decision without affecting the current caller', async () => {
+			const cache = new PromiseCache<string, number>();
+			const decision = deferred<boolean>();
+			const result = cache.getOrCreate('k', () => Promise.resolve(42), {
+				evictWhen: () => decision.promise,
+			});
+
+			assert.strictEqual(await result, 42);
+			assert.ok(cache.get('k') != null, 'entry remains cached while the retention decision is pending');
+
+			decision.resolve(true);
+			await flush();
+			assert.strictEqual(cache.get('k'), undefined);
+		});
+
+		test("a deleted entry's late retention decision does not evict its successor", async () => {
+			const cache = new PromiseCache<string, number>();
+			const decision = deferred<boolean>();
+			const first = cache.getOrCreate('k', () => Promise.resolve(1), {
+				evictWhen: () => decision.promise,
+			});
+			assert.strictEqual(await first, 1);
+
+			cache.delete('k');
+			const successor = cache.getOrCreate('k', () => Promise.resolve(2));
+			assert.strictEqual(await successor, 2);
+
+			decision.resolve(true);
+			await flush();
+			assert.strictEqual(await cache.get('k'), 2);
+		});
+	});
+
 	suite('delete while in flight, then recreate', () => {
 		test("the deleted entry's late settle does not clobber the successor's controller", async () => {
 			const cache = new PromiseCache<string, number>();
@@ -789,6 +823,20 @@ suite('RepoPromiseMap Test Suite', () => {
 });
 
 suite('RepoPromiseCacheMap Test Suite', () => {
+	test('entryCount sums retained entries across repository caches without changing size semantics', () => {
+		const cache = new RepoPromiseCacheMap<string, number>();
+		cache.set('/repo-a', 'one', Promise.resolve(1));
+		cache.set('/repo-a', 'two', Promise.resolve(2));
+		cache.set('/repo-b', 'three', Promise.resolve(3));
+
+		assert.strictEqual(cache.size, 2);
+		assert.strictEqual(cache.entryCount, 3);
+
+		cache.delete('/repo-a', 'one');
+		assert.strictEqual(cache.size, 2);
+		assert.strictEqual(cache.entryCount, 2);
+	});
+
 	test('invalidate(repoPath, key) soft-invalidates specific entry', async () => {
 		const cache = new RepoPromiseCacheMap<string, number>();
 		const d = deferred<number>();

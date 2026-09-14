@@ -1,40 +1,115 @@
 import type { Disposable, QuickPickItem } from 'vscode';
-import { commands, EventEmitter, ProgressLocation, Uri, window, workspace } from 'vscode';
+import {
+	commands,
+	ConfigurationTarget,
+	env,
+	EventEmitter,
+	l10n,
+	ProgressLocation,
+	Uri,
+	window,
+	workspace,
+} from 'vscode';
+import { claudeCodeCapabilities, getAgentCapabilitiesByProviderId } from '@gitlens/agents/agentCapabilities.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { arePathsEqual } from '@gitlens/utils/path.js';
-import { getSettledValue } from '@gitlens/utils/promise.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { Source, Sources } from '../constants.telemetry.js';
 import type { Container } from '../container.js';
-import { openWorktreeInNewWindow, showWorktreeInGraph } from '../plus/graph/worktreeActions.js';
+import { getPresentableErrorMessage } from '../errors.js';
+import { showWorktreeInGraph } from '../plus/graph/worktreeActions.js';
 import { createQuickPickSeparator } from '../quickpicks/items/common.js';
-import { registerCommand } from '../system/-webview/command.js';
+import { executeCommand, registerCommand } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { openWorkspace } from '../system/-webview/vscode/workspaces.js';
+import { isWebviewItemContext } from '../system/webview.js';
 import type { GkAgent } from './agentService.js';
 import type {
 	AgentSessionState,
 	AgentSessionWorktreeMetadata,
+	PastAgentSessionDetail,
 	PastAgentSessionsResult,
 	PastAgentSessionState,
 } from './models/agentSessionState.js';
-import { getSessionDisplayName, serializeAgentSession, serializePastAgentSession } from './models/agentSessionState.js';
+import {
+	getAgentSessionIdentityKey,
+	getSessionDisplayName,
+	serializeAgentSession,
+	serializePastAgentSession,
+} from './models/agentSessionState.js';
 import type {
 	AgentSession,
+	AgentSessionHistoryActions,
+	AgentSessionHistoryResult,
 	AgentSessionProvider,
+	AgentSessionResumeTarget,
 	PermissionDecision,
 	PermissionSuggestion,
-	ResumableSessionsResult,
 } from './provider.js';
 import { isActiveAgentPhase } from './provider.js';
+import { AgentExtensionAvailability, computeResumeTargets } from './utils/-webview/agentExtensions.js';
+import { canResumeSession, resumeAgentSessionInTerminal, toResumableSessionRef } from './utils/-webview/agentResume.js';
 import {
 	isActiveClaudeTab,
 	isClaudeExtensionAvailable,
 	tryOpenClaudeSession,
 } from './utils/-webview/claudeExtension.js';
+import { revealTerminalForProcess } from './utils/-webview/terminalReveal.js';
 import {
-	canResumeSession,
-	resumeClaudeSessionInTerminal,
-	toResumableSessionRef,
-} from './utils/-webview/claudeResume.js';
-import { areHooksAllowedForAgent, getHookClientId } from './utils/agentHooks.js';
+	areHooksOfferedForAgent,
+	getHookClientId,
+	getManualActivationHint,
+	stripHintCodeMarkers,
+} from './utils/agentHooks.js';
+import { getAgentProviderIcon } from './utils/agentIcon.js';
+
+/** Value carried by a `gitlens:agent-session…` webview-item context — mirrors
+ *  `agentUtils.ts`'s `AgentSessionContextValue` (webview-side). Declared separately here rather
+ *  than imported: host code (this file) must not import from `webviews/apps/*`, and the shape
+ *  only needs to agree at the JSON boundary, not share a TS type. */
+interface AgentSessionContextArgValue {
+	sessionId?: string;
+	providerId?: string;
+	worktreePath?: string;
+	cwd?: string;
+	lastPrompt?: string;
+	planFilePath?: string;
+	target?: AgentSessionResumeTarget;
+}
+
+/**
+ * Normalizes the three arg shapes an agent-session command can receive into one
+ * `{sessionId, cwd, ...}` value: a bare session id (older tree/card action links), the
+ * `{sessionId, cwd}` object the resume commands already used, or a real right-click's
+ * webview-item context (whose fields ride on `webviewItemValue`). Returns `undefined` only when
+ * none of the three match, so callers can `?.` straight into the fields they need.
+ */
+function resolveAgentSessionArg(arg: unknown): AgentSessionContextArgValue | undefined {
+	if (arg == null) return undefined;
+	if (typeof arg === 'string') return { sessionId: arg };
+
+	if (isWebviewItemContext<AgentSessionContextArgValue>(arg) && arg.webviewItem.startsWith('gitlens:agent-session')) {
+		return arg.webviewItemValue;
+	}
+
+	if (typeof arg === 'object' && 'sessionId' in arg) return arg as AgentSessionContextArgValue;
+
+	return undefined;
+}
+
+/** One predicate for "this provider's live session ids" — built both before a history query (the
+ *  provider-local exclusion) and again after it settles (the staleness recheck), so the two can
+ *  never drift apart. */
+function getLiveSessionIds(provider: AgentSessionProvider): Set<string> {
+	return new Set(provider.sessions.filter(session => session.status !== 'ended').map(session => session.id));
+}
+
+/** The `@env/agents/agentHooks.js` install/uninstall pair `runHooksOperation` drives — real
+ *  implementation dynamic-imported in production, injectable in tests (see `_hooksInstaller`). */
+interface HooksInstallerFns {
+	installAgentHook: (hookClientId: string) => Promise<void>;
+	uninstallAgentHook: (hookClientId: string) => Promise<void>;
+}
 
 export class AgentStatusService implements Disposable {
 	private readonly _onDidChange = new EventEmitter<void>();
@@ -42,7 +117,7 @@ export class AgentStatusService implements Disposable {
 
 	private readonly _onDidChangeHooksInstallState = new EventEmitter<void>();
 	/**
-	 * Fires after the user installs or uninstalls Claude Code hooks. Webviews subscribe so banners
+	 * Fires after the user installs or uninstalls GitKraken Hooks for an agent. Webviews subscribe so banners
 	 * and integration chips reflect the new state without waiting for the 30s cache to expire.
 	 */
 	readonly onDidChangeHooksInstallState = this._onDidChangeHooksInstallState.event;
@@ -61,7 +136,7 @@ export class AgentStatusService implements Disposable {
 	 * content: a cache hit means nothing about that session changed.
 	 *
 	 * This exists because the change-detect below runs on every `onDidChangeSessions` — which fires
-	 * per hook event (each tool call) — while `_sessions` also holds every `completed` session in the
+	 * per hook event (each tool call) — while `_sessions` also holds every `ended` session in the
 	 * CLI's 30-day window. Re-serializing and stringifying that whole set per event scales the live
 	 * path by total history rather than by what's actually running. Terminal rows never change, so
 	 * they land here once and cost a lookup thereafter.
@@ -75,7 +150,7 @@ export class AgentStatusService implements Disposable {
 		{ state: AgentSessionState; key: string; generation: number }
 	>();
 	private _worktreeMetadataGeneration = 0;
-	/** `sessionId -> change-detect key` from the last published snapshot. */
+	/** Provider-scoped session identity -> change-detect key from the last published snapshot. */
 	private _lastSessionKeys = new Map<string, string>();
 
 	/**
@@ -87,7 +162,7 @@ export class AgentStatusService implements Disposable {
 	 */
 	private readonly _worktreeNameByPath = new Map<string, AgentSessionWorktreeMetadata>();
 	/** Worktree paths a refresh has already attempted, resolved or not. Gates the deferred-publish
-	 *  branch in the `onDidChangeSessions` trigger: a path no open repo owns — a completed session
+	 *  branch in the `onDidChangeSessions` trigger: a path no open repo owns — an ended session
 	 *  from a repo this window doesn't have open — never resolves, and without this every phase tick
 	 *  would take the deferral and re-run the (ungated) refresh. Repos opening later still resolve
 	 *  it: `onDidChangeRepositories` re-runs the refresh regardless of this set. */
@@ -101,16 +176,33 @@ export class AgentStatusService implements Disposable {
 	private readonly _providers: AgentSessionProvider[];
 	/** Timer for the deferred initial hooks-installed push; cleared on dispose if it hasn't fired. */
 	private _initialHooksPushTimer: ReturnType<typeof setTimeout> | undefined;
+	/** Overrides the `@env/agents/agentHooks.js` install/uninstall pair `runHooksOperation` otherwise
+	 *  dynamic-imports — tests only. The real functions ultimately shell out to the `gk` CLI, and the
+	 *  dynamic import's exports are non-configurable (esbuild-bundled), so they can't be sinon-stubbed
+	 *  from outside; this is the seam instead. */
+	private readonly _hooksInstaller: HooksInstallerFns | undefined;
+	/** Reveals the integrated terminal hosting a `pid` — defaults to {@link revealTerminalForProcess};
+	 *  injectable so tests can stub it without a live VS Code `Terminal`. */
+	private readonly _revealTerminal: (pid: number) => Promise<boolean>;
+	/** Sync view of which agent extensions are installed and reachable — feeds
+	 *  {@link getResumeTargets}. */
+	private readonly _extensionAvailability = new AgentExtensionAvailability();
 
 	constructor(
 		private readonly container: Container,
 		providers: AgentSessionProvider[],
-		/** Commands are a process-wide singleton surface — VS Code throws on a duplicate id — so an
-		 *  instance beyond the container's own (tests) must opt out of claiming them. Everything else
-		 *  about the service is per-instance and safe to stand up more than once. */
-		options?: { registerCommands?: boolean },
+		options?: {
+			/** Commands are a process-wide singleton surface — VS Code throws on a duplicate id — so an
+			 *  instance beyond the container's own (tests) must opt out of claiming them. Everything else
+			 *  about the service is per-instance and safe to stand up more than once. */
+			registerCommands?: boolean;
+			hooksInstaller?: HooksInstallerFns;
+			revealTerminal?: (pid: number) => Promise<boolean>;
+		},
 	) {
 		this._providers = providers;
+		this._hooksInstaller = options?.hooksInstaller;
+		this._revealTerminal = options?.revealTerminal ?? revealTerminalForProcess;
 
 		for (const provider of this._providers) {
 			this._disposables.push(
@@ -119,13 +211,18 @@ export class AgentStatusService implements Disposable {
 					// status row) stay snappy.
 					this._onDidChange.fire();
 
-					// If any session has a worktree path we haven't resolved yet, defer the rich
-					// snapshot publish until the refresh completes so webviews don't paint with a
-					// cold-fallback name (`On <path-basename>`) and then re-paint a moment later
-					// with the proper branch name. The refresh publishes itself when metadata
-					// changed; we only fire here when it didn't (couldn't resolve the path) or
-					// failed, so the new session is never permanently swallowed.
+					// If any session has a worktree path we haven't resolved yet, the tick that STARTS a
+					// fresh refresh defers its snapshot publish until that refresh completes, so webviews
+					// don't paint with a cold-fallback name (`On <path-basename>`) and then re-paint a
+					// moment later with the proper branch name. Every other tick — including one that
+					// lands while a refresh is already in flight — publishes immediately instead of also
+					// waiting: a wedged `getWorktrees()` call (hung git subprocess) can leave a refresh
+					// in flight indefinitely, and piling every subsequent tick onto its `.then()` would
+					// freeze the webview on stale state until it eventually settles. The `.then()`
+					// continuation is still attached so the refresh's own eventual completion re-publishes
+					// too; `maybeFireSessionsChanged()`'s change-gate coalesces the redundant call.
 					if (this.hasUnresolvedWorktreePaths()) {
+						const refreshInFlight = this._worktreeRefreshPromise != null;
 						this.refreshWorktreeNameCache().then(
 							changed => {
 								if (!changed) {
@@ -134,6 +231,10 @@ export class AgentStatusService implements Disposable {
 							},
 							() => this.maybeFireSessionsChanged(),
 						);
+
+						if (refreshInFlight) {
+							this.maybeFireSessionsChanged();
+						}
 					} else {
 						this.maybeFireSessionsChanged();
 						this.refreshWorktreeNameCacheIfSessionsChanged();
@@ -143,6 +244,13 @@ export class AgentStatusService implements Disposable {
 		}
 
 		this._disposables.push(
+			this._extensionAvailability,
+			this._extensionAvailability.onDidChange(() => {
+				// Extension availability is embedded in every ended session's resume targets, so a flip
+				// has to invalidate the per-session memo the same way a worktree-metadata change does.
+				this._worktreeMetadataGeneration++;
+				this.maybeFireSessionsChanged();
+			}),
 			window.onDidChangeWindowState(e => {
 				if (e.focused) {
 					this.startProviders();
@@ -210,12 +318,15 @@ export class AgentStatusService implements Disposable {
 		this._onDidChangeHooksInstallState.fire();
 	}
 
-	/** Resolves the host's Claude hooks-installed state and pushes it to all providers so they can
-	 *  gate their reconciliation poll (the CLI `list-sessions` call). Resolves to `false` when the
-	 *  agent can't be detected (e.g. the browser stub's `getClaude()` returns `undefined`); fails
-	 *  *open* (`installed = true`) only if detection throws unexpectedly, so a transient failure
-	 *  never wrongly suppresses polling. The browser has no providers to receive the push regardless.
-	 *  Pass `invalidate` after an install/uninstall so the stale agent cache is dropped before re-reading.
+	/** Resolves whether ANY agent GitLens holds a capability descriptor for has hooks installed on
+	 *  this host, and pushes that to all providers so they can gate their reconciliation poll (the
+	 *  CLI `list-sessions` call). Deliberately not keyed on Claude: the flag gates the poll for every
+	 *  agent the provider fronts, so an installation with Codex hooks but no Claude hooks would
+	 *  otherwise have its poll suppressed. Resolves to `false` when no such agent is detected (e.g.
+	 *  the browser stub returns an empty list); fails *open* (`installed = true`) only if detection
+	 *  throws unexpectedly, so a transient failure never wrongly suppresses polling. The browser has
+	 *  no providers to receive the push regardless. Pass `invalidate` after an install/uninstall so
+	 *  the stale agent cache is dropped before re-reading.
 	 *
 	 *  Note: an external `gk ai hook install` (run outside GitLens) isn't observed here until
 	 *  something else re-reads — acceptable per the staleness window documented in
@@ -227,15 +338,15 @@ export class AgentStatusService implements Disposable {
 			if (options?.invalidate) {
 				this.container.agents.invalidateCache();
 			}
-			const claude = await this.container.agents.getClaude();
-			installed = claude?.hooksInstalled ?? false;
+			const agents = await this.container.agents.getAll();
+			installed = agents.some(a => a.hooksInstalled && areHooksOfferedForAgent(a.name));
 		} catch {
 			// Unexpected detection failure — leave fail-open (assume installed) so a transient error
 			// doesn't wrongly suppress polling. (The browser stub returns an empty list above, yielding
 			// installed=false, and has no providers anyway.)
 		}
 		for (const provider of this._providers) {
-			provider.setClaudeHooksInstalled?.(installed);
+			provider.setHooksInstalled?.(installed);
 		}
 	}
 
@@ -251,14 +362,17 @@ export class AgentStatusService implements Disposable {
 			await this.runHooksOperation(agents, op, source ?? 'commandPalette');
 		} catch (ex) {
 			Logger.error(ex, `AgentStatusService.${op}Hooks`);
+			const error = getPresentableErrorMessage(ex);
 			void window.showErrorMessage(
-				`Failed to ${op} GitKraken Hooks: ${ex instanceof Error ? ex.message : String(ex)}`,
+				op === 'install'
+					? l10n.t('Failed to install GitKraken Hooks: {0}', error)
+					: l10n.t('Failed to uninstall GitKraken Hooks: {0}', error),
 			);
 		}
 	}
 
-	/** `gitlens.agents.installHooksForAgent` / `uninstallHooksForAgent` — hidden, dispatched by the
-	 *  Settings → Agents table for a single agent's Hooks cell. */
+	/** `gitlens.agents.installHooksForAgent` / `uninstallHooksForAgent` — hidden, per-agent variants of
+	 *  the install-all commands above, for UI surfaces that already know which agent (`agentId` arg). */
 	private async handleHooksOperationForAgentCommand(
 		op: 'install' | 'uninstall',
 		args?: { agentId?: string; source?: Sources },
@@ -271,15 +385,18 @@ export class AgentStatusService implements Disposable {
 		try {
 			const agent = (await this.container.agents.getAll()).find(a => a.name === name);
 			if (agent == null) {
-				void window.showWarningMessage(`Agent '${name}' is no longer available.`);
+				void window.showWarningMessage(l10n.t("Agent '{0}' is no longer available.", name));
 				return;
 			}
 
 			await this.runHooksOperation([agent], op, args?.source ?? 'commandPalette');
 		} catch (ex) {
 			Logger.error(ex, `AgentStatusService.${op}HooksForAgent`);
+			const error = getPresentableErrorMessage(ex);
 			void window.showErrorMessage(
-				`Failed to ${op} GitKraken Hooks for ${name}: ${ex instanceof Error ? ex.message : String(ex)}`,
+				op === 'install'
+					? l10n.t('Failed to install GitKraken Hooks for {0}: {1}', name, error)
+					: l10n.t('Failed to uninstall GitKraken Hooks for {0}: {1}', name, error),
 			);
 		}
 	}
@@ -294,28 +411,49 @@ export class AgentStatusService implements Disposable {
 		op: 'install' | 'uninstall',
 		source: Sources,
 	): Promise<void> {
-		// Honor the Claude-only hooks flag — silently drop any non-Claude targets before operating.
-		const targets = agents.filter(a => areHooksAllowedForAgent(a.name));
+		// Silently drop any agent GitLens holds no capability descriptor for — see
+		// `areHooksOfferedForAgent` for why a descriptor is the gate.
+		const targets = agents.filter(a => areHooksOfferedForAgent(a.name));
 		if (targets.length === 0) {
 			void window.showInformationMessage(
 				op === 'install'
-					? 'No additional hook-ready agents were detected on your machine.'
-					: 'No agents currently have GitKraken Hooks installed.',
+					? l10n.t('No additional hook-ready agents were detected on your machine.')
+					: l10n.t('No agents currently have GitKraken Hooks installed.'),
 			);
 			return;
 		}
 
-		const { installAgentHook, uninstallAgentHook } = await import(
-			/* webpackChunkName: "agents" */ '@env/agents/agentHooks.js'
-		);
+		const { installAgentHook, uninstallAgentHook } =
+			this._hooksInstaller ?? (await import(/* webpackChunkName: "agents" */ '@env/agents/agentHooks.js'));
 
 		const succeeded: string[] = [];
 		const failed: { agent: string; error: string }[] = [];
+		// Collected only for agents that actually succeeded, and only for `install` (an uninstall
+		// needs no activation note) — never re-derived from `targets`, so a partial failure can't
+		// attach a hint to an agent whose install didn't actually happen.
+		const manualActivationHints = new Set<string>();
+		// The `GkAgent`s behind those hints — captured here (not re-derived from `manualActivationHints`,
+		// which is de-duped on hint TEXT and would collapse two agents sharing identical wording) so the
+		// toast's action button can target the CLI it actually belongs to.
+		const hintedAgents: GkAgent[] = [];
 
 		await window.withProgress(
 			{
 				location: ProgressLocation.Notification,
-				title: `${op === 'install' ? 'Installing' : 'Uninstalling'} GitKraken Hooks for ${targets.length} agent${targets.length > 1 ? 's' : ''}...`,
+				title:
+					op === 'install'
+						? formatPlural(
+								l10n.t(
+									'{0, plural, one{Installing GitKraken Hooks for {0} agent...} other{Installing GitKraken Hooks for {0} agents...}}',
+								),
+								[targets.length],
+							)
+						: formatPlural(
+								l10n.t(
+									'{0, plural, one{Uninstalling GitKraken Hooks for {0} agent...} other{Uninstalling GitKraken Hooks for {0} agents...}}',
+								),
+								[targets.length],
+							),
 				cancellable: false,
 			},
 			async () => {
@@ -328,6 +466,13 @@ export class AgentStatusService implements Disposable {
 							await uninstallAgentHook(hookClientId);
 						}
 						succeeded.push(agent.displayName);
+						if (op === 'install') {
+							const hint = getManualActivationHint(agent.name);
+							if (hint != null) {
+								manualActivationHints.add(hint);
+								hintedAgents.push(agent);
+							}
+						}
 						this.container.telemetry.sendEvent(
 							op === 'install' ? 'agents/hookInstalled' : 'agents/hookUninstalled',
 							{ 'agent.provider': hookClientId },
@@ -336,7 +481,7 @@ export class AgentStatusService implements Disposable {
 						Logger.error(ex, `AgentStatusService.runHooksOperation(${op})`, `agent=${agent.name}`);
 						failed.push({
 							agent: agent.displayName,
-							error: ex instanceof Error ? ex.message : 'Unknown error',
+							error: getPresentableErrorMessage(ex),
 						});
 					}
 				}
@@ -352,19 +497,70 @@ export class AgentStatusService implements Disposable {
 			'agents.failed': failed.map(f => f.agent).join(',') || undefined,
 		});
 
-		const parts: string[] = [];
+		const succeededAgents = succeeded.join(', ');
+		const failedAgents = failed.map(f => f.agent).join(', ');
+		// A notification renders plain text, so the hint's authored backticks would show literally.
+		const activationHint = Array.from(manualActivationHints, stripHintCodeMarkers).join(' ');
+		let message: string;
 		if (succeeded.length > 0) {
-			parts.push(`${op === 'install' ? 'Installed' : 'Uninstalled'} for ${succeeded.join(', ')}`);
-		}
-		if (failed.length > 0) {
-			parts.push(`Failed for ${failed.map(f => f.agent).join(', ')}`);
+			if (failed.length > 0) {
+				if (op === 'install') {
+					message = activationHint
+						? l10n.t(
+								'GitKraken Hooks: Installed for {0}. Failed for {1}. {2}',
+								succeededAgents,
+								failedAgents,
+								activationHint,
+							)
+						: l10n.t('GitKraken Hooks: Installed for {0}. Failed for {1}.', succeededAgents, failedAgents);
+				} else {
+					message = activationHint
+						? l10n.t(
+								'GitKraken Hooks: Uninstalled for {0}. Failed for {1}. {2}',
+								succeededAgents,
+								failedAgents,
+								activationHint,
+							)
+						: l10n.t(
+								'GitKraken Hooks: Uninstalled for {0}. Failed for {1}.',
+								succeededAgents,
+								failedAgents,
+							);
+				}
+			} else if (op === 'install') {
+				message = activationHint
+					? l10n.t('GitKraken Hooks: Installed for {0}. {1}', succeededAgents, activationHint)
+					: l10n.t('GitKraken Hooks: Installed for {0}.', succeededAgents);
+			} else {
+				message = activationHint
+					? l10n.t('GitKraken Hooks: Uninstalled for {0}. {1}', succeededAgents, activationHint)
+					: l10n.t('GitKraken Hooks: Uninstalled for {0}.', succeededAgents);
+			}
+		} else {
+			message = activationHint
+				? l10n.t('GitKraken Hooks: Failed for {0}. {1}', failedAgents, activationHint)
+				: l10n.t('GitKraken Hooks: Failed for {0}.', failedAgents);
 		}
 
-		const message = `GitKraken Hooks: ${parts.join('. ')}.`;
-		if (failed.length > 0) {
-			void window.showWarningMessage(message);
-		} else {
-			void window.showInformationMessage(message);
+		// A button can only ever point at ONE agent — with two hinted agents there's no single
+		// command to run, so the action is omitted and the hint text (already folded into `message`
+		// above) is all the user gets. Today this can't happen (only Codex carries a hint), but the
+		// check is here so a future second hinted agent degrades gracefully instead of picking one
+		// arbitrarily.
+		const singleHintedAgent = hintedAgents.length === 1 ? hintedAgents[0] : undefined;
+		const startSessionAction =
+			singleHintedAgent != null
+				? { title: l10n.t('Start {0} Session', singleHintedAgent.displayName) }
+				: undefined;
+		const actions = startSessionAction != null ? [startSessionAction] : [];
+
+		const selection =
+			failed.length > 0
+				? await window.showWarningMessage(message, ...actions)
+				: await window.showInformationMessage(message, ...actions);
+
+		if (selection === startSessionAction && singleHintedAgent != null) {
+			void executeCommand('gitlens.startAgentSession', { agentId: `cli:${singleHintedAgent.name}` });
 		}
 	}
 
@@ -376,12 +572,57 @@ export class AgentStatusService implements Disposable {
 		return this.sessions.map(s => this.getSessionStateEntry(s).state);
 	}
 
+	/** Resume destinations for a session of `providerId` homed at `cwd` — see
+	 *  {@link computeResumeTargets}. Wired into `GkAgentProvider`'s `getResumeTargets` callback. */
+	getResumeTargets(providerId: string, cwd: string): readonly AgentSessionResumeTarget[] {
+		return computeResumeTargets(
+			providerId,
+			cwd,
+			id => this._extensionAvailability.isAvailable(id),
+			(workspace.workspaceFolders ?? []).map(folder => folder.uri.fsPath),
+		);
+	}
+
+	/** Archive and resume actions for an `ended` live session — `archive` when the owning provider
+	 *  can archive it, `resume` when its agent supports resume and a cwd resolves (the same
+	 *  cascade {@link toResumableSessionRef} uses). `undefined` when neither applies. */
+	private getEndedSessionActions(
+		session: AgentSession,
+		provider: AgentSessionProvider | undefined,
+	): Pick<AgentSessionHistoryActions, 'archive' | 'resume'> | undefined {
+		const archive = provider?.archiveSession != null ? (true as const) : undefined;
+
+		const resumeCwd = toResumableSessionRef(session).cwd;
+		const resume =
+			resumeCwd != null && getAgentCapabilitiesByProviderId(session.providerId)?.supportsResume === true
+				? { cwd: resumeCwd, targets: this.getResumeTargets(session.providerId, resumeCwd) }
+				: undefined;
+
+		if (archive == null && resume == null) return undefined;
+
+		const actions: { archive?: true; resume?: { cwd: string; targets: readonly AgentSessionResumeTarget[] } } = {};
+		if (archive != null) {
+			actions.archive = archive;
+		}
+		if (resume != null) {
+			actions.resume = resume;
+		}
+		return actions;
+	}
+
 	/** Memoized {@link serializeAgentSession} + its change-detect key — see {@link _sessionStateCache}. */
 	private getSessionStateEntry(session: AgentSession): { state: AgentSessionState; key: string; generation: number } {
 		const cached = this._sessionStateCache.get(session);
 		if (cached != null && cached.generation === this._worktreeMetadataGeneration) return cached;
 
-		const state = serializeAgentSession(session, this.getWorktreeMetadataForSession(session));
+		// Owner by session id, NOT `provider.id === session.providerId`: a session's `providerId` names
+		// the AGENT (`claudeCode`, `codex`, …) while `provider.id` names the provider hosting it, and
+		// one provider now fronts several agents. Same lookup shape as `dispatchSessionAction`.
+		const provider = this._providers.find(candidate =>
+			candidate.sessions.some(candidateSession => candidateSession.id === session.id),
+		);
+		const actions = session.status === 'ended' ? this.getEndedSessionActions(session, provider) : undefined;
+		const state = serializeAgentSession(session, this.getWorktreeMetadataForSession(session), actions);
 		const entry = {
 			state: state,
 			key: JSON.stringify(state, coarsenVolatileTimestamps),
@@ -414,143 +655,214 @@ export class AgentStatusService implements Disposable {
 	/**
 	 * Lists the past, resumable sessions for `worktreePath`, most-recently-active first.
 	 *
-	 * Excludes sessions that are still live (working/idle) — those already flow to consumers through
-	 * {@link onDidChangeSessions} and are opened, not resumed. Terminal `completed` sessions are kept
-	 * by default: they're themselves resumable-past sessions, so they fall through and pick up a
-	 * proper `displayName` from the transcript store below. Archived sessions ARE excluded — the
-	 * tracked row is gone, but the transcript on disk survives and would otherwise resurface. The
-	 * exclude set is passed down via `excludeSessionIds` so a provider excludes it before its own
-	 * `limit` applies, rather than this method dropping them from an already-limited slice.
-	 *
-	 * `excludeCompleted` is for callers that already render tracked completed sessions themselves
-	 * (the webviews show them as cards). Without it those sessions occupy the `limit` slots here and
-	 * are then deduped away at render, so a worktree whose newest transcripts are all tracked can
-	 * show NO past rows — and no "N more" footer — while older ones exist. The resume picker leaves
-	 * it off: it drops completed from its live group precisely so they surface here instead.
+	 * Each provider owns reconciliation of its tracked terminal rows, durable history, archive state,
+	 * and supported actions. This service supplies only that provider's live ids, stamps provenance,
+	 * then merges the normalized results. Provider-local exclusion is load-bearing: session ids are
+	 * not globally unique across harnesses.
 	 */
 	async getPastSessions(
 		worktreePath: string,
-		options?: { limit?: number; excludeCompleted?: boolean },
+		options?: { limit?: number; requireResume?: boolean },
 	): Promise<PastAgentSessionsResult> {
-		const excludeIds = new Set(
-			this.sessions
-				.filter(
-					s =>
-						s.status !== 'completed' ||
-						// Scoped to the ones the caller actually renders a card for HERE. A completed
-						// session whose worktree never resolved (an old CLI record with no worktree
-						// data) matches no worktree, so it has no card — excluding it would make it
-						// invisible rather than merely deduped, and this list is its only surface.
-						(options?.excludeCompleted === true &&
-							s.worktreePath != null &&
-							arePathsEqual(s.worktreePath, worktreePath)),
-				)
-				.map(s => s.id),
-		);
+		const worktreeNamePromise = this.getWorktreeName(worktreePath);
 
-		// Archiving drops the tracked row, but the CLI's transcript survives on disk — without this,
-		// an archived session would resurface here on every subsequent listing. Run alongside the
-		// worktree-name lookup: the archived-id query spawns a CLI process, and serializing the two
-		// would put that latency in front of every panel open.
-		const [archivedSettled, worktreeNameResult] = await Promise.all([
-			Promise.allSettled(
-				this._providers.map(provider => provider.getArchivedSessionIds?.() ?? Promise.resolve([])),
-			),
-			this.getWorktreeName(worktreePath),
-		]);
-		for (const result of archivedSettled) {
-			const ids = getSettledValue(result);
-			if (ids == null) continue;
+		// Retries whenever a provider's `terminalGeneration` moved while its query was in flight — a
+		// session ended, was removed on end, or was pruned mid-query, however the provider represents
+		// that, so the answer may be missing it. A stale answer drops such a session from every
+		// surface — and the resume picker is one-shot, with no follow-up fetch to heal it. A session
+		// that went LIVE mid-query needs no retry: the post-settlement recheck below drops its row
+		// and the caller's live snapshot picks it up; the only residue is a transient over-count in
+		// `total`, which the next fetch corrects. Deliberately uncapped — each extra pass requires
+		// yet ANOTHER terminal transition during the pass before it, so the loop terminates on
+		// quiescence instead of returning an answer known to be missing a session.
+		for (let attempt = 0; ; attempt++) {
+			const sessions: PastAgentSessionState[] = [];
+			let total = 0;
 
-			for (const id of ids) {
-				excludeIds.add(id);
+			// Providers with no historical source omit `listSessionHistory` entirely.
+			const pending: Promise<{
+				provider: AgentSessionProvider;
+				generation: number;
+				result: AgentSessionHistoryResult;
+			}>[] = [];
+			for (const provider of this._providers) {
+				const generation = provider.terminalGeneration;
+				const listing = provider.listSessionHistory?.(worktreePath, {
+					limit: options?.limit,
+					excludeSessionIds: getLiveSessionIds(provider),
+					requireResume: options?.requireResume,
+				});
+				if (listing != null) {
+					pending.push(
+						listing.then(result => ({ provider: provider, generation: generation, result: result })),
+					);
+				}
 			}
-		}
 
-		const worktreeName = worktreeNameResult;
+			const [settled, worktreeName] = await Promise.all([Promise.allSettled(pending), worktreeNamePromise]);
+			let endedMidQuery = false;
+			for (const result of settled) {
+				if (result.status !== 'fulfilled') continue;
 
-		const sessions: PastAgentSessionState[] = [];
-		let total = 0;
+				const { provider, generation, result: listing } = result.value;
+				// Re-evaluated AFTER the query settles, deliberately not the exclusion snapshot: a
+				// session that went live mid-query must not come back as a past row — the picker would
+				// offer Resume against a transcript a live process is still writing. Also the safety
+				// net for a future provider that doesn't honor the provider-local exclusion.
+				const liveIds = getLiveSessionIds(provider);
+				endedMidQuery ||= provider.terminalGeneration !== generation;
+				total += listing.total;
+				for (const session of listing.sessions) {
+					if (liveIds.has(session.id) || session.disposition !== 'ended') continue;
 
-		// Providers with no durable per-directory store omit `listResumableSessions` entirely.
-		const pending: Promise<ResumableSessionsResult>[] = [];
-		for (const provider of this._providers) {
-			const listing = provider.listResumableSessions?.(worktreePath, {
-				limit: options?.limit,
-				excludeSessionIds: excludeIds,
-			});
-			if (listing != null) {
-				pending.push(listing);
+					const normalized = {
+						...session,
+						actions: {
+							...(session.actions.resume != null && provider.resumeSession != null
+								? { resume: session.actions.resume }
+								: {}),
+							...(session.actions.archive === true && provider.archiveSession != null
+								? { archive: true as const }
+								: {}),
+						},
+					};
+					// The item's own agent id, not `provider.id` — consumers dedupe a past row against a
+					// live one via `getAgentSessionIdentityKey(providerId, id)`, so the two must share the
+					// agent namespace.
+					sessions.push(
+						serializePastAgentSession(normalized.providerId, normalized, worktreePath, worktreeName),
+					);
+				}
 			}
-		}
 
-		const settled = await Promise.allSettled(pending);
-		for (const result of settled) {
-			if (result.status !== 'fulfilled') continue;
-
-			total += result.value.total;
-			for (const session of result.value.sessions) {
-				// Safety net: `listResumableSessions` is optional on the interface, and a future
-				// provider may not honor `excludeSessionIds` — re-check here regardless.
-				if (excludeIds.has(session.id)) continue;
-
-				sessions.push(serializePastAgentSession(session, worktreePath, worktreeName));
+			if (endedMidQuery) {
+				Logger.debug(
+					`AgentStatusService.getPastSessions: session(s) ended mid-query; retrying (attempt ${attempt + 1})`,
+				);
+				continue;
 			}
-		}
 
-		// Providers are ordered, so re-sort across them.
-		sessions.sort((a, b) => b.lastActivity - a.lastActivity);
-		// Re-apply the limit across the merged, sorted result — a no-op with a single provider, but
-		// honors the contract once 2+ providers each return up to `limit`.
-		const limited = options?.limit != null && options.limit > 0 ? sessions.slice(0, options.limit) : sessions;
-		return { sessions: limited, total: total };
+			// Providers are ordered, so re-sort across them.
+			sessions.sort((a, b) => b.lastActivity - a.lastActivity);
+			// Re-apply the limit across the merged, sorted result — a no-op with a single provider, but
+			// honors the contract once 2+ providers each return up to `limit`.
+			const limited = options?.limit != null && options.limit > 0 ? sessions.slice(0, options.limit) : sessions;
+			return { sessions: limited, total: total };
+		}
+	}
+
+	/** On-demand enrichment for a past-session sheet — resolves the transcript-backed titles and
+	 *  first/last prompt lazily, paying the read only when the sheet actually opens. Returns
+	 *  `undefined` when the provider is unresolvable or has nothing to add. */
+	async getPastSessionDetail(
+		sessionId: string,
+		providerId: string | undefined,
+		cwd?: string,
+	): Promise<PastAgentSessionDetail | undefined> {
+		const provider = this.getProviderForSession(providerId, sessionId);
+		if (provider?.resolveSessionDetails == null) return undefined;
+
+		try {
+			const details = await provider.resolveSessionDetails(sessionId, cwd);
+			if (details == null) return undefined;
+
+			return { titles: details.titles, firstPrompt: details.firstPrompt, lastPrompt: details.lastPrompt };
+		} catch (ex) {
+			Logger.error(ex, 'AgentStatusService.getPastSessionDetail');
+			return undefined;
+		}
 	}
 
 	/** The worktree's sessions as the resume picker shows them: the live ones it can open, then the
-	 *  past ones it can resume. `completed` sessions are excluded from `live` — they're resumable-past,
-	 *  not open-able, so they're picked up by {@link getPastSessions} instead. */
+	 *  past ones it can resume. `ended` sessions are excluded from `live` — they're resumable-past,
+	 *  not open-able, so they're picked up by {@link getPastSessions} instead. `total` is the
+	 *  provider-reported resumable discovery count (not `past.length`), so the picker's overflow
+	 *  header can tell "N of M" apart from a `limit`-truncated window. */
 	async getResumableSessions(
 		worktreePath: string,
 		options?: { limit?: number },
 	): Promise<{ live: AgentSession[]; past: PastAgentSessionState[]; total: number }> {
+		const { sessions, total } = await this.getPastSessions(worktreePath, { ...options, requireResume: true });
+		// Snapshot `live` AFTER the history query so a session that went live while it was in flight
+		// shows up here (open-able) rather than falling between the two lists.
 		const live = this.sessions.filter(
-			s => !s.isSubagent && s.status !== 'completed' && s.worktreePath === worktreePath,
+			s => !s.isSubagent && s.status !== 'ended' && s.worktreePath === worktreePath,
 		);
-		const { sessions, total } = await this.getPastSessions(worktreePath, options);
-		return { live: live, past: sessions, total: total };
+		// Safety net for a provider that doesn't honor `requireResume`.
+		const past = sessions.filter(session => session.actions.resume != null);
+		return { live: live, past: past, total: total };
 	}
 
 	/**
-	 * Resumes a past session by starting a fresh process against its transcript.
-	 *
-	 * `'default'` uses the Claude Code extension only when `cwd` is itself one of this window's
-	 * workspace folders, and otherwise falls back to a terminal. The extension's open command takes a
-	 * session id and no cwd, so it resolves the session against the window's own folder — right only
-	 * when that folder IS the session's directory. An ancestor folder won't do: the transcript is
-	 * homed under the exact cwd, so the extension would look elsewhere and come up empty. A terminal
-	 * is anchored at `cwd`, so it stays correct for any worktree.
+	 * Resumes a past session by starting a fresh process against its transcript. `target` is
+	 * `undefined` for a target-less resume (Enter in the picker, or a command invoked with no
+	 * explicit destination) — {@link resolveResumeTarget} decides where it goes, and a dismissed
+	 * ask means this no-ops.
 	 */
 	private async resumeSession(
+		providerId: string | undefined,
 		sessionId: string,
 		cwd: string,
-		target: 'default' | 'terminal',
+		target: AgentSessionResumeTarget | undefined,
 		source: 'webview' | 'quickpick',
 		name?: string,
 	): Promise<void> {
-		const useExtension =
-			target === 'default' &&
-			this.getWorkspacePaths().some(p => arePathsEqual(p, cwd)) &&
-			(await isClaudeExtensionAvailable());
-		const resumedInExtension = useExtension && (await tryOpenClaudeSession(sessionId));
-		if (!resumedInExtension) {
-			await resumeClaudeSessionInTerminal({ id: sessionId, cwd: cwd, name: name }, this.container);
+		const provider = this.getProviderForSession(providerId, sessionId);
+		if (provider?.resumeSession == null) return;
+
+		const resolvedProviderId = this.resolveAgentProviderId(provider, sessionId, providerId);
+
+		let resolvedTarget = target;
+		if (resolvedTarget == null) {
+			resolvedTarget = await this.resolveResumeTarget(
+				resolvedProviderId,
+				cwd,
+				name,
+				this.getResumeTargets(resolvedProviderId, cwd),
+			);
+			if (resolvedTarget == null) return;
 		}
 
+		const outcome = await provider.resumeSession(resolvedProviderId, sessionId, cwd, resolvedTarget, name);
+		if (outcome === false) return;
+
 		this.container.telemetry.sendEvent('agents/sessionResumed', {
-			'agent.provider': 'claudeCode',
+			'agent.provider': resolvedProviderId,
 			'agent.resume.source': source,
-			'agent.resume.target': resumedInExtension ? 'extension' : 'terminal',
+			'agent.resume.target': outcome,
 		});
+	}
+
+	/** Resolves an explicit target for a target-less resume. A single-target row always resumes in
+	 *  a terminal — there's nothing to ask. A two-target row honors `gitlens.agents.resumeTarget`
+	 *  when it names one of `targets`, falling back to `'terminal'` when it names the other; `null`
+	 *  asks via the resume-target picker, persisting the pick as the new setting when its pin
+	 *  button was used. Returns `undefined` when the picker was dismissed. */
+	private async resolveResumeTarget(
+		providerId: string,
+		cwd: string,
+		name: string | undefined,
+		targets: readonly AgentSessionResumeTarget[],
+	): Promise<AgentSessionResumeTarget | undefined> {
+		if (targets.length === 1) return 'terminal';
+
+		const setting = configuration.get('agents.resumeTarget');
+		if (setting === 'terminal' || setting === 'extension') {
+			return targets.includes(setting) ? setting : 'terminal';
+		}
+
+		const { showResumeTargetPicker } = await import(
+			/* webpackChunkName: "agents" */ '../quickpicks/resumeTargetPicker.js'
+		);
+		const agentLabel = getAgentCapabilitiesByProviderId(providerId)?.displayName ?? providerId;
+		const pick = await showResumeTargetPicker(providerId, name ?? l10n.t('Session'), agentLabel, cwd, targets);
+		if (pick == null) return undefined;
+
+		if (pick.remember) {
+			await configuration.update('agents.resumeTarget', pick.target, ConfigurationTarget.Global);
+		}
+
+		return pick.target;
 	}
 
 	private async showResumeSessionPicker(worktreePath: string): Promise<void> {
@@ -564,21 +876,40 @@ export class AgentStatusService implements Disposable {
 		if (pick == null) return;
 
 		if (pick.live != null) {
-			if (pick.target === 'resume-terminal') {
-				await resumeClaudeSessionInTerminal(toResumableSessionRef(pick.live), this.container);
+			if (pick.action === 'open') {
+				await this.dispatchSessionAction(pick.live);
 				return;
 			}
 
-			await this.dispatchSessionAction(pick.live);
+			const resumable = toResumableSessionRef(pick.live);
+			// Falls back to the first workspace folder — same as `resumeAgentSessionInTerminal`'s own
+			// fallback — so a cwd-less pick still opens a terminal instead of silently no-oping.
+			const cwd = resumable.cwd ?? workspace.workspaceFolders?.[0]?.uri.fsPath;
+			if (cwd != null) {
+				await this.resumeSession(
+					pick.live.providerId,
+					resumable.id,
+					cwd,
+					'terminal',
+					'quickpick',
+					resumable.name,
+				);
+			} else {
+				await resumeAgentSessionInTerminal(resumable, this.container);
+			}
 			return;
 		}
 
 		if (pick.past == null) return;
 
+		const resume = pick.past.actions.resume;
+		if (resume == null) return;
+
 		await this.resumeSession(
+			pick.past.providerId,
 			pick.past.id,
-			pick.past.cwd,
-			pick.target === 'resume-terminal' ? 'terminal' : 'default',
+			resume.cwd,
+			pick.target,
 			'quickpick',
 			pick.past.displayName,
 		);
@@ -597,8 +928,9 @@ export class AgentStatusService implements Disposable {
 		for (const session of this.sessions) {
 			const entry = this.getSessionStateEntry(session);
 			states.push(entry.state);
-			keys.set(session.id, entry.key);
-			if (!changed && this._lastSessionKeys.get(session.id) !== entry.key) {
+			const identityKey = getAgentSessionIdentityKey(session.providerId, session.id);
+			keys.set(identityKey, entry.key);
+			if (!changed && this._lastSessionKeys.get(identityKey) !== entry.key) {
 				changed = true;
 			}
 		}
@@ -607,6 +939,8 @@ export class AgentStatusService implements Disposable {
 			changed = true;
 		}
 		if (!changed && !force) return;
+
+		Logger.debug(`AgentStatusService.maybeFireSessionsChanged: publishing ${states.length} sessions`);
 
 		this._lastSessionKeys = keys;
 		this._onDidChangeSessions.fire(states);
@@ -668,6 +1002,7 @@ export class AgentStatusService implements Disposable {
 
 		this._worktreeRefreshPromise = (async () => {
 			let changed = false;
+			const start = Date.now();
 			try {
 				// Capture the path set this run resolves so the noisy session trigger can skip
 				// no-op refreshes; the `finally` re-checks it to catch paths that appeared while
@@ -681,7 +1016,7 @@ export class AgentStatusService implements Disposable {
 				//
 				// Keying by the session's `worktreePath` when `commonPath` is missing would be a real
 				// fan-out: `getWorktrees()` dedupes by common path, and an UNREGISTERED worktree dir
-				// resolves to itself — one `git worktree list` per path. Completed sessions read from
+				// resolves to itself — one `git worktree list` per path. Ended sessions read from
 				// the CLI's durable store are exactly that case (they carry a `worktreePath` but never
 				// a `commonPath`, since they're never git-probed) and can span a 30-day history.
 				//
@@ -724,8 +1059,13 @@ export class AgentStatusService implements Disposable {
 					}
 				}
 
+				Logger.debug(
+					`AgentStatusService.refreshWorktreeNameCache: refreshing ${repoPaths.size} repo(s) for ${referencedWorktreePaths.size} worktree path(s)`,
+				);
+
+				const repoPathList = [...repoPaths];
 				const results = await Promise.allSettled(
-					Array.from(repoPaths, async repoPath => {
+					repoPathList.map(async repoPath => {
 						const worktrees = await this.container.git
 							.getRepositoryService(repoPath)
 							.worktrees?.getWorktrees();
@@ -733,10 +1073,16 @@ export class AgentStatusService implements Disposable {
 					}),
 				);
 
-				for (const r of results) {
-					const value = getSettledValue(r);
-					if (value == null) continue;
+				for (const [i, r] of results.entries()) {
+					if (r.status === 'rejected') {
+						Logger.error(
+							r.reason,
+							`AgentStatusService.refreshWorktreeNameCache: getWorktrees failed for ${repoPathList[i]}`,
+						);
+						continue;
+					}
 
+					const value = r.value;
 					for (const wt of value.worktrees) {
 						if (!referencedWorktreePaths.has(wt.path)) continue;
 
@@ -744,7 +1090,7 @@ export class AgentStatusService implements Disposable {
 							name: wt.name,
 							type: wt.type,
 							isDefault: wt.isDefault,
-							// The owning repo — the identity a probe-less completed session lacks. Taken
+							// The owning repo — the identity a probe-less ended session lacks. Taken
 							// from the path we QUERIED, not `wt.repoPath`: the cache rewrites that to the
 							// caller's path whenever it differs from the common path, so it can't be
 							// trusted as an identity.
@@ -793,6 +1139,9 @@ export class AgentStatusService implements Disposable {
 				}
 			} finally {
 				this._worktreeRefreshPromise = undefined;
+				Logger.debug(
+					`AgentStatusService.refreshWorktreeNameCache: completed in ${Date.now() - start}ms, changed=${changed}`,
+				);
 				// A session worktree path may have appeared/changed while this run was in-flight
 				// (it snapshotted `this.sessions` at the top, and `_worktreeRefreshPromise`
 				// deduped any calls since). Re-run if the set no longer matches what we resolved.
@@ -810,45 +1159,87 @@ export class AgentStatusService implements Disposable {
 	 *  unconditionally — the repair path behind the sidebar's Refresh action. The forced publish is
 	 *  the point: a change-gated one would skip a no-op reconcile and leave a diverged webview stale. */
 	async refresh(): Promise<void> {
-		await Promise.allSettled(this._providers.map(p => p.sync?.() ?? Promise.resolve()));
+		Logger.debug(`AgentStatusService.refresh: reconciling ${this._providers.length} provider(s)`);
+
+		const results = await Promise.allSettled(this._providers.map(p => p.sync?.() ?? Promise.resolve()));
+		for (const [i, r] of results.entries()) {
+			if (r.status === 'rejected') {
+				Logger.error(r.reason, `AgentStatusService.refresh: sync failed for provider ${this._providers[i].id}`);
+			}
+		}
+
+		Logger.debug('AgentStatusService.refresh: sync settled, forcing a snapshot publish');
 		this.maybeFireSessionsChanged(true);
+	}
+
+	/** Resolves a provider-scoped session reference. `providerId` is a SESSION provider id — the agent
+	 *  (`claudeCode`, `codex`, …) — which is a different namespace from `AgentSessionProvider.id`, so
+	 *  it can never be matched against `provider.id` directly. Ownership of the session id is the real
+	 *  lookup; `providerId` only disambiguates it. A historical row isn't tracked by anyone, so those
+	 *  fall back to the provider that declares it hosts that agent. `providerId` remains optional only
+	 *  for legacy command links; every current webview context supplies it. */
+	private getProviderForSession(providerId: string | undefined, sessionId: string): AgentSessionProvider | undefined {
+		let provider = this._providers.find(candidate =>
+			candidate.sessions.some(
+				session => session.id === sessionId && (providerId == null || session.providerId === providerId),
+			),
+		);
+		if (provider == null && providerId != null) {
+			// A provider that hosts exactly one agent may omit `agentProviderIds`, in which case its
+			// own id IS the agent id.
+			provider = this._providers.find(candidate =>
+				candidate.agentProviderIds != null
+					? candidate.agentProviderIds.includes(providerId)
+					: candidate.id === providerId,
+			);
+		}
+		if (provider == null) {
+			Logger.warn(
+				`AgentStatusService.getProviderForSession: no provider tracks session ${sessionId}; provider-scoped context required`,
+			);
+		}
+
+		return provider;
+	}
+
+	/** The agent id to attribute a session-scoped telemetry event to. Prefers the caller's
+	 *  provider-scoped context, then the tracked session's own identity, and only falls back to the
+	 *  provider's id when neither is available (a legacy command link against an untracked session). */
+	private resolveAgentProviderId(
+		provider: AgentSessionProvider,
+		sessionId: string,
+		providerId: string | undefined,
+	): string {
+		return providerId ?? provider.sessions.find(session => session.id === sessionId)?.providerId ?? provider.id;
+	}
+
+	private getTrackedSession(providerId: string | undefined, sessionId: string): AgentSession | undefined {
+		return this.getProviderForSession(providerId, sessionId)?.sessions.find(session => session.id === sessionId);
 	}
 
 	resolvePermission(
 		sessionId: string,
 		decision: PermissionDecision,
 		updatedPermissions?: PermissionSuggestion[],
+		providerId?: string,
 	): void {
-		for (const provider of this._providers) {
-			const session = provider.sessions.find(s => s.id === sessionId);
-			if (session == null) continue;
+		const provider = this.getProviderForSession(providerId, sessionId);
+		const session = provider?.sessions.find(candidate => candidate.id === sessionId);
+		if (provider == null || session == null) return;
 
-			// `false` means the local provider holds no `_pendingPermissions` entry to fulfil, for one
-			// of two reasons: another GitLens window owns the session, or the ask arrived on a
-			// non-blocking path (an elicitation, or one the reconciliation poll discovered) and can
-			// only be answered in the agent's own session. Point at the right place rather than
-			// leaving a silent no-op.
-			const resolved = provider.resolvePermission?.(sessionId, decision, updatedPermissions) ?? false;
-			if (!resolved) {
-				// The ask may have been answered in the agent's own session between the render and this
-				// click — a raced click, not an unroutable ask, so say nothing.
-				const refetched = provider.sessions.find(s => s.id === sessionId);
-				if (refetched?.pendingPermission == null) return;
+		// `false` means the local provider holds no pending entry to fulfil — the ask arrived on a
+		// non-blocking path (an elicitation, or one the reconciliation poll discovered) and can only be
+		// answered in the agent's own session. Point at the right place rather than leaving a silent
+		// no-op.
+		const resolved = provider.resolvePermission?.(sessionId, decision, updatedPermissions) ?? false;
+		if (!resolved) {
+			// The ask may have been answered between render and click — a raced click, not an error.
+			const refetched = provider.sessions.find(candidate => candidate.id === sessionId);
+			if (refetched?.pendingPermission == null) return;
 
-				if (session.isPeerOwned) {
-					const target = session.workspacePath
-						? `the GitLens window for ${session.workspacePath}`
-						: 'another GitLens window';
-					void window.showInformationMessage(
-						`This agent session is owned by ${target}. Resolve the request from there.`,
-					);
-				} else {
-					void window.showInformationMessage(
-						`This request can only be answered in the agent's session. Open the session to respond.`,
-					);
-				}
-			}
-			return;
+			void window.showInformationMessage(
+				l10n.t("This request can only be answered in the agent's session. Open the session to respond."),
+			);
 		}
 	}
 
@@ -866,42 +1257,89 @@ export class AgentStatusService implements Disposable {
 			registerCommand('gitlens.agents.uninstallHooksForAgent', (args?: { agentId?: string; source?: Sources }) =>
 				this.handleHooksOperationForAgentCommand('uninstall', args),
 			),
-			registerCommand('gitlens.agents.openSession', (sessionId?: string) => this.openSession(sessionId)),
-			registerCommand('gitlens.agents.resumeSession', (args?: { sessionId: string; cwd: string }) => {
-				if (args?.sessionId == null) return Promise.resolve();
+			registerCommand('gitlens.agents.openSession', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				return this.openSession(session?.sessionId, session?.providerId);
+			}),
+			registerCommand('gitlens.agents.resumeSession', (arg?: unknown) => {
+				const resolved = resolveAgentSessionArg(arg);
+				if (resolved?.sessionId == null || resolved.cwd == null) return Promise.resolve();
 
-				return this.resumeSession(args.sessionId, args.cwd, 'default', 'webview');
+				return this.resumeSession(
+					resolved.providerId,
+					resolved.sessionId,
+					resolved.cwd,
+					resolved.target,
+					'webview',
+				);
+			}),
+			registerCommand('gitlens.agents.resumeSessionInExtension', (arg?: unknown) => {
+				const resolved = resolveAgentSessionArg(arg);
+				if (resolved?.sessionId == null || resolved.cwd == null) return Promise.resolve();
+
+				return this.resumeSession(
+					resolved.providerId,
+					resolved.sessionId,
+					resolved.cwd,
+					'extension',
+					'webview',
+				);
+			}),
+			registerCommand('gitlens.agents.resumeSessionInTerminal', (arg?: unknown) => {
+				const resolved = resolveAgentSessionArg(arg);
+				if (resolved?.sessionId == null || resolved.cwd == null) return Promise.resolve();
+
+				return this.resumeSession(resolved.providerId, resolved.sessionId, resolved.cwd, 'terminal', 'webview');
 			}),
 			registerCommand('gitlens.agents.showResumeSessionPicker', (args?: { worktreePath: string }) => {
 				if (args?.worktreePath == null) return Promise.resolve();
 
 				return this.showResumeSessionPicker(args.worktreePath);
 			}),
-			registerCommand('gitlens.agents.showSessionWorktreeInGraph', (sessionId?: string) =>
-				this.showSessionWorktreeInGraph(sessionId),
-			),
-			registerCommand('gitlens.agents.focusSessionWorktreeInGraph', (sessionId?: string) =>
-				this.focusSessionWorktreeInGraph(sessionId),
-			),
-			registerCommand('gitlens.agents.openSessionWorktreeInNewWindow', (sessionId?: string) =>
-				this.openSessionWorktreeInNewWindow(sessionId),
-			),
+			registerCommand('gitlens.agents.showSessionWorktreeInGraph', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				this.showSessionWorktreeInGraph(session?.sessionId, session?.providerId);
+			}),
+			registerCommand('gitlens.agents.focusSessionWorktreeInGraph', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				this.focusSessionWorktreeInGraph(session?.sessionId, session?.providerId);
+			}),
+			registerCommand('gitlens.agents.openSessionWorktreeInNewWindow', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				this.openSessionWorktree(session?.sessionId, 'newWindow', session?.providerId);
+			}),
+			registerCommand('gitlens.agents.openWorktree', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				this.openSessionWorktree(session?.sessionId, 'currentWindow', session?.providerId);
+			}),
+			registerCommand('gitlens.agents.openWorktreeInNewWindow', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				this.openSessionWorktree(session?.sessionId, 'newWindow', session?.providerId);
+			}),
 			registerCommand('gitlens.agents.switchDefaultAgent', async () => {
 				const { pickAndSetDefaultAgent } = await import(
 					/* webpackChunkName: "agents" */ '../plus/agents/agentPicker.js'
 				);
 				await pickAndSetDefaultAgent(this.container);
 			}),
-			registerCommand('gitlens.agents.openPlanFile', async (planFilePath?: string) => {
+			registerCommand('gitlens.agents.openPlanFile', async (arg?: unknown) => {
+				let planFilePath: string | undefined;
+				if (typeof arg === 'string') {
+					planFilePath = arg;
+				} else if (
+					arg != null &&
+					isWebviewItemContext<AgentSessionContextArgValue>(arg) &&
+					arg.webviewItem.startsWith('gitlens:agent-session')
+				) {
+					planFilePath = arg.webviewItemValue.planFilePath;
+				}
 				if (!planFilePath) return;
 
 				try {
 					await commands.executeCommand('vscode.open', Uri.file(planFilePath));
 				} catch (ex) {
 					Logger.error(ex, 'AgentStatusService.openPlanFile');
-					void window.showErrorMessage(
-						`Failed to open plan: ${ex instanceof Error ? ex.message : String(ex)}`,
-					);
+					void window.showErrorMessage(l10n.t('Failed to open plan: {0}', getPresentableErrorMessage(ex)));
 				}
 			}),
 			registerCommand(
@@ -909,56 +1347,98 @@ export class AgentStatusService implements Disposable {
 				(args?: { sessionId: string; decision: PermissionDecision; alwaysAllow?: boolean }) => {
 					if (args?.sessionId == null || args.decision == null) return;
 
-					let updatedPermissions: PermissionSuggestion[] | undefined;
-					if (args.alwaysAllow) {
-						const session = this.sessions.find(s => s.id === args.sessionId);
-						const suggestions = session?.pendingPermission?.suggestions;
-						if (suggestions != null && suggestions.length > 0) {
-							updatedPermissions = [...suggestions];
-						}
-					}
-
-					this.resolvePermission(args.sessionId, args.decision, updatedPermissions);
+					this.resolvePermissionFromArg(args.sessionId, args.decision, args.alwaysAllow ?? false);
 				},
 			),
-			registerCommand('gitlens.agents.archiveSession', (sessionId?: string) => this.archiveSession(sessionId)),
+			registerCommand('gitlens.agents.allowPermission', (arg?: unknown) =>
+				this.resolvePermissionFromArg(arg, 'allow'),
+			),
+			registerCommand('gitlens.agents.alwaysAllowPermission', (arg?: unknown) =>
+				this.resolvePermissionFromArg(arg, 'allow', true),
+			),
+			registerCommand('gitlens.agents.denyPermission', (arg?: unknown) =>
+				this.resolvePermissionFromArg(arg, 'deny'),
+			),
+			registerCommand('gitlens.agents.approvePlan', (arg?: unknown) =>
+				this.resolvePermissionFromArg(arg, 'allow'),
+			),
+			registerCommand('gitlens.agents.rejectPlan', (arg?: unknown) => this.resolvePermissionFromArg(arg, 'deny')),
+			registerCommand('gitlens.agents.archiveSession', (arg?: unknown) => {
+				const session = resolveAgentSessionArg(arg);
+				return this.archiveSession(session?.sessionId, session?.providerId);
+			}),
+			registerCommand('gitlens.agents.copySessionId', async (arg?: unknown) => {
+				const sessionId = resolveAgentSessionArg(arg)?.sessionId;
+				if (!sessionId) return;
+
+				await env.clipboard.writeText(sessionId);
+			}),
+			registerCommand('gitlens.agents.copyLastPrompt', async (arg?: unknown) => {
+				const lastPrompt = resolveAgentSessionArg(arg)?.lastPrompt;
+				if (!lastPrompt) return;
+
+				await env.clipboard.writeText(lastPrompt);
+			}),
 		];
 	}
 
-	private async archiveSession(sessionId?: string): Promise<void> {
-		if (!sessionId) return;
+	/** Shared by the direct `resolvePermission` command (bare `{sessionId, decision, alwaysAllow}` arg,
+	 *  used by the tree/card action links) and the five label-specific webview-context wrappers
+	 *  (Allow/Always Allow/Deny/Approve Plan/Reject Plan) — VS Code can't pass a per-invocation
+	 *  `decision`/`alwaysAllow` from a `webview/context` menu (it always passes the single merged
+	 *  context object), so those wrappers bake the decision into the command id instead and share this
+	 *  resolution + always-allow-suggestions logic. */
+	private resolvePermissionFromArg(arg: unknown, decision: PermissionDecision, alwaysAllow = false): void {
+		const resolved = resolveAgentSessionArg(arg);
+		const sessionId = resolved?.sessionId;
+		if (sessionId == null) return;
 
-		for (const provider of this._providers) {
-			if (provider.sessions.find(s => s.id === sessionId) == null) continue;
-
-			try {
-				// The CLI archive is keyed by session id and machine-global, so archiving succeeds
-				// regardless of which window discovered the (completed) session. Only record the
-				// telemetry when the provider actually archived — it returns `false` when it refused a
-				// row that resumed out of `completed` since the click.
-				const archived = await provider.archiveSession?.(sessionId);
-				if (archived) {
-					this.container.telemetry.sendEvent('agents/session/archived', { 'agent.provider': provider.id });
-				}
-			} catch (ex) {
-				Logger.error(ex, 'AgentStatusService.archiveSession');
-				void window.showErrorMessage(
-					`Failed to archive session: ${ex instanceof Error ? ex.message : String(ex)}`,
-				);
+		let updatedPermissions: PermissionSuggestion[] | undefined;
+		if (alwaysAllow) {
+			const session = this.getTrackedSession(resolved?.providerId, sessionId);
+			const suggestions = session?.pendingPermission?.suggestions;
+			if (suggestions != null && suggestions.length > 0) {
+				updatedPermissions = [...suggestions];
 			}
+		}
 
-			return;
+		this.resolvePermission(sessionId, decision, updatedPermissions, resolved?.providerId);
+	}
+
+	async archiveSession(sessionId?: string, providerId?: string): Promise<boolean> {
+		if (!sessionId) return false;
+
+		const provider = this.getProviderForSession(providerId, sessionId);
+		if (provider?.archiveSession == null) return false;
+
+		try {
+			// The CLI archive is keyed by session id and machine-global, so archiving succeeds
+			// regardless of which window discovered the (ended) session. Only record the
+			// telemetry when the provider actually archived — it returns `false` when it refused a
+			// row that resumed out of `ended` since the click.
+			// Resolved BEFORE the archive: it drops the row, so the session's own identity is gone by
+			// the time the event is sent.
+			const agentProviderId = this.resolveAgentProviderId(provider, sessionId, providerId);
+			const archived = await provider.archiveSession(sessionId);
+			if (archived) {
+				this.container.telemetry.sendEvent('agents/session/archived', { 'agent.provider': agentProviderId });
+			}
+			return archived;
+		} catch (ex) {
+			Logger.error(ex, 'AgentStatusService.archiveSession');
+			void window.showErrorMessage(l10n.t('Failed to archive session: {0}', getPresentableErrorMessage(ex)));
+			return false;
 		}
 	}
 
-	private async openSession(sessionId?: string): Promise<void> {
+	private async openSession(sessionId?: string, providerId?: string): Promise<void> {
 		const sessions = [...this.sessions];
 		if (sessions.length === 0) return;
 
 		let session: AgentSession | undefined;
 
 		if (sessionId != null) {
-			session = sessions.find(s => s.id === sessionId);
+			session = this.getTrackedSession(providerId, sessionId);
 		} else if (sessions.length === 1) {
 			session = sessions[0];
 		} else {
@@ -972,23 +1452,23 @@ export class AgentStatusService implements Disposable {
 			const items: (SessionPickItem | QuickPickItem)[] = [];
 
 			if (workspaceSessions.length > 0) {
-				items.push(createQuickPickSeparator('This workspace'));
+				items.push(createQuickPickSeparator(l10n.t('This workspace')));
 				for (const s of workspaceSessions) {
 					const worktreeName = this.getWorktreeMetadataForSession(s)?.name;
 					items.push({
-						label: `$(robot) ${getSessionDisplayName(s, worktreeName)}`,
+						label: `$(${getAgentProviderIcon(s.providerId)}) ${getSessionDisplayName(s, worktreeName)}`,
 						description: s.status,
-						detail: worktreeName ? `worktree: ${worktreeName}` : undefined,
+						detail: worktreeName ? l10n.t('worktree: {0}', worktreeName) : undefined,
 						session: s,
 					} satisfies SessionPickItem);
 				}
 			}
 
 			if (externalSessions.length > 0) {
-				items.push(createQuickPickSeparator('Other workspaces'));
+				items.push(createQuickPickSeparator(l10n.t('Other workspaces')));
 				for (const s of externalSessions) {
 					items.push({
-						label: `$(robot) ${getSessionDisplayName(s, this.getWorktreeMetadataForSession(s)?.name)}`,
+						label: `$(${getAgentProviderIcon(s.providerId)}) ${getSessionDisplayName(s, this.getWorktreeMetadataForSession(s)?.name)}`,
 						description: s.status,
 						detail: s.workspacePath ?? undefined,
 						session: s,
@@ -997,7 +1477,7 @@ export class AgentStatusService implements Disposable {
 			}
 
 			const pick = await window.showQuickPick<SessionPickItem | QuickPickItem>(items, {
-				placeHolder: 'Select an agent session',
+				placeHolder: l10n.t('Select an agent session'),
 			});
 			if (pick == null || !('session' in pick)) return;
 
@@ -1012,8 +1492,8 @@ export class AgentStatusService implements Disposable {
 	/** Opens the Commit Graph at a Claude session's worktree with its WIP row selected, highlighting
 	 *  the session's card in the details panel. Backs the editor-title button and tab context menu
 	 *  on Claude Code conversation tabs. Never prompts. */
-	private showSessionWorktreeInGraph(sessionId?: string): void {
-		const session = this.resolveSessionForCommand(sessionId);
+	private showSessionWorktreeInGraph(sessionId?: string, providerId?: string): void {
+		const session = this.resolveSessionForCommand(sessionId, providerId);
 		if (session?.worktreePath == null) return;
 
 		void showWorktreeInGraph(this.container, session.worktreePath, {
@@ -1024,8 +1504,8 @@ export class AgentStatusService implements Disposable {
 
 	/** Focus counterpart to {@link showSessionWorktreeInGraph}: also scopes the graph to the
 	 *  worktree's branch, keeping the details panel closed to match the in-graph Focus commands. */
-	private focusSessionWorktreeInGraph(sessionId?: string): void {
-		const session = this.resolveSessionForCommand(sessionId);
+	private focusSessionWorktreeInGraph(sessionId?: string, providerId?: string): void {
+		const session = this.resolveSessionForCommand(sessionId, providerId);
 		if (session?.worktreePath == null) return;
 
 		void showWorktreeInGraph(this.container, session.worktreePath, {
@@ -1035,11 +1515,15 @@ export class AgentStatusService implements Disposable {
 		});
 	}
 
-	private openSessionWorktreeInNewWindow(sessionId?: string): void {
-		const session = this.resolveSessionForCommand(sessionId);
+	private openSessionWorktree(
+		sessionId: string | undefined,
+		location: 'currentWindow' | 'newWindow',
+		providerId?: string,
+	): void {
+		const session = this.resolveSessionForCommand(sessionId, providerId);
 		if (session?.worktreePath == null) return;
 
-		openWorktreeInNewWindow(session.worktreePath);
+		openWorkspace(Uri.file(session.worktreePath), { location: location });
 	}
 
 	/** Shared resolution for the Claude tab worktree commands. `sessionId` is only a real id when a
@@ -1047,16 +1531,16 @@ export class AgentStatusService implements Disposable {
 	 *  Uri), which is ignored in favor of the active tab's label (the Claude extension renames each
 	 *  tab to the conversation summary — the only handle it exposes), falling back to the
 	 *  most-recently-active local session. Shows a message instead of prompting when nothing matches. */
-	private resolveSessionForCommand(sessionId?: string): AgentSession | undefined {
+	private resolveSessionForCommand(sessionId?: string, providerId?: string): AgentSession | undefined {
 		let session: AgentSession | undefined;
 		if (typeof sessionId === 'string') {
-			session = this.sessions.find(s => s.id === sessionId && s.worktreePath != null);
+			session = this.getTrackedSession(providerId, sessionId);
 		} else {
 			session = this.resolveSessionForActiveClaudeTab({ fallbackToMostRecent: true });
 		}
 
 		if (session?.worktreePath == null) {
-			void window.showInformationMessage('No agent session with an associated worktree was found.');
+			void window.showInformationMessage(l10n.t('No agent session with an associated worktree was found.'));
 			return undefined;
 		}
 
@@ -1068,7 +1552,7 @@ export class AgentStatusService implements Disposable {
 	 *  tab resolves to the most-recently-active session instead — appropriate for explicit user
 	 *  invocations; passive callers should omit it so a failed match does nothing. */
 	resolveSessionForActiveClaudeTab(options?: { fallbackToMostRecent?: boolean }): AgentSession | undefined {
-		const local = this.sessions.filter(s => s.worktreePath != null && !s.isPeerOwned);
+		const local = this.sessions.filter(s => s.worktreePath != null);
 		const session = this.matchSessionToActiveClaudeTab(local);
 		if (session != null || !options?.fallbackToMostRecent) return session;
 
@@ -1109,14 +1593,60 @@ export class AgentStatusService implements Disposable {
 		return pickMostRecentSession(matches);
 	}
 
+	/** Reveals `sessionId` inside THIS window — the Claude Code tab or the integrated terminal that
+	 *  hosts it. The receiving end of `gk ai hook open-session`. `false` when the session is unknown,
+	 *  ended, or lives nowhere this window can show. */
+	async revealSession(sessionId: string): Promise<boolean> {
+		const session = this._providers.flatMap(p => p.sessions).find(s => s.id === sessionId);
+		if (session == null || session.status === 'ended') return false;
+
+		let host: 'extension' | 'cli' | undefined;
+		if (session.providerId === claudeCodeCapabilities.providerId && session.pid != null) {
+			const { classifyClaudeSessionHost } = await import(
+				/* webpackChunkName: "agents" */ '@env/agents/claudeSessionFile.js'
+			);
+			host = await classifyClaudeSessionHost(session.pid);
+			// The relay targets windows by workspace path, so a session whose live panel belongs to
+			// another window's extension host can still land here; opening it in OUR extension would
+			// only create an inert view.
+			if (host === 'extension' && !(await this.isExtensionSessionLocallyHosted(session.pid))) return false;
+		}
+
+		return this.revealSessionInWindow(session, host);
+	}
+
+	/** In-window reveal shared by {@link revealSession} and {@link dispatchSessionAction}: the Claude
+	 *  extension tab when the session is extension-hosted (or host unknown and the extension is
+	 *  present), else the integrated terminal owning `session.pid`. Never reaches for OS-level window
+	 *  focus. */
+	private async revealSessionInWindow(
+		session: AgentSession,
+		host: 'extension' | 'cli' | undefined,
+	): Promise<boolean> {
+		if (session.providerId === claudeCodeCapabilities.providerId) {
+			const useExtension = host === 'extension' || (host == null && (await isClaudeExtensionAvailable()));
+			if (useExtension && (await tryOpenClaudeSession(session.id))) return true;
+		}
+
+		// `host === 'extension'` means the pid IS the extension host itself; never search terminals
+		// for it.
+		if (host !== 'extension' && session.pid != null && (await this._revealTerminal(session.pid))) return true;
+
+		return false;
+	}
+
 	/**
-	 * Deterministically picks the right action for a resolved session — no quickpick:
+	 * Deterministically picks the right action for a resolved session — no quickpick.
+	 *
+	 * Claude Code sessions take the full chain below. Every other agent takes
+	 * {@link dispatchOtherAgentSessionAction}, because each rung here is Claude-specific plumbing:
 	 *  - Extension-hosted, owned by another VS Code window → notify the owning peer (if it has
 	 *    GitLens running with the workspace) to open the session in its Claude Code extension,
 	 *    then `vscode.openFolder` (different workspace) or an info message (same/no workspace,
 	 *    where OS-level cross-window focus is unreliable on multi-window VS Code instances).
 	 *  - Extension-hosted, owned by this window → open in our Claude Code extension.
-	 *  - CLI-hosted → focus the terminal via `pid`.
+	 *  - CLI-hosted → reveal the integrated terminal owning `pid` (see {@link revealSessionInWindow}),
+	 *    falling back to OS-level window focus via `pid` when no such terminal is found.
 	 *  - Neither workspace nor pid → warn.
 	 *
 	 *  Host classification reads `~/.claude/sessions/<pid>.json` for the `entrypoint` field; the
@@ -1124,6 +1654,11 @@ export class AgentStatusService implements Disposable {
 	 *  binary's direct parent is the owning extension host process, so `parent === process.pid`
 	 *  ⇔ ours, with one extra hop reserved as a safety margin for a hypothetical Claude shim
 	 *  between the binary and the extension host.
+	 *
+	 *  A CLI-hosted or unknown-host Claude session, and every non-Claude session, also gets one
+	 *  more rung before OS-level focus: {@link relayAndRaise} asks a peer window to reveal the
+	 *  session, in case it (not this window) actually hosts it. Skipped when the host is known to
+	 *  be this window's own extension — there's no peer to relay to.
 	 */
 	private async dispatchSessionAction(session: AgentSession): Promise<void> {
 		// Match by id, not object identity — provider session arrays are rebuilt on every update
@@ -1131,14 +1666,34 @@ export class AgentStatusService implements Disposable {
 		// its array between the user's pick and this dispatch.
 		const provider = this._providers.find(p => p.sessions.some(s => s.id === session.id));
 
-		// A completed session has no live process — its retained `pid` is a dead (and, across the
+		// An ended session has no live process — its retained `pid` is a dead (and, across the
 		// 30-day retention window, potentially reused) process id, so it must NOT reach the
-		// classify/focus dispatch below. Trigger lazy title/prompt resolution (the poll skips it),
-		// then route straight to resume: `canResumeSession` includes `completed`, so the user gets a
-		// "Resume in Terminal" prompt instead of a focus attempt on an unrelated process.
-		if (session.status === 'completed') {
-			provider?.resolveCompletedSessionDetails?.(session.id);
-			await this.offerResumeOrWarn(session, 'This agent session has ended.');
+		// classify/focus dispatch below. This is true by construction, not assumption: the provider
+		// checks every `ended` CLI record against `claude agents --json` before accepting `ended`,
+		// so a session that's actually still running never reaches this state. Trigger lazy
+		// title/prompt resolution (the poll skips it), then route straight to resume:
+		// `canResumeSession` includes `ended`, so the user gets a "Resume in Terminal" prompt
+		// instead of a focus attempt on an unrelated process.
+		if (session.status === 'ended') {
+			provider?.resolveEndedSessionDetails?.(session.id);
+			await this.offerResumeOrWarn(
+				session,
+				l10n.t('This agent session has ended.'),
+				l10n.t('This agent session has ended. Resume it in a terminal?'),
+			);
+			return;
+		}
+
+		// Fork before ANY Claude-specific probe. `classifyClaudeSessionHost` reads
+		// `~/.claude/sessions/<pid>.json`, which no other agent writes, so it always answers
+		// `undefined` for them — which used to fall through to `tryOpenClaudeSession` with a foreign
+		// session id, asking the Claude Code extension to open a session it has never heard of. A
+		// session whose `providerId` is unrecognized takes the agnostic path too: we cannot claim it's
+		// Claude, and guessing wrong is exactly the bug above. Compared against the descriptor's own
+		// `providerId` — the same constant the provider stamps onto a Claude session — so the two
+		// cannot drift.
+		if (session.providerId !== claudeCodeCapabilities.providerId) {
+			await this.dispatchOtherAgentSessionAction(provider, session);
 			return;
 		}
 
@@ -1157,10 +1712,10 @@ export class AgentStatusService implements Disposable {
 				? await this.isExtensionSessionLocallyHosted(session.pid)
 				: true;
 
-		// Peer-owned extension session, OR a peer-sync-discovered session. Either way the live
-		// panel lives in another VS Code window; opening locally would just create an inert view.
-		if ((host === 'extension' && !isExtensionLocal) || session.isPeerOwned) {
-			await this.dispatchPeerOwnedSession(provider, session);
+		// Extension-hosted session owned by another VS Code window's extension host. The live panel
+		// lives there; opening locally would just create an inert view.
+		if (host === 'extension' && !isExtensionLocal) {
+			await this.dispatchRemotelyHostedSession(provider, session);
 			return;
 		}
 
@@ -1170,14 +1725,16 @@ export class AgentStatusService implements Disposable {
 			// the generic "unable to open" fallback. Forcing `true` here would make the
 			// extension-specific warning unreachable.
 			const extensionAvailable = await isClaudeExtensionAvailable();
-			const useExtension = host === 'extension' || (host == null && extensionAvailable);
 
-			if (useExtension && (await tryOpenClaudeSession(session.id))) return;
-			// Skip the terminal-focus fallback when we *know* the session is extension-hosted —
-			// `pid` would be the extension host (VS Code itself), so focusing it is a no-op that
-			// would falsely signal success and swallow the warning the user needs.
-			if (host !== 'extension' && session.pid != null && (await this.tryFocusProcessWindow(session.pid))) {
-				return;
+			if (await this.revealSessionInWindow(session, host)) return;
+			// Skip the relay and the terminal-focus fallback when we *know* the session is
+			// extension-hosted and owned by THIS window (the only way to reach here with
+			// `host === 'extension'`) — there's no peer to relay to, and `pid` would be the
+			// extension host (VS Code itself), so focusing it is a no-op that would falsely signal
+			// success and swallow the warning the user needs.
+			if (host !== 'extension') {
+				if (await this.relayAndRaise(provider, session)) return;
+				if (session.pid != null && (await this.tryFocusProcessWindow(session.pid))) return;
 			}
 
 			Logger.warn(
@@ -1186,120 +1743,202 @@ export class AgentStatusService implements Disposable {
 			await this.offerResumeOrWarn(
 				session,
 				host === 'extension' && !extensionAvailable
-					? 'The Claude Code extension is not installed or not available.'
-					: 'Unable to open agent session.',
+					? l10n.t('The Claude Code extension is not installed or not available.')
+					: l10n.t('Unable to open agent session.'),
+				host === 'extension' && !extensionAvailable
+					? l10n.t('The Claude Code extension is not installed or not available. Resume it in a terminal?')
+					: l10n.t('Unable to open agent session. Resume it in a terminal?'),
 			);
 			return;
 		}
 
-		// CLI-hosted out-of-workspace session — focus the terminal.
+		// CLI-hosted (or extension-hosted-but-locally-owned, out-of-workspace) session — reveal the
+		// integrated terminal, relay to a peer window (skipped when we *know* it's ours — see the
+		// in-workspace branch above for why), then fall back to OS-level window focus.
+		if (await this.revealSessionInWindow(session, host)) return;
+		if (host !== 'extension') {
+			if (await this.relayAndRaise(provider, session)) return;
+		}
 		if (session.pid != null && (await this.tryFocusProcessWindow(session.pid))) return;
 
 		Logger.warn(
 			`AgentStatusService.dispatchSessionAction: no actionable target for session ${session.id} (isInWorkspace=${session.isInWorkspace}, workspacePath=${session.workspacePath ?? 'none'}, pid=${session.pid ?? 'none'})`,
 		);
-		await this.offerResumeOrWarn(session, 'Unable to open agent session.');
+		await this.offerResumeOrWarn(
+			session,
+			l10n.t('Unable to open agent session.'),
+			l10n.t('Unable to open agent session. Resume it in a terminal?'),
+		);
+	}
+
+	/**
+	 * Open path for every agent that isn't Claude Code. Deliberately reaches for nothing
+	 * Claude-specific — no `classifyClaudeSessionHost`, no `isClaudeExtensionAvailable`, no
+	 * `tryOpenClaudeSession`: none of those know anything about a Codex/Copilot/OpenCode session id.
+	 * What's left is the terminal the agent is actually running in, reached through its `pid` — in
+	 * this window, then (via {@link relayAndRaise}) a peer window that might actually host it — and
+	 * a warning when even that fails.
+	 *
+	 * `sharesPids` (Codex) does NOT suppress the focus attempt. A shared pid is ambiguous for
+	 * *liveness* — it can't tell you which of the multiplexed sessions is still running, which is why
+	 * the provider's pruning handles that separately — but it unambiguously names the host process
+	 * whose terminal the session lives in, and that terminal is exactly what the user asked to see.
+	 */
+	private async dispatchOtherAgentSessionAction(
+		provider: AgentSessionProvider | undefined,
+		session: AgentSession,
+	): Promise<void> {
+		if (await this.revealSessionInWindow(session, undefined)) return;
+		if (await this.relayAndRaise(provider, session)) return;
+		if (session.pid != null && (await this.tryFocusProcessWindow(session.pid))) return;
+
+		Logger.warn(
+			`AgentStatusService.dispatchOtherAgentSessionAction: no actionable target for ${session.providerId} session ${session.id} (isInWorkspace=${session.isInWorkspace}, workspacePath=${session.workspacePath ?? 'none'}, pid=${session.pid ?? 'none'})`,
+		);
+		await this.offerResumeOrWarn(
+			session,
+			l10n.t('Unable to open agent session.'),
+			l10n.t('Unable to open agent session. Resume it in a terminal?'),
+		);
 	}
 
 	/** Shared dead-end handler for every open path that can't reach the live session. When the
-	 *  session is resumable (idle, or waiting on user input — see {@link canResumeSession}),
-	 *  prompts the user to spawn a fresh terminal running `claude --resume <id>`; otherwise just
-	 *  surfaces the original warning. Keeps the prompt single-action so a dismiss is the obvious
-	 *  "no" — the warning text itself communicates the failure that triggered the fallback. */
-	private async offerResumeOrWarn(session: AgentSession, warning: string): Promise<void> {
-		if (!canResumeSession(session)) {
+	 *  session is resumable (idle, or waiting on user input — see {@link canResumeSession}) AND its
+	 *  agent declares a CLI resume command (`supportsResume`), prompts the user to spawn a fresh
+	 *  terminal running it; otherwise just surfaces the original warning. Keeps the prompt
+	 *  single-action so a dismiss is the obvious "no" — the warning text itself communicates the
+	 *  failure that triggered the fallback.
+	 *
+	 *  The capability check is load-bearing, not defensive: {@link resumeAgentSessionInTerminal}
+	 *  runs the agent's own resume command against `session.id`, so offering it for an agent with no
+	 *  descriptor would spawn nothing (or the wrong thing) against an id it has never seen. */
+	private async offerResumeOrWarn(session: AgentSession, warning: string, resumePrompt: string): Promise<void> {
+		const supportsResume = getAgentCapabilitiesByProviderId(session.providerId)?.supportsResume === true;
+		if (!supportsResume || !canResumeSession(session)) {
 			void window.showWarningMessage(warning);
 			return;
 		}
 
-		const action = 'Resume in Terminal';
-		const choice = await window.showWarningMessage(`${warning} Resume it in a terminal?`, action);
+		const action = l10n.t('Resume in Terminal');
+		const choice = await window.showWarningMessage(resumePrompt, action);
 		if (choice !== action) return;
 
 		// Re-read after the prompt: it can sit unanswered indefinitely, and a resume reuses the SAME
-		// session id, so acting on the captured snapshot could start a second `claude --resume` against
-		// a transcript another window is already writing. A row that's gone (archived, or reconciled
+		// session id, so acting on the captured snapshot could start a second resume against a
+		// transcript another window is already writing. A row that's gone (archived, or reconciled
 		// away) is still safe to resume — its transcript is on disk and nothing is holding it.
 		//
 		// The test is that status AND pid are unchanged, not merely that it's still resumable. A
-		// resume elsewhere revives a `completed` row to `idle`, which `canResumeSession` accepts, so
+		// resume elsewhere revives an `ended` row to `idle`, which `canResumeSession` accepts, so
 		// a resumability check alone would wave the second process straight through; and a reconnect
 		// can swap the pid while HOLDING `idle`, which a status-only check would miss. Either move
 		// means the situation the user agreed to no longer holds.
 		const current = this.sessions.find(s => s.id === session.id);
 		if (current != null && (current.status !== session.status || current.pid !== session.pid)) {
-			void window.showInformationMessage('That agent session changed state, so it was not resumed.');
+			void window.showInformationMessage(l10n.t('That agent session changed state, so it was not resumed.'));
 			return;
 		}
 
-		await resumeClaudeSessionInTerminal(toResumableSessionRef(current ?? session), this.container);
+		await resumeAgentSessionInTerminal(toResumableSessionRef(current ?? session), this.container);
 	}
 
-	/** Routes a session that's owned by another VS Code window. Notifies the owning peer (if it
-	 *  has GitLens running with the workspace) so its Claude Code extension surfaces the session,
-	 *  then either `vscode.openFolder` (different workspace — focuses the peer window via the
-	 *  folder-already-open path) or an info message (same workspace or unknown workspace, where
-	 *  OS-level cross-window focus across a multi-window VS Code app is unreliable). */
-	private async dispatchPeerOwnedSession(
+	/** Relays an open-session request to whichever VS Code window actually hosts `session`, then
+	 *  raises that window into view — the shared core of {@link dispatchRemotelyHostedSession}
+	 *  (which knows the session IS extension-hosted elsewhere) and the CLI-hosted/unknown-host and
+	 *  non-Claude fallback rungs in {@link dispatchSessionAction}/{@link dispatchOtherAgentSessionAction}
+	 *  (which only suspect it might be, after the in-window reveal came up empty). Returns `false` —
+	 *  having done nothing — when the provider can't relay, there's no target path, or the relay
+	 *  wasn't confirmed delivered within the wait cap; every caller falls back to its own dead-end
+	 *  handling in that case. `vscode.openFolder` is only safe to fire once delivery is confirmed:
+	 *  unlike a focus-only call, it would otherwise risk opening a folder no window actually holds,
+	 *  replacing the current workspace instead of finding a peer to focus. */
+	private async relayAndRaise(provider: AgentSessionProvider | undefined, session: AgentSession): Promise<boolean> {
+		// Target folder to focus. Each step picks a more general fallback so out-of-workspace
+		// sessions (cwd doesn't match any of OUR workspace folders) still resolve to a path some
+		// other window likely has open as its workspace root:
+		//  - workspacePath: our matched folder (only set when isInWorkspace=true; unused here)
+		//  - worktreePath:  the session's worktree root — correct for named worktrees where the
+		//                   other window has the worktree dir open, not the common repo dir
+		//  - commonPath:    the parent repo's common dir — correct for default-worktree sessions
+		//  - cwd:           last-resort raw cwd. May be a subdir of the other window's workspace,
+		//                   in which case `vscode.openFolder` would open the subdir as its own
+		//                   workspace instead of focusing that window. In practice Claude sessions
+		//                   run at the workspace root so cwd usually equals what it holds; the
+		//                   residual risk is documented rather than fixed (full fix would have the
+		//                   relay return the matched workspacePath so this function could pass
+		//                   that exact path to `openFolder` instead).
+		const targetPath = session.workspacePath ?? session.worktreePath ?? session.commonPath ?? session.cwd;
+		if (provider?.relayOpenSession == null || targetPath == null) return false;
+
+		// Cap the wait so an unhealthy relay can't stall the user click for the full CLI spawn
+		// timeout — a relay that hasn't confirmed delivery within the cap is treated the same as one
+		// that failed outright, and the caller falls back to its own next rung. `.catch` is on the
+		// relay promise itself (not the race) so a late rejection after the timeout wins is still
+		// observed, just discarded.
+		const relayPromise = provider.relayOpenSession(session.id, targetPath).catch((ex: unknown) => {
+			Logger.warn(
+				`AgentStatusService.relayAndRaise: relayOpenSession failed: ${
+					ex instanceof Error ? ex.message : String(ex)
+				}`,
+			);
+			return false;
+		});
+		const delivered = await Promise.race([
+			relayPromise,
+			new Promise<boolean>(resolve => setTimeout(resolve, 500, false)),
+		]);
+		if (!delivered) return false;
+
+		// Different workspace → `vscode.openFolder` with `forceNewWindow: false` asks VS Code to
+		// focus the existing window holding `targetPath`. Delivery already confirmed a live window
+		// holds the session, so VS Code's window-folder matching reliably hits it instead of
+		// replacing the current window.
+		if (!session.isInWorkspace) {
+			void commands.executeCommand('vscode.openFolder', Uri.file(targetPath), { forceNewWindow: false });
+			return true;
+		}
+
+		// Same workspace (already open here, can't disambiguate which window to focus at the OS
+		// level). Surface a clear hint with the cwd so the user can switch manually.
+		const warning = session.cwd
+			? l10n.t('This session is running in another VS Code window ({0}). Switch to it to view.', session.cwd)
+			: l10n.t('This session is running in another VS Code window. Switch to it to view.');
+		const resumePrompt = session.cwd
+			? l10n.t(
+					'This session is running in another VS Code window ({0}). Switch to it to view. Resume it in a terminal?',
+					session.cwd,
+				)
+			: l10n.t(
+					'This session is running in another VS Code window. Switch to it to view. Resume it in a terminal?',
+				);
+		await this.offerResumeOrWarn(session, warning, resumePrompt);
+		return true;
+	}
+
+	/** Routes a session that's hosted in another VS Code window's extension: relays and raises it
+	 *  via {@link relayAndRaise}, falling back to the same "switch to it" info hint when the relay
+	 *  isn't delivered (unhealthy relay, no target path, or the owning window never confirmed). */
+	private async dispatchRemotelyHostedSession(
 		provider: AgentSessionProvider | undefined,
 		session: AgentSession,
 	): Promise<void> {
-		// Target folder to focus. Each step picks a more general fallback so out-of-workspace
-		// sessions (cwd doesn't match any of OUR workspace folders) still resolve to a path some
-		// peer window likely has open as its workspace root:
-		//  - workspacePath: our matched folder (only set when isInWorkspace=true; unused here)
-		//  - worktreePath:  the session's worktree root — correct for named worktrees where the
-		//                   peer has the worktree dir open, not the common repo dir
-		//  - commonPath:    the parent repo's common dir — correct for default-worktree sessions
-		//  - cwd:           last-resort raw cwd. May be a subdir of the peer's workspace, in which
-		//                   case `vscode.openFolder` would open the subdir as its own workspace
-		//                   instead of focusing the peer. In practice Claude sessions run at the
-		//                   workspace root so cwd usually equals what the peer holds; the residual
-		//                   risk is documented rather than fixed (full fix would have
-		//                   `notifyPeerOpenSession` return the matched workspacePath so this
-		//                   function could pass that exact path to `openFolder` instead).
-		const targetPath = session.workspacePath ?? session.worktreePath ?? session.commonPath ?? session.cwd;
+		if (await this.relayAndRaise(provider, session)) return;
 
-		if (provider?.notifyPeerOpenSession != null && targetPath != null) {
-			// Cap the wait so an unhealthy peer can't stall the user click for the full per-fetch
-			// timeout. The peer only needs to *start* opening the session before the focus switch
-			// lands. `.catch` is on the notify promise itself (not the race) so a late rejection
-			// after the timeout wins is still observed. We don't use the return value: VS Code's
-			// `openFolder` finds and focuses the owning window whether or not it has GitLens, so
-			// peer match status isn't the right signal for `forceNewWindow`.
-			const notifyPromise = provider.notifyPeerOpenSession(targetPath, session.id).catch((ex: unknown) => {
-				Logger.warn(
-					`AgentStatusService.dispatchPeerOwnedSession: notifyPeerOpenSession failed: ${
-						ex instanceof Error ? ex.message : String(ex)
-					}`,
-				);
-				return false;
-			});
-			await Promise.race([notifyPromise, new Promise<void>(resolve => setTimeout(resolve, 500))]);
-		}
-
-		// Different workspace → `vscode.openFolder` with `forceNewWindow: false` asks VS Code to
-		// focus the existing window holding `targetPath` (this works across windows even if the
-		// peer doesn't have GitLens). Peer-owned implies *some* live window holds the folder (the
-		// session is running there), so VS Code's window-folder matching reliably hits it instead
-		// of replacing the current window.
-		if (!session.isInWorkspace && targetPath != null) {
-			void commands.executeCommand('vscode.openFolder', Uri.file(targetPath), {
-				forceNewWindow: false,
-			});
-			return;
-		}
-
-		// Same workspace (already open here, can't disambiguate) or no target at all. Surface a
-		// clear hint with the cwd so the user can switch manually.
 		Logger.warn(
-			`AgentStatusService.dispatchPeerOwnedSession: routed via info hint (pid=${session.pid ?? 'none'}, workspacePath=${session.workspacePath ?? 'none'}, cwd=${session.cwd ?? 'none'})`,
+			`AgentStatusService.dispatchRemotelyHostedSession: routed via info hint (pid=${session.pid ?? 'none'}, workspacePath=${session.workspacePath ?? 'none'}, cwd=${session.cwd ?? 'none'})`,
 		);
-		const cwdHint = session.cwd ? ` (${session.cwd})` : '';
-		await this.offerResumeOrWarn(
-			session,
-			`This session is running in another VS Code window${cwdHint}. Switch to it to view.`,
-		);
+		const warning = session.cwd
+			? l10n.t('This session is running in another VS Code window ({0}). Switch to it to view.', session.cwd)
+			: l10n.t('This session is running in another VS Code window. Switch to it to view.');
+		const resumePrompt = session.cwd
+			? l10n.t(
+					'This session is running in another VS Code window ({0}). Switch to it to view. Resume it in a terminal?',
+					session.cwd,
+				)
+			: l10n.t(
+					'This session is running in another VS Code window. Switch to it to view. Resume it in a terminal?',
+				);
+		await this.offerResumeOrWarn(session, warning, resumePrompt);
 	}
 
 	/** Returns `true` iff the given `pid` (a Claude binary process for an extension-hosted session)
@@ -1362,10 +2001,10 @@ export class AgentStatusService implements Disposable {
  *  drift; real changes (phase/status/membership/permission/worktree) still differ in the key and
  *  push immediately. The timestamps stay full-precision in the payload itself.
  *
- *  Dates reach this already converted by `toJSON`, hence the `string` check. */
+ *  `lastActivity`/`phaseSince` on the DTO are epoch-ms numbers, hence the `number` check. */
 function coarsenVolatileTimestamps(key: string, value: unknown): unknown {
-	return (key === 'lastActivity' || key === 'phaseSince') && typeof value === 'string'
-		? `${Math.floor(Date.parse(value) / 60000)}`
+	return (key === 'lastActivity' || key === 'phaseSince') && typeof value === 'number'
+		? Math.floor(value / 60000)
 		: value;
 }
 

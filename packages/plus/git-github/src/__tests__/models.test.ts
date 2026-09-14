@@ -1,11 +1,12 @@
 import * as assert from 'node:assert/strict';
 import { suite, test } from 'mocha';
+import { PullRequestReviewState } from '@gitlens/git/models/pullRequest.js';
 import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { GitHubApiConfig } from '../api/config.js';
 import { GitHubApi } from '../api/github.js';
 import type { GitHubTokenInfo } from '../api/token.js';
-import type { GitHubIssue, GitHubPullRequestLite } from '../models.js';
-import { fromGitHubIssue, fromGitHubPullRequestLite } from '../models.js';
+import type { GitHubIssue, GitHubPullRequest, GitHubPullRequestLite } from '../models.js';
+import { fromGitHubIssue, fromGitHubPullRequest, fromGitHubPullRequestLite } from '../models.js';
 
 /**
  * GitHub's GraphQL `Issue.author` is an `Actor` and is nullable — it comes back `null` once the
@@ -82,7 +83,7 @@ suite('fromGitHubIssue', () => {
  * reject the fields — so the mapper sees them absent (Enterprise), `null` (github.com, unstacked), or
  * populated. Only the last case may produce stack info.
  */
-function createPullRequest(stack?: Pick<GitHubPullRequestLite, 'stack' | 'stackEntry'>): GitHubPullRequestLite {
+function createPullRequestLite(stack?: Pick<GitHubPullRequestLite, 'stack' | 'stackEntry'>): GitHubPullRequestLite {
 	return {
 		id: 'pr-5702',
 		number: 5702,
@@ -98,6 +99,7 @@ function createPullRequest(stack?: Pick<GitHubPullRequestLite, 'stack' | 'stackE
 		isDraft: false,
 		isCrossRepository: false,
 		author: member,
+		body: null,
 		baseRefName: 'feature/stacks-model',
 		baseRefOid: 'b21f904',
 		headRefName: 'feature/stacks-merge',
@@ -118,13 +120,13 @@ function createPullRequest(stack?: Pick<GitHubPullRequestLite, 'stack' | 'stackE
 			viewerPermission: 'ADMIN',
 		},
 		...stack,
-	} as unknown as GitHubPullRequestLite;
+	};
 }
 
 suite('fromGitHubPullRequestLite stack mapping', () => {
 	test('maps a stacked pull request to its layer', () => {
 		const pr = fromGitHubPullRequestLite(
-			createPullRequest({
+			createPullRequestLite({
 				stack: { id: 'stack-7', number: 7, size: 3, baseRefName: 'main' },
 				stackEntry: { position: 2 },
 			}),
@@ -136,7 +138,7 @@ suite('fromGitHubPullRequestLite stack mapping', () => {
 
 	test('keeps the stack base distinct from the pull request base', () => {
 		const pr = fromGitHubPullRequestLite(
-			createPullRequest({
+			createPullRequestLite({
 				stack: { id: 'stack-7', number: 7, size: 3, baseRefName: 'main' },
 				stackEntry: { position: 2 },
 			}),
@@ -149,24 +151,153 @@ suite('fromGitHubPullRequestLite stack mapping', () => {
 	});
 
 	test('leaves an unstacked pull request without stack info', () => {
-		const pr = fromGitHubPullRequestLite(createPullRequest({ stack: null, stackEntry: null }), provider);
+		const pr = fromGitHubPullRequestLite(createPullRequestLite({ stack: null, stackEntry: null }), provider);
 
 		assert.equal(pr.stack, undefined);
 	});
 
 	test('leaves stack info off when the fields were never selected (Enterprise)', () => {
-		const pr = fromGitHubPullRequestLite(createPullRequest(), provider);
+		const pr = fromGitHubPullRequestLite(createPullRequestLite(), provider);
 
 		assert.equal(pr.stack, undefined);
 	});
 
 	test('requires both halves — a stack without an entry has no position to report', () => {
 		const pr = fromGitHubPullRequestLite(
-			createPullRequest({ stack: { id: 'stack-7', number: 7, size: 3, baseRefName: 'main' }, stackEntry: null }),
+			createPullRequestLite({
+				stack: { id: 'stack-7', number: 7, size: 3, baseRefName: 'main' },
+				stackEntry: null,
+			}),
 			provider,
 		);
 
 		assert.equal(pr.stack, undefined);
+	});
+});
+
+/**
+ * `latestReviews` is capped at 25 and `viewerLatestReview` is the escape hatch for the row a "needs my review"
+ * surface is actually asking about, so the union of the two is the delicate part of the full projection: it can
+ * lose the viewer's review, duplicate it, or invent one that was never submitted.
+ */
+suite('fromGitHubPullRequest review projection', () => {
+	function createFullPullRequest(
+		latestReviews: GitHubPullRequest['latestReviews']['nodes'],
+		viewerLatestReview: GitHubPullRequest['viewerLatestReview'],
+	): GitHubPullRequest {
+		const repository = {
+			isFork: false,
+			name: 'vscode-gitlens',
+			owner: { login: 'gitkraken' },
+			sshUrl: 'git@github.com:gitkraken/vscode-gitlens.git',
+			url: 'https://github.com/gitkraken/vscode-gitlens',
+		};
+
+		return {
+			id: 'pr-1',
+			number: 1,
+			title: 'PR 1',
+			url: 'https://github.com/gitkraken/vscode-gitlens/pull/1',
+			permalink: 'https://github.com/gitkraken/vscode-gitlens/pull/1',
+			state: 'OPEN',
+			createdAt: '2026-01-01T00:00:00Z',
+			updatedAt: '2026-01-02T00:00:00Z',
+			closed: false,
+			closedAt: null,
+			mergedAt: null,
+			author: member,
+			body: null,
+			baseRefName: 'main',
+			baseRefOid: 'base-sha',
+			headRefName: 'feature',
+			headRefOid: 'head-sha',
+			headRepository: repository,
+			repository: { ...repository, viewerPermission: 'WRITE' },
+			isCrossRepository: false,
+			isDraft: false,
+			additions: 1,
+			deletions: 0,
+			changedFiles: 1,
+			assignees: { nodes: [] },
+			checksUrl: 'https://github.com/gitkraken/vscode-gitlens/pull/1/checks',
+			mergeable: 'MERGEABLE',
+			reviewDecision: 'REVIEW_REQUIRED',
+			latestReviews: { nodes: latestReviews },
+			viewerLatestReview: viewerLatestReview,
+			reviewRequests: { nodes: [] },
+			commits: { totalCount: 0, nodes: [] },
+			totalCommentsCount: 0,
+			viewerCanUpdate: true,
+		};
+	}
+
+	const otherReview = {
+		id: 'review-other',
+		author: { login: 'octo', avatarUrl: '', url: 'https://github.com/octo' },
+		state: 'COMMENTED' as const,
+		commit: { oid: 'other-sha' },
+	};
+
+	test('appends the viewer review when it falls outside the capped window, with its commit oid', () => {
+		const pr = fromGitHubPullRequest(
+			createFullPullRequest([otherReview], {
+				id: 'review-viewer',
+				author: member,
+				state: 'APPROVED',
+				commit: { oid: 'viewer-sha' },
+			}),
+			provider,
+		);
+
+		assert.equal(pr.latestReviews?.length, 2);
+		const viewer = pr.latestReviews?.find(r => r.reviewer.name === 'eamodio');
+		assert.equal(viewer?.state, PullRequestReviewState.Approved);
+		assert.equal(viewer?.commitOid, 'viewer-sha', 'the oid the review was submitted against survives');
+	});
+
+	test('does not duplicate the viewer review when it is already inside the window', () => {
+		const viewerReview = {
+			id: 'review-viewer',
+			author: member,
+			state: 'CHANGES_REQUESTED' as const,
+			commit: { oid: 'viewer-sha' },
+		};
+
+		const pr = fromGitHubPullRequest(createFullPullRequest([otherReview, viewerReview], viewerReview), provider);
+
+		assert.equal(pr.latestReviews?.length, 2, 'the same review id must not appear twice');
+		assert.equal(
+			pr.latestReviews?.filter(r => r.reviewer.name === 'eamodio').length,
+			1,
+			'one row per reviewer, not one per selection it arrived in',
+		);
+	});
+
+	test('drops an unsubmitted viewer draft rather than reporting it as a submitted review', () => {
+		// GitHub exposes a PENDING (unsubmitted) review only to its own author, and only through
+		// `viewerLatestReview` — appending it would tell a "needs my review" consumer the review is done.
+		const pr = fromGitHubPullRequest(
+			createFullPullRequest([otherReview], {
+				id: 'review-draft',
+				author: member,
+				state: 'PENDING',
+				commit: { oid: 'draft-sha' },
+			}),
+			provider,
+		);
+
+		assert.equal(pr.latestReviews?.length, 1);
+		assert.equal(pr.latestReviews?.[0]?.reviewer.name, 'octo');
+	});
+
+	test('keeps a submitted viewer review that supersedes nothing when the window is empty', () => {
+		const pr = fromGitHubPullRequest(
+			createFullPullRequest([], { id: 'review-viewer', author: member, state: 'APPROVED', commit: null }),
+			provider,
+		);
+
+		assert.equal(pr.latestReviews?.length, 1);
+		assert.equal(pr.latestReviews?.[0]?.commitOid, undefined, 'a review without a commit maps to no oid');
 	});
 });
 
@@ -195,7 +326,7 @@ suite('GitHubApi.searchMyIssues', () => {
 		const issues = await api.searchMyIssues(provider, token);
 
 		assert.deepEqual(
-			issues?.map(i => i.id),
+			issues?.values.map(i => i.id),
 			['2', '1'],
 			'the unmappable node is skipped, the rest survive',
 		);
@@ -213,11 +344,11 @@ suite('GitHubApi.searchMyIssues', () => {
 		const issues = await api.searchMyIssues(provider, token);
 
 		assert.deepEqual(
-			issues?.map(i => i.id),
+			issues?.values.map(i => i.id),
 			['2701', '1'],
 			'a null author no longer discards every issue in the response',
 		);
-		assert.equal(issues?.find(i => i.id === '2701')?.author, undefined);
+		assert.equal(issues?.values.find(i => i.id === '2701')?.author, undefined);
 
 		api.dispose();
 	});
@@ -232,7 +363,7 @@ suite('GitHubApi.searchMyIssues', () => {
 		const issues = await api.searchMyIssues(provider, token);
 
 		assert.deepEqual(
-			issues?.map(i => i.id),
+			issues?.values.map(i => i.id),
 			['1'],
 		);
 

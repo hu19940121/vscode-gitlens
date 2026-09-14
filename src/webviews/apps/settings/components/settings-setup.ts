@@ -1,17 +1,21 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { styleMap } from 'lit/directives/style-map.js';
+import { focusOutline } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { cspStyleMap } from '@gitlens/components/cspStyleMap.directive.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { GraphWalkthroughProgress, WalkthroughProgress } from '../../../../constants.walkthroughs.js';
 import { graphWalkthroughProgressSteps, walkthroughProgressSteps } from '../../../../constants.walkthroughs.js';
 import { createCommandLink } from '../../../../system/commands.js';
-import { focusOutline } from '../../shared/components/styles/lit/a11y.css.js';
-import { boxSizingBase } from '../../shared/components/styles/lit/base.css.js';
+import type { SubscriptionContextState } from '../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../shared/contexts/subscription.js';
 import type { SettingsActions } from '../actions.js';
 import type { SettingsState } from '../state.js';
 import { settingsStateContext } from '../state.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 
 // Register the ring's sweep angle as a typed custom property so its fill can transition.
 // @property inside a constructable/shadow stylesheet doesn't reliably register in Chromium —
@@ -172,10 +176,12 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				color: var(--color-foreground);
 			}
 
-			/* Ring fill by completed-step count — set via static CSS, not a styleMap inline style:
-			   styleMap-set custom properties don't apply when this component mounts via in-app
-			   navigation (only on initial page load), which left the conic ring greyed until reload.
-			   Keep the count of rules in sync with the number of steps rendered. */
+			/* Ring fill by completed-step count — set via static CSS rather than a dynamic style.
+  This worked around Lit's styleMap writing the style attribute on its first update,
+  which the webview CSP blocks; on an in-app navigation mount that first update is the
+  only one, so the ring stayed greyed. cspStyleMap fixes that at the source, so these
+  rules could now collapse back to a single dynamic custom property.
+  Until then, keep the count of rules in sync with the number of steps rendered. */
 			.hero__ring--0 {
 				--setup-ring-angle: 0deg;
 			}
@@ -247,7 +253,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			}
 
 			/* Per-step purple→blue rail/icon accent, by position — static CSS for the same
-			   navigation-remount reason as the ring above. */
+  navigation-remount reason as the ring above. */
 			.steps > li:nth-child(1) .step {
 				--step-accent: color-mix(in srgb, var(--gl-brand-purple), var(--gl-brand-blue) 0%);
 			}
@@ -391,6 +397,9 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	@consume({ context: settingsStateContext })
 	private _state!: SettingsState;
 
+	@consume({ context: subscriptionContext, subscribe: true })
+	private _subscription!: SubscriptionContextState;
+
 	@property({ attribute: false })
 	actions?: SettingsActions;
 
@@ -415,16 +424,20 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	private renderHero(done: number, total: number) {
 		const { title, subtitle } = this.heroCopy(done, total);
 
-		// The ring fill (angle) is applied by the `.hero__ring--<done>` static class, not an inline
-		// style — see the CSS note; styleMap custom properties don't survive an in-app navigation mount.
+		// The ring fill (angle) is applied by the `.hero__ring--<done>` static class rather than a
+		// dynamic style — see the CSS note for why, and why it no longer has to be this way.
 		return html`<div class="hero ${done > 0 ? 'hero--started' : ''}">
 			<div class="hero__mark"><code-icon icon="checklist" aria-hidden="true"></code-icon></div>
 			<div class="hero__text">
 				<h2 class="hero__title">${title}</h2>
 				<p class="hero__subtitle">${subtitle}</p>
 			</div>
-			<div class="hero__ring hero__ring--${done}" role="img" aria-label="${done} of ${total} steps complete">
-				<span class="hero__ring-count" aria-hidden="true">${done}/${total}</span>
+			<div
+				class="hero__ring hero__ring--${done}"
+				role="img"
+				aria-label=${l10n.t('{0} of {1} steps complete', done, total)}
+			>
+				<span class="hero__ring-count" aria-hidden="true">${l10n.t('{0}/{1}', done, total)}</span>
 			</div>
 		</div>`;
 	}
@@ -444,7 +457,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 						? html`<span class="step__progress"
 								><span
 									class="step__progress-fill"
-									style=${styleMap({ inlineSize: `${Math.round(step.progress * 100)}%` })}
+									style=${cspStyleMap({ inlineSize: `${Math.round(step.progress * 100)}%` })}
 								></span
 							></span>`
 						: nothing
@@ -452,10 +465,10 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			</span>
 			<span class="step__action step__action--${step.actionVariant}" aria-hidden="true">${step.action}</span>`;
 
-		// The rail/icon accent comes from the `.steps > li:nth-child(n) .step` static CSS, not an
-		// inline style — styleMap custom properties don't survive an in-app navigation mount.
+		// The rail/icon accent comes from the `.steps > li:nth-child(n) .step` static CSS rather than
+		// a dynamic style — see the `.hero__ring--*` note for why, and why it no longer has to be.
 		const cls = `step step--${step.state}`;
-		const label = `${step.title}. ${step.status}`;
+		const label = l10n.t('{0}. {1}', step.title, step.status);
 
 		if (step.href != null) {
 			return html`<li>
@@ -482,7 +495,7 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	// ── Step builders ──
 
 	private signInStep(index: number): SetupStep {
-		const sub = this._state.subscription.get();
+		const sub = this._subscription.subscription.get();
 		const account = sub?.account;
 		const done = account != null;
 
@@ -490,11 +503,17 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			key: 'account',
 			accent: this.accent(index),
 			icon: account != null ? 'account' : 'sign-in',
-			title: 'Sign in to unlock GitLens Pro',
-			why: 'Sign in or create a free GitKraken account to access AI workflows, integrations, and the full Commit Graph. Your account carries your setup to every device you code on.',
+			title: l10n.t('Sign in to unlock GitLens Pro'),
+			why: l10n.t(
+				'Sign in or create a free GitKraken account to access AI workflows, integrations, and the full Commit Graph. Your account carries your setup to every device you code on.',
+			),
 			state: done ? 'done' : 'todo',
-			status: done ? `Signed in${account.name ? ` as ${account.name}` : ''}` : 'Not signed in',
-			action: done ? 'Manage' : 'Sign in',
+			status: done
+				? account.name
+					? l10n.t('Signed in as {0}', account.name)
+					: l10n.t('Signed in')
+				: l10n.t('Not signed in'),
+			action: done ? l10n.t('Manage') : l10n.t('Sign in'),
 			actionVariant: done ? 'quiet' : 'primary',
 			// The Account section carries the real sign-in / create-account / manage CTAs
 			nav: 'account',
@@ -510,11 +529,13 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			key: 'integrations',
 			accent: this.accent(index),
 			icon: 'plug',
-			title: 'Bring your PRs and Issues into the IDE',
-			why: 'Link GitHub, GitLab, Bitbucket, Azure DevOps, or Jira so branches carry their PRs and issues, and Launchpad can tell you what needs you next.',
+			title: l10n.t('Bring your PRs and Issues into the IDE'),
+			why: l10n.t(
+				'Link GitHub, GitLab, Bitbucket, Azure DevOps, or Jira so branches carry their PRs and issues, and Launchpad can tell you what needs you next.',
+			),
 			state: done ? 'done' : 'todo',
-			status: done ? `Connected · ${this.connectedSummary(connected.map(i => i.name))}` : 'Not connected',
-			action: done ? 'Connect More' : 'Connect',
+			status: done ? this.connectedStatus(connected.map(i => i.name)) : l10n.t('Not connected'),
+			action: done ? l10n.t('Connect More') : l10n.t('Connect'),
 			actionVariant: done ? 'quiet' : 'primary',
 			nav: 'integrations',
 		};
@@ -526,8 +547,10 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		const base = {
 			key: 'ai',
 			accent: this.accent(index),
-			title: 'Let AI review, compose, and resolve for you',
-			why: 'Auto-compose a sprawling working tree into logical commits, get a review pass before you push, resolve conflicts, and explain unfamiliar history - with whatever model you pick.',
+			title: l10n.t('Let AI review, compose, and resolve for you'),
+			why: l10n.t(
+				'Auto-compose a sprawling working tree into logical commits, get a review pass before you push, resolve conflicts, and explain unfamiliar history - with whatever model you pick.',
+			),
 			nav: 'ai',
 		} as const;
 
@@ -536,8 +559,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 				...base,
 				icon: 'sparkle',
 				state: 'todo',
-				status: 'Disabled by your GitKraken admin',
-				action: 'Open AI',
+				status: l10n.t('Disabled by your GitKraken admin'),
+				action: l10n.t('Open AI'),
 				actionVariant: 'primary',
 			};
 		}
@@ -547,8 +570,10 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			...base,
 			icon: done ? 'sparkle-filled' : 'sparkle',
 			state: done ? 'done' : 'todo',
-			status: done ? `${model.provider.name} · ${model.name}` : 'No provider or model selected',
-			action: done ? 'Change Model' : 'Choose Model',
+			status: done
+				? l10n.t('{0} · {1}', model.provider.name, model.name)
+				: l10n.t('No provider or model selected'),
+			action: done ? l10n.t('Change Model') : l10n.t('Choose Model'),
 			actionVariant: done ? 'quiet' : 'primary',
 		};
 	}
@@ -563,27 +588,20 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		const hooksDone = !hooksApplicable || hookAgents.every(a => a.installed);
 		const done = mcpActive && hooksDone;
 
-		let status: string;
-		if (done) {
-			status = hooksApplicable
-				? `MCP connected · Hooks installed for ${hookAgents.length} of ${hookAgents.length} agents`
-				: 'MCP connected';
-		} else if (hooksApplicable) {
-			const installedCount = hookAgents.filter(a => a.installed).length;
-			status = `MCP ${mcpActive ? 'connected' : 'not connected'} · Hooks installed for ${installedCount} of ${hookAgents.length} agents`;
-		} else {
-			status = 'MCP and hooks not set up';
-		}
+		const installedCount = hookAgents.filter(a => a.installed).length;
+		const status = this.agentsStatus(mcpActive, hooksApplicable, installedCount, hookAgents.length);
 
 		return {
 			key: 'agents',
 			accent: this.accent(index),
 			icon: 'robot',
-			title: 'Give agents Git context, and watch them work',
-			why: 'MCP gives agents your history, branches, PRs, and issue context; hooks report their sessions back, so you can view and manage agents directly in the Graph.',
+			title: l10n.t('Give agents Git context, and watch them work'),
+			why: l10n.t(
+				'MCP gives agents your history, branches, PRs, and issue context; hooks report their sessions back, so you can view and manage agents directly in the Graph.',
+			),
 			state: done ? 'done' : 'todo',
 			status: status,
-			action: done ? 'Manage Agents' : 'Set up',
+			action: done ? l10n.t('Manage Agents') : l10n.t('Set up'),
 			actionVariant: done ? 'quiet' : 'primary',
 			nav: 'agents',
 		};
@@ -594,8 +612,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			index,
 			'walkthrough',
 			'gl-gitlens',
-			'Take a tour: blame, hovers, and more',
-			'Walk through deep authorship insights, getting line-level authorship as you scan code',
+			l10n.t('Take a tour: blame, hovers, and more'),
+			l10n.t('Walk through deep authorship insights, getting line-level authorship as you scan code'),
 			this._state.walkthrough.get()?.main,
 			walkthroughProgressSteps,
 			createCommandLink('gitlens.showWelcomeView', { mode: 'main' }),
@@ -607,8 +625,10 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			index,
 			'graph-walkthrough',
 			'gl-graph',
-			'Run your whole Git workflow from the Graph',
-			'Six steps to ship a change end-to-end: monitor your agents, manage parallel work, review changes with AI, compose commits, compare refs, and know your next steps.',
+			l10n.t('Run your whole Git workflow from the Graph'),
+			l10n.t(
+				'Six steps to ship a change end-to-end: monitor your agents, manage parallel work, review changes with AI, compose commits, compare refs, and know your next steps.',
+			),
 			this._state.walkthrough.get()?.graph,
 			graphWalkthroughProgressSteps,
 			createCommandLink('gitlens.showWelcomeView', { mode: 'graph' }),
@@ -628,7 +648,13 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		const base = { key: key, accent: this.accent(index), icon: icon, title: title, why: why, href: href } as const;
 
 		if (progress == null) {
-			return { ...base, state: 'todo', status: 'Not started', action: 'Start', actionVariant: 'secondary' };
+			return {
+				...base,
+				state: 'todo',
+				status: l10n.t('Not started'),
+				action: l10n.t('Start'),
+				actionVariant: 'secondary',
+			};
 		}
 
 		const { doneCount, allCount } = progress;
@@ -636,8 +662,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			return {
 				...base,
 				state: 'done',
-				status: 'Completed',
-				action: 'Replay',
+				status: l10n.t('Completed'),
+				action: l10n.t('Replay'),
 				actionVariant: 'quiet',
 			};
 		}
@@ -647,8 +673,11 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 			return {
 				...base,
 				state: 'progress',
-				status: `In progress · ${doneCount} of ${allCount} steps${next != null ? ` · next up, ${next}` : ''}`,
-				action: 'Continue',
+				status:
+					next != null
+						? l10n.t('In progress · {0} of {1} steps · next up, {2}', doneCount, allCount, next)
+						: l10n.t('In progress · {0} of {1} steps', doneCount, allCount),
+				action: l10n.t('Continue'),
 				actionVariant: 'primary',
 				progress: allCount > 0 ? doneCount / allCount : 0,
 			};
@@ -657,8 +686,8 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		return {
 			...base,
 			state: 'todo',
-			status: `Not started · 0 of ${allCount} steps`,
-			action: 'Start',
+			status: l10n.t('Not started · 0 of {0} steps', allCount),
+			action: l10n.t('Start'),
 			actionVariant: 'secondary',
 		};
 	}
@@ -670,9 +699,34 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 		return `color-mix(in srgb, var(--gl-brand-purple), var(--gl-brand-blue) ${index * 20}%)`;
 	}
 
-	private connectedSummary(names: string[]): string {
-		if (names.length <= 3) return names.join(', ');
-		return `${names.slice(0, 3).join(', ')} and ${names.length - 3} more`;
+	private connectedStatus(names: string[]): string {
+		switch (names.length) {
+			case 1:
+				return l10n.t('Connected · {0}', names[0]);
+			case 2:
+				return l10n.t('Connected · {0}, {1}', names[0], names[1]);
+			case 3:
+				return l10n.t('Connected · {0}, {1}, {2}', names[0], names[1], names[2]);
+			default:
+				return l10n.t('Connected · {0}, {1}, {2} and {3} more', names[0], names[1], names[2], names.length - 3);
+		}
+	}
+
+	private agentsStatus(
+		mcpActive: boolean,
+		hooksApplicable: boolean,
+		installedCount: number,
+		allCount: number,
+	): string {
+		if (!hooksApplicable) {
+			return mcpActive ? l10n.t('MCP connected') : l10n.t('MCP and hooks not set up');
+		}
+
+		if (mcpActive) {
+			return l10n.t('MCP connected · Hooks installed for {0} of {1} agents', installedCount, allCount);
+		}
+
+		return l10n.t('MCP not connected · Hooks installed for {0} of {1} agents', installedCount, allCount);
 	}
 
 	/** Label of the first not-yet-done step, in the walkthrough's own step order. */
@@ -686,22 +740,28 @@ export class GlSettingsSetup extends SignalWatcher(LitElement) {
 	private heroCopy(done: number, total: number): { title: string; subtitle: string } {
 		if (done === 0) {
 			return {
-				title: 'Set up GitLens',
-				subtitle:
+				title: l10n.t('Set up GitLens'),
+				subtitle: l10n.t(
 					'A few steps unlock your account, PR context on your branches, AI for commits and reviews, agent access, and the guided tours.',
+				),
 			};
 		}
 		if (done >= total) {
 			return {
-				title: "You're all set",
-				subtitle: 'GitLens is fully set up. Revisit any step below to make changes.',
+				title: l10n.t("You're all set"),
+				subtitle: l10n.t('GitLens is fully set up. Revisit any step below to make changes.'),
 			};
 		}
 
 		const remaining = total - done;
 		return {
-			title: 'Almost there',
-			subtitle: `${done} of ${total} done — ${remaining} ${remaining === 1 ? 'step' : 'steps'} left to finish setting up GitLens.`,
+			title: l10n.t('Almost there'),
+			subtitle: formatPlural(
+				l10n.t(
+					'{2, plural, one{{0} of {1} done — {2} step left to finish setting up GitLens.} other{{0} of {1} done — {2} steps left to finish setting up GitLens.}}',
+				),
+				[done, total, remaining],
+			),
 		};
 	}
 }

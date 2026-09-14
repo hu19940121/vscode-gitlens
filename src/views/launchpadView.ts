@@ -1,8 +1,7 @@
 import type { ConfigurationChangeEvent, TreeViewVisibilityChangeEvent } from 'vscode';
-import { Disposable, ThemeIcon, TreeItem, TreeItemCollapsibleState, Uri, window } from 'vscode';
+import { Disposable, l10n, ThemeIcon, TreeItem, TreeItemCollapsibleState, Uri, window } from 'vscode';
 import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
 import { Logger } from '@gitlens/utils/logger.js';
-import type { OpenWalkthroughCommandArgs } from '../commands/walkthroughs.js';
 import type { LaunchpadViewConfig, ViewFilesLayout } from '../config.js';
 import { proBadge } from '../constants.js';
 import type { Container } from '../container.js';
@@ -97,7 +96,7 @@ export class LaunchpadItemNode extends CacheableChildrenViewNode<'launchpad-item
 		item.iconPath = lpi.author?.avatarUrl != null ? Uri.parse(lpi.author.avatarUrl) : undefined;
 		item.command = createCommand<[Omit<LaunchpadCommandArgs, 'command'>]>(
 			'gitlens.showLaunchpad',
-			'Open in Launchpad',
+			l10n.t('Open in Launchpad'),
 			{
 				source: 'launchpad-view',
 				state: {
@@ -151,9 +150,7 @@ export class LaunchpadViewNode extends CacheableChildrenViewNode<
 	}
 
 	async getChildren(): Promise<(GroupingNode | LaunchpadItemNode | MessageNode)[]> {
-		this.view.description = this.view.grouped
-			? `${this.view.name.toLocaleLowerCase()}\u00a0\u2022\u00a0 ${proBadge}`
-			: proBadge;
+		this.view.description = this.view.grouped ? l10n.t('launchpad\u00a0\u2022\u00a0 {0}', proBadge) : proBadge;
 		this.view.message = undefined;
 
 		if (this.children == null) {
@@ -171,7 +168,7 @@ export class LaunchpadViewNode extends CacheableChildrenViewNode<
 				error = result.error;
 
 				if (!error && !result.items?.length) {
-					this.view.message = 'All done! Take a vacation.';
+					this.view.message = l10n.t('All done! Take a vacation.');
 					return [];
 				}
 
@@ -229,15 +226,15 @@ export class LaunchpadViewNode extends CacheableChildrenViewNode<
 		const errorMessage = getPresentableErrorMessage(error);
 
 		const tooltip = isAuthError
-			? `Authentication Required\n\n${errorMessage}\n\nReconnect your integration`
+			? l10n.t('Authentication Required\n\n{0}\n\nReconnect your integration', errorMessage)
 			: error.name === 'HttpError' && 'status' in error && typeof error.status === 'number'
-				? `Unable to fully load items\n\n${error.status}: ${String(error)}`
-				: `Unable to fully load items\n\n${String(error)}`;
+				? l10n.t('Unable to fully load items\n\n{0}: {1}', error.status, String(error))
+				: l10n.t('Unable to fully load items\n\n{0}', String(error));
 
 		return new MessageNode(
 			this.view,
 			this,
-			isAuthError ? 'Authentication Required' : 'Unable to fully load items',
+			isAuthError ? l10n.t('Authentication Required') : l10n.t('Unable to fully load items'),
 			isAuthError
 				? errorMessage
 				: error.name === 'HttpError' && 'status' in error && typeof error.status === 'number'
@@ -250,7 +247,7 @@ export class LaunchpadViewNode extends CacheableChildrenViewNode<
 	}
 
 	getTreeItem(): TreeItem {
-		const item = new TreeItem('Launchpad', TreeItemCollapsibleState.Expanded);
+		const item = new TreeItem(l10n.t('Launchpad'), TreeItemCollapsibleState.Expanded);
 		return item;
 	}
 }
@@ -260,7 +257,7 @@ export class LaunchpadView extends ViewBase<'launchpad', LaunchpadViewNode, Laun
 	private _disposable: Disposable | undefined;
 
 	constructor(container: Container, grouped?: GroupedViewContext) {
-		super(container, 'launchpad', 'Launchpad', 'launchpadView', grouped);
+		super(container, 'launchpad', l10n.t('Launchpad'), 'launchpadView', grouped);
 	}
 
 	override dispose(): void {
@@ -300,11 +297,7 @@ export class LaunchpadView extends ViewBase<'launchpad', LaunchpadViewNode, Laun
 		return [
 			registerViewCommand(
 				this.getQualifiedCommand('info'),
-				() =>
-					executeCommand<OpenWalkthroughCommandArgs>('gitlens.openWalkthrough', {
-						step: 'accelerate-pr-reviews',
-						source: { source: 'launchpad-view', detail: 'info' },
-					}),
+				() => executeCommand('gitlens.showWelcomeView'),
 				this,
 			),
 			registerViewCommand(

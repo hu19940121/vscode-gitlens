@@ -19,20 +19,20 @@ jobs:
             contents: read
         steps:
             - name: Checkout code
-              uses: actions/checkout@v4
+              uses: actions/checkout@v7
 
-            - name: Setup node
-              uses: actions/setup-node@v4
+            # Publishing relies on pnpm resolving this package's `catalog:` dependencies when packing;
+            # pnpm/setup reads the version to install from `packageManager` in the root manifest.
+            - name: Setup Node.js
+              uses: actions/setup-node@v7
               with:
-                  node-version: '22'
+                  node-version: '24'
                   registry-url: 'https://registry.npmjs.org'
 
-            # Publishing relies on pnpm resolving this package's `catalog:` dependencies when packing,
-            # so pin the major we verify against locally (`packageManager` in the root manifest).
             - name: Setup pnpm
-              uses: pnpm/action-setup@v3
+              uses: pnpm/setup@v2
               with:
-                  version: 11
+                  install: false
 
             - name: Verify tag matches package version
               if: github.event_name == 'push'
@@ -54,17 +54,28 @@ jobs:
             - name: Check dependency hygiene
               run: pnpm run check:deps
 
-            - name: Build sub-packages
+            # The bundle below compiles the sub-packages' sources itself and its declaration pass runs with
+            # `--noCheck`, so this `tsc -b` is what actually type-checks them. Keep it ahead of the bundle:
+            # it is the gate that stops a type error from reaching the published tarball.
+            - name: Type-check sub-packages
               run: pnpm run build:packages
 
             - name: Bundle core package
-              run: pnpm --filter @gitkraken/core-gitlens run bundle
+              run: pnpm --filter @gitkraken/core-gitlens run build
+
+            # Consumers load this package with Node's own CJS->ESM interop, not a bundler's. A release is
+            # the last place to discover that a module cannot even be linked there.
+            - name: Verify bundle loads under Node ESM
+              run: pnpm --filter @gitkraken/core-gitlens run verify:esm
+
+            - name: Verify packed package as an external consumer
+              run: pnpm --filter @gitkraken/core-gitlens run verify:package
 
             - name: Pack tarball (artifact)
               run: pnpm --filter @gitkraken/core-gitlens pack --pack-destination packages/core
 
             - name: Upload tarball artifact
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: core-gitlens-tarball
                   path: packages/core/*.tgz

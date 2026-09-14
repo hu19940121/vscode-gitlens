@@ -1,5 +1,5 @@
 import type { Disposable } from 'vscode';
-import { CancellationTokenSource, QuickInputButtons, window } from 'vscode';
+import { CancellationTokenSource, l10n, QuickInputButtons, window } from 'vscode';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { GitTag } from '@gitlens/git/models/tag.js';
@@ -69,11 +69,11 @@ export async function showReferencePicker2(
 	quickpick.title = title;
 	quickpick.placeholder =
 		allowRanges && allowRevs
-			? `${placeholder} (or enter a range, or a revision prefixed with #)`
+			? l10n.t('{0} (or enter a range, or a revision prefixed with #)', placeholder)
 			: allowRanges
-				? `${placeholder} (or enter a range)`
+				? l10n.t('{0} (or enter a range)', placeholder)
 				: allowRevs
-					? `${placeholder} (or enter a revision prefixed with #)`
+					? l10n.t('{0} (or enter a revision prefixed with #)', placeholder)
 					: placeholder;
 	quickpick.matchOnDescription = true;
 	if (options?.allowBack) {
@@ -129,6 +129,12 @@ export async function showReferencePicker2(
 	quickpick.busy = true;
 	quickpick.show();
 
+	// Track hides while items are loading: `onDidHide` isn't subscribed until after the fetch
+	// completes, so a hide during the fetch (e.g. the quick-pick focus race when opened from a
+	// webview click) would otherwise leave the caller's await pending forever.
+	let hiddenWhileLoading = false;
+	disposables.push(quickpick.onDidHide(() => (hiddenWhileLoading = true)));
+
 	const getValidateGitReference = getValidateGitReferenceFn(Container.instance.git.getRepository(repoPath), {
 		revs: { allow: allowRevs ?? false, buttons: [RevealInSideBarQuickInputButton] },
 		ranges: { allow: allowRanges ?? false, validate: true },
@@ -142,6 +148,8 @@ export async function showReferencePicker2(
 		}
 	}
 	quickpick.busy = false;
+
+	if (hiddenWhileLoading) return { value: undefined };
 
 	try {
 		const pick = await new Promise<QuickPickResult<GitReference>>(resolve => {

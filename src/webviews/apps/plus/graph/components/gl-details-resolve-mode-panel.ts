@@ -1,8 +1,12 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
 import { keyed } from 'lit/directives/keyed.js';
 import { repeat } from 'lit/directives/repeat.js';
+import { scrollableBase, subPanelEnterStyles } from '@gitlens/components/components/styles/lit/base.css.js';
+import { cspStyleMap } from '@gitlens/components/cspStyleMap.directive.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
@@ -13,9 +17,10 @@ import {
 } from '@gitlens/git/utils/conflictResolution.utils.js';
 import type { ConflictKind } from '@gitlens/git/utils/conflictResolution.utils.js';
 import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { ViewFilesLayout } from '../../../../../config.js';
-import { serializeWebviewItemContext } from '../../../../../system/webview.js';
+import { getWipFileWebviewItem, serializeWebviewItemContext } from '../../../../../system/webview.js';
 import type { DetailsItemTypedContext } from '../../../../plus/graph/detailsProtocol.js';
 import { buildFolderContext } from '../../../../plus/graph/detailsProtocol.js';
 import type {
@@ -29,8 +34,6 @@ import type {
 } from '../../../../plus/graph/graphService.js';
 import type { AiModelInfo } from '../../../../rpc/services/types.js';
 import type { GlAiInput } from '../../../shared/components/ai-input.js';
-import { cspStyleMap } from '../../../shared/components/csp-style-map.directive.js';
-import { scrollableBase, subPanelEnterStyles } from '../../../shared/components/styles/lit/base.css.js';
 import type { TreeItemCheckedDetail } from '../../../shared/components/tree/base.js';
 import type { FileChangeListItemDetail } from '../../../shared/components/tree/gl-file-tree-pane.js';
 import { prunePathsToFiles } from './aiExclusion.js';
@@ -43,15 +46,16 @@ import {
 	resolveDisplayStyles,
 	strategyDisplay,
 } from './resolveDisplay.js';
+import { liveRefineDraft, liveRefineMode, syncRefinePosture } from './shared-panel-helpers.js';
 import { renderErrorState, renderLoadingState } from './shared-panel-templates.js';
 import { panelErrorStyles, panelHostStyles, panelLoadingStageStyles, panelLoadingStyles } from './shared-panel.css.js';
 import '../../../shared/components/ai-input.js';
 import '../../../shared/components/branch-name.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/checkbox/checkbox.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/gl-ai-model-chip.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../../shared/components/panes/pane-group.js';
 import '../../../shared/components/tree/gl-file-tree-pane.js';
 import './gl-converging-loading-animation.js';
@@ -62,31 +66,23 @@ export type ResolveModeStatus = 'idle' | 'loading' | 'ready' | 'error' | 'applyi
  *  status-driven content (an idle tree would read "No conflicted files" before the first pause). */
 const autoRebaseRunningPhases = new Set<AutoRebaseRunPhase>(['starting', 'resolving', 'applying', 'continuing']);
 
-export interface ResolveViewDiffDetail {
-	filePath: string;
-}
-
-export interface ResolveOpenFileDetail {
-	filePath: string;
-}
-
 /** Short badge label + a distinct icon per conflict kind for the "needs your input" rows. The badge
  *  stays terse — the one-line explanation is carried by the row's message
- *  (`getConflictKindLabel(...).description`, computed host-side). A per-kind icon replaces a uniform
+ *  (`getConflictKindLabel(...).reason`, computed host-side). A per-kind icon replaces a uniform
  *  warning glyph so the list is scannable; the amber tone + section already signal "needs you". */
 const conflictKindDisplay: Record<ConflictKind, { label: string; icon: string }> = {
-	text: { label: 'Text', icon: 'diff' },
-	binary: { label: 'Binary', icon: 'file-binary' },
-	symlink: { label: 'Symlink', icon: 'file-symlink-file' },
-	submodule: { label: 'Submodule', icon: 'repo' },
-	'mode-only': { label: 'File mode', icon: 'settings-gear' },
-	'add-add': { label: 'Both added', icon: 'diff-added' },
-	'delete-modify': { label: 'Modified & deleted', icon: 'diff-modified' },
-	'both-deleted': { label: 'Both deleted', icon: 'trash' },
-	'rename-rename': { label: 'Both renamed', icon: 'arrow-swap' },
-	'rename-delete': { label: 'Renamed & deleted', icon: 'diff-renamed' },
-	'rename-modify': { label: 'Renamed & modified', icon: 'diff-renamed' },
-	unknown: { label: 'Conflict', icon: 'warning' },
+	text: { label: l10n.t('Text'), icon: 'diff' },
+	binary: { label: l10n.t('Binary'), icon: 'file-binary' },
+	symlink: { label: l10n.t('Symlink'), icon: 'file-symlink-file' },
+	submodule: { label: l10n.t('Submodule'), icon: 'repo' },
+	'mode-only': { label: l10n.t('File mode'), icon: 'settings-gear' },
+	'add-add': { label: l10n.t('Both added'), icon: 'diff-added' },
+	'delete-modify': { label: l10n.t('Modified & deleted'), icon: 'diff-modified' },
+	'both-deleted': { label: l10n.t('Both deleted'), icon: 'trash' },
+	'rename-rename': { label: l10n.t('Both renamed'), icon: 'arrow-swap' },
+	'rename-delete': { label: l10n.t('Renamed & deleted'), icon: 'diff-renamed' },
+	'rename-modify': { label: l10n.t('Renamed & modified'), icon: 'diff-renamed' },
+	unknown: { label: l10n.t('Conflict'), icon: 'warning' },
 };
 
 /** Badge display for a still-conflicted (skipped/errored) row; falls back to a generic warning when
@@ -94,11 +90,11 @@ const conflictKindDisplay: Record<ConflictKind, { label: string; icon: string }>
  *  one-sided paths (AU/UA), so only a true AA is "Both added" — AU/UA are labelled by their side. */
 function kindDisplay(kind: ConflictKind | undefined, status?: GitFileConflictStatus): { label: string; icon: string } {
 	if (kind === 'add-add') {
-		if (status === 'AU') return { label: 'Added (current)', icon: 'diff-added' };
-		if (status === 'UA') return { label: 'Added (incoming)', icon: 'diff-added' };
-		return { label: 'Both added', icon: 'diff-added' };
+		if (status === 'AU') return { label: l10n.t('Added (current)'), icon: 'diff-added' };
+		if (status === 'UA') return { label: l10n.t('Added (incoming)'), icon: 'diff-added' };
+		return { label: l10n.t('Both added'), icon: 'diff-added' };
 	}
-	return kind != null ? conflictKindDisplay[kind] : { label: 'Needs review', icon: 'warning' };
+	return kind != null ? conflictKindDisplay[kind] : { label: l10n.t('Needs review'), icon: 'warning' };
 }
 
 /** Conflicted files across a run's recorded steps — the unit users count, where a step is one rebase
@@ -117,14 +113,12 @@ function describeEmptySkipped(steps: readonly AutoRebaseSummaryStep[]): string |
 	const count = steps.reduce((n, s) => (s.kind === 'empty-skipped' ? n + 1 : n), 0);
 	if (count === 0) return undefined;
 
-	return `${pluralize('commit', count)} became empty and ${count === 1 ? 'was' : 'were'} skipped.`;
-}
-
-/** Drop the trailing action hint ("… — choose a side to keep") from a conflict description — the row's
- *  buttons already say what to do. */
-function conflictWhat(message: string): string {
-	const i = message.indexOf(' — ');
-	return i === -1 ? message : message.slice(0, i);
+	return formatPlural(
+		l10n.t(
+			'{count, plural, one{{count} commit became empty and was skipped.} other{{count} commits became empty and were skipped.}}',
+		),
+		{ count: count },
+	);
 }
 
 /**
@@ -147,8 +141,8 @@ export class GlDetailsResolveModePanel extends LitElement {
 		resolveDisplayStyles,
 		css`
 			/* Matches the fade+slide-up entrance used by compose/review so resolve mode animates in
-			   instead of popping. The @keyframes comes from subPanelEnterStyles; overflow is gated to
-			   the animation's lifetime there, reverting to the panelHostStyles :host overflow-y: auto. */
+  instead of popping. The @keyframes comes from subPanelEnterStyles; overflow is gated to
+  the animation's lifetime there, reverting to the panelHostStyles :host overflow-y: auto. */
 			:host {
 				animation: sub-panel-enter var(--gl-duration-medium) var(--gl-ease-out);
 			}
@@ -181,14 +175,14 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			.resolve-files {
-				margin: 0;
 				padding: 0;
+				margin: 0;
 				list-style: none;
 			}
 
 			/* Automatic rebase run — the panel's content while a rebase is automating itself, and after it
-			   ends when nothing else seeded the panel. Column layout so the step list scrolls between a
-			   fixed header/progress bar and the fixed stop actions. */
+  ends when nothing else seeded the panel. Column layout so the step list scrolls between a
+  fixed header/progress bar and the fixed stop actions. */
 			.auto-rebase {
 				display: flex;
 				flex: 1;
@@ -197,10 +191,10 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* Stage for the run's backdrop animation — same relationship review mode uses via
-			   panel-loading-stage, but on the run's own column layout so the header, progress bar and step
-			   list keep their positions. Deliberately stops short of the actions row: the animation anchors
-			   its bucket to the bottom of its own box, so including the footer would tuck the bucket behind
-			   the button. Everything except the animation is lifted above it. */
+  panel-loading-stage, but on the run's own column layout so the header, progress bar and step
+  list keep their positions. Deliberately stops short of the actions row: the animation anchors
+  its bucket to the bottom of its own box, so including the footer would tuck the bucket behind
+  the button. Everything except the animation is lifted above it. */
 			.auto-rebase__stage {
 				position: relative;
 				display: flex;
@@ -244,7 +238,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* Run context above an escalated step's review — a bounded, scrollable band so a long rebase's
-			   history can't push the actionable resolutions off-screen. */
+  history can't push the actionable resolutions off-screen. */
 			.auto-rebase__context {
 				display: flex;
 				flex: none;
@@ -291,23 +285,23 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			.resolve-progress__need {
-				color: var(--vscode-editorWarning-foreground, #cca700);
 				font-weight: 600;
+				color: var(--vscode-editorWarning-foreground, #cca700);
 			}
 
 			.resolve-progress__bar {
 				display: flex;
 				height: 0.4rem;
 				overflow: hidden;
-				border-radius: 999px;
 				background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+				border-radius: 999px;
 			}
 
 			/* Two-tone fill: green = resolved fraction, amber = still-needs-input fraction, so the bar reads
-			   as a split rather than "complete". Segments size by flex-grow = their file count. */
+  as a split rather than "complete". Segments size by flex-grow = their file count. */
 			.resolve-progress__bar-seg {
-				height: 100%;
 				flex-basis: 0;
+				height: 100%;
 			}
 
 			.resolve-progress__bar-seg--done {
@@ -334,12 +328,12 @@ export class GlDetailsResolveModePanel extends LitElement {
 				align-items: center;
 				width: 100%;
 				padding: var(--gl-space-8) var(--gl-space-12) var(--gl-space-6);
-				color: var(--vscode-descriptionForeground);
 				font: inherit;
+				color: var(--vscode-descriptionForeground);
 				text-align: left;
+				cursor: pointer;
 				background: var(--vscode-sideBar-background, var(--vscode-editor-background));
 				border: none;
-				cursor: pointer;
 			}
 
 			.resolve-section__chevron {
@@ -367,8 +361,8 @@ export class GlDetailsResolveModePanel extends LitElement {
 			.resolve-section__label {
 				font-size: var(--gl-font-sm);
 				font-weight: 700;
-				letter-spacing: 0.05em;
 				text-transform: uppercase;
+				letter-spacing: 0.05em;
 			}
 
 			.resolve-section__count {
@@ -417,9 +411,9 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* The pane group is a flex child with no intrinsic grow — without this it stays at content
-			   height and the inner gl-file-tree-pane (flex:1; min-height:0; overflow:hidden) collapses its
-			   tree to ~0 and clips every row. Mirrors the .scope-files__tree webview-pane-group rule in
-			   shared-panel.css.ts (compose's file curation). */
+  height and the inner gl-file-tree-pane (flex:1; min-height:0; overflow:hidden) collapses its
+  tree to ~0 and clips every row. Mirrors the .scope-files__tree webview-pane-group rule in
+  shared-panel.css.ts (compose's file curation). */
 			.resolve-tree webview-pane-group {
 				flex: 1;
 				min-height: 0;
@@ -427,7 +421,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* Badge + confidence-pip styles are shared with the auto-rebase summary sheet — see
-			   resolveDisplayStyles (resolveDisplay.ts) in the styles array above. */
+  resolveDisplayStyles (resolveDisplay.ts) in the styles array above. */
 
 			.resolve-file__reasoning {
 				margin: 0;
@@ -444,8 +438,8 @@ export class GlDetailsResolveModePanel extends LitElement {
 				display: flex;
 				flex-direction: column;
 				gap: var(--gl-space-4);
-				margin: var(--gl-space-6) 0 var(--gl-space-2) var(--gl-space-6);
 				padding-left: var(--gl-space-8);
+				margin: var(--gl-space-6) 0 var(--gl-space-2) var(--gl-space-6);
 				border-left: var(--gl-border-width) solid var(--vscode-panel-border);
 			}
 
@@ -460,16 +454,16 @@ export class GlDetailsResolveModePanel extends LitElement {
 				min-width: 5rem;
 				font-size: var(--gl-font-sm);
 				font-variant: all-small-caps;
-				letter-spacing: 0.02em;
 				color: var(--vscode-descriptionForeground);
+				letter-spacing: 0.02em;
 			}
 
 			.resolve-file__side-path {
 				flex: 1;
 				min-width: 0;
 				overflow: hidden;
-				font-weight: 600;
 				text-overflow: ellipsis;
+				font-weight: 600;
 				white-space: nowrap;
 			}
 
@@ -484,15 +478,15 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* Ready-state action zone: the Refine gate on top, then either the Apply row (Apply posture)
-			   or the detached refine input (Refine posture) — mirrors compose-plan__actions. The container
-			   query below keeps the gate label and the right-anchored model tab from colliding when narrow. */
+  or the detached refine input (Refine posture) — mirrors compose-plan__actions. The container
+  query below keeps the gate label and the right-anchored model tab from colliding when narrow. */
 			.resolve-ready-actions {
-				container: resolve-ready / inline-size;
 				display: flex;
 				flex: none;
 				flex-direction: column;
 				gap: var(--gl-space-8);
 				padding: var(--gl-space-8) var(--gl-space-12) var(--gl-space-10);
+				container: resolve-ready / inline-size;
 				border-top: var(--gl-border-width) solid var(--vscode-panel-border);
 			}
 
@@ -501,7 +495,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* Once wide enough that the gate label and the model tab can't collide, drop the gate's bottom
-			   margin to pull the input up tight; narrower, keep it so the tab drops clear below the gate. */
+  margin to pull the input up tight; narrower, keep it so the tab drops clear below the gate. */
 			@container resolve-ready (min-width: 44rem) {
 				.resolve-gate {
 					margin-bottom: 0;
@@ -521,20 +515,20 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 
 			/* The detached refine input self-insets/-centres; inside the already-padded zone that doubles
-			   the inset, so pin it flush to the zone's content box (mirrors compose's override). Orange-tint
-			   the Refine submit with the SAME recompose accent compose uses (blue stays reserved for Apply);
-			   the custom props pierce gl-ai-input's shadow boundary. */
+  the inset, so pin it flush to the zone's content box (mirrors compose's override). Orange-tint
+  the Refine submit with the SAME recompose accent compose uses (blue stays reserved for Apply);
+  the custom props pierce gl-ai-input's shadow boundary. */
 			.resolve-ready-actions > gl-ai-input.resolve-refine-input {
 				width: 100%;
 				max-width: none;
 				margin: 0;
-				--gl-resolve-refine-accent: oklch(0.6 0.13 62);
+				--gl-resolve-refine-accent: oklch(60% 0.13 62deg);
 				--gl-ai-submit-bg: var(--gl-resolve-refine-accent);
 				--gl-ai-submit-hover-bg: color-mix(in srgb, #000 15%, var(--gl-resolve-refine-accent));
 			}
 
 			/* The per-row "Retry with feedback" button is a toggle — show the standard active-toggle
-			   background while its feedback input is open (keyed off the existing aria-expanded). */
+  background while its feedback input is open (keyed off the existing aria-expanded). */
 			.resolve-file__head gl-button[aria-expanded='true'] {
 				--button-background: var(--vscode-inputOption-activeBackground);
 				--button-foreground: var(--vscode-inputOption-activeForeground);
@@ -653,14 +647,17 @@ export class GlDetailsResolveModePanel extends LitElement {
 	 *  meaningful in the ready state (the gate/refine input only exist there); other states report the
 	 *  default so a non-ready leave can't clobber a captured posture. */
 	get refineModeLive(): boolean {
-		return this.status === 'ready' ? this._refineMode : false;
+		return liveRefineMode(this.status, this._refineMode);
 	}
 
 	/** Live unsubmitted Refine text, read by the host on mode-leave. Empty unless the refine input is
 	 *  actually mounted (ready + refine posture). */
 	get refineDraftLive(): string {
-		if (this.status !== 'ready' || !this._refineMode) return '';
-		return this.renderRoot.querySelector<GlAiInput>('gl-ai-input.resolve-refine-input')?.currentValue ?? '';
+		return liveRefineDraft(
+			this.status,
+			this._refineMode,
+			() => this.renderRoot.querySelector<GlAiInput>('gl-ai-input.resolve-refine-input')?.currentValue,
+		);
 	}
 
 	/** Default-checked state for a conflict: resolve-all entry checks everything; a focused entry
@@ -677,11 +674,12 @@ export class GlDetailsResolveModePanel extends LitElement {
 	}
 
 	override willUpdate(changedProperties: Map<string, unknown>): void {
-		// Ready always opens in Apply posture. A refine (or per-row retry) re-run returns through
-		// loading→ready, so resetting here means the refreshed resolutions show Apply — not a still-ticked
-		// gate hiding it. Placed before the early-returning identity block so it can't be skipped.
+		// Ready always opens in Apply posture — the shared Refine-posture lifecycle below resets the
+		// gate on EVERY ready entry (deliberately unlike compose, which only resets on a successful
+		// run). A refine (or per-row retry) re-run returns through loading→ready, so resetting here
+		// means the refreshed resolutions show Apply — not a still-ticked gate hiding it. Placed
+		// before the early-returning identity block so it can't be skipped.
 		if (changedProperties.has('status') && this.status === 'ready') {
-			this._refineMode = false;
 			// Auto-expand the reasoning of low-confidence resolutions so the risky ones get scrutiny.
 			this._openReasons = new Set(
 				(this.resolutions ?? [])
@@ -690,13 +688,19 @@ export class GlDetailsResolveModePanel extends LitElement {
 			);
 		}
 
-		// Seed the live posture from the persisted `refineMode` on mount and on an anchor switch (the
-		// element is reused across WIP-row switches). Gated on the property changing — the entry only
-		// writes it on mode-leave, so it's stable during a session and never fights the local toggle.
-		// Placed AFTER the status→ready reset so a completed refine still lands in Apply posture (that
-		// transition doesn't change `refineMode`) and BEFORE the early-returning identity block below.
-		if (changedProperties.has('refineMode')) {
-			this._refineMode = this.refineMode;
+		// Shared Refine-posture lifecycle (see `syncRefinePosture`): resets on every ready entry (see
+		// above), then reseeds the live posture from the persisted `refineMode` on mount and on an
+		// anchor switch (the element is reused across WIP-row switches). The seed is gated on the
+		// property changing — the entry only writes it on mode-leave, so it's stable during a session
+		// and never fights the local toggle. Placed BEFORE the early-returning identity block below.
+		const refinePosture = syncRefinePosture(changedProperties, {
+			status: this.status,
+			refineMode: this._refineMode,
+			persistedRefineMode: this.refineMode,
+			resetOnEveryReadyEntry: true,
+		});
+		if (refinePosture != null) {
+			this._refineMode = refinePosture;
 		}
 
 		// Automatic-rebase steps arrive collapsed: while the run is live the row worth watching is the
@@ -774,7 +778,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 	}
 
 	override render(): unknown {
-		return html`<div class="resolve-panel" role="region" aria-label="Resolve conflicts">
+		return html`<div class="resolve-panel" role="region" aria-label=${l10n.t('Resolve conflicts')}>
 			${this.renderContent()}
 		</div>`;
 	}
@@ -801,11 +805,11 @@ export class GlDetailsResolveModePanel extends LitElement {
 			case 'loading':
 				return this.renderLoading();
 			case 'applying':
-				return renderLoadingState('Applying resolutions…');
+				return renderLoadingState(l10n.t('Applying resolutions…'));
 			case 'error':
 				return renderErrorState(
 					this.errorMessage,
-					'An error occurred while resolving conflicts.',
+					l10n.t('An error occurred while resolving conflicts.'),
 					'resolve-error-retry',
 					'resolve-error-back',
 				);
@@ -823,13 +827,13 @@ export class GlDetailsResolveModePanel extends LitElement {
 			<div class="panel-loading-stage">
 				<gl-converging-loading-animation class="panel-loading-stage__anim"></gl-converging-loading-animation>
 				<div class="panel-loading-stage__foreground">
-					${renderLoadingState(this.progressMessage ?? 'Resolving conflicts…')}
+					${renderLoadingState(this.progressMessage ?? l10n.t('Resolving conflicts…'))}
 					<gl-button
 						class="resolve-cancel"
 						appearance="secondary"
 						@click=${() => this.emit('resolve-cancel')}
 					>
-						Cancel
+						${l10n.t('Cancel')}
 					</gl-button>
 				</div>
 			</div>
@@ -859,14 +863,21 @@ export class GlDetailsResolveModePanel extends LitElement {
 							? html`<div class="resolve-progress">
 									<span class="resolve-progress__text">
 										<span class="resolve-progress__done"
-											>Step ${run.step.current} of ${run.step.total}</span
+											>${l10n.t('Step {current} of {total}', {
+												current: getNumericFormat()(run.step.current),
+												total: getNumericFormat()(run.step.total),
+											})}</span
 										>
 										${
 											resolvedFiles > 0
 												? html`<span class="resolve-progress__sep">·</span
 														><span
-															>${pluralize('conflicted file', resolvedFiles)}
-															resolved</span
+															>${formatPlural(
+																l10n.t(
+																	'{count, plural, one{{count} conflicted file resolved} other{{count} conflicted files resolved}}',
+																),
+																{ count: resolvedFiles },
+															)}</span
 														>`
 												: nothing
 										}
@@ -888,14 +899,14 @@ export class GlDetailsResolveModePanel extends LitElement {
 						${this.renderAutoRebaseSteps(run)}
 						<div class="auto-rebase__activity">
 							<code-icon icon="loading" modifier="spin"></code-icon>
-							<span>${run.message ?? 'Rebasing…'}</span>
+							<span>${run.message ?? l10n.t('Rebasing…')}</span>
 						</div>
 					</div>
 				</div>
 				<div class="auto-rebase__actions">
-					<gl-tooltip content="Abort the rebase and restore the branch to its pre-rebase state">
+					<gl-tooltip content=${l10n.t('Abort the rebase and restore the branch to its pre-rebase state')}>
 						<gl-button appearance="secondary" @click=${() => this.emit('auto-rebase-cancel')}
-							>Cancel Rebase</gl-button
+							>${l10n.t('Cancel Rebase')}</gl-button
 						>
 					</gl-tooltip>
 				</div>
@@ -912,16 +923,26 @@ export class GlDetailsResolveModePanel extends LitElement {
 		// Git drops a step whose resolution left nothing to commit — a completed run has to say so here,
 		// where the eye lands, not only on the step row further down.
 		const emptied = describeEmptySkipped(run.steps);
+		// Like the cancelled message below, only reachable for a render or two before the mode exit
+		// lands (see `auto-rebase-exit`).
+		const noStepsMessage = run.unchanged
+			? run.branch
+				? l10n.t('Rebase completed — {branch} had nothing to rewrite.', { branch: run.branch })
+				: l10n.t('Rebase completed — the branch had nothing to rewrite.')
+			: l10n.t('Rebase completed — no conflicts.');
 		const outcome =
 			run.phase === 'completed'
 				? [
 						resolvedByAi > 0
-							? `Rebase completed — ${pluralize('conflicted file', resolvedByAi)} resolved with AI.`
+							? formatPlural(
+									l10n.t(
+										'{count, plural, one{Rebase completed — {count} conflicted file resolved with AI.} other{Rebase completed — {count} conflicted files resolved with AI.}}',
+									),
+									{ count: resolvedByAi },
+								)
 							: run.steps.length > 0
-								? 'Rebase completed — you resolved every conflict.'
-								: // Like the cancelled message below, only reachable for a render or two before the
-									// mode exit lands (see `auto-rebase-exit`).
-									'Rebase completed — no conflicts.',
+								? l10n.t('Rebase completed — you resolved every conflict.')
+								: noStepsMessage,
 						emptied,
 					]
 						.filter(Boolean)
@@ -930,14 +951,18 @@ export class GlDetailsResolveModePanel extends LitElement {
 					? // A cancelled run leaves the mode (see `auto-rebase-exit`), so this is only reachable for
 						// the render or two before that lands — kept accurate rather than removed so a missed
 						// exit degrades to a correct message instead of an empty panel.
-						`Rebase cancelled — ${run.branch ?? 'the branch'} is unchanged.`
+						run.branch
+						? l10n.t('Rebase cancelled — {branch} is unchanged.', { branch: run.branch })
+						: l10n.t('Rebase cancelled — the branch is unchanged.')
 					: run.phase === 'undone'
-						? `Rebase undone — ${run.branch ?? 'the branch'} was restored.`
+						? run.branch
+							? l10n.t('Rebase undone — {branch} was restored.', { branch: run.branch })
+							: l10n.t('Rebase undone — the branch was restored.')
 						: run.phase === 'failed'
-							? 'Rebase failed.'
+							? l10n.t('Rebase failed.')
 							: // An escalation's own message says why it stopped — notably that a `stopped` reason was
 								// the user's own doing, not a problem the rebase ran into.
-								(run.escalation?.message ?? 'Rebase paused — it needs your attention.');
+								(run.escalation?.message ?? l10n.t('Rebase paused — it needs your attention.'));
 
 		return html`
 			<div class="auto-rebase">
@@ -951,19 +976,23 @@ export class GlDetailsResolveModePanel extends LitElement {
 				${
 					// An escalated run left the rebase paused for the user — keep the toast's actions
 					// available here durably, since the toast itself is transient and the palette command
-					// (`Continue Automatic Rebase`) isn't discoverable from the panel
+					// (`Continue with Auto-Rebase`) isn't discoverable from the panel
 					run.phase === 'escalated'
 						? html`<div class="auto-rebase__actions">
 								<gl-tooltip
-									content="Let AI continue the rebase from here — resolving any remaining conflicts and finishing the remaining steps"
+									content=${l10n.t(
+										'Let AI continue the rebase from here — resolving any remaining conflicts and finishing the remaining steps',
+									)}
 								>
 									<gl-button @click=${() => this.emit('auto-rebase-resume')}
-										>Resume with AI</gl-button
+										>${l10n.t('Resume with AI')}</gl-button
 									>
 								</gl-tooltip>
-								<gl-tooltip content="Abort the rebase and restore the branch to its pre-rebase state">
+								<gl-tooltip
+									content=${l10n.t('Abort the rebase and restore the branch to its pre-rebase state')}
+								>
 									<gl-button appearance="secondary" @click=${() => this.emit('auto-rebase-cancel')}
-										>Abort Rebase</gl-button
+										>${l10n.t('Abort Rebase')}</gl-button
 									>
 								</gl-tooltip>
 							</div>`
@@ -984,11 +1013,14 @@ export class GlDetailsResolveModePanel extends LitElement {
 		return html`<div class="auto-rebase__context">
 			<div class="auto-rebase__header">
 				<code-icon icon="gl-merge"></code-icon>
-				<span class="auto-rebase__title">Automatic Rebase</span>
+				<span class="auto-rebase__title">${l10n.t('Auto-Rebase')}</span>
 				${
 					run.step != null
 						? html`<span class="auto-rebase__onto"
-								>paused at step ${run.step.current} of ${run.step.total}</span
+								>${l10n.t('paused at step {current} of {total}', {
+									current: getNumericFormat()(run.step.current),
+									total: getNumericFormat()(run.step.total),
+								})}</span
 							>`
 						: nothing
 				}
@@ -1004,13 +1036,20 @@ export class GlDetailsResolveModePanel extends LitElement {
 	private renderAutoRebaseHeader(run: AutoRebaseRunUpdate): unknown {
 		return html`<div class="auto-rebase__header">
 			<code-icon icon="gl-merge"></code-icon>
-			<span class="auto-rebase__title">Automatic Rebase</span>
-			${run.branch ? html`<gl-branch-name .name=${run.branch}></gl-branch-name>` : nothing}
+			<span class="auto-rebase__title">${l10n.t('Auto-Rebase')}</span>
 			${
-				run.upstream
-					? html`<span class="auto-rebase__onto">onto</span
-							><gl-branch-name .name=${run.upstream}></gl-branch-name>`
-					: nothing
+				run.branch && run.upstream
+					? localizedContent(l10n.t('{branch} onto {upstream}'), {
+							branch: html`<gl-branch-name .name=${run.branch}></gl-branch-name>`,
+							upstream: html`<gl-branch-name .name=${run.upstream}></gl-branch-name>`,
+						})
+					: run.branch
+						? html`<gl-branch-name .name=${run.branch}></gl-branch-name>`
+						: run.upstream
+							? localizedContent(l10n.t('onto {upstream}'), {
+									upstream: html`<gl-branch-name .name=${run.upstream}></gl-branch-name>`,
+								})
+							: nothing
 			}
 		</div>`;
 	}
@@ -1029,10 +1068,19 @@ export class GlDetailsResolveModePanel extends LitElement {
 		const key = `auto-rebase-step-${step.step}`;
 		const label =
 			step.kind === 'empty-skipped'
-				? `Step ${step.step} of ${step.totalSteps} — became empty, skipped`
+				? l10n.t('Step {current} of {total} — became empty, skipped', {
+						current: getNumericFormat()(step.step),
+						total: getNumericFormat()(step.totalSteps),
+					})
 				: step.kind === 'manual'
-					? `Step ${step.step} of ${step.totalSteps} — resolved by you`
-					: `Step ${step.step} of ${step.totalSteps}`;
+					? l10n.t('Step {current} of {total} — resolved by you', {
+							current: getNumericFormat()(step.step),
+							total: getNumericFormat()(step.totalSteps),
+						})
+					: l10n.t('Step {current} of {total}', {
+							current: getNumericFormat()(step.step),
+							total: getNumericFormat()(step.totalSteps),
+						});
 
 		return this.renderSection(
 			key,
@@ -1046,6 +1094,18 @@ export class GlDetailsResolveModePanel extends LitElement {
 			),
 			'step',
 		);
+	}
+
+	/** Memoized `.filesLayout` payload for the inner pane — a fresh literal per render would trip
+	 * the pane's tree-model rebuild via Lit's reference-equality dirty check. */
+	private _paneFilesLayout?: { layout: ViewFilesLayout };
+	private get paneFilesLayout(): { layout: ViewFilesLayout } {
+		let cached = this._paneFilesLayout;
+		if (cached?.layout !== this.fileLayout) {
+			cached = { layout: this.fileLayout };
+			this._paneFilesLayout = cached;
+		}
+		return cached;
 	}
 
 	private renderIdle(): unknown {
@@ -1064,7 +1124,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 		return html`
 			${this.renderAutoRebaseContext()}
 			<p class="resolve-intro">
-				Choose the conflicts to resolve with AI, then review each resolution before applying.
+				${l10n.t('Choose the conflicts to resolve with AI, then review each resolution before applying.')}
 			</p>
 			<div class="resolve-tree">
 				<webview-pane-group flexible>
@@ -1074,15 +1134,14 @@ export class GlDetailsResolveModePanel extends LitElement {
 						?multi-selectable=${true}
 						?show-file-icons=${true}
 						.collapsable=${false}
-						.filesLayout=${{ layout: this.fileLayout }}
+						.filesLayout=${this.paneFilesLayout}
 						.checkableStates=${checkableStates}
 						.fileContext=${this.getFileContext}
 						.folderContext=${(folder: { relativePath: string }) => buildFolderContext(this.repoPath, folder)}
 						.contextRevision=${this.repoPath}
 						selection-action="file-open"
-						check-verb="Resolve"
-						uncheck-verb="Skip"
-						empty-text="No conflicted files"
+						check-action="resolve"
+						empty-text=${l10n.t('No conflicted files')}
 						@file-checked=${this.onFileChecked}
 						@gl-check-all=${this.onToggleCheckAll}
 						@file-open=${(e: CustomEvent<FileChangeListItemDetail>) =>
@@ -1095,12 +1154,12 @@ export class GlDetailsResolveModePanel extends LitElement {
 					multiline
 					active
 					rows="2"
-					button-label="Resolve"
-					busy-label="Resolving conflicts…"
+					button-label=${l10n.t('Resolve')}
+					busy-label=${l10n.t('Resolving conflicts…')}
 					event-name="resolve-run"
-					placeholder='Optional guidance — e.g. "prefer incoming for generated files"'
+					placeholder=${l10n.t('Optional guidance — e.g. "prefer incoming for generated files"')}
 					?disabled=${checkedCount === 0}
-					disabled-reason="Select Conflicts to Resolve"
+					disabled-reason=${l10n.t('Select Conflicts to Resolve')}
 					.value=${this.lastPrompt}
 				>
 					<gl-ai-model-chip slot="footer" .model=${this.aiModel}></gl-ai-model-chip>
@@ -1164,7 +1223,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 			}
 			webviewItem = `gitlens:file${modifiers.join('')}`;
 		} else {
-			webviewItem = file.staged ? 'gitlens:file+staged' : 'gitlens:file+unstaged';
+			webviewItem = getWipFileWebviewItem(file);
 		}
 
 		const context: DetailsItemTypedContext = {
@@ -1194,7 +1253,15 @@ export class GlDetailsResolveModePanel extends LitElement {
 		const applicable = resolutions.filter(r => r.strategy !== 'skipped').length;
 		// Always show the count when there's something to apply ("Apply 1 Resolution" / "Apply 3
 		// Resolutions"); the disabled/none case reads the plain noun so it never says "0" or "all".
-		const applyLabel = applicable > 0 ? `Apply ${pluralize('Resolution', applicable)}` : 'Apply Resolutions';
+		const applyLabel =
+			applicable === 0
+				? l10n.t('Apply Resolutions')
+				: formatPlural(
+						l10n.t('{count, plural, one{Apply {count} Resolution} other{Apply {count} Resolutions}}'),
+						{
+							count: applicable,
+						},
+					);
 
 		const resolvedCount = resolutions.length;
 		const needCount = skipped.length + errors.length;
@@ -1213,12 +1280,19 @@ export class GlDetailsResolveModePanel extends LitElement {
 				total > 0
 					? html`<div class="resolve-progress">
 							<span class="resolve-progress__text">
-								<span class="resolve-progress__done">${resolvedCount} of ${total} resolved</span>
+								<span class="resolve-progress__done"
+									>${l10n.t('{resolved} of {total} resolved', {
+										resolved: getNumericFormat()(resolvedCount),
+										total: getNumericFormat()(total),
+									})}</span
+								>
 								${
 									needCount > 0
 										? html`<span class="resolve-progress__sep">·</span
 												><span class="resolve-progress__need"
-													>${needCount} need your input</span
+													>${l10n.t('{count} need your input', {
+														count: getNumericFormat()(needCount),
+													})}</span
 												>`
 										: nothing
 								}
@@ -1241,7 +1315,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 					resolvedCount > 0
 						? this.renderSection(
 								'resolved',
-								'Resolved',
+								l10n.t('Resolved'),
 								resolvedCount,
 								'pass',
 								repeat(
@@ -1257,7 +1331,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 					needCount > 0
 						? this.renderSection(
 								'needs',
-								'Needs your input',
+								l10n.t('Needs your input'),
 								needCount,
 								'warning',
 								this.renderNeedsBody(skipped, errors),
@@ -1272,7 +1346,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 					?checked=${this._refineMode}
 					@gl-change-value=${this.handleToggleRefineMode}
 				>
-					<code-icon icon="wand"></code-icon> Refine Resolutions
+					<code-icon icon="wand"></code-icon> ${l10n.t('Refine Resolutions')}
 				</gl-checkbox>
 				${
 					this._refineMode
@@ -1283,10 +1357,10 @@ export class GlDetailsResolveModePanel extends LitElement {
 									class="resolve-refine-input"
 									multiline
 									rows="2"
-									button-label="Refine Resolutions"
-									busy-label="Re-resolving…"
+									button-label=${l10n.t('Refine Resolutions')}
+									busy-label=${l10n.t('Re-resolving…')}
 									event-name="resolve-refine"
-									placeholder='Refine all — e.g. "prefer incoming for generated files"'
+									placeholder=${l10n.t('Refine all — e.g. "prefer incoming for generated files"')}
 									.recall=${this.lastPrompt}
 									.value=${this.refineDraft}
 								>
@@ -1295,7 +1369,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 										slot="actions"
 										appearance="secondary"
 										@click=${() => this.emit('resolve-discard')}
-										>Discard</gl-button
+										>${l10n.t('Discard')}</gl-button
 									>
 								</gl-ai-input>`,
 							)
@@ -1305,8 +1379,8 @@ export class GlDetailsResolveModePanel extends LitElement {
 										? html`<gl-tooltip
 												content=${
 													canResume
-														? 'Apply these resolutions and let AI finish the rebase'
-														: 'Resolve the remaining conflicts before resuming'
+														? l10n.t('Apply these resolutions and let AI finish the rebase')
+														: l10n.t('Resolve the remaining conflicts before resuming')
 												}
 											>
 												<gl-button
@@ -1314,7 +1388,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 													full
 													?disabled=${!canResume}
 													@click=${() => this.emit('resolve-apply-and-resume')}
-													>Apply &amp; Resume with AI</gl-button
+													>${l10n.t('Apply & Resume with AI')}</gl-button
 												>
 											</gl-tooltip>`
 										: nothing
@@ -1331,13 +1405,13 @@ export class GlDetailsResolveModePanel extends LitElement {
 									// Explain the disabled state via an external tooltip (real `?disabled` blocks the
 									// button's own hover), mirroring the summary sheet's Undo button pattern.
 									return applicable === 0
-										? html`<gl-tooltip content="No resolutions ready to apply"
+										? html`<gl-tooltip content=${l10n.t('No resolutions ready to apply')}
 												>${applyButton}</gl-tooltip
 											>`
 										: applyButton;
 								})()}
 								<gl-button appearance="secondary" @click=${() => this.emit('resolve-discard')}
-									>Discard</gl-button
+									>${l10n.t('Discard')}</gl-button
 								>
 							</div>`
 				}
@@ -1369,7 +1443,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 				<code-icon class="resolve-section__chevron" icon="chevron-down"></code-icon>
 				<code-icon class="resolve-section__status" icon=${icon}></code-icon>
 				<span class="resolve-section__label">${label}</span>
-				<span class="resolve-section__count">${count}</span>
+				<span class="resolve-section__count">${getNumericFormat()(count)}</span>
 			</button>
 			${
 				expanded
@@ -1417,7 +1491,7 @@ export class GlDetailsResolveModePanel extends LitElement {
 			<div class="resolve-file__head">
 				<span
 					class="resolve-file__badge ${display.warn ? 'resolve-file__badge--warn' : ''}"
-					title="Resolution strategy"
+					title=${l10n.t('Resolution strategy')}
 				>
 					<code-icon icon=${display.icon} size="11"></code-icon
 					><span class="resolve-file__badge-text">${display.label}</span>
@@ -1429,22 +1503,26 @@ export class GlDetailsResolveModePanel extends LitElement {
 						? html`<gl-button
 								appearance="toolbar"
 								class="resolve-file__view"
-								aria-label="View resolved changes for ${r.filePath}"
+								aria-label=${l10n.t('View resolved changes for {file}', { file: r.filePath })}
 								@click=${() => this.emit('resolve-view-diff', { filePath: r.filePath })}
 							>
 								<code-icon icon="diff"></code-icon
-								><span class="resolve-file__view-label">View Changes</span>
+								><span class="resolve-file__view-label">${l10n.t('View Changes')}</span>
 							</gl-button>`
 						: nothing
 				}
 				${
 					readonly
 						? nothing
-						: html`<gl-tooltip content=${retrying ? 'Re-resolving…' : 'Retry with feedback'}>
+						: html`<gl-tooltip
+								content=${retrying ? l10n.t('Re-resolving…') : l10n.t('Retry with feedback')}
+							>
 								<gl-button
 									appearance="toolbar"
 									aria-label=${
-										retrying ? `Re-resolving ${r.filePath}…` : `Retry ${r.filePath} with feedback`
+										retrying
+											? l10n.t('Re-resolving {file}…', { file: r.filePath })
+											: l10n.t('Retry {file} with feedback', { file: r.filePath })
 									}
 									aria-expanded=${expanded}
 									?disabled=${retrying}
@@ -1473,10 +1551,10 @@ export class GlDetailsResolveModePanel extends LitElement {
 							active
 							floating-footer
 							rows="1"
-							button-label="Retry"
-							busy-label="Re-resolving…"
+							button-label=${l10n.t('Retry')}
+							busy-label=${l10n.t('Re-resolving…')}
 							event-name="resolve-row-retry"
-							placeholder='What was wrong? e.g. "keep the new import, drop the old one"'
+							placeholder=${l10n.t('What was wrong? e.g. "keep the new import, drop the old one"')}
 							.busy=${retrying}
 							@resolve-row-retry=${(e: CustomEvent<{ prompt?: string }>) => this.onRowRetry(r.filePath, e)}
 						>
@@ -1555,13 +1633,15 @@ export class GlDetailsResolveModePanel extends LitElement {
 		const ordered = group.toSorted((a, b) => (a.canStageCurrent ? 0 : 1) - (b.canStageCurrent ? 0 : 1));
 		return html`<li class="resolve-file">
 			<div class="resolve-file__head">
-				<span class="resolve-file__badge resolve-file__badge--warn" title="Needs manual resolution">
+				<span class="resolve-file__badge resolve-file__badge--warn" title=${l10n.t('Needs manual resolution')}>
 					<code-icon icon="arrow-swap" size="11"></code-icon
-					><span class="resolve-file__badge-text">Both renamed</span>
+					><span class="resolve-file__badge-text">${l10n.t('Both renamed')}</span>
 				</span>
 				<span class="resolve-file__path">${renameOf}</span>
 			</div>
-			<p class="resolve-file__reasoning">“${renameOf}” was renamed differently on each side</p>
+			<p class="resolve-file__reasoning">
+				${l10n.t('“{file}” was renamed differently on each side', { file: renameOf })}
+			</p>
 			<div class="resolve-file__sides">${ordered.map(entry => this.renderRenameSide(entry))}</div>
 		</li>`;
 	}
@@ -1573,13 +1653,13 @@ export class GlDetailsResolveModePanel extends LitElement {
 		const staging = this.stagingFiles?.has(entry.filePath) ?? false;
 		const side: ConflictSide = entry.canStageCurrent ? 'current' : 'incoming';
 		return html`<div class="resolve-file__side">
-			<span class="resolve-file__side-tag">${side === 'current' ? 'Current' : 'Incoming'}</span>
+			<span class="resolve-file__side-tag">${side === 'current' ? l10n.t('Current') : l10n.t('Incoming')}</span>
 			<span class="resolve-file__side-path">${entry.filePath}</span>
 			${status != null ? this.renderTakeSideButton(entry.filePath, side, status, staging) : nothing}
-			<gl-tooltip content="Open in the merge editor">
+			<gl-tooltip content=${l10n.t('Open in the merge editor')}>
 				<gl-button
 					appearance="toolbar"
-					aria-label="Open ${entry.filePath} in the merge editor"
+					aria-label=${l10n.t('Open {file} in the merge editor', { file: entry.filePath })}
 					@click=${() => this.emit('resolve-open-file', { filePath: entry.filePath })}
 				>
 					<code-icon icon="go-to-file"></code-icon>
@@ -1594,10 +1674,10 @@ export class GlDetailsResolveModePanel extends LitElement {
 		const badge = kindDisplay(s.kind, s.conflictStatus);
 		// Keep the message interpolation flush inside the <p> — `.resolve-file__reasoning` is `pre-wrap`,
 		// so any newline/indent around it would render as literal blank space before the text.
-		const message = s.conflictStatus == null ? 'This file is no longer conflicted.' : conflictWhat(s.message);
+		const message = s.conflictStatus == null ? l10n.t('This file is no longer conflicted.') : s.message;
 		return html`<li class="resolve-file">
 			<div class="resolve-file__head">
-				<span class="resolve-file__badge resolve-file__badge--warn" title="Needs manual resolution">
+				<span class="resolve-file__badge resolve-file__badge--warn" title=${l10n.t('Needs manual resolution')}>
 					<code-icon icon=${badge.icon} size="11"></code-icon
 					><span class="resolve-file__badge-text">${badge.label}</span>
 				</span>
@@ -1618,7 +1698,9 @@ export class GlDetailsResolveModePanel extends LitElement {
 				<code-icon class="resolve-file__error" icon="error"></code-icon>
 				${
 					badge != null
-						? html`<span class="resolve-file__badge resolve-file__badge--warn" title="Conflict type"
+						? html`<span
+								class="resolve-file__badge resolve-file__badge--warn"
+								title=${l10n.t('Conflict type')}
 								><code-icon icon=${badge.icon} size="11"></code-icon
 								><span class="resolve-file__badge-text">${badge.label}</span></span
 							>`
@@ -1655,10 +1737,10 @@ export class GlDetailsResolveModePanel extends LitElement {
 		// Open the conflicted file in the 3-way merge editor to inspect both sides before choosing. A
 		// both-deleted file has no working-tree content to open, so skip it there.
 		if (file.kind !== 'both-deleted') {
-			buttons.push(html`<gl-tooltip content="Open in the merge editor">
+			buttons.push(html`<gl-tooltip content=${l10n.t('Open in the merge editor')}>
 				<gl-button
 					appearance="toolbar"
-					aria-label="Open ${file.filePath} in the merge editor"
+					aria-label=${l10n.t('Open {file} in the merge editor', { file: file.filePath })}
 					@click=${() => this.emit('resolve-open-file', { filePath: file.filePath })}
 				>
 					<code-icon icon="go-to-file"></code-icon>
@@ -1680,10 +1762,20 @@ export class GlDetailsResolveModePanel extends LitElement {
 	): unknown {
 		const isDelete = side === 'delete' ? true : classifyConflictAction(status, side) === 'delete';
 		const icon = isDelete ? 'trash' : side === 'current' ? 'gl-accept-left' : 'gl-accept-right';
-		const label = isDelete ? 'Delete File' : side === 'current' ? 'Take Current' : 'Take Incoming';
+		const label = isDelete
+			? l10n.t('Delete File')
+			: side === 'current'
+				? l10n.t('Take Current')
+				: l10n.t('Take Incoming');
 		return html`<gl-button
 			appearance="toolbar"
-			aria-label="${label} for ${filePath}"
+			aria-label=${
+				isDelete
+					? l10n.t('Delete File for {file}', { file: filePath })
+					: side === 'current'
+						? l10n.t('Take Current for {file}', { file: filePath })
+						: l10n.t('Take Incoming for {file}', { file: filePath })
+			}
 			?disabled=${staging}
 			@click=${() => this.emit('resolve-take-side', { filePath: filePath, side: side })}
 		>

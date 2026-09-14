@@ -1,10 +1,13 @@
+import type { GraphRefFinderRenderContext } from '@gitkraken/commit-graph-ui/contracts/refFinder.js';
+import { refPillKey } from '@gitkraken/commit-graph-ui/extensions/refs/pills.js';
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property, query, state } from 'lit/decorators.js';
-import type { TelemetryContext } from '../../../shared/contexts/telemetry.js';
-import { telemetryContext } from '../../../shared/contexts/telemetry.js';
+import { ref } from 'lit/directives/ref.js';
+import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import { parseFilterTerms } from '../../../shared/utils/filter-match.js';
 import type { AppState } from '../context.js';
 import { graphStateContext } from '../context.js';
@@ -19,12 +22,11 @@ import {
 	refreshMatchRows,
 	stepMatchIndex,
 } from '../utils/refFind.utils.js';
-import { refPillKey } from '../utils/refKey.utils.js';
 import { getSelectedRepoPath } from '../utils/repository.utils.js';
 import { graphRefFindStyles } from './gl-graph-ref-find.css.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 export interface GraphRefFindJumpEventDetail {
 	sha: string;
@@ -32,10 +34,28 @@ export interface GraphRefFindJumpEventDetail {
 	focus: boolean;
 	/** Which pill on the landed row answered the query, so the graph can emphasize that one. */
 	refKey: string;
+	/** The row already landed and was revealed by the jump that started its page-in — just take focus,
+	 *  don't re-navigate or re-flash. */
+	handoff?: boolean;
+}
+
+/** GitLens profile adapter for the optional ref-finder slot. Keeping the template here means the
+ * renderer package never imports or registers this product component in profiles that omit it. */
+export function renderGitLensGraphRefFinder(context: GraphRefFinderRenderContext) {
+	return html`<gl-graph-ref-find
+		${ref(context.elementRef)}
+		?open=${context.open}
+		.openedBy=${context.openedBy}
+		.getRowIndex=${context.getRowIndex}
+		.rowsLoaded=${context.rowsLoaded}
+		@click=${context.onClick}
+		@gl-graph-ref-find-jump=${context.onJump}
+		@gl-graph-ref-find-close=${context.onClose}
+	></gl-graph-ref-find>`;
 }
 
 /**
- * Type-ahead ref finder — the filtered counterpart to `Alt+PgUp`/`Alt+PgDn` ("previous / next ref").
+ * Type-ahead ref finder — the filtered counterpart to `[`/`]` ("previous / next branch or tag").
  *
  * TYPE-AHEAD, not a find box and not a picker. The input exists only so you can see and correct what
  * you typed; the graph does the answering, jumping to the best-matching ref on every keystroke the
@@ -54,14 +74,11 @@ export interface GraphRefFindJumpEventDetail {
 export class GlGraphRefFind extends SignalWatcher(LitElement) {
 	static override styles = [graphRefFindStyles];
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private _graphState!: AppState;
 
 	@consume({ context: sidebarActionsContext, subscribe: true })
 	private _sidebarActions?: SidebarActions;
-
-	@consume({ context: telemetryContext as { __context__: TelemetryContext } })
-	private _telemetry!: TelemetryContext;
 
 	/** How this session of the finder was opened, for telemetry. Set by the graph when it opens us. */
 	@property({ attribute: false })
@@ -96,6 +113,13 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 
 	/** Ref key of the match we last jumped the graph to. Not reactive — used to gate re-jumps, not to render. */
 	private _landedRefKey: string | undefined;
+
+	/**
+	 * Sha of the still-unloaded match an Enter last committed to. Set in `commit()`, cleared once its row
+	 * lands and the keyboard hands off (see `completePendingLoad`), or by any user action that supersedes
+	 * it — typing, stepping, or closing. `undefined` means no unloaded-ref Enter is waiting on a page-in.
+	 */
+	private _pendingLoadSha: string | undefined;
 
 	private get activeMatch(): RefFindMatch | undefined {
 		return this._index >= 0 ? this._matches[this._index] : undefined;
@@ -176,6 +200,8 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 				const index = refreshed.findIndex(m => m.sha === activeSha);
 				this._index = index === -1 ? this._index : index;
 			}
+
+			this.completePendingLoad();
 		}
 
 		if (changedProperties.has('open')) {
@@ -199,27 +225,31 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 	}
 
 	/**
-	 * Fetches any candidate panel that has no data and isn't already loading.
+	 * Fetches any candidate panel that has no data and isn't already loading; with `force`, re-fetches
+	 * panels that already hold data too (the old value stays live until the fresh one lands).
 	 *
 	 * Runs on every update while open, not just on open: the panels are shared with the sidebar and get
 	 * INVALIDATED out from under us (they reset to a null value with `loading` false), which silently
 	 * emptied the match set mid-session and left it empty until the widget was reopened.
 	 */
-	private ensurePanels(): void {
+	private ensurePanels(force?: boolean): void {
 		const actions = this._sidebarActions;
 		if (actions == null) return;
 
 		for (const panel of ['branches', 'remotes', 'tags'] as const) {
 			const resource = actions.state.panels[panel];
-			if (resource.value.get() == null && !resource.loading.get()) {
+			if (!resource.loading.get() && (force || resource.value.get() == null)) {
 				actions.fetchPanel(panel);
 			}
 		}
 	}
 
 	private onOpened(): void {
-		// Usually a no-op — the sidebar/scope popover share these — but the finder can be first to need them.
-		this.ensurePanels();
+		// Force a re-fetch rather than fetch-if-empty: the panels only refresh on a host invalidation
+		// signal, and a ref created outside the extension can slip past the FS watcher — leaving the
+		// finder unable to match a branch the graph itself already renders. A fresh round-trip is cheap
+		// relative to how rarely the finder opens, and the stale candidates stay usable until it lands.
+		this.ensurePanels(true);
 
 		// Re-run against whatever the panels now hold; a preserved query should still be live on reopen.
 		this.recompute({ jump: false });
@@ -230,6 +260,26 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		this._matches = [];
 		this._index = -1;
 		this._landedRefKey = undefined;
+		this._pendingLoadSha = undefined;
+	}
+
+	/**
+	 * Finishes an unloaded-ref Enter once its row lands, provided the match is still the active one — a
+	 * later keystroke or step already cleared `_pendingLoadSha`, so a superseded target never yanks focus.
+	 * The row itself was already navigated to, selected, and revealed by the jump `commit()` fired while
+	 * waiting (`emitJump(match, false)`), so this only hands the keyboard to it and dismisses — a
+	 * `handoff` jump tells the graph to focus the row without re-navigating or re-flashing.
+	 */
+	private completePendingLoad(): void {
+		const sha = this._pendingLoadSha;
+		if (sha == null) return;
+
+		const match = this.activeMatch;
+		if (match?.sha !== sha || match.rowIndex == null) return;
+
+		this._pendingLoadSha = undefined;
+		this.emitJump(match, true, { handoff: true });
+		this.close();
 	}
 
 	private buildCandidates(): RefFindCandidate[] {
@@ -293,12 +343,12 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		this.emitJump(match, false);
 	}
 
-	private emitJump(match: RefFindMatch, focus: boolean): void {
+	private emitJump(match: RefFindMatch, focus: boolean, options?: { handoff?: boolean }): void {
 		const refKey = refPillKey(match);
 		this._landedRefKey = refKey;
 		this.dispatchEvent(
 			new CustomEvent<GraphRefFindJumpEventDetail>('gl-graph-ref-find-jump', {
-				detail: { sha: match.sha, focus: focus, refKey: refKey },
+				detail: { sha: match.sha, focus: focus, refKey: refKey, handoff: options?.handoff },
 				bubbles: true,
 				composed: true,
 			}),
@@ -312,8 +362,7 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 	/**
 	 * Closes on focus-out only when `refFindAutoHide` is explicitly on. The setting defaults to `false`
 	 * and `GraphComponentConfig.refFindAutoHide` is optional, so `!== true` is the check that treats an
-	 * absent value as the documented default — the convention this component's other default-off config
-	 * fields (`experimentalKanbanEnabled`, `experimentalVisualizationsEnabled`) already follow.
+	 * absent value as the documented default.
 	 *
 	 * `relatedTarget` is retargeted to the nearest
 	 * ancestor in OUR shadow tree (e.g. `gl-button` itself, even when focus actually landed on its
@@ -349,6 +398,9 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 	private step(direction: 1 | -1): void {
 		if (this._matches.length === 0) return;
 
+		// Stepping off the pending match cancels its auto-close — only the match still active when its
+		// row lands gets the handoff.
+		this._pendingLoadSha = undefined;
 		this._index = stepMatchIndex(this._index, this._matches.length, direction);
 		this.jumpToActive();
 	}
@@ -357,6 +409,8 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		this._query = (e.target as HTMLInputElement).value;
 		// A new query legitimately re-lands, so drop the old landed ref key before recomputing.
 		this._landedRefKey = undefined;
+		// Same reasoning as `step()` — a new query supersedes whatever the last Enter was waiting on.
+		this._pendingLoadSha = undefined;
 		this.recompute();
 	}
 
@@ -402,13 +456,19 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		const match = this.activeMatch;
 		if (match == null) return;
 
-		this.reportLanding(match);
-
 		if (match.rowIndex == null) {
+			// A repeat Enter on the same still-loading match is a no-op — the first one already reported
+			// and started the page-in, and `completePendingLoad` is what finishes it.
+			if (match.sha === this._pendingLoadSha) return;
+
+			this._pendingLoadSha = match.sha;
+			this.reportLanding(match);
 			this.emitJump(match, false);
 			return;
 		}
 
+		this._pendingLoadSha = undefined;
+		this.reportLanding(match);
 		this.emitJump(match, true);
 		this.close();
 	}
@@ -416,7 +476,7 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 	/** One event per landed reference — on commit, not per keystroke, which would be mostly noise. */
 	private reportLanding(match: RefFindMatch): void {
 		const terms = parseFilterTerms(this._query);
-		this._telemetry?.sendEvent({
+		emitTelemetrySentEvent(this, {
 			name: 'graph/action/refFind',
 			data: {
 				source: this.openedBy,
@@ -458,7 +518,7 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		// when elision ate part of it, or what Enter will do for a ref that isn't paged in. A tooltip
 		// echoing a name that's fully visible is noise.
 		const tooltip = unloaded
-			? `${match.label} — not loaded, press Enter to fetch it`
+			? l10n.t('{ref} — not loaded, press Enter to fetch it', { ref: match.label })
 			: label !== match.label
 				? match.label
 				: undefined;
@@ -471,7 +531,9 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		// fact, and announcing a changing count on every keystroke would be noise.
 		const nav =
 			total > 1
-				? html`<span class="find__nav" aria-hidden="true">↑↓ ${this._index + 1} of ${total}</span>`
+				? html`<span class="find__nav" aria-hidden="true"
+						>${l10n.t('↑↓ {current} of {total}', { current: this._index + 1, total: total })}</span
+					>`
 				: nothing;
 
 		return html`<div class="find__result">${hitEl}${nav}</div>`;
@@ -483,7 +545,7 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 		return html`<div
 			class="find"
 			role="search"
-			aria-label="Find a branch, tag, or worktree"
+			aria-label=${l10n.t('Find a branch, tag, or worktree')}
 			@focusout=${this.onFocusOut}
 		>
 			<div class="find__row">
@@ -494,8 +556,8 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 						type="text"
 						spellcheck="false"
 						autocomplete="off"
-						placeholder="Find a branch, tag, or worktree..."
-						aria-label="Find a branch, tag, or worktree"
+						placeholder=${l10n.t('Find a branch, tag, or worktree...')}
+						aria-label=${l10n.t('Find a branch, tag, or worktree')}
 						aria-keyshortcuts="ArrowDown ArrowUp"
 						.value=${this._query}
 						@input=${this.onInput}
@@ -506,11 +568,11 @@ export class GlGraphRefFind extends SignalWatcher(LitElement) {
 					class="find__close"
 					appearance="toolbar"
 					density="compact"
-					aria-label="Close"
+					aria-label=${l10n.t('Close')}
 					@click=${this.close}
 				>
 					<code-icon icon="close"></code-icon>
-					<span slot="tooltip">Close</span>
+					<span slot="tooltip">${l10n.t('Close')}</span>
 				</gl-button>
 			</div>
 			${this.renderHit()}

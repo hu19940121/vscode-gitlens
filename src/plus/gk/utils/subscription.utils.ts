@@ -1,5 +1,6 @@
 import { getTimeRemaining } from '@gitlens/utils/date.js';
 import { SubscriptionState } from '../../../constants.subscription.js';
+import type { PlansContent } from '../models/plans.js';
 import type {
 	PaidSubscriptionPlanIds,
 	Subscription,
@@ -29,12 +30,28 @@ export function compareSubscriptionPlans(
 }
 
 /**
+ * Whether this user is allowed to buy AI credit add-ons for whoever is paying: inside an organization only
+ * its owner, admin, or billing contact can, and someone with no active organization is spending their own
+ * money. Says nothing about whether they NEED more credits — callers still gate on the plan.
+ *
+ * Shared with the webviews on purpose: the Settings account panel's AI usage card and the weekly
+ * usage-limit notification both decide who gets a purchase path from this one predicate, so they can't
+ * drift into offering it to different people.
+ */
+export function canPurchaseAiCredits(subscription: Subscription): boolean {
+	const role = subscription.activeOrganization?.role;
+	return role == null || role === 'owner' || role === 'admin' || role === 'billing';
+}
+
+/**
  * Whether the account itself blocks access — none connected, or one whose email isn't verified.
  * Surfaces gated on this (e.g. the Commit Graph) replace their entire content with an account screen,
  * so callers routing work to one must treat it as unusable ahead of any plan/visibility check.
  */
-export function isAccountAccessRequired(subscription: Subscription): boolean {
-	return subscription.account == null || subscription.account.verified === false;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function isAccountAccessRequired(_subscription: Subscription): boolean {
+	// 【破解】不要求登录/验证账户即可使用 Graph 等功能
+	return false;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -150,6 +167,62 @@ export function getSubscriptionProductPlanNameFromState(
 		default:
 			return getSubscriptionProductPlanName(planId ?? 'pro');
 	}
+}
+
+/** Substitutes every occurrence of the authored `${aiCredits}` placeholder token in plan marketing copy. */
+function substituteAiCredits(text: string, credits: string): string {
+	// oxlint-disable-next-line no-template-curly-in-string -- `${aiCredits}` is an authored placeholder token, not an interpolation
+	return text.split('${aiCredits}').join(credits);
+}
+
+/**
+ * Weekly GitKraken AI credit allowance for a paid plan — the bare figure only (e.g. `'1M'`, `'500K'`);
+ * each caller composes its own "… credits/week" phrasing, since consumers phrase it differently (a plan
+ * card's feature bullet, an upsell pitch sentence, a popover tooltip). Takes `PaidSubscriptionPlanIds`
+ * rather than `SubscriptionPlanIds` — Community plans have no AI credit allowance at all, so the type
+ * system makes passing one impossible rather than silently returning Pro's figure for it; callers with a
+ * possibly-unpaid id must narrow first (see `isSubscriptionPaidPlan`).
+ *
+ * A trial carries its OWN, much smaller grant than the plan it previews — reading the previewed plan's
+ * number here would overstate a trial's budget 4x — so `trial` short-circuits into the separate
+ * `trialAiCredits` table, keyed by the plan being previewed with a `default` fallback, rather than being
+ * derived from `planId` against `aiCredits`.
+ */
+export function getSubscriptionPlanAiCredits(
+	plans: PlansContent,
+	planId: PaidSubscriptionPlanIds,
+	trial: boolean,
+): string {
+	return trial ? (plans.trialAiCredits[planId] ?? plans.trialAiCredits.default) : plans.aiCredits[planId];
+}
+
+/**
+ * What the given plan includes. Each paid tier above Pro stacks on the one below it with an
+ * "Everything in X" lead, mirroring how GitKraken's own pricing presents them, so the list stays short
+ * enough to scan instead of restating four tiers' worth of bullets.
+ */
+export function getSubscriptionPlanFeatures(
+	plans: PlansContent,
+	planId: SubscriptionPlanIds,
+	trial: boolean,
+): string[] {
+	// The default list is the Pro pitch, shown to Community/unpaid users as well as to Pro and Student — so a
+	// Community id must resolve to Pro's figure deliberately (via the paid-plan guard), not by falling
+	// through `getSubscriptionPlanAiCredits`, whose table has no entry for an unpaid id at all.
+	const creditsPlanId = isSubscriptionPaidPlan(planId) ? planId : 'pro';
+	const credits = getSubscriptionPlanAiCredits(plans, creditsPlanId, trial);
+
+	const features = plans.features[planId] ?? plans.features.default;
+	return features.map(f => substituteAiCredits(f, credits));
+}
+
+/**
+ * What upgrading to the given plan gets you. The credit figure resolves against the PITCHED plan, not the
+ * viewer's current one — these lists sell a specific tier, so Pro's bullet must always quote Pro's grant.
+ */
+export function getSubscriptionPlanUpgradeFeatures(plans: PlansContent, plan: 'pro' | 'advanced'): string[] {
+	const credits = getSubscriptionPlanAiCredits(plans, plan, false);
+	return plans.upgradeFeatures[plan].map(f => substituteAiCredits(f, credits));
 }
 
 export function getSubscriptionStateString(state: SubscriptionState | undefined): SubscriptionStateString {

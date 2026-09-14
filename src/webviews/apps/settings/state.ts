@@ -1,8 +1,8 @@
 import { computed } from '@lit-labs/signals';
 import { createContext } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { IssuesCloudHostIntegrationId } from '@gitlens/integrations/constants.js';
 import type { Config } from '../../../config.js';
-import type { Subscription } from '../../../plus/gk/models/subscription.js';
 import type {
 	AgentInfo,
 	AiModelInfo,
@@ -46,11 +46,10 @@ export function createSettingsState(storage?: HostStorage) {
 	const config = signal<Config | undefined>(undefined);
 	const customSettings = signal<Record<string, boolean>>({});
 	const version = signal<string>('');
-	const scopes = signal<SettingsScope[]>([['user', 'User']]);
+	const scopes = signal<SettingsScope[]>([['user', l10n.t('User')]]);
 
-	// Shared-service domain data (subscription/integrations/ai) — `undefined`
+	// Shared-service domain data (integrations/ai) — `undefined`
 	// means not yet loaded, so panels can show skeletons instead of empty states
-	const subscription = signal<Subscription | undefined>(undefined);
 	const cloudIntegrations = signal<IntegrationStateInfo[] | undefined>(undefined);
 	const aiState = signal<AIState | undefined>(undefined);
 	const aiModel = signal<AiModelInfo | undefined>(undefined);
@@ -60,8 +59,7 @@ export function createSettingsState(storage?: HostStorage) {
 	/** The compose/review/resolve scoped overrides, in display order; `undefined` means not yet loaded. */
 	const scopedAiModels = signal<ScopedAiModelInfo[] | undefined>(undefined);
 	/** Shared-service fetch failures, so panels can show an error + retry instead of a forever-skeleton */
-	const serviceErrors = signal<{ subscription: boolean; integrations: boolean; ai: boolean; agents: boolean }>({
-		subscription: false,
+	const serviceErrors = signal<{ integrations: boolean; ai: boolean; agents: boolean }>({
 		integrations: false,
 		ai: false,
 		agents: false,
@@ -102,8 +100,6 @@ export function createSettingsState(storage?: HostStorage) {
 		return match?.matchedKeys ?? [];
 	});
 
-	const hasAccount = computed<boolean>(() => subscription.get()?.account != null);
-
 	const isIntegrationConnected = (id: IssuesCloudHostIntegrationId) =>
 		cloudIntegrations.get()?.some(i => i.id === id && i.connected) ?? false;
 
@@ -138,7 +134,6 @@ export function createSettingsState(storage?: HostStorage) {
 		scopes: scopes,
 
 		// Shared services
-		subscription: subscription,
 		cloudIntegrations: cloudIntegrations,
 		aiState: aiState,
 		aiModel: aiModel,
@@ -158,7 +153,6 @@ export function createSettingsState(storage?: HostStorage) {
 		searchResults: searchResults,
 		selectedCategory: selectedCategory,
 		highlightedKeys: highlightedKeys,
-		hasAccount: hasAccount,
 		hasConnectedJira: hasConnectedJira,
 		hasConnectedLinear: hasConnectedLinear,
 

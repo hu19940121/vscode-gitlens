@@ -1,7 +1,9 @@
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { boxSizingBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type {
 	LaunchpadSummaryError,
 	LaunchpadSummaryResult,
@@ -9,7 +11,6 @@ import type {
 import type { GitBranchShape, Wip } from '../../../../plus/graph/detailsProtocol.js';
 import type { BranchMergeTargetStatus } from '../../../../rpc/services/branches.js';
 import type { BranchRef } from '../../../../shared/branchRefs.js';
-import { elementBase } from '../../../shared/components/styles/lit/base.css.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
 import { detailsWipEmptyPaneStyles } from './gl-details-wip-empty-pane.css.js';
@@ -17,7 +18,7 @@ import type { NextStep } from './nextStep.js';
 import { nextStepStyles, renderNextStep } from './nextStep.js';
 import '../../../shared/components/button.js';
 import '../../../shared/components/button-container.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import './gl-launchpad-summary.js';
 
 function getRemoteNameFromUpstream(upstreamName: string | undefined): string {
@@ -29,7 +30,7 @@ function getRemoteNameFromUpstream(upstreamName: string | undefined): string {
 
 @customElement('gl-details-wip-empty-pane')
 export class GlDetailsWipEmptyPane extends LitElement {
-	static override styles = [elementBase, nextStepStyles, detailsWipEmptyPaneStyles];
+	static override styles = [boxSizingBase, nextStepStyles, detailsWipEmptyPaneStyles];
 
 	@consume({ context: webviewContext })
 	private _webview!: WebviewContext;
@@ -50,7 +51,6 @@ export class GlDetailsWipEmptyPane extends LitElement {
 	 *  so consumers that don't wire Launchpad props (e.g., the commit-details `gl-details-wip-panel`)
 	 *  don't accidentally surface a Launchpad block they never opted into. */
 	@property({ type: Boolean, attribute: 'show-launchpad' }) showLaunchpad = false;
-	@property({ type: Boolean }) aiEnabled = false;
 	@property({ type: Boolean }) aiCreatePrEnabled = false;
 	@property({ type: Object }) mergeTargetStatus?: BranchMergeTargetStatus;
 
@@ -67,17 +67,13 @@ export class GlDetailsWipEmptyPane extends LitElement {
 
 	override render(): unknown {
 		// Stable bottom anchor — `Start New` always renders. Sections above it (`Next steps`,
-		// `AI workflows`, `Launchpad`) appear conditionally on data and order is fixed; their
+		// `Launchpad`) appear conditionally on data and order is fixed; their
 		// arrival pushes the start-new section down but never displaces it. Review/Recompose
 		// surface inside `Next steps` (via `uniqueWorkSteps`) when there's unique-work; the
 		// previous renderIdle's bottom-of-cluster Review/Recompose buttons are replaced by that
 		// path.
-		const branch = this.wip?.branch;
 		const allSteps = [...this._cachedNextSteps, ...this._cachedUniqueWorkSteps];
 		const hasSteps = allSteps.length > 0;
-		const ahead = branch?.tracking?.ahead ?? 0;
-		const hasDiverged =
-			branch != null && (ahead > 0 || branch.upstream?.missing === true || branch.upstream == null);
 
 		// Launchpad renders from initial mount (when `showLaunchpad`) — the summary content is
 		// branch-agnostic (PRs across the user's connected integrations) and the inner
@@ -89,12 +85,11 @@ export class GlDetailsWipEmptyPane extends LitElement {
 			${
 				hasSteps
 					? html`<section class="section">
-							<h3 class="section__heading">Next steps</h3>
+							<h3 class="section__heading">${l10n.t('Next steps')}</h3>
 							${allSteps.map(step => renderNextStep(step))}
 						</section>`
 					: nothing
 			}
-			${branch != null && this.aiEnabled && hasDiverged ? this.renderAiWorkflows(ahead) : nothing}
 			${this.showLaunchpad ? this.renderLaunchpadSection() : nothing} ${this.renderStartNewSection()}
 		</div>`;
 	}
@@ -102,13 +97,13 @@ export class GlDetailsWipEmptyPane extends LitElement {
 	private renderLaunchpadSection() {
 		return html`<section class="section">
 			<header class="section__header">
-				<h3 class="section__heading">Launchpad</h3>
+				<h3 class="section__heading">${l10n.t('Launchpad')}</h3>
 				<gl-button
 					class="section__heading-action"
 					appearance="toolbar"
 					aria-busy=${this.launchpadSummaryLoading}
 					?disabled=${this.launchpadSummaryLoading}
-					tooltip="Refresh Launchpad"
+					tooltip=${l10n.t('Refresh Launchpad')}
 					@click=${() => this.emit('refresh-launchpad')}
 				>
 					<code-icon icon="refresh"></code-icon>
@@ -124,25 +119,25 @@ export class GlDetailsWipEmptyPane extends LitElement {
 
 	private renderStartNewSection() {
 		return html`<section class="section">
-			<h3 class="section__heading">Start New</h3>
+			<h3 class="section__heading">${l10n.t('Start New')}</h3>
 			<div class="start-new">
 				<gl-button appearance="secondary" @click=${() => this.emit('start-work', { showOpenInAgent: 'ask' })}>
-					Start Work on an Issue…
+					${l10n.t('Start Work on an Issue…')}
 				</gl-button>
 				<gl-button appearance="secondary" @click=${() => this.emit('start-review', { showOpenInAgent: 'ask' })}>
-					Start Review on a PR…
+					${l10n.t('Start Review on a PR…')}
 				</gl-button>
 				<gl-button appearance="secondary" @click=${() => this.emit('apply-stash')}>
-					Apply / Pop Stash…
+					${l10n.t('Apply / Pop Stash…')}
 				</gl-button>
 				<gl-button appearance="secondary" @click=${() => this.emit('new-worktree')}>
-					Create Worktree…
+					${l10n.t('Create Worktree…')}
 				</gl-button>
 				<gl-button appearance="secondary" @click=${() => this.emit('create-branch')}>
-					Create Branch…
+					${l10n.t('Create Branch…')}
 				</gl-button>
 				<gl-button appearance="secondary" @click=${() => this.emit('switch-branch')}>
-					Switch Branch…
+					${l10n.t('Switch Branch…')}
 				</gl-button>
 			</div>
 		</section>`;
@@ -169,41 +164,13 @@ export class GlDetailsWipEmptyPane extends LitElement {
 	protected override updated(): void {
 		// Counts BOTH sources the Next-steps section renders. A section showing only
 		// Review/Recompose (uniqueWorkSteps populated, no cached steps) still has to fire
-		// `next-steps-shown` — it drives `TrackGraphDetailsWipShownCommand` and the
-		// deferred-walkthrough trigger.
+		// `next-steps-shown` — it drives the `action:gitlens.graph.details.wipShown:happened`
+		// usage track and the deferred-walkthrough trigger.
 		const hasNextSteps = this._cachedNextSteps.length + this._cachedUniqueWorkSteps.length > 0;
 		if (hasNextSteps && !this._hadNextSteps) {
 			this.emit('next-steps-shown');
 		}
 		this._hadNextSteps = hasNextSteps;
-	}
-
-	private renderAiWorkflows(ahead: number) {
-		return html`<section class="section">
-			<h3 class="section__heading">AI workflows</h3>
-			<div class="ai-grid">
-				<gl-button class="ai-button" appearance="secondary" @click=${() => this.emit('ai-draft-pr')}>
-					<code-icon icon="sparkle"></code-icon>Draft PR Description
-				</gl-button>
-				<gl-button class="ai-button" appearance="secondary" @click=${() => this.emit('ai-summarize-branch')}>
-					<code-icon icon="sparkle"></code-icon>Summarize Branch
-				</gl-button>
-				${
-					ahead > 0
-						? html`<gl-button
-								class="ai-button"
-								appearance="secondary"
-								@click=${() => this.emit('ai-review-unpushed')}
-							>
-								<code-icon icon="sparkle"></code-icon>Review ${pluralize('Unpushed Commit', ahead)}
-							</gl-button>`
-						: nothing
-				}
-				<gl-button class="ai-button" appearance="secondary" @click=${() => this.emit('ai-changelog')}>
-					<code-icon icon="sparkle"></code-icon>Generate Changelog Entry
-				</gl-button>
-			</div>
-		</section>`;
 	}
 
 	private computeNextSteps(branch: GitBranchShape): NextStep[] {
@@ -217,23 +184,54 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		if (upstreamMissing) {
 			steps.push({
 				icon: 'cloud-upload',
-				label: `Publish ${branch.name} to ${remoteName}`,
-				actionLabel: 'Publish',
+				label: l10n.t('Publish {branch} to {remote}', { branch: branch.name, remote: remoteName }),
+				actionLabel: l10n.t('Publish'),
 				onClick: () => this.emit('publish-branch'),
 			});
 		} else {
-			if (behind > 0) {
+			if (ahead > 0 && behind > 0) {
+				steps.push({
+					icon: 'repo-force-push',
+					label: l10n.t('Diverged from {remote} — {behind} behind, {ahead} ahead', {
+						remote: remoteName,
+						behind: behind,
+						ahead: ahead,
+					}),
+					actionLabel: l10n.t('Pull'),
+					onClick: () => this.emit('pull'),
+					alt: {
+						actionLabel: l10n.t('Force Push'),
+						tooltip: formatPlural(
+							l10n.t(
+								'{count, plural, one{Force push {count} commit to {remote}} other{Force push {count} commits to {remote}}}',
+							),
+							{ count: ahead, remote: remoteName },
+						),
+						onClick: () => this.emit('force-push'),
+					},
+				});
+			} else if (behind > 0) {
 				steps.push({
 					icon: 'repo-pull',
-					label: `Pull ${pluralize('commit', behind)} from ${remoteName}`,
-					actionLabel: 'Pull',
+					label: formatPlural(
+						l10n.t(
+							'{count, plural, one{Pull {count} commit from {remote}} other{Pull {count} commits from {remote}}}',
+						),
+						{ count: behind, remote: remoteName },
+					),
+					actionLabel: l10n.t('Pull'),
 					onClick: () => this.emit('pull'),
 				});
 			} else if (ahead > 0) {
 				steps.push({
 					icon: 'repo-push',
-					label: `Push ${pluralize('commit', ahead)} to ${remoteName}`,
-					actionLabel: 'Push',
+					label: formatPlural(
+						l10n.t(
+							'{count, plural, one{Push {count} commit to {remote}} other{Push {count} commits to {remote}}}',
+						),
+						{ count: ahead, remote: remoteName },
+					),
+					actionLabel: l10n.t('Push'),
 					onClick: () => this.emit('push'),
 				});
 			}
@@ -247,23 +245,23 @@ export class GlDetailsWipEmptyPane extends LitElement {
 				const pr = this.pullRequest;
 				steps.push({
 					icon: 'git-pull-request',
-					label: `Pull Request #${pr.id}: ${pr.title}`,
-					actionLabel: 'View',
+					label: l10n.t('Pull Request #{id}: {title}', { id: pr.id, title: pr.title }),
+					actionLabel: l10n.t('View'),
 					href: pr.url,
 				});
 			} else if (this.pullRequestLoading) {
 				steps.push({
 					icon: 'git-pull-request',
-					label: 'Checking for pull request…',
-					actionLabel: 'Checking',
+					label: l10n.t('Checking for pull request…'),
+					actionLabel: l10n.t('Checking'),
 					loading: true,
 				});
 			} else {
 				const useAI = this.aiCreatePrEnabled;
 				steps.push({
 					icon: 'git-pull-request-create',
-					label: 'Create a Pull Request',
-					actionLabel: 'Create PR',
+					label: l10n.t('Create a Pull Request'),
+					actionLabel: l10n.t('Create PR'),
 					actionPrefixIcon: useAI ? 'sparkle' : undefined,
 					onClick: () => this.emit(useAI ? 'create-pr-ai' : 'create-pr'),
 				});
@@ -297,14 +295,14 @@ export class GlDetailsWipEmptyPane extends LitElement {
 
 		const review: NextStep = {
 			icon: 'checklist',
-			label: 'Review Changes',
-			actionLabel: 'Review',
+			label: l10n.t('Review Changes'),
+			actionLabel: l10n.t('Review'),
 			onClick: () => this.emit('review-branch-changes'),
 		};
 		const recompose: NextStep = {
 			icon: 'wand',
-			label: 'Recompose Branch',
-			actionLabel: 'Recompose',
+			label: l10n.t('Recompose Branch'),
+			actionLabel: l10n.t('Recompose'),
 			onClick: () => this.emit('recompose-branch-changes'),
 		};
 
@@ -344,7 +342,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		};
 
 		const isWorktree = branch.worktree != null && !branch.worktree.isDefault;
-		const deleteLabel = isWorktree ? 'Delete Worktree' : 'Delete Branch';
+		const deleteLabel = isWorktree ? l10n.t('Delete Worktree') : l10n.t('Delete Branch');
 
 		const mergedStatus = mergeTarget.mergedStatus;
 		if (mergedStatus?.merged && mergedStatus.localBranchOnly) {
@@ -354,12 +352,14 @@ export class GlDetailsWipEmptyPane extends LitElement {
 				branchName: mergedStatus.localBranchOnly.name,
 				branchUpstreamName: mergedStatus.localBranchOnly.upstream?.name,
 			};
-			const likely = mergedStatus.confidence !== 'highest' ? 'Likely ' : '';
 			return {
 				icon: 'git-merge',
 				iconFlip: 'block',
-				label: `Branch ${likely}Merged Locally into ${mergeTarget.name}`,
-				actionLabel: `Push ${mergedStatus.localBranchOnly.name}`,
+				label:
+					mergedStatus.confidence !== 'highest'
+						? l10n.t('Branch Likely Merged Locally into {target}', { target: mergeTarget.name })
+						: l10n.t('Branch Merged Locally into {target}', { target: mergeTarget.name }),
+				actionLabel: l10n.t('Push {branch}', { branch: mergedStatus.localBranchOnly.name }),
 				href: this._webview.createCommandLink<BranchRef>('gitlens.pushBranch:', localTargetRef),
 				alt: {
 					actionLabel: deleteLabel,
@@ -373,11 +373,13 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		}
 
 		if (mergedStatus?.merged) {
-			const likely = mergedStatus.confidence !== 'highest' ? 'Likely ' : '';
 			return {
 				icon: 'git-merge',
 				iconFlip: 'block',
-				label: `Branch ${likely}Merged into ${mergeTarget.name}`,
+				label:
+					mergedStatus.confidence !== 'highest'
+						? l10n.t('Branch Likely Merged into {target}', { target: mergeTarget.name })
+						: l10n.t('Branch Merged into {target}', { target: mergeTarget.name }),
 				actionLabel: deleteLabel,
 				href: this._webview.createCommandLink<[BranchRef, BranchRef]>('gitlens.deleteBranchOrWorktree:', [
 					branchRef,
@@ -391,12 +393,15 @@ export class GlDetailsWipEmptyPane extends LitElement {
 			return {
 				icon: 'git-merge',
 				iconFlip: 'block',
-				label: `Potential Conflicts with ${mergeTarget.name}`,
-				actionLabel: 'Rebase',
+				label: l10n.t('Potential Conflicts with {target}', { target: mergeTarget.name }),
+				actionLabel: l10n.t('Rebase'),
 				onClick: () => this.emit('rebase-onto-merge-target'),
 				alt: {
-					actionLabel: 'Merge',
-					tooltip: `Merge ${mergeTarget.name} into ${branch.name} instead`,
+					actionLabel: l10n.t('Merge'),
+					tooltip: l10n.t('Merge {target} into {branch} instead', {
+						target: mergeTarget.name,
+						branch: branch.name,
+					}),
 					onClick: () => this.emit('merge-merge-target-into-current'),
 				},
 			};
@@ -408,12 +413,18 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		return {
 			icon: 'git-merge',
 			iconFlip: 'block',
-			label: `${pluralize('Commit', behind)} Behind ${mergeTarget.name}`,
-			actionLabel: 'Rebase',
+			label: formatPlural(
+				l10n.t('{count, plural, one{{count} Commit Behind {target}} other{{count} Commits Behind {target}}}'),
+				{ count: behind, target: mergeTarget.name },
+			),
+			actionLabel: l10n.t('Rebase'),
 			onClick: () => this.emit('rebase-onto-merge-target'),
 			alt: {
-				actionLabel: 'Merge',
-				tooltip: `Merge ${mergeTarget.name} into ${branch.name} instead`,
+				actionLabel: l10n.t('Merge'),
+				tooltip: l10n.t('Merge {target} into {branch} instead', {
+					target: mergeTarget.name,
+					branch: branch.name,
+				}),
 				onClick: () => this.emit('merge-merge-target-into-current'),
 			},
 		};

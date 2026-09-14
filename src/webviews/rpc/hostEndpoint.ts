@@ -2,7 +2,7 @@
  * Supertalk Endpoint adapter for VS Code extension host side.
  *
  * Wraps the VS Code Webview API to conform to Supertalk's Endpoint interface.
- * Uses a namespace wrapper to avoid collisions with existing IPC messages.
+ * Uses a namespace wrapper so the pipe can carry non-RPC frames (e.g. persistence pings) safely.
  *
  * Includes a visibility-aware message buffer for `retainContextWhenHidden` webviews.
  * When hidden, VS Code silently drops `webview.postMessage()` calls. The buffer
@@ -14,15 +14,31 @@
  * - All other types (`call`, `return`, `release`, `resolve`, `reject`, `throw`):
  *   FIFO queue — each is a unique logical operation.
  *
+ * Exception: `st:ch:*` wireTypes (Supertalk's SequencedChannel) are handler
+ * messages but ride the FIFO queue, not the handler map. A channel is an
+ * ordered, counted stream — including replay-request/response pairs used to
+ * heal gaps — so last-write-wins would silently collapse the sequence down to
+ * one message and desync the receiver's expected `seq`. Dedup is only valid
+ * for last-wins snapshot events (signals, abort), not sequenced streams.
+ *
  * On visibility restore, the FIFO queue flushes first (preserving order), then
  * the deduped handler map values. This ensures RPC responses arrive before the
  * signal/event catch-up burst.
  */
 import type { Endpoint } from '@eamodio/supertalk';
 import type { Disposable, Webview } from 'vscode';
+import { env } from 'vscode';
+import { deflateRaw } from '@env/compression.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { RpcMessageWrapper } from './constants.js';
-import { decodeRpcPayload, encodeRpcPayload, isRpcMessage, RPC_NAMESPACE } from './constants.js';
+import {
+	decodeRpcPayload,
+	encodeRpcPayload,
+	isBinaryRpcPayload,
+	isRpcMessage,
+	RPC_NAMESPACE,
+	rpcCompressionMinBytes,
+} from './constants.js';
 
 // Re-export for convenience
 export type { RpcMessageWrapper } from './constants.js';
@@ -44,16 +60,27 @@ export interface BufferedEndpoint extends Endpoint, Disposable {
 /** Depth at which the hidden-side FIFO is reported as suspicious (see {@link bufferMessage}). */
 const fifoWarnThreshold = 500;
 
+/** Wire-type prefix for Supertalk's SequencedChannel — see the dedup exception above. */
+const sequencedChannelWireTypePrefix = 'st:ch:';
+
 /**
  * Creates a Supertalk-compatible Endpoint from a VS Code Webview.
  *
- * Messages are wrapped with a namespace to avoid collisions with existing
- * IPC messages. Only messages with the RPC namespace are processed.
+ * Messages are wrapped with a namespace; only frames carrying the RPC
+ * namespace are processed, anything else is ignored.
  *
  * @param webview - The VS Code Webview instance
+ * @param options.compress - Force compression on or off. Defaults to gating on `env.remoteName`.
+ *   The option exists for tests.
  * @returns A BufferedEndpoint that can be used with Supertalk's expose() function
  */
-export function createHostEndpoint(webview: Webview): BufferedEndpoint {
+export function createHostEndpoint(webview: Webview, options?: { compress?: boolean }): BufferedEndpoint {
+	// Compression only pays for itself when webview messages cross a network — i.e. a remote extension
+	// host (SSH / WSL / container / Codespaces from desktop); locally it is pure CPU cost. The browser
+	// host cannot compress at all (its `deflateRaw` always returns `undefined`) — probe once here so a
+	// web + remote session (e.g. vscode.dev over a tunnel) doesn't pay a no-op deflate call per message.
+	const compress = (options?.compress ?? env.remoteName != null) && deflateRaw(new Uint8Array()) != null;
+
 	const listeners = new Map<(event: MessageEvent) => void, Disposable>();
 
 	let visible = true;
@@ -63,19 +90,66 @@ export function createHostEndpoint(webview: Webview): BufferedEndpoint {
 	const handlerMap = new Map<string, TypedMessage>();
 
 	function doPost(message: unknown): void {
-		const wrapped: RpcMessageWrapper = {
-			[RPC_NAMESPACE]: true,
-			payload: encodeRpcPayload(message),
+		// VS Code's `postMessage` can silently drop a message (known bug) or reject if the webview
+		// is gone. Neither requeues here — that's a bigger design change — but both are worth knowing
+		// about when a webview appears to hang waiting on a response that never arrives.
+		const msg = message as TypedMessage;
+		const post = (wrapped: RpcMessageWrapper): void => {
+			void webview.postMessage(wrapped).then(
+				ok => {
+					if (!ok) {
+						Logger.error(
+							undefined,
+							`RPC host endpoint: postMessage was not delivered (type=${msg.type}, wireType=${msg.wireType})`,
+						);
+					}
+				},
+				(ex: unknown) =>
+					Logger.error(
+						ex,
+						`RPC host endpoint: postMessage failed (type=${msg.type}, wireType=${msg.wireType})`,
+					),
+			);
 		};
-		void webview.postMessage(wrapped);
+
+		const encoded = encodeRpcPayload(message);
+
+		if (compress && encoded.byteLength >= rpcCompressionMinBytes) {
+			try {
+				const deflated = deflateRaw(encoded);
+				// Skip compression when the host can't provide it or it didn't actually shrink the payload
+				if (deflated != null && deflated.byteLength < encoded.byteLength) {
+					post({
+						[RPC_NAMESPACE]: true,
+						payload: deflated,
+						compressed: 'deflate-raw',
+						byteLength: deflated.byteLength,
+					});
+
+					return;
+				}
+			} catch (ex) {
+				debugger;
+				// Never let a compression failure escape into Supertalk's send path — dropping the message
+				// would strand the webview promise waiting on it; fall back to the uncompressed payload
+				Logger.error(ex, 'RPC deflate compression failed; sending uncompressed');
+			}
+		}
+
+		post({ [RPC_NAMESPACE]: true, payload: encoded, byteLength: encoded.byteLength });
 	}
 
 	/**
 	 * Buffer a single Supertalk message (not a batch wrapper).
-	 * Handler messages are deduped by wireType; everything else is queued FIFO.
+	 * Handler messages are deduped by wireType, except `st:ch:*` (SequencedChannel)
+	 * messages, which need FIFO ordering to preserve the channel's sequence.
 	 */
 	function bufferMessage(msg: TypedMessage): void {
-		if (msg.type === 'handler' && msg.wireType != null) {
+		if (
+			msg.type === 'handler' &&
+			msg.wireType != null &&
+			!msg.wireType.startsWith(sequencedChannelWireTypePrefix)
+		) {
 			handlerMap.set(msg.wireType, msg);
 		} else {
 			// Deliberately uncapped: unlike the deduped handler map, every entry here is a distinct logical
@@ -154,12 +228,19 @@ export function createHostEndpoint(webview: Webview): BufferedEndpoint {
 				// Only process messages with our RPC namespace
 				if (!isRpcMessage(message)) return;
 
+				// Webview→host messages are never compressed (see webviewEndpoint's postMessage) — a
+				// `compressed` frame here would be binary garbage to decodeRpcPayload, so drop it loudly
+				// instead of throwing out of the receive callback
+				if (message.compressed != null) {
+					debugger;
+					Logger.error(undefined, 'RPC host endpoint received an unexpected compressed message; dropping it');
+
+					return;
+				}
+
 				// Decode binary payload if present, fall back to plain object
 				const { payload } = message;
-				const data =
-					payload instanceof Uint8Array || payload instanceof ArrayBuffer
-						? decodeRpcPayload(payload)
-						: payload;
+				const data = isBinaryRpcPayload(payload) ? decodeRpcPayload(payload) : payload;
 
 				// Create a MessageEvent-like object with the unwrapped payload
 				const event = {

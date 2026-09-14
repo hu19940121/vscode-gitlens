@@ -1,3 +1,4 @@
+import type { CollectionMetadata, CollectionScope, CollectionScopeFailure } from '@gitkraken/provider-apis';
 import type { Account, UnidentifiedAuthor } from '@gitlens/git/models/author.js';
 import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
 import type { Issue, IssueShape } from '@gitlens/git/models/issue.js';
@@ -9,9 +10,10 @@ import type {
 	PullRequestStateFilter,
 } from '@gitlens/git/models/pullRequest.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
+import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import { base64 } from '@gitlens/utils/base64.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
 import type { Emitter } from '@gitlens/utils/event.js';
-import { flatSettled } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type {
@@ -20,11 +22,13 @@ import type {
 	TokenWithInfo,
 } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
+import { toCollectionScopeFailure } from '../collectionMetadata.js';
 import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
+import type { SearchMyPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
-import type { IntegrationKey } from '../models/integration.js';
+import type { AccountWideIssuesResult, IntegrationKey, SearchMyIssuesOptions } from '../models/integration.js';
 import type {
 	AzureOrganizationDescriptor,
 	AzureProjectDescriptor,
@@ -33,19 +37,48 @@ import type {
 	AzureRepositoryDescriptor,
 } from './azure/models.js';
 import type {
+	ProviderApiCollectionResult,
+	ProviderApiPagedResult,
 	ProviderHierarchyResult,
 	ProviderOrganization,
 	ProviderPullRequest,
+	ProviderRepoInput,
 	ProviderRepository,
 } from './models.js';
 import {
 	fromProviderIssue,
 	fromProviderPullRequest,
+	getProviderPullRequestIdentity,
+	IssueFilter,
+	providerPullRequestMatchesSearch,
 	providersMetadata,
+	PullRequestFilter,
 	toProviderPullRequestStates,
 } from './models.js';
 import type { ProvidersApi } from './providersApi.js';
-import { collectProviderPagedResult } from './utils/providerPaging.js';
+import { collectProviderPagedResult, flatSettledOrThrow, mergeCollectionMetadata } from './utils/providerPaging.js';
+
+function getAzureRepositoryIdentity(repo: Pick<AzureRepositoryDescriptor, 'owner' | 'name' | 'project'>): {
+	resourceName: string;
+	projectName?: string;
+	repositoryName: string;
+} {
+	const match = /^([^/]+)\/_git\/([^/]+)$/i.exec(repo.name);
+	return {
+		resourceName: repo.owner,
+		projectName: repo.project ?? match?.[1],
+		repositoryName: match?.[2] ?? repo.name,
+	};
+}
+
+/**
+ * Matches an org/project descriptor against a caller-supplied name, mirroring the facade's own
+ * key/id/name comparison so `listIssuesPage({ org, project })` narrows on the same identifiers a consumer
+ * already got back from `listOrgs`/`listProjects`.
+ */
+function azureResourceMatches(resource: { key?: string; id?: string; name?: string }, value: string): boolean {
+	return resource.key === value || resource.id === value || resource.name === value;
+}
 
 export abstract class AzureDevOpsIntegrationBase<
 	TIntegrationId extends GitCloudHostIntegrationId.AzureDevOps | GitSelfManagedHostIntegrationId.AzureDevOpsServer,
@@ -126,11 +159,19 @@ export abstract class AzureDevOpsIntegrationBase<
 	}
 
 	private _projects: Map<string, AzureProjectDescriptor[] | undefined> | undefined;
+	/**
+	 * Discovers (and caches) each resource's projects. Only resources whose drain completed cleanly are cached;
+	 * a rejected or backstop-truncated drain is left uncached (retried next call). When `failures` is supplied,
+	 * a rejected resource is recorded there as a structured {@link CollectionScopeFailure} so an account-wide
+	 * caller can surface the incomplete project set (a whole org's PRs/issues silently missing otherwise) as a
+	 * scope-aware warning + `fetchFailed` rather than an all-pages success over a hole.
+	 */
 	private async getProviderProjectsForResources(
 		session: ProviderAuthenticationSession,
 		resources: AzureOrganizationDescriptor[],
 		force: boolean = false,
-	): Promise<AzureProjectDescriptor[] | undefined> {
+		failures?: CollectionScopeFailure[],
+	): Promise<ProviderApiCollectionResult<AzureProjectDescriptor>> {
 		this._projects ??= new Map<string, AzureProjectDescriptor[] | undefined>();
 		const { accessToken } = session;
 
@@ -147,40 +188,115 @@ export abstract class AzureDevOpsIntegrationBase<
 			}
 		}
 
+		const allProjects: AzureProjectDescriptor[] = [];
+		let resultMetadata: CollectionMetadata | undefined;
+
 		if (resourcesWithoutProjects.length > 0) {
 			const api = await this.getProvidersApi();
 			const { tokenWithInfo, options } = this.getApiOptions(session);
-			const azureProjects = await flatSettled(
-				resourcesWithoutProjects.map(
-					async resource =>
-						(await api.getAzureProjectsForResource(tokenWithInfo, resource.name, options)).values,
-				),
+			// The projects API is paginated; a single call would drop every project past the first page (and
+			// with it their repos and PRs). Drain all pages per resource, threading the returned cursor.
+			// Per-resource (not a shared flatSettled) so a resource whose drain was truncated (hit the paging
+			// backstop) or rejected is NOT cached — caching a partial list here would make every later repo/PR/
+			// issue read for that org silently inherit an incomplete project set. Leaving it uncached means the
+			// next call retries it. The scope is passed so a page-level failure preserves the prefix already
+			// fetched and records a structured failure instead of re-throwing.
+			const drains = await Promise.allSettled(
+				resourcesWithoutProjects.map(async resource => ({
+					resource: resource,
+					result: await collectProviderPagedResult(
+						cursor =>
+							api.getAzureProjectsForResource(tokenWithInfo, resource.name, {
+								...options,
+								cursor: cursor,
+							}),
+						20,
+						{ providerId: this.id, resourceId: resource.id },
+					),
+				})),
 			);
 
-			for (const resource of resourcesWithoutProjects) {
-				const projects = azureProjects?.filter(p => p.namespace === resource.name);
-				if (projects != null) {
-					this._projects.set(
-						`${accessToken}:${resource.id}`,
-						projects.map(p => ({
-							id: p.id,
-							name: p.name,
-							resourceId: resource.id,
-							resourceName: resource.name,
-							key: p.id,
-						})),
+			// `allSettled` preserves order, so `drains[i]` is `resourcesWithoutProjects[i]`.
+			drains.forEach((drain, i) => {
+				// A rejected resource drain contributes nothing and is left uncached (retried next call). Record
+				// it as a structured failure so an account-wide caller can warn on the org whose projects (and
+				// thus PRs/issues) are missing, instead of silently narrowing the read.
+				if (drain.status !== 'fulfilled') {
+					const resource = resourcesWithoutProjects[i];
+					const failure = toCollectionScopeFailure(
+						{ providerId: this.id, resourceId: resource.id },
+						drain.reason,
 					);
+					failures?.push(failure);
+					resultMetadata = mergeCollectionMetadata(resultMetadata, {
+						completeness: 'partial',
+						failures: [failure],
+					});
+					return;
 				}
-			}
+
+				const { resource, result } = drain.value;
+				const projects = result.values
+					.filter(p => p.namespace === resource.name)
+					.map(p => ({
+						id: p.id,
+						name: p.name,
+						resourceId: resource.id,
+						resourceName: resource.name,
+						key: p.id,
+					}));
+
+				if (result.metadata != null) {
+					resultMetadata = mergeCollectionMetadata(resultMetadata, result.metadata);
+				}
+
+				const metadataIncomplete = result.metadata != null && result.metadata.completeness !== 'complete';
+				if (result.truncated || metadataIncomplete) {
+					// A truncated drain is an incomplete project set; include its partial values in the current
+					// result but don't cache it as if complete. Add a structured failure for the truncation unless
+					// the drain already recorded a page-level failure for this resource.
+					if (
+						result.truncated &&
+						!result.metadata?.failures?.some(
+							f => f.scope?.resourceId === resource.id && f.kind !== 'unknown',
+						)
+					) {
+						const failure = toCollectionScopeFailure(
+							{ providerId: this.id, resourceId: resource.id },
+							new Error('Project discovery was truncated before all pages were read'),
+						);
+						failures?.push(failure);
+						resultMetadata = mergeCollectionMetadata(resultMetadata, {
+							completeness: 'partial',
+							failures: [failure],
+						});
+					}
+					allProjects.push(...projects);
+					return;
+				}
+
+				this._projects!.set(`${accessToken}:${resource.id}`, projects);
+			});
 		}
 
-		return resources.reduce<AzureProjectDescriptor[]>((projects, resource) => {
+		const cachedProjects = resources.reduce<AzureProjectDescriptor[]>((projects, resource) => {
 			const resourceProjects = this._projects!.get(`${accessToken}:${resource.id}`);
 			if (resourceProjects != null) {
 				projects.push(...resourceProjects);
 			}
 			return projects;
 		}, []);
+		allProjects.push(...cachedProjects);
+
+		const projectsByIdentity = new Map<string, AzureProjectDescriptor>();
+		for (const project of allProjects) {
+			const identity = `${project.resourceId}:${project.id}`;
+			if (!projectsByIdentity.has(identity)) {
+				projectsByIdentity.set(identity, project);
+			}
+		}
+		const values = [...projectsByIdentity.values()];
+		return resultMetadata != null ? { values: values, metadata: resultMetadata } : { values: values };
 	}
 
 	private async getRepoDescriptorsForProjects(
@@ -226,7 +342,43 @@ export abstract class AzureDevOpsIntegrationBase<
 		if (orgs == null) return undefined;
 
 		return {
-			values: orgs.map(o => ({ id: o.id, name: o.name, url: `${this.apiBaseUrl}/${o.name}` })),
+			values: orgs.map(o => ({
+				id: o.id,
+				providerId: this.id,
+				name: o.name,
+				url: `${this.apiBaseUrl}/${o.name}`,
+			})),
+		};
+	}
+
+	protected override async getProviderProjectsForOrg(
+		session: ProviderAuthenticationSession,
+		org?: string,
+	): Promise<ProviderHierarchyResult<ProviderOrganization> | undefined> {
+		// Azure is the one git host with a project tier: repos live under org (resource) → project. Enumerate
+		// the user's orgs (optionally scoped to `org`), read their projects, and surface each as an org-shaped
+		// entry so the ProviderBackend facade can list them uniformly.
+		const orgs = await this.getProviderResourcesForUser(session);
+		if (orgs == null) return undefined;
+		if (orgs.length === 0) {
+			return { values: [], paging: { cursor: '{}', more: false } };
+		}
+
+		const scopedOrgs = org != null ? orgs.filter(o => o.name === org || o.id === org) : orgs;
+		if (scopedOrgs.length === 0) return { values: [] };
+
+		const projects = await this.getProviderProjectsForResources(session, scopedOrgs);
+		if (projects.values.length === 0 && projects.metadata == null) return { values: [] };
+
+		return {
+			values: projects.values.map(p => ({
+				id: p.id,
+				providerId: this.id,
+				name: p.name,
+				org: p.resourceName,
+				url: `${this.apiBaseUrl}/${p.resourceName}/${p.name}`,
+			})),
+			...(projects.metadata != null ? { metadata: projects.metadata } : {}),
 		};
 	}
 
@@ -255,13 +407,23 @@ export abstract class AzureDevOpsIntegrationBase<
 		const orgDescriptor = (await this.getProviderResourcesForUser(session))?.find(o => o.name === org);
 		if (orgDescriptor == null) return undefined;
 
-		const projects = await this.getProviderProjectsForResources(session, [orgDescriptor]);
-		if (!projects?.length) return { values: [] };
+		const discoveryFailures: CollectionScopeFailure[] = [];
+		const projects = await this.getProviderProjectsForResources(session, [orgDescriptor], false, discoveryFailures);
+		// An empty result is only proven-empty when discovery itself succeeded; a rejected project-discovery
+		// leaves the repo set unknowable, so surface the discovery metadata rather than publishing a hole as a
+		// complete list.
+		if (projects.values.length === 0) {
+			return { values: [], metadata: projects.metadata };
+		}
 
+		let repoMetadata: CollectionMetadata | undefined;
 		const results = await Promise.allSettled(
-			projects.map(p =>
-				collectProviderPagedResult(cursor =>
-					api.getReposForAzureProject(tokenWithInfo, org, p.name, { ...apiOptions, cursor: cursor }),
+			projects.values.map(p =>
+				collectProviderPagedResult(
+					cursor =>
+						api.getReposForAzureProject(tokenWithInfo, org, p.name, { ...apiOptions, cursor: cursor }),
+					20,
+					{ providerId: this.id, resourceId: org, projectId: p.name },
 				),
 			),
 		);
@@ -269,15 +431,25 @@ export abstract class AzureDevOpsIntegrationBase<
 		const values: ProviderRepository[] = [];
 		let truncated = false;
 		for (const result of results) {
-			if (result.status !== 'fulfilled') continue;
+			// With a per-project scope, collectProviderPagedResult catches page-level failures itself and returns
+			// them as metadata rather than rejecting. A rejected promise here is an unexpected internal error.
+			if (result.status !== 'fulfilled') {
+				truncated = true;
+				continue;
+			}
 
 			values.push(...result.value.values);
+			if (result.value.metadata != null) {
+				repoMetadata = mergeCollectionMetadata(repoMetadata, result.value.metadata);
+			}
 			truncated ||= result.value.truncated === true;
 		}
 
+		const metadata = mergeCollectionMetadata(repoMetadata, projects.metadata);
 		return {
 			values: values,
-			...(truncated ? { truncated: true } : {}),
+			...(metadata != null ? { metadata: metadata } : {}),
+			...(truncated || (metadata != null && metadata.completeness !== 'complete') ? { truncated: true } : {}),
 		};
 	}
 
@@ -387,9 +559,9 @@ export abstract class AzureDevOpsIntegrationBase<
 		if (orgs == null || orgs.length === 0) return undefined;
 
 		const projects = await this.getProviderProjectsForResources(session, orgs);
-		if (projects == null || projects.length === 0) return undefined;
+		if (projects.values.length === 0) return undefined;
 
-		const matchingProject = projects.find(p => p.resourceName === project.owner && p.name === project.name);
+		const matchingProject = projects.values.find(p => p.resourceName === project.owner && p.name === project.name);
 		if (matchingProject == null) return undefined;
 
 		return (await this.authenticationService.apis.azure)?.getIssue(
@@ -442,13 +614,25 @@ export abstract class AzureDevOpsIntegrationBase<
 	public override async getRepoInfo(repo: {
 		owner: string;
 		name: string;
-		project: string;
+		project?: string;
+		connectionId?: string;
 	}): Promise<ProviderRepository | undefined> {
-		const api = await this.getProvidersApi();
-		if (this._session == null) return undefined;
+		const identity = getAzureRepositoryIdentity(repo);
+		if (identity.projectName == null) return undefined;
 
-		const { tokenWithInfo, options } = this.getApiOptions(this._session);
-		return api.getRepo(tokenWithInfo, repo.owner, repo.name, repo.project, options);
+		const api = await this.getProvidersApi();
+		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
+		const session = await this.resolveReadSession(repo.connectionId, undefined);
+		if (session == null) return undefined;
+
+		const { tokenWithInfo, options } = this.getApiOptions(session);
+		return api.getRepo(
+			tokenWithInfo,
+			identity.resourceName,
+			identity.repositoryName,
+			identity.projectName,
+			options,
+		);
 	}
 
 	protected override async getProviderRepositoryMetadata(
@@ -472,6 +656,7 @@ export abstract class AzureDevOpsIntegrationBase<
 		_cancellation?: AbortSignal,
 		_silent?: boolean,
 		state?: PullRequestStateFilter,
+		_options?: SearchMyPullRequestsOptions,
 	): Promise<PullRequest[] | undefined> {
 		const api = await this.getProvidersApi();
 		if (repos != null) {
@@ -482,42 +667,47 @@ export abstract class AzureDevOpsIntegrationBase<
 		const states = toProviderPullRequestStates(state);
 
 		const user = await this.getProviderCurrentAccount(session);
-		if (user?.username == null) return undefined;
+		// Azure filters key on the identity GUID (account id), not the display name — see
+		// getProviderMyPullRequestsForUser and the repo-scoped path in gitHostIntegration.ts.
+		if (user?.id == null) return undefined;
 
 		const orgs = await this.getProviderResourcesForUser(session);
 		if (orgs == null || orgs.length === 0) return undefined;
 
 		const projects = await this.getProviderProjectsForResources(session, orgs);
-		if (projects == null || projects.length === 0) return undefined;
+		if (projects.values.length === 0) return undefined;
 
 		const repoDescriptors = [
-			...((await this.getRepoDescriptorsForProjects(session, projects)) ?? new Map()).values(),
+			...((await this.getRepoDescriptorsForProjects(session, projects.values)) ?? new Map()).values(),
 		]
 			.filter(r => r != null)
 			.flat();
 
 		const { tokenWithInfo, options } = this.getApiOptions(session);
-		const projectInputs = projects.map(p => ({ namespace: p.resourceName, project: p.name }));
+		const projectInputs = projects.values.map(p => ({ namespace: p.resourceName, project: p.name }));
+		// Legacy array-returning path (Launchpad/focus view): unwrap `.values` from the SDK collection result.
+		// The metadata (partial/failures) isn't surfaced here because this path's return type has no warning
+		// channel; the metadata-aware ProviderBackend surface is getProviderMyPullRequestsForUser above.
 		const assignedPrs = (
 			await api.getPullRequestsForAzureProjects(tokenWithInfo, projectInputs, {
 				...options,
-				assigneeLogins: [user.username],
+				assigneeLogins: [user.id],
 				states: states,
 			})
-		)?.map(pr => this.fromAzureProviderPullRequest(pr, repoDescriptors, projects));
+		).values.map(pr => this.fromAzureProviderPullRequest(pr, repoDescriptors, projects.values));
 		const authoredPrs = (
 			await api.getPullRequestsForAzureProjects(tokenWithInfo, projectInputs, {
 				...options,
-				authorLogin: user.username,
+				authorLogin: user.id,
 				states: states,
 			})
-		)?.map(pr => this.fromAzureProviderPullRequest(pr, repoDescriptors, projects));
+		).values.map(pr => this.fromAzureProviderPullRequest(pr, repoDescriptors, projects.values));
 		const prsById = new Map<string, PullRequest>();
-		for (const pr of authoredPrs ?? []) {
+		for (const pr of authoredPrs) {
 			prsById.set(pr.id, pr);
 		}
 
-		for (const pr of assignedPrs ?? []) {
+		for (const pr of assignedPrs) {
 			const existing = prsById.get(pr.id);
 			if (existing == null) {
 				prsById.set(pr.id, pr);
@@ -527,63 +717,418 @@ export abstract class AzureDevOpsIntegrationBase<
 		return [...prsById.values()];
 	}
 
+	protected override async getProviderMyPullRequestsForUser(
+		session: ProviderAuthenticationSession,
+		options?: { state?: PullRequestStateFilter[]; cursor?: string; filters?: PullRequestFilter[] },
+	): Promise<ProviderApiPagedResult<ProviderPullRequest> | undefined> {
+		const api = await this.getProvidersApi();
+		const user = await this.getProviderCurrentAccount(session);
+		// Azure routes authorLogin/assigneeLogins to `searchCriteria.creatorId`/`reviewerId`, which require the
+		// identity GUID (account id), not the display name — matching the repo-scoped path in
+		// gitHostIntegration.ts. Using `username` here would match nothing and return zero PRs.
+		if (user?.id == null) return undefined;
+
+		// Azure PRs are org + project scoped: enumerate the user's orgs and their projects, then read authored
+		// and assigned PRs across all of them. Return the raw provider shape (not the normalized model) so the
+		// ProviderBackend surface stays uniform with the other providers.
+		const orgs = await this.getProviderResourcesForUser(session);
+		if (orgs == null || orgs.length === 0) return undefined;
+
+		// Structured per-scope failures from BOTH project discovery (a whole org dropped) and the per-project PR
+		// drains, so the facade warns on the failed scope + sets `fetchFailed` instead of silently narrowing.
+		const failures: CollectionScopeFailure[] = [];
+		const projects = await this.getProviderProjectsForResources(session, orgs, false, failures);
+		if (projects.values.length === 0) {
+			// Project discovery itself was incomplete (e.g. a truncated org); surface the metadata so the facade
+			// can warn and set fetchFailed rather than reporting an empty account.
+			const incomplete = projects.metadata != null && projects.metadata.completeness !== 'complete';
+			return {
+				values: [],
+				paging: { cursor: '{}', more: false, truncated: incomplete || undefined },
+				...(projects.metadata != null ? { metadata: projects.metadata } : {}),
+			};
+		}
+
+		const { tokenWithInfo, options: apiOptions } = this.getApiOptions(session);
+		const states = toProviderPullRequestStates(options?.state);
+		const maxPagesPerProject = 20;
+
+		// Drain each project fully (numbered pages) for both the authored and assigned reads. Azure has no
+		// single cross-project cursor, so the aggregate is one page; `truncated` is set only if a project hit
+		// the backstop with more pages remaining.
+		let truncated = projects.metadata != null && projects.metadata.completeness !== 'complete';
+		// Drain one project's numbered pages, returning its PRs and any per-page failure. Returns per-project
+		// (not mutating shared state) so the fan-out below can be settled independently: one project's read
+		// failure must not discard every other project's already-drained PRs.
+		const drainProject = async (
+			project: { namespace: string; project: string },
+			scope: CollectionScope,
+			filter: { authorLogin?: string; assigneeLogins?: string[]; reviewerId?: string },
+		): Promise<{ prs: ProviderPullRequest[]; projectIdentity: string; failure?: CollectionScopeFailure }> => {
+			const collected: ProviderPullRequest[] = [];
+			const projectIdentity = `${project.namespace}/${project.project}`;
+			let page: number | undefined;
+			for (let i = 0; i < maxPagesPerProject; i++) {
+				try {
+					const result = await api.getPullRequestsForAzureProject(tokenWithInfo, project, {
+						...apiOptions,
+						...filter,
+						states: states,
+						page: page,
+					});
+					if (result == null) {
+						if (page == null) break;
+
+						truncated = true;
+						return {
+							prs: collected,
+							projectIdentity: projectIdentity,
+							failure: toCollectionScopeFailure(
+								scope,
+								new Error('Azure DevOps returned no page after advertising a continuation'),
+							),
+						};
+					}
+
+					collected.push(...result.data);
+					if (!result.hasMore) break;
+					if (result.nextPage == null || result.nextPage === page) {
+						truncated = true;
+						return {
+							prs: collected,
+							projectIdentity: projectIdentity,
+							failure: toCollectionScopeFailure(
+								scope,
+								new Error('Azure DevOps returned no advancing pull request continuation'),
+							),
+						};
+					}
+
+					page = result.nextPage;
+					if (i === maxPagesPerProject - 1) {
+						truncated = true;
+					}
+				} catch (ex) {
+					// A page failure after the first page leaves the already-drained prefix intact; record the
+					// failure at the project scope instead of re-throwing and discarding the prefix.
+					truncated = true;
+					return {
+						prs: collected,
+						projectIdentity: projectIdentity,
+						failure: toCollectionScopeFailure(scope, ex),
+					};
+				}
+			}
+			return { prs: collected, projectIdentity: projectIdentity };
+		};
+
+		// Settle per-project failures instead of rejecting the whole sweep. `drainProject` already catches its own
+		// page-level failures, so the structured failure (attributed to that project) is preserved rather than
+		// re-thrown — re-throwing an auth/rate-limit rejection would discard every other project's already-drained
+		// PRs. Auth/rate-limit stay actionable through the failure's kind (the facade maps it to an `auth`/`rate-limit`
+		// warning + `fetchFailed`), matching the SDK's model. `failures` was declared above so project-discovery
+		// failures and per-project drain failures share it.
+		const requested = options?.filters?.length ? new Set(options.filters) : undefined;
+		const wantAuthored = requested == null || requested.has(PullRequestFilter.Author);
+		// Azure has no assignee concept distinct from reviewer. Both neutral relationships map to reviewerId.
+		const wantReviewed =
+			requested == null ||
+			requested.has(PullRequestFilter.Assignee) ||
+			requested.has(PullRequestFilter.ReviewRequested);
+		const outcomes = await Promise.all(
+			projects.values.flatMap(p => {
+				const project = { namespace: p.resourceName, project: p.name };
+				const scope = { providerId: this.id, resourceId: p.resourceId, projectId: p.name };
+				const drains = [];
+				if (wantAuthored) {
+					drains.push(drainProject(project, scope, { authorLogin: user.id }));
+				}
+				if (wantReviewed) {
+					drains.push(drainProject(project, scope, { reviewerId: user.id }));
+				}
+				return drains;
+			}),
+		);
+
+		// Azure's `pullRequestId` is not account-global. Prefer repository + PR id, then the org-qualified URL.
+		// If neither is available, preserve the row instead of collapsing unrelated repositories by numeric id.
+		const prsByIdentity = new Map<string, ProviderPullRequest>();
+		for (const outcome of outcomes) {
+			if (outcome.failure != null) {
+				failures.push(outcome.failure);
+			}
+			for (const pr of outcome.prs) {
+				const key =
+					getProviderPullRequestIdentity(pr) ?? `project:${outcome.projectIdentity}:pull-request:${pr.id}`;
+				if (!prsByIdentity.has(key)) {
+					prsByIdentity.set(key, pr);
+				}
+			}
+		}
+
+		const metadata: CollectionMetadata | undefined = mergeCollectionMetadata(
+			failures.length > 0 ? { completeness: 'partial', failures: failures } : undefined,
+			projects.metadata,
+		);
+
+		return {
+			values: [...prsByIdentity.values()],
+			paging: { cursor: '{}', more: false, truncated: truncated || undefined },
+			metadata: metadata,
+		};
+	}
+
+	protected override async searchProviderPullRequests(
+		session: ProviderAuthenticationSession,
+		searchQuery: string,
+		repos?: AzureRepositoryDescriptor[],
+		cancellation?: AbortSignal,
+		options?: { include?: PullRequestState[] },
+	): Promise<PullRequest[] | undefined> {
+		if (cancellation?.aborted) throw new CancellationError();
+
+		const orgs = await this.getProviderResourcesForUser(session);
+		if (cancellation?.aborted) throw new CancellationError();
+		if (orgs == null || orgs.length === 0) return undefined;
+
+		// `getProviderProjectsForResources` returns a collection result ({ values, metadata }); this search
+		// path only needs the resolved projects, so read `.values`.
+		const projects = (await this.getProviderProjectsForResources(session, orgs)).values;
+		if (cancellation?.aborted) throw new CancellationError();
+		if (projects.length === 0) return undefined;
+
+		const repoDescriptorsByProject = await this.getRepoDescriptorsForProjects(session, projects);
+		if (cancellation?.aborted) throw new CancellationError();
+
+		const repoDescriptors = [...repoDescriptorsByProject.values()].filter(r => r != null).flat();
+		const requestedRepos = repos?.map(getAzureRepositoryIdentity);
+		const repoInputs =
+			requestedRepos == null
+				? undefined
+				: repoDescriptors.filter(r =>
+						requestedRepos.some(
+							repo =>
+								repo.resourceName === r.resourceName &&
+								repo.repositoryName === r.name &&
+								(repo.projectName == null || repo.projectName === r.projectName),
+						),
+					);
+		if (repoInputs?.length === 0) return [];
+
+		const api = await this.getProvidersApi();
+		const { tokenWithInfo, options: apiOptions } = this.getApiOptions(session);
+		const states = toProviderPullRequestStates(options?.include);
+		const searchScopes: { project: { namespace: string; project: string }; repo?: ProviderRepoInput }[] =
+			repoInputs != null
+				? repoInputs.flatMap(repo =>
+						repo.projectName == null
+							? []
+							: [
+									{
+										project: { namespace: repo.resourceName, project: repo.projectName },
+										repo: {
+											id: repo.id,
+											name: repo.name,
+											namespace: repo.resourceName,
+											project: repo.projectName,
+										},
+									},
+								],
+					)
+				: projects.map(project => ({
+						project: { namespace: project.resourceName, project: project.name },
+					}));
+
+		const providerPullRequests = await flatSettledOrThrow(
+			searchScopes.map(async scope => {
+				const values: ProviderPullRequest[] = [];
+				let page: number | undefined;
+				for (let i = 0; i < 20; i++) {
+					if (cancellation?.aborted) throw new CancellationError();
+
+					const result = await api.getPullRequestsForAzureProject(tokenWithInfo, scope.project, {
+						...apiOptions,
+						page: page,
+						repo: scope.repo,
+						states: states,
+					});
+					if (result == null) break;
+
+					values.push(...result.data);
+					if (!result.hasMore || result.nextPage == null) break;
+
+					page = result.nextPage;
+				}
+				return values;
+			}),
+		);
+		if (cancellation?.aborted) throw new CancellationError();
+
+		return [...new Map(providerPullRequests.map(pr => [pr.url ?? `${pr.repository.id}:${pr.id}`, pr])).values()]
+			.filter(pr => providerPullRequestMatchesSearch(pr, searchQuery))
+			.map(pr => this.fromAzureProviderPullRequest(pr, repoDescriptors, projects));
+	}
+
 	protected override async searchProviderMyIssues(
 		session: ProviderAuthenticationSession,
-		_repos?: AzureRepositoryDescriptor[],
+		repos?: AzureRepositoryDescriptor[],
 	): Promise<IssueShape[] | undefined> {
+		return (await this.searchProviderMyIssuesWithTruncation(session, repos))?.values;
+	}
+
+	/**
+	 * Account-wide "my issues" for Azure = the user's authored + assigned work items across every project of
+	 * every org. Azure's issue read is numbered-page, so each (project × filter) read is drained to exhaustion
+	 * (bounded by a defensive per-read backstop). Unlike a silent `flatSettled`, a project read that was
+	 * truncated by the backstop or rejected outright is recorded as `truncated`, so the facade reports an
+	 * incomplete read instead of publishing a partial list as complete.
+	 *
+	 * `searchOptions.org`/`.project` narrow the fan-out server-side (each drain is already a per-project read,
+	 * so scoping just selects which projects to drain). Without this there was no way to ask for "work items in
+	 * project P": a consumer had to filter the account-wide page client-side, which desynchronizes the filtered
+	 * `items` from the `hasMore`/`currentPage` of the pre-filter read — a project-less page reads as "no issues"
+	 * while `hasMore` is still true.
+	 */
+	protected override async searchProviderMyIssuesWithTruncation(
+		session: ProviderAuthenticationSession,
+		_resources?: ResourceDescriptor[],
+		_cancellation?: AbortSignal,
+		searchOptions?: SearchMyIssuesOptions,
+	): Promise<AccountWideIssuesResult | undefined> {
 		const api = await this.getProvidersApi();
 
 		const user = await this.getProviderCurrentAccount(session);
 		if (user?.username == null) return undefined;
 
-		const orgs = await this.getProviderResourcesForUser(session);
-		if (orgs == null || orgs.length === 0) return undefined;
+		const allOrgs = await this.getProviderResourcesForUser(session);
+		if (allOrgs == null) return undefined;
+		if (allOrgs.length === 0) return { values: [], truncated: false };
 
-		const projects = await this.getProviderProjectsForResources(session, orgs);
-		if (projects == null || projects.length === 0) return undefined;
+		// Scope by org first so project discovery only fans out over the requested account. An org filter that
+		// matches nothing is an empty-but-successful read, not an unsupported one: returning `undefined` here
+		// would be reported as "account-wide issue search is not supported by this provider".
+		const orgs =
+			searchOptions?.org != null ? allOrgs.filter(o => azureResourceMatches(o, searchOptions.org!)) : allOrgs;
+		if (orgs.length === 0) return { values: [], truncated: false };
 
-		const { tokenWithInfo, options } = this.getApiOptions(session);
-		const assignedIssues = await flatSettled(
-			projects.map(async p => {
-				const issuesResponse = (
-					await api.getIssuesForAzureProject(tokenWithInfo, p.resourceName, p.name, {
-						...options,
-						assigneeLogins: [user.username!],
-					})
-				).values;
-				return issuesResponse.map(i => fromProviderIssue(i, this as any, { project: p }));
-			}),
-		);
-		const authoredIssues = await flatSettled(
-			projects.map(async p => {
-				const issuesResponse = (
-					await api.getIssuesForAzureProject(tokenWithInfo, p.resourceName, p.name, {
-						...options,
-						authorLogin: user.username!,
-					})
-				).values;
-				return issuesResponse.map(i => fromProviderIssue(i, this as any, { project: p }));
-			}),
-		);
-		// TODO: Add mentioned issues
-		const issuesById = new Map<string, IssueShape>();
-
-		for (const issue of authoredIssues ?? []) {
-			issuesById.set(issue.id, issue);
+		// Structured per-scope failures from BOTH project discovery (a whole org dropped) and the per-project
+		// issue drains, so the facade warns on the failed scope + sets `fetchFailed` instead of narrowing silently.
+		const failures: CollectionScopeFailure[] = [];
+		const discovered = await this.getProviderProjectsForResources(session, orgs, false, failures);
+		const projects =
+			searchOptions?.project != null
+				? {
+						...discovered,
+						values: discovered.values.filter(p => azureResourceMatches(p, searchOptions.project!)),
+					}
+				: discovered;
+		if (projects.values.length === 0) {
+			// An explicitly-scoped read that found no matching project is an empty SUCCESS: `undefined` here is
+			// reported as "account-wide issue search is not supported by this provider", which would send the
+			// consumer down a repo-scoped fallback for what is simply an empty scope. Only an incomplete discovery
+			// (which may itself have dropped the requested project) is truncated, and its metadata is forwarded so
+			// the facade still warns on the failed scope.
+			return projects.metadata != null
+				? {
+						values: [],
+						truncated: projects.metadata.completeness !== 'complete',
+						metadata: projects.metadata,
+					}
+				: { values: [], truncated: false };
 		}
 
-		for (const issue of assignedIssues ?? []) {
-			const existing = issuesById.get(issue.id);
-			if (existing == null) {
-				issuesById.set(issue.id, issue);
+		const { tokenWithInfo, options } = this.getApiOptions(session);
+
+		// Drain one (project × filter) read fully, threading the provider's paging cursor. The scope is passed so
+		// a page-level failure preserves the already-drained prefix and records a structured failure instead of
+		// re-throwing.
+		const drain = async (
+			p: AzureProjectDescriptor,
+			filter: { assigneeLogins?: string[]; authorLogin?: string },
+		): Promise<{
+			issues: IssueShape[];
+			projectKey: string;
+			truncated: boolean;
+			metadata?: CollectionMetadata;
+		}> => {
+			const result = await collectProviderPagedResult(
+				cursor =>
+					api.getIssuesForAzureProject(tokenWithInfo, p.resourceName, p.name, {
+						...options,
+						...filter,
+						cursor: cursor,
+						sort: searchOptions?.sort,
+					}),
+				20,
+				{ providerId: this.id, resourceId: p.resourceId, projectId: p.name },
+			);
+			return {
+				issues: result.values.map(i => fromProviderIssue(i, this, { project: p })),
+				// Azure work-item ids are organization-scoped. Include both org and project so the
+				// assigned/authored passes dedupe the same item without collapsing another org's item.
+				projectKey: `${p.resourceId}:${p.id}`,
+				truncated: result.truncated ?? false,
+				metadata: result.metadata,
+			};
+		};
+
+		// `includeAllAssignees` broadens to every issue in each project (any assignee, any author), so a single
+		// unfiltered drain per project replaces the assigned+authored pair — an unfiltered assignee drain already
+		// subsumes the authored one.
+		//
+		// `filters` narrows the other way: unfiltered, "my issues" here is assigned ∪ authored, which is wider than
+		// `assignee:@me`. Selecting the drains is the only correct place to narrow — dropping authored-only items
+		// from the returned page would leave them counted in the per-project paging that produced it.
+		const filters = searchOptions?.filters;
+		const wantAssigned = !filters?.length || filters.includes(IssueFilter.Assignee);
+		const wantAuthored = !filters?.length || filters.includes(IssueFilter.Author);
+		const outcomes = await Promise.all(
+			projects.values.flatMap(p => {
+				if (searchOptions?.includeAllAssignees) return [drain(p, {})];
+
+				const drains = [];
+				if (wantAssigned) {
+					drains.push(drain(p, { assigneeLogins: [user.username!] }));
+				}
+				if (wantAuthored) {
+					drains.push(drain(p, { authorLogin: user.username! }));
+				}
+				return drains;
+			}),
+		);
+
+		const issuesById = new Map<string, IssueShape>();
+		let truncated = projects.metadata != null && projects.metadata.completeness !== 'complete';
+		let drainMetadata: CollectionMetadata | undefined;
+		for (const outcome of outcomes) {
+			if (outcome.truncated) {
+				truncated = true;
+			}
+			if (outcome.metadata != null) {
+				drainMetadata = mergeCollectionMetadata(drainMetadata, outcome.metadata);
+			}
+
+			for (const issue of outcome.issues) {
+				const key = `${outcome.projectKey}:${issue.nodeId ?? issue.id}`;
+				if (!issuesById.has(key)) {
+					issuesById.set(key, issue);
+				}
 			}
 		}
 
-		return [...issuesById.values()];
+		const metadata: CollectionMetadata | undefined = mergeCollectionMetadata(
+			failures.length > 0 ? { completeness: 'partial', failures: failures } : undefined,
+			mergeCollectionMetadata(drainMetadata, projects.metadata),
+		);
+
+		return { values: [...issuesById.values()], truncated: truncated, metadata: metadata };
 	}
 
 	protected override async providerOnConnect(): Promise<void> {
 		if (this._session == null) return;
+
+		const canHydrateStoredProjects = (metadata: CollectionMetadata | undefined): boolean =>
+			metadata == null || metadata.completeness === 'complete';
 
 		const storedAccount = this.ctx.storage.get(`azure:${this._session.accessToken}:account`);
 		const storedOrganizations = this.ctx.storage.get(`azure:${this._session.accessToken}:organizations`);
@@ -592,7 +1137,20 @@ export abstract class AzureDevOpsIntegrationBase<
 
 		let organizations = storedOrganizations?.data?.map((o: AzureOrganizationDescriptor) => ({ ...o }));
 
-		let projects = storedProjects?.data?.map((p: AzureProjectDescriptor) => ({ ...p }));
+		const storedProjectsData = storedProjects?.data as
+			| ProviderApiCollectionResult<AzureProjectDescriptor>
+			| AzureProjectDescriptor[]
+			| undefined;
+		let projects: ProviderApiCollectionResult<AzureProjectDescriptor> | undefined;
+		if (!Array.isArray(storedProjectsData) && Array.isArray(storedProjectsData?.values)) {
+			const hydrated = {
+				values: storedProjectsData.values.map((p: AzureProjectDescriptor) => ({ ...p })),
+				...(storedProjectsData.metadata != null ? { metadata: storedProjectsData.metadata } : {}),
+			};
+			if (canHydrateStoredProjects(hydrated.metadata)) {
+				projects = hydrated;
+			}
+		}
 
 		if (storedAccount == null) {
 			account = await this.getProviderCurrentAccount(this._session);
@@ -628,23 +1186,29 @@ export abstract class AzureDevOpsIntegrationBase<
 		this._organizations ??= new Map<string, AzureOrganizationDescriptor[] | undefined>();
 		this._organizations.set(this._session.accessToken, organizations);
 
-		if (storedProjects == null && organizations?.length) {
+		if (projects == null && organizations?.length) {
 			projects = await this.getProviderProjectsForResources(this._session, organizations);
-			await this.ctx.storage.store(`azure:${this._session.accessToken}:projects`, {
-				v: 1,
-				timestamp: Date.now(),
-				data: projects,
-			});
+			if (projects != null && canHydrateStoredProjects(projects.metadata)) {
+				await this.ctx.storage.store(`azure:${this._session.accessToken}:projects`, {
+					v: 2,
+					timestamp: Date.now(),
+					data: projects,
+				});
+			} else {
+				await this.ctx.storage.delete(`azure:${this._session.accessToken}:projects`);
+			}
 		}
 
 		this._projects ??= new Map<string, AzureProjectDescriptor[] | undefined>();
-		for (const project of projects ?? []) {
-			const projectKey = `${this._session.accessToken}:${project.resourceId}`;
-			const projects = this._projects.get(projectKey);
-			if (projects == null) {
-				this._projects.set(projectKey, [project]);
-			} else if (!projects.some(p => p.id === project.id)) {
-				projects.push(project);
+		if (projects != null && canHydrateStoredProjects(projects.metadata)) {
+			for (const project of projects.values) {
+				const projectKey = `${this._session.accessToken}:${project.resourceId}`;
+				const projects = this._projects.get(projectKey);
+				if (projects == null) {
+					this._projects.set(projectKey, [project]);
+				} else if (!projects.some(p => p.id === project.id)) {
+					projects.push(project);
+				}
 			}
 		}
 	}
@@ -660,10 +1224,10 @@ export abstract class AzureDevOpsIntegrationBase<
 		repoDescriptors: AzureRemoteRepositoryDescriptor[],
 		projectDescriptors: AzureProjectDescriptor[],
 	): PullRequest {
-		const baseRepoDescriptor = repoDescriptors.find(r => r.name === azurePullRequest.repository.name);
+		const baseRepoDescriptor = repoDescriptors.find(r => r.id === azurePullRequest.repository.id);
 		const headRepoDescriptor =
 			azurePullRequest.headRepository != null
-				? repoDescriptors.find(r => r.name === azurePullRequest.headRepository!.name)
+				? repoDescriptors.find(r => r.id === azurePullRequest.headRepository!.id)
 				: undefined;
 		let project: AzureProjectDescriptor | undefined;
 		if (baseRepoDescriptor != null) {
@@ -691,7 +1255,9 @@ export abstract class AzureDevOpsIntegrationBase<
 		}
 
 		if (baseRepoDescriptor?.projectName != null) {
-			project = projectDescriptors.find(p => p.name === baseRepoDescriptor.projectName);
+			project = projectDescriptors.find(
+				p => p.resourceName === baseRepoDescriptor.resourceName && p.name === baseRepoDescriptor.projectName,
+			);
 		}
 		return fromProviderPullRequest(azurePullRequest, this, { project: project });
 	}

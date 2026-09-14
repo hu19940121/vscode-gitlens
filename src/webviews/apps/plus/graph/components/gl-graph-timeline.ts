@@ -1,11 +1,11 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import type { GitReference } from '@gitlens/git/models/reference.js';
 import type { RepositoryShape } from '../../../../../git/models/repositoryShape.js';
-import { GetMoreRowsCommand } from '../../../../plus/graph/protocol.js';
 import type {
 	TimelineDatum,
 	TimelinePeriod,
@@ -14,17 +14,17 @@ import type {
 	TimelineSliceBy,
 } from '../../../../plus/timeline/protocol.js';
 import { periodToMs } from '../../../../plus/timeline/utils/period.js';
-import { ipcContext } from '../../../shared/contexts/ipc.js';
+import { noop } from '../../../shared/actions/rpc.js';
 import { emitTelemetrySentEvent } from '../../../shared/telemetry.js';
 import type { CommitEventDetail, LoadMoreEventDetail } from '../../timeline/components/chart.js';
 import { isPseudoCommitDatum } from '../../timeline/components/chart/timelineData.js';
 import { graphServicesContext, graphStateContext } from '../context.js';
-import { getSelectedRepo } from '../utils/repository.utils.js';
+import { countOpenRepositories, getSelectedRepo } from '../utils/repository.utils.js';
 import { getAdditionalBranches, shouldWalkAllBranches } from './visualizations.utils.js';
 import '../../timeline/components/chart.js';
 import '../../timeline/components/header.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import './gl-graph-coachmark.js';
 import './gl-graph-visualizations-switcher.js';
 
@@ -62,7 +62,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 			min-height: 3.2rem;
 
 			/* 0.6rem horizontal so the switcher (left) and close button (right) sit at matching
-		 * tight insets — same chrome as the Treemap visualization toolbar. */
+ * tight insets — same chrome as the Treemap visualization toolbar. */
 			padding: var(--gl-space-4) var(--gl-space-6);
 			border-bottom: var(--gl-border-width) solid var(--vscode-editorWidget-border, transparent);
 		}
@@ -72,9 +72,9 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		}
 
 		/* Matches the treemap toolbar's title — uppercase, dim, fixed-width — so the visualization
-	 * label anchors both header rows identically. Sits between the icon switcher and the
-	 * shared timeline header so the standalone Visual History webview (which doesn't use this
-	 * file) keeps its existing chrome. */
+* label anchors both header rows identically. Sits between the icon switcher and the
+* shared timeline header so the standalone Visual History webview (which doesn't use this
+* file) keeps its existing chrome. */
 		.header-row__title {
 			flex: none;
 			font-size: var(--gl-font-sm);
@@ -118,14 +118,11 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 	@property({ type: Boolean, attribute: 'graph-ready' })
 	graphReady = false;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
 
 	@consume({ context: graphServicesContext, subscribe: true })
 	private services?: typeof graphServicesContext.__context__;
-
-	@consume({ context: ipcContext })
-	private _ipc?: typeof ipcContext.__context__;
 
 	@state()
 	private _resolvedScope?: TimelineScopeSerialized;
@@ -177,16 +174,11 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 	@state()
 	private _hasShownData = false;
 
-	/** Reactive flag — true while a `GetMoreRowsCommand` request is in flight (we've sent it, the
-	 *  graph hasn't responded yet). The graph webview doesn't toggle `state.loading` during paging
-	 *  so this is the ONLY signal we have for "load-more is happening" — drives both the chart's
-	 *  edge indicator and our debounce so we don't queue duplicate requests. Cleared when
-	 *  `graphState.rows` reference changes (new data arrived). */
+	/** Reactive flag — true while a `rows.getMoreRows` call is outstanding. Drives both the chart's
+	 *  edge indicator and our debounce so we don't queue duplicate requests. Set and cleared around
+	 *  the host promise, which resolves once the page's rows emission has been posted. */
 	@state()
-	private _loadMoreInFlight = false;
-	/** Last-seen `graphState.rows` reference; used to detect when the graph has merged in new
-	 *  rows so we can clear `_loadMoreInFlight`. */
-	private _lastSeenRowsRef?: unknown;
+	private _pageInFlight = false;
 
 	/** Live visible-time-range span (ms) reported by the chart. Drives the header pill so it
 	 *  shows the actual span (zoomed, panned) instead of the static period setting. */
@@ -241,15 +233,6 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		if (localScopeKey !== this._lastLocalScopeKey) {
 			this._lastLocalScopeKey = localScopeKey;
 			this._resetLocalScopeState();
-		}
-
-		// Clear the load-more in-flight flag when the graph's rows reference changes (response to
-		// our `GetMoreRowsCommand` has landed). This is the only signal we get since the host
-		// doesn't toggle `state.loading` during paging.
-		const rows = this.graphState.rows;
-		if (this._loadMoreInFlight && rows != null && rows !== this._lastSeenRowsRef) {
-			this._loadMoreInFlight = false;
-			this._lastSeenRowsRef = rows;
 		}
 
 		// Dispatch dataset derivation by scope. Repo scope builds synchronously from
@@ -311,7 +294,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 	}
 
 	private _maybeAutoPageForAllTime(): void {
-		if (this._loadMoreInFlight) return;
+		if (this._pageInFlight) return;
 		if (this.graphState.paging?.hasMore !== true) return;
 		if (this._allTimePageAttempts >= GlGraphTimeline.maxAllTimePageAttempts) return;
 
@@ -322,13 +305,32 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		if (!oldestSha) return;
 
 		this._allTimePageAttempts++;
-		this._loadMoreInFlight = true;
-		this._lastSeenRowsRef = rows;
+		void this._requestMoreRows(oldestSha, GlGraphTimeline.adaptivePageSize(rows.length, 'all'));
+	}
+
+	/**
+	 * Drives one graph page and holds both the local edge indicator and the graph's shared `loading`
+	 * affordance for exactly its duration. The host resolves the call only after posting the page's
+	 * rows emission, so the flags clear when the rows are in hand — no rows-reference heuristic.
+	 *
+	 * ACCEPTED EDGE: a visibility flip mid-page resolves with the emission still buffered, so the
+	 * indicator clears a moment before the deeper history appears (it lands on the restore flush).
+	 */
+	private async _requestMoreRows(id: string, limit: number): Promise<void> {
+		const services = this.services;
+		if (services == null) return;
+
+		this._pageInFlight = true;
 		this.graphState.loading = true;
-		this._ipc?.sendCommand(GetMoreRowsCommand, {
-			id: oldestSha,
-			limit: GlGraphTimeline.adaptivePageSize(rows.length, 'all'),
-		});
+		try {
+			await (await services.rows).getMoreRows(id, limit);
+		} catch (ex) {
+			// A failed page leaves the current rows in place; the next scroll retries.
+			noop(ex);
+		} finally {
+			this._pageInFlight = false;
+			this.graphState.loading = false;
+		}
 	}
 
 	private get effectiveRepo() {
@@ -497,11 +499,9 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 
 	/** Chart asks for more older history when the user pans into the left edge. In windowed mode we
 	 *  ask the graph host to load more rows — its existing paging path merges new rows into state,
-	 *  which bubbles back via SignalWatcher and triggers a fresh dataset derivation. We track the
-	 *  in-flight state ourselves because `state.loading` is NOT toggled by the graph webview during
-	 *  paging (verified in `graphWebview.ts:onGetMoreRows` — it just calls `notifyDidChangeRows`). */
+	 *  which bubbles back via SignalWatcher and triggers a fresh dataset derivation. */
 	private onChartLoadMoreFromGraph = (_e: CustomEvent<LoadMoreEventDetail>): void => {
-		if (this._loadMoreInFlight) return; // already requested; wait for response
+		if (this._pageInFlight) return; // already requested; wait for response
 		if (this.graphState.paging?.hasMore !== true) return;
 
 		const rows = this.graphState.rows;
@@ -510,17 +510,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		const oldestSha = rows.at(-1)?.sha;
 		if (!oldestSha) return;
 
-		this._loadMoreInFlight = true;
-		this._lastSeenRowsRef = rows;
-		// Also flip the graph's global loading flag so the header's progress-indicator activates
-		// alongside the chart's edge scanner — matches the `onScopeAnchorsUnreachable` paging path
-		// in graph-wrapper.ts. The notification handler in stateProvider resets it to false on
-		// `DidChangeRowsNotification` arrival.
-		this.graphState.loading = true;
-		this._ipc?.sendCommand(GetMoreRowsCommand, {
-			id: oldestSha,
-			limit: GlGraphTimeline.adaptivePageSize(rows.length, 'pan'),
-		});
+		void this._requestMoreRows(oldestSha, GlGraphTimeline.adaptivePageSize(rows.length, 'pan'));
 	};
 
 	private onChartVisibleRangeChanged = (e: CustomEvent<{ oldest: number; newest: number }>): void => {
@@ -541,12 +531,11 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		return this.graphState.rowsStatsLoading === true;
 	}
 
-	/** True while a `GetMoreRowsCommand` is in flight OR stats are catching up for already-loaded
-	 *  rows. Drives the chart's edge-indicator affordance — the chart stays fully interactive
-	 *  while paging is in flight. */
+	/** True while a page is in flight OR stats are catching up for already-loaded rows. Drives the
+	 *  chart's edge-indicator affordance — the chart stays fully interactive while paging runs. */
 	private get graphIsLoadingMore(): boolean {
 		if (!this._hasShownData) return false; // initial load is handled by `graphIsInitialLoading`
-		if (this._loadMoreInFlight) return true;
+		if (this._pageInFlight) return true;
 		return this.graphState.rowsStatsLoading === true;
 	}
 
@@ -591,7 +580,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		const path = localScope.relativePath;
 		// All-time SHAs touching the path — one cheap `git log --all --pretty=%H -- <path>`. The
 		// visible dataset is bounded by `graphState.rows` (paginated via the chart's
-		// `gl-load-more` → `GetMoreRowsCommand`), so a period-based filter here would prevent
+		// `gl-load-more` → `rows.getMoreRows`), so a period-based filter here would prevent
 		// older file history from surfacing as the user pans into the graph's older rows.
 		// Cache key includes `rows[0].sha` so an amend/rebase that swaps the head commit
 		// invalidates correctly; `rows.length` discriminates paging extensions; both are
@@ -679,9 +668,9 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		this._hasShownData = true;
 
 		// Sparse-file auto-page: if the graph rows we have yielded NO file-touching commits and
-		// the graph has more rows to load, kick off a `GetMoreRowsCommand` to surface deeper
-		// history. Fixes the case where a file last modified hundreds of commits ago appears as
-		// an empty chart until the user manually pans into the left edge.
+		// the graph has more rows to load, kick off a page to surface deeper history. Fixes the
+		// case where a file last modified hundreds of commits ago appears as an empty chart until
+		// the user manually pans into the left edge.
 		//
 		// Gated by:
 		//   - `data.length === 0` (was previously `< 20`, which kept firing for files with a
@@ -690,23 +679,17 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		//     we stop the moment ANY match appears; the user pans manually for more.
 		//   - `_autoPageAttempts < maxAutoPageAttempts` so files with NO matches anywhere don't
 		//     page through the entire repo. Cap is reset on scope/repo change.
-		//   - Shared `_loadMoreInFlight` debounce with the chart's `gl-load-more` path.
+		//   - Shared `_pageInFlight` debounce with the chart's `gl-load-more` path.
 		if (
 			data.length === 0 &&
 			this._autoPageAttempts < GlGraphTimeline.maxAutoPageAttempts &&
 			this.graphState.paging?.hasMore === true &&
-			!this._loadMoreInFlight
+			!this._pageInFlight
 		) {
 			const oldestSha = rows.at(-1)?.sha;
 			if (oldestSha) {
 				this._autoPageAttempts++;
-				this._loadMoreInFlight = true;
-				this._lastSeenRowsRef = rows;
-				this.graphState.loading = true;
-				this._ipc?.sendCommand(GetMoreRowsCommand, {
-					id: oldestSha,
-					limit: GlGraphTimeline.adaptivePageSize(rows.length, 'pan'),
-				});
+				void this._requestMoreRows(oldestSha, GlGraphTimeline.adaptivePageSize(rows.length, 'pan'));
 			}
 		}
 	}
@@ -729,7 +712,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 	 *  or display-mode entry), so first-render is exactly one impression. The externally-pushed
 	 *  `scope` is adopted into `_localScope` in `willUpdate`, so `scoped` is accurate here. */
 	protected override firstUpdated(): void {
-		emitTelemetrySentEvent<'graph/timeline/shown'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/timeline/shown',
 			data: {
 				period: this.period,
@@ -749,7 +732,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 
 		// First-paint auto-selections are forwarded to the details panel but are not user actions.
 		if (e.detail.auto !== true) {
-			emitTelemetrySentEvent<'graph/timeline/commitSelected'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/timeline/commitSelected',
 				data: { shift: e.detail.shift },
 			});
@@ -783,7 +766,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 	private onHeaderPeriodChange = (e: CustomEvent<{ period: TimelinePeriod }>): void => {
 		const previous = this.period;
 		if (e.detail.period !== previous) {
-			emitTelemetrySentEvent<'graph/timeline/periodChanged'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/timeline/periodChanged',
 				data: { 'period.old': previous, 'period.new': e.detail.period },
 			});
@@ -799,7 +782,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		const previous = this.effectiveSliceBy;
 		const next = this.sliceBySupportedEffective && this.showAllBranchesEffective ? e.detail.sliceBy : 'author';
 		if (next !== previous) {
-			emitTelemetrySentEvent<'graph/timeline/sliceByChanged'>(this, {
+			emitTelemetrySentEvent(this, {
 				name: 'graph/timeline/sliceByChanged',
 				data: { 'sliceBy.old': previous, 'sliceBy.new': next },
 			});
@@ -821,7 +804,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		const result = await graphTimeline.choosePath({
 			repoUri: repo.path,
 			ref: this.graphState.branch,
-			title: 'Choose File or Folder to Visualize',
+			title: l10n.t('Choose File or Folder to Visualize'),
 			initialPath: this._localScope?.relativePath,
 		});
 		if (result?.picked == null) return;
@@ -832,7 +815,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		if (this._localScope?.type === next.type && this._localScope.relativePath === next.relativePath) return;
 
 		this._localScope = next;
-		emitTelemetrySentEvent<'graph/timeline/scopeChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/timeline/scopeChanged',
 			data: { action: 'choose', 'scope.type': next.type, scoped: true },
 		});
@@ -842,7 +825,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		if (this._localScope == null) return;
 
 		this._localScope = undefined;
-		emitTelemetrySentEvent<'graph/timeline/scopeChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/timeline/scopeChanged',
 			data: { action: 'clear', scoped: false },
 		});
@@ -859,7 +842,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		if (type === 'repo' || !value) {
 			if (this._localScope != null) {
 				this._localScope = undefined;
-				emitTelemetrySentEvent<'graph/timeline/scopeChanged'>(this, {
+				emitTelemetrySentEvent(this, {
 					name: 'graph/timeline/scopeChanged',
 					data: { action: 'breadcrumb', scoped: false },
 				});
@@ -871,7 +854,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		if (this._localScope?.type === next.type && this._localScope.relativePath === next.relativePath) return;
 
 		this._localScope = next;
-		emitTelemetrySentEvent<'graph/timeline/scopeChanged'>(this, {
+		emitTelemetrySentEvent(this, {
 			name: 'graph/timeline/scopeChanged',
 			data: { action: 'breadcrumb', 'scope.type': type, scoped: true },
 		});
@@ -890,7 +873,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 	override render(): unknown {
 		const repo = this.effectiveRepo;
 		if (repo == null) {
-			return html`<div class="empty"><p>No repository selected</p></div>`;
+			return html`<div class="empty"><p>${l10n.t('No repository selected')}</p></div>`;
 		}
 
 		const dateFormat = this.graphState.config?.dateFormat ?? 'MMMM Do, YYYY h:mma';
@@ -901,13 +884,13 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 		const localRelativePath = this._localScope?.relativePath ?? '';
 
 		const emptySlot = html`<div slot="empty">
-			<p>No commits found for the specified time period</p>
+			<p>${l10n.t('No commits found for the specified time period')}</p>
 		</div>`;
 
 		return html`
 			<div class="header-row">
 				<gl-graph-visualizations-switcher></gl-graph-visualizations-switcher>
-				${this._localScope == null ? html`<span class="header-row__title">Visual History</span>` : nothing}
+				${this._localScope == null ? html`<span class="header-row__title">${l10n.t('Visual History')}</span>` : nothing}
 				<gl-graph-coachmark
 					mark="visualizations"
 					placement="bottom"
@@ -918,7 +901,7 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 					placement=${this.placement}
 					host="graph"
 					.repository=${repoWithRef}
-					.repositoryCount=${this.graphState.repositories?.length ?? 0}
+					.repositoryCount=${countOpenRepositories(this.graphState.repositories)}
 					.headRef=${this.graphState.branch}
 					.scopeType=${localScopeType}
 					.relativePath=${localRelativePath}
@@ -940,8 +923,8 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 									slot="toolbox"
 									appearance="toolbar"
 									href="command:gitlens.views.graph.openTimelineInTab"
-									tooltip="Open in Editor"
-									aria-label="Open in Editor"
+									tooltip=${l10n.t('Open in Editor')}
+									aria-label=${l10n.t('Open in Editor')}
 								>
 									<code-icon icon="link-external"></code-icon>
 								</gl-button>`
@@ -950,8 +933,8 @@ export class GlGraphTimeline extends SignalWatcher(LitElement) {
 					<gl-button
 						slot="toolbox"
 						appearance="toolbar"
-						tooltip="Close Visualizations"
-						aria-label="Close Visualizations"
+						tooltip=${l10n.t('Close Visualizations')}
+						aria-label=${l10n.t('Close Visualizations')}
 						@click=${this.onCloseClick}
 					>
 						<code-icon icon="close"></code-icon>

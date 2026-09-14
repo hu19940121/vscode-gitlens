@@ -1,4 +1,5 @@
 import { flow } from '@lit-labs/virtualizer/layouts/flow.js';
+import * as l10n from '@vscode/l10n';
 import type { TemplateResult } from 'lit';
 import { css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
@@ -7,7 +8,11 @@ import type { Ref } from 'lit/directives/ref.js';
 import { createRef, ref } from 'lit/directives/ref.js';
 import { when } from 'lit/directives/when.js';
 import type { AgentSessionPhase } from '@gitlens/agents/types.js';
-import { agentPhaseToCategory, agentSuffixIconFor } from '../../agentUtils.js';
+import { GlElement } from '@gitlens/components/components/element.js';
+import type { AutolinkIconStatus } from '@gitlens/components/components/icons/providerIcons.js';
+import { getAutolinkIcon } from '@gitlens/components/components/icons/providerIcons.js';
+import { scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { agentPhaseToCategory, agentProviderIcon } from '../../agentUtils.js';
 import type { CollectionIndexController } from '../../controllers/collection-index.js';
 import { FilterController } from '../../controllers/filter.js';
 import type { FocusController } from '../../controllers/focus.js';
@@ -15,11 +20,7 @@ import type { SelectionController } from '../../controllers/selection.js';
 import { VirtualCollectionController } from '../../controllers/virtual-collection.js';
 import type { VirtualScrollController } from '../../controllers/virtual-scroll.js';
 import { parseFilterTerms } from '../../utils/filter-match.js';
-import { GlElement } from '../element.js';
-import type { AutolinkIconStatus } from '../rich/utils.js';
-import { getAutolinkIcon } from '../rich/utils.js';
 import type { GlGitStatus } from '../status/git-status.js';
-import { scrollableBase } from '../styles/lit/base.css.js';
 import type {
 	TreeItemAction,
 	TreeItemActionDetail,
@@ -31,16 +32,17 @@ import type {
 } from './base.js';
 import type { GlTreeItem } from './tree-item.js';
 import '@lit-labs/virtualizer';
+import '@gitlens/components/components/agentMark.js';
 import '../chips/action-chip.js';
 import '../branch-icon.js';
-import '../commit/wip-stats.js';
-import '../overlays/popover.js';
-import '../pills/tracking.js';
+import '@gitlens/components/components/wipStats.js';
+import '@gitlens/components/components/overlays/popover.js';
+import '@gitlens/components/components/pills/tracking.js';
 import '../file-icon/file-icon.js';
 import '../status/git-status.js';
 import '../button.js';
-import '../code-icon.js';
-import '../overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../markdown/markdown.js';
 import './tree-item.js';
 
@@ -60,8 +62,8 @@ export class GlTreeView extends GlElement {
 			}
 
 			/* Signals "the tree has focus" to descendant gl-tree-item rows (inherits across the shadow
-	   boundary). Drives the active-vs-inactive selection background on every selected row —
-	   reliable for click-focus, which doesn't surface as a focusin on this host. */
+boundary). Drives the active-vs-inactive selection background on every selected row —
+reliable for click-focus, which doesn't surface as a focusin on this host. */
 			:host(:focus-within) {
 				--gl-tree-focus-within: 1;
 			}
@@ -84,10 +86,10 @@ export class GlTreeView extends GlElement {
 				height: 100%;
 
 				/* lit-virtualizer sets an inline min-height based on its initial item-size
-		   estimate, which can exceed the scrollable container in small viewports and
-		   push scrolling onto the outer .scrollable div instead of the virtualizer's
-		   own scroller. Since height: 100% already provides correct sizing from the
-		   flex layout, the min-height is always redundant. */
+ estimate, which can exceed the scrollable container in small viewports and
+ push scrolling onto the outer .scrollable div instead of the virtualizer's
+ own scroller. Since height: 100% already provides correct sizing from the
+ flex layout, the min-height is always redundant. */
 				min-height: 0 !important;
 
 				/* Use layout containment instead of strict to avoid rendering issues */
@@ -101,7 +103,7 @@ export class GlTreeView extends GlElement {
 			}
 
 			/* Dim non-matched items when highlighting: either the search box is in highlight mode
-	   (search-box-filter absent) or an external source forces dim (dim-unmatched). */
+(search-box-filter absent) or an external source forces dim (dim-unmatched). */
 			:host([filtered]:not([search-box-filter])) gl-tree-item:not([matched]),
 			:host([filtered][dim-unmatched]) gl-tree-item:not([matched]) {
 				opacity: 0.6;
@@ -177,7 +179,7 @@ export class GlTreeView extends GlElement {
 			}
 
 			/* Shared by both the no-data case (emptyText) and the filter-yields-no-matches
-	   case ("No results found"); class name dates from the latter. */
+case ("No results found"); class name dates from the latter. */
 			.no-results {
 				padding: var(--gl-space-10);
 				font-style: italic;
@@ -197,17 +199,18 @@ export class GlTreeView extends GlElement {
 			.hover-content {
 				font-size: var(--gl-font-md);
 				line-height: 1.5;
-
-				/* anywhere wraps at any character when forced — avoids the default behavior of
-		   breaking paths at hyphens (the worst possible split point). */
 				overflow-wrap: anywhere;
 			}
 
+			.hover-content--break-all {
+				word-break: break-all;
+			}
+
 			/* Sizes codicons to the text for markdown tooltips only, where an icon appears mid-sentence
-			   and 16px towers over the words. Scoped to gl-markdown rather than the wrapper on purpose:
-			   component tooltips render in the same wrapper and own their icon sizing (gl-agent-tooltip
-			   builds a layout around full-size icons), and a custom property on the wrapper would
-			   silently shrink theirs too. */
+  and 16px towers over the words. Scoped to gl-markdown rather than the wrapper on purpose:
+  component tooltips render in the same wrapper and own their icon sizing (gl-agent-tooltip
+  builds a layout around full-size icons), and a custom property on the wrapper would
+  silently shrink theirs too. */
 			.hover-content gl-markdown {
 				--code-icon-size: 1.3rem;
 			}
@@ -225,23 +228,28 @@ export class GlTreeView extends GlElement {
 			}
 
 			/* Set in a wash of the row's own foreground rather than a fixed tint: the badge marks
-	   membership, not urgency, so it should read as a shape without competing with the state
-	   glyph or the attention indicator. Tabular figures so 2/3 and 2/10 align down a column. */
+membership, not urgency, so it should read as a shape without competing with the state
+glyph or the attention indicator. Tabular figures so 2/3 and 2/10 align down a column. */
 			.stack-count {
 				display: inline-flex;
 				gap: 0.3rem;
 				align-items: center;
 				height: 1.5rem;
 				padding: 0 var(--gl-space-4);
-				font-size: var(--gl-font-sm);
+				font-size: var(--gl-font-micro);
 				font-variant-numeric: tabular-nums;
-				border-radius: 0.8rem;
 				background: color-mix(in srgb, transparent 88%, var(--color-foreground));
+				border-radius: 0.8rem;
+			}
+
+			/* The layers glyph reads ~1px high against the count under flex centering; nudge it level. */
+			.stack-count code-icon {
+				transform: translateY(0.1rem);
 			}
 
 			/* Pull-request state, in GitLens's contributed theme colors so a retheme carries. Draft has
-	   no color of its own — it borrows the description foreground, which is what marks it as the
-	   not-yet-real one of the four. */
+no color of its own — it borrows the description foreground, which is what marks it as the
+not-yet-real one of the four. */
 			code-icon.tree-icon--pr-opened {
 				color: var(--vscode-gitlens-openPullRequestIconColor);
 			}
@@ -259,54 +267,72 @@ export class GlTreeView extends GlElement {
 			}
 
 			/* Phase-tinted agent icon — pulls from the shared --gl-agent-* palette defined in
-	   theme.scss so leaf, tooltip, pill, and details panel all dereference the same set
-	   of variables. code-icon's :host inherits color from its parent, so styling the
-	   element here flows through to its rendered glyph. */
-			code-icon.tree-icon-agent {
+theme.scss so leaf, tooltip, pill, and details panel all dereference the same set
+of variables. Unqualified (not scoped to code-icon) so the same rules also tint the
+gl-agent-mark corner badge below — both the identity glyph and its phase mark carry
+these classes and must always agree on color. code-icon's :host inherits color from its
+parent, so styling the element here flows through to its rendered glyph; gl-agent-mark
+draws entirely in currentColor, so it picks the color up the same way. */
+			.tree-icon-agent {
 				color: var(--gl-agent-idle-color);
 			}
 
-			code-icon.tree-icon-agent--working {
+			.tree-icon-agent--working {
 				color: var(--gl-agent-working-color);
 			}
 
-			code-icon.tree-icon-agent--waiting {
+			.tree-icon-agent--waiting {
 				color: var(--gl-agent-waiting-color);
 			}
 
-			code-icon.tree-icon-agent--completed {
-				color: var(--vscode-descriptionForeground);
+			.tree-icon-agent--ended {
+				color: var(--gl-agent-ended-color);
 			}
 
-			/* Positioning context for the robot + its overlaid phase badge, which together read as
-	   one identity marker. The decoration slot's gap applies between this wrapper and any
-	   sibling decoration, never inside it. */
+			/* Positioning context for the robot + its overlaid phase mark, which together read as
+one identity marker. The decoration slot's gap applies between this wrapper and any
+sibling decoration, never inside it. */
+			/* The leaf's logomark gets the graph's icon size, not the tree's 1.3rem default: at 1.3rem
+the badge covers more than half of a thin radial mark. Scoped to this anchor so file-tree
+decorations keep the tree's own sizing. */
 			.tree-icon-agent-anchor {
 				position: relative;
 				display: inline-flex;
 				align-items: center;
 			}
 
-			/* Phase glyph overlaid on the robot's bottom-right corner, mirroring the graph's WIP row
-	   indicator (.gl-graph__row-action-status). Sized via code-icon's own size attribute
-	   rather than font-size, so it lands on the same 12px disc the graph uses. */
-			code-icon.tree-icon-agent__badge {
-				position: absolute;
-				right: -0.1rem;
-				bottom: -0.1rem;
+			/* Opaque chip behind the mark, in the row's own colour, so the identity glyph is
+OCCLUDED rather than cut. A cutout has to survive whatever glyph it lands on, and a thin
+radiating mark like Claude's comes apart when you punch a hole through it. The chip needs
+the row's background, which tree-item publishes as --gl-tree-row-bg for each of its states
+(rest / hover / selected); custom properties inherit through the flattened tree, so slotted
+content picks up the right one without tracking state itself.
+
+Sized to circumscribe the mark's RING, in em so it tracks the glyph — the triangle runs
+wider than the circle and the square's corners reach furthest, so both take the larger disc.
+Painted between the glyph and the mark, hence the z-index ladder. */
+			/* The leaf mirrors the graph's WIP-row indicator exactly — same glyph size, same badge
+basis, same offsets — so one composition is learned once. The mark draws its own opaque
+backing in its own silhouette; all this supplies is the colour to cut with, which
+tree-item publishes per row state as --gl-tree-row-bg. */
+			.tree-icon-agent-anchor--leaf {
+				--code-icon-size: 1.6rem;
 			}
 
-			/* Punch a hole in the robot behind the badge rather than backing the badge with an opaque
-	   chip (what the graph does). A chip has to re-tint itself against every row state; this
-	   component has no row-tint variable to track, and a cutout needs none — the row's own
-	   background (rest, hover, selected, drag) shows through untouched. Geometry resolves
-	   against the robot's own em box (1em = --code-icon-size = 16px): the badge's 12px disc
-	   centers ~0.69em in from each edge, so a 0.4em radius clears it with a hair to spare.
-	   Only applied when a badge is actually present, so a lone robot isn't needlessly notched. */
-			code-icon.tree-icon-agent--badged {
-				--gl-agent-badge-cutout: radial-gradient(circle 0.4em at 0.69em 0.69em, transparent 96%, #000 100%);
-				-webkit-mask-image: var(--gl-agent-badge-cutout);
-				mask-image: var(--gl-agent-badge-cutout);
+			.tree-icon-agent-anchor gl-agent-mark.tree-icon-agent {
+				/* Composited, not a bare var: the hover and selection colours tree-item publishes are
+ semi-transparent, so painting one directly leaves a see-through chip that occludes
+ nothing — the cut vanishes exactly when a row is hovered or selected. Layering the row
+ colour over the panel's opaque background reproduces the row's effective surface. */
+				--gl-agent-mark-chip:
+					linear-gradient(var(--gl-tree-row-bg, transparent), var(--gl-tree-row-bg, transparent)),
+					var(--color-view-background, var(--vscode-sideBar-background));
+
+				position: absolute;
+				right: 0.05em;
+				bottom: 0.05em;
+				z-index: 2;
+				font-size: 1.2rem;
 			}
 		`,
 	];
@@ -352,7 +378,15 @@ export class GlTreeView extends GlElement {
 	dimUnmatched = false;
 
 	@property({ type: String, attribute: 'empty-text' })
-	emptyText = 'No items';
+	emptyText = l10n.t('No items');
+
+	/**
+	 * Set by consumers that slot their own `empty` content — a loading skeleton, an error with a retry.
+	 * Keeps the tree's chrome (filter bar, aria wiring, filter text) on screen around that content even
+	 * when {@link emptyText} is blank, so a panel's filter box doesn't come and go with its data.
+	 */
+	@property({ type: Boolean, attribute: 'has-empty-content' })
+	hasEmptyContent = false;
 
 	@property({ type: Boolean, attribute: 'tooltip-anchor-right' })
 	tooltipAnchorRight = false;
@@ -400,7 +434,7 @@ export class GlTreeView extends GlElement {
 	});
 
 	@property({ type: String, attribute: 'aria-label' })
-	override ariaLabel = 'Tree';
+	override ariaLabel = l10n.t('Tree');
 
 	/** External hint for which path should be focused when the model is set. Consumed once on model update. */
 	@property({ type: String, attribute: 'focused-path' })
@@ -495,9 +529,13 @@ export class GlTreeView extends GlElement {
 	// Hover tooltip state
 	private _hoverTimer?: ReturnType<typeof setTimeout>;
 	private _unhoverTimer?: ReturnType<typeof setTimeout>;
+	private _dismissedHoverBounds?: DOMRect;
 
 	@state()
 	private _hoveredTooltip?: string | TemplateResult;
+
+	@state()
+	private _hoveredTooltipWrap?: 'break-all';
 
 	@state()
 	private _hoveredAnchor?: HTMLElement | { getBoundingClientRect: () => Omit<DOMRect, 'toJSON'> };
@@ -715,7 +753,7 @@ export class GlTreeView extends GlElement {
 			| { type: 'status'; name: GlGitStatus['status'] }
 			| { type: 'branch'; status?: string; worktree?: boolean; hasChanges?: boolean }
 			| { type: 'file-icon'; filename: string }
-			| { type: 'agent'; phase: AgentSessionPhase }
+			| { type: 'agent'; phase: AgentSessionPhase; provider?: string }
 			| { type: 'pull-request'; state?: string; draft?: boolean },
 	) {
 		if (icon == null) return nothing;
@@ -742,26 +780,22 @@ export class GlTreeView extends GlElement {
 		}
 
 		if (icon.type === 'agent') {
-			// Phase-driven glyph AND color so the leaf telegraphs state at a glance — color alone
-			// is a single-axis signal and fails for color-blind scanning. Idle keeps the Claude
-			// brand asterisk (default state retains provider identity); working spins a `sync`
-			// glyph as an activity cue; waiting flips to `warning` as a call-to-action; completed
-			// settles on a neutral `pass` check. Colors come from the shared palette via static styles.
-			const phaseIcon =
-				icon.phase === 'working'
-					? 'sync'
-					: icon.phase === 'waiting'
-						? 'warning'
-						: icon.phase === 'completed'
-							? 'pass'
-							: 'claude';
-			const modifier = icon.phase === 'working' ? 'spin' : undefined;
-			return html`<code-icon
-				slot="icon"
-				icon="${phaseIcon}"
-				modifier=${ifDefined(modifier)}
-				class="tree-icon-agent tree-icon-agent--${icon.phase}"
-			></code-icon>`;
+			// Provider glyph with the phase mark OVERLAID on its corner, same composition as the
+			// graph's WIP-row indicator and the file decoration below. The glyph is rendered at the
+			// larger icon size here so the badge reads as a badge rather than swallowing it — a
+			// logomark is thinner than the robot and needs the extra room to survive an overlay.
+			return html`<span class="tree-icon-agent-anchor tree-icon-agent-anchor--leaf" slot="icon">
+				<code-icon
+					icon=${agentProviderIcon(icon.provider)}
+					class="tree-icon-agent tree-icon-agent--${icon.phase}"
+				></code-icon>
+				<gl-agent-mark
+					class="tree-icon-agent tree-icon-agent--${icon.phase}"
+					category=${agentPhaseToCategory[icon.phase]}
+					variant="badge"
+					aria-hidden="true"
+				></gl-agent-mark>
+			</span>`;
 		}
 
 		if (icon.type === 'pull-request') {
@@ -871,34 +905,27 @@ export class GlTreeView extends GlElement {
 
 			if (decoration.type === 'agent') {
 				// One identity glyph: the robot (never animates) carries identity + phase color, with
-				// the phase glyph overlaid as a corner badge — the same vocabulary the graph's WIP row
-				// indicator uses, via the shared `agentSuffixIconFor`. The badge must be its own
+				// the ONE agent-phase mark (`<gl-agent-mark>`) overlaid as a corner badge — the same
+				// mark the graph's WIP row indicator and the details panel's cards use, so every
+				// surface agrees on shape/tempo per phase, not just color. The mark must be its own
 				// element rather than a ::after on the robot: code-icon's `modifier="spin"` rotates
 				// the whole host, which would spin the robot along with it. Color comes from the
-				// shared --gl-agent-* palette via `tree-icon-agent--${phase}` on each `code-icon`.
+				// shared --gl-agent-* palette via `tree-icon-agent--${phase}` on both elements.
 				const tooltip = decoration.tooltip ?? decoration.label;
 				const category = agentPhaseToCategory[decoration.phase];
-				const badge = agentSuffixIconFor(category);
 				return html`<gl-tooltip slot=${slot} part=${slot} placement="top">
 					<span class="tree-icon-agent-anchor">
 						<code-icon
 							icon="robot"
-							class="tree-icon-agent tree-icon-agent--${decoration.phase} ${
-								badge != null ? 'tree-icon-agent--badged' : ''
-							}"
+							class="tree-icon-agent tree-icon-agent--${decoration.phase}"
 							aria-label=${ifDefined(tooltip)}
 						></code-icon>
-						${
-							badge != null
-								? html`<code-icon
-										icon=${badge}
-										size="12"
-										modifier=${category === 'working' ? 'spin' : ''}
-										class="tree-icon-agent tree-icon-agent--${decoration.phase} tree-icon-agent__badge"
-										aria-hidden="true"
-									></code-icon>`
-								: nothing
-						}
+						<gl-agent-mark
+							class="tree-icon-agent tree-icon-agent--${decoration.phase}"
+							category=${category}
+							variant="badge"
+							aria-hidden="true"
+						></gl-agent-mark>
 					</span>
 					<span slot="content">${tooltip}</span>
 				</gl-tooltip>`;
@@ -1026,6 +1053,7 @@ export class GlTreeView extends GlElement {
 			@gl-tree-item-toggle=${() => this.onTreeItemToggle(model)}
 			@gl-tree-item-checked=${(e: CustomEvent<TreeItemCheckedDetail>) => this.onTreeItemChecked(e, model)}
 			@mouseenter=${(e: MouseEvent) => this.onTreeItemHover(e, model)}
+			@mousemove=${(e: MouseEvent) => this.onTreeItemMove(e, model)}
 			@mouseleave=${() => this.onTreeItemUnhover()}
 			@gl-tree-item-suspend-tooltip=${() => this.onSuspendRowTooltip()}
 			@gl-tree-item-resume-tooltip=${() => this.onResumeRowTooltip()}
@@ -1069,8 +1097,8 @@ export class GlTreeView extends GlElement {
 						appearance="input"
 						role="checkbox"
 						aria-checked=${this.searchBoxFilter ? 'true' : 'false'}
-						tooltip="Filter Results"
-						aria-label="Filter Results"
+						tooltip=${l10n.t('Filter Results')}
+						aria-label=${l10n.t('Filter Results')}
 						@click=${this.toggleSearchBoxFilter}
 					>
 						<code-icon icon="list-filter"></code-icon>
@@ -1086,7 +1114,9 @@ export class GlTreeView extends GlElement {
 		const showNoResults = !hasItems && this._filter.query && this._model?.length;
 		const showEmptyText = !hasItems && !showNoResults && Boolean(this.emptyText);
 
-		if (!hasItems && !showNoResults && !showEmptyText) return nothing;
+		// Slotted empty content stands in for `emptyText`, so it also stands in for the blank-`emptyText`
+		// escape hatch that renders nothing at all.
+		if (!hasItems && !showNoResults && !showEmptyText && !this.hasEmptyContent) return nothing;
 
 		// Container-focused approach: the scrollable div is the focusable element
 		// Use aria-activedescendant to indicate which tree item is active for screen readers.
@@ -1120,8 +1150,10 @@ export class GlTreeView extends GlElement {
 							></lit-virtualizer>
 						</div>`
 					: showNoResults
-						? html`<div class="no-results">No results found</div>`
-						: html`<div class="no-results">${this.emptyText}</div>`
+						? html`<div class="no-results">${l10n.t('No results found')}</div>`
+						: // The no-data body only. A filter that matches nothing is the tree's own answer about
+							// the model it holds, so it stays out of the consumer's slot.
+							html`<slot name="empty"><div class="no-results">${this.emptyText}</div></slot>`
 			}
 			${
 				this._hoverOpen && this._hoveredTooltip
@@ -1129,14 +1161,23 @@ export class GlTreeView extends GlElement {
 							class="hover-popover"
 							?open=${this._hoverOpen}
 							.anchor=${this._hoveredAnchor}
-							placement="right-start"
-							flip-fallback-placements="bottom-start top-start"
+							placement=${this.tooltipAnchorRight ? 'right-start' : 'bottom-start'}
+							flip-fallback-placements=${this.tooltipAnchorRight ? 'bottom-start top-start' : 'top-start'}
 							trigger="manual"
 							.distance=${12}
-							@mouseenter=${this.onHoverPopoverEnter}
+							@mouseenter=${
+								this.tooltipAnchorRight ? this.onHoverPopoverEnter : this.onDefaultHoverPopoverEnter
+							}
 							@mouseleave=${() => this.onTreeItemUnhover()}
 						>
-							<div slot="content" class="hover-content">
+							<div
+								slot="content"
+								class=${
+									this._hoveredTooltipWrap === 'break-all' && !this.tooltipAnchorRight
+										? 'hover-content hover-content--break-all'
+										: 'hover-content'
+								}
+							>
 								${
 									typeof this._hoveredTooltip === 'string'
 										? html`<gl-markdown
@@ -1342,6 +1383,20 @@ export class GlTreeView extends GlElement {
 	};
 
 	private onTreeItemHover(event: MouseEvent, model: TreeModelFlat) {
+		const dismissedBounds = this._dismissedHoverBounds;
+		if (!this.tooltipAnchorRight && dismissedBounds != null) {
+			if (
+				event.clientX >= dismissedBounds.left &&
+				event.clientX <= dismissedBounds.right &&
+				event.clientY >= dismissedBounds.top &&
+				event.clientY <= dismissedBounds.bottom
+			) {
+				return;
+			}
+
+			this._dismissedHoverBounds = undefined;
+		}
+
 		if (!model.tooltip) {
 			this.onTreeItemUnhover();
 			return;
@@ -1352,10 +1407,10 @@ export class GlTreeView extends GlElement {
 		clearTimeout(this._unhoverTimer);
 
 		const itemRect = element.getBoundingClientRect();
-		// Anchor at the cursor's X (or the host's right edge in `tooltipAnchorRight` mode), aligned
-		// vertically with the row so the tooltip floats just to the side and never sits in the
-		// vertical path the cursor takes when moving between rows.
-		const x = this.tooltipAnchorRight ? this.getBoundingClientRect().right : event.clientX;
+		// Default tooltips open below the row with their body roughly 8px right of the cursor; the
+		// 24px anchor offset accounts for wa-popup's start-aligned arrow inset. Externally anchored
+		// trees keep the host's right edge so their tooltip stays outside the tree.
+		const x = this.tooltipAnchorRight ? this.getBoundingClientRect().right : event.clientX + 24;
 		const rect = this._virtualAnchorRect;
 		rect.x = rect.left = rect.right = x;
 		rect.y = rect.top = itemRect.top;
@@ -1364,6 +1419,7 @@ export class GlTreeView extends GlElement {
 		// width stays 0
 		this._hoveredAnchor = this._virtualAnchor;
 		this._hoveredTooltip = model.tooltip;
+		this._hoveredTooltipWrap = model.tooltipWrap;
 
 		if (this._hoverOpen) {
 			// Already showing — anchor identity is unchanged so Lit/wa-popup won't trigger a
@@ -1376,6 +1432,23 @@ export class GlTreeView extends GlElement {
 		this._hoverTimer = setTimeout(() => {
 			this._hoverOpen = true;
 		}, 500);
+	}
+
+	private onTreeItemMove(event: MouseEvent, model: TreeModelFlat): void {
+		const dismissedBounds = this._dismissedHoverBounds;
+		if (
+			this.tooltipAnchorRight ||
+			dismissedBounds == null ||
+			(event.clientX >= dismissedBounds.left &&
+				event.clientX <= dismissedBounds.right &&
+				event.clientY >= dismissedBounds.top &&
+				event.clientY <= dismissedBounds.bottom)
+		) {
+			return;
+		}
+
+		this._dismissedHoverBounds = undefined;
+		this.onTreeItemHover(event, model);
 	}
 
 	private async _repositionHoverPopover(): Promise<void> {
@@ -1396,6 +1469,7 @@ export class GlTreeView extends GlElement {
 		this._unhoverTimer = setTimeout(() => {
 			this._hoverOpen = false;
 			this._hoveredTooltip = undefined;
+			this._hoveredTooltipWrap = undefined;
 			this._hoveredAnchor = undefined;
 		}, 100);
 	}
@@ -1408,11 +1482,19 @@ export class GlTreeView extends GlElement {
 		clearTimeout(this._unhoverTimer);
 	};
 
+	private readonly onDefaultHoverPopoverEnter = (event: MouseEvent): void => {
+		const popover = event.currentTarget as HTMLElement;
+		this._dismissedHoverBounds = popover?.shadowRoot
+			?.querySelector<HTMLElement>('.popover__body')
+			?.getBoundingClientRect();
+		this.dismissRowTooltip();
+	};
+
 	private onSuspendRowTooltip() {
 		clearTimeout(this._hoverTimer);
 		clearTimeout(this._unhoverTimer);
 		this._hoverOpen = false;
-		// Keep _hoveredTooltip and _hoveredAnchor so we can resume
+		// Keep the hovered tooltip state and anchor so we can resume
 	}
 
 	private readonly dismissRowTooltip = (): void => {
@@ -1420,6 +1502,7 @@ export class GlTreeView extends GlElement {
 		clearTimeout(this._unhoverTimer);
 		this._hoverOpen = false;
 		this._hoveredTooltip = undefined;
+		this._hoveredTooltipWrap = undefined;
 		this._hoveredAnchor = undefined;
 	};
 

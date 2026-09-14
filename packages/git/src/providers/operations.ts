@@ -105,6 +105,16 @@ export interface GitOperationsSubProvider {
 			 */
 			programmaticEditor?: boolean;
 			/**
+			 * Tri-state autosquash control. `true` passes `--autosquash`, folding every pending
+			 * `fixup!`/`squash!` commit into its target and reordering the todo accordingly; `false` passes
+			 * `--no-autosquash`, explicitly overriding a `rebase.autosquash=true` git config (omitting the
+			 * flag would let the config fold anyway); `undefined` passes neither, deferring to git config.
+			 * `true` is mutually exclusive with {@link programmaticEditor}, which forces
+			 * `rebase.autosquash=false` so its script-based editor sees a plain, natural-order todo —
+			 * combining them is a programmer error; the CLI provider throws rather than silently dropping one.
+			 */
+			autosquash?: boolean;
+			/**
 			 * Command git uses to edit per-commit messages (the combined message a `squash` produces, or a
 			 * `reword`). Applied as `GIT_EDITOR` — which git's interactive-rebase `reword`/`squash` step honors,
 			 * unlike `core.editor` — with `core.editor` also set as a fallback. When omitted, git falls back to

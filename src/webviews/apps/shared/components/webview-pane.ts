@@ -1,7 +1,8 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
-import { scrollableBase } from './styles/lit/base.css.js';
-import './code-icon.js';
+import { scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import '@gitlens/components/components/codeIcon.js';
 import './progress.js';
 
 export interface WebviewPaneExpandedChangeEventDetail {
@@ -75,7 +76,7 @@ export class WebviewPane extends LitElement {
 			}
 
 			:host(:not([collapsable])) .title {
-				margin-left: var(--gl-space-8);
+				margin-left: var(--gl-webview-pane-title-indent, var(--gl-space-8));
 			}
 
 			.subtitle {
@@ -129,7 +130,7 @@ export class WebviewPane extends LitElement {
 	private renderTitle() {
 		if (!this.collapsable) {
 			return html`<div class="label">
-				<span class="title"><slot name="title">Section</slot></span>
+				<span class="title"><slot name="title">${l10n.t('Section')}</slot></span>
 				<span class="subtitle"><slot name="subtitle"></slot></span>
 			</div>`;
 		}
@@ -141,7 +142,7 @@ export class WebviewPane extends LitElement {
 			@click="${this.toggleExpanded}"
 		>
 			<code-icon class="icon" icon=${this.expanded ? 'chevron-down' : 'chevron-right'}></code-icon
-			><span class="title"><slot name="title">Section</slot></span>
+			><span class="title"><slot name="title">${l10n.t('Section')}</slot></span>
 			<span class="subtitle"><slot name="subtitle"></slot></span>
 		</button>`;
 	}

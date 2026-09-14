@@ -1,4 +1,4 @@
-import { Disposable, window } from 'vscode';
+import { Disposable, l10n, window } from 'vscode';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { once } from '@gitlens/utils/function.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
@@ -67,10 +67,11 @@ export class OrganizationService implements Disposable {
 		}
 
 		if (this._organizations === undefined || options?.force) {
-			if (!options?.force) {
+			if (this._organizations == null) {
 				this.loadStoredOrganizations(userId);
-				if (this._organizations != null) return this._organizations;
 			}
+
+			if (!options?.force && this._organizations != null) return this._organizations;
 
 			let rsp;
 			try {
@@ -91,10 +92,12 @@ export class OrganizationService implements Disposable {
 				scope?.error(ex);
 
 				void window.showErrorMessage(
-					`Unable to get organizations due to error: ${getPresentableErrorMessage(ex)}`,
-					'OK',
+					l10n.t('Unable to get organizations due to error: {0}', getPresentableErrorMessage(ex)),
+					l10n.t('OK'),
 				);
-				this.updateOrganizations(undefined);
+				if (this._organizations == null) {
+					this.updateOrganizations(undefined);
+				}
 				return this._organizations;
 			}
 
@@ -102,10 +105,15 @@ export class OrganizationService implements Disposable {
 				debugger;
 				scope?.error(undefined, `Unable to get organizations; status=(${rsp.status}): ${rsp.statusText}`);
 
-				void window.showErrorMessage(`Unable to get organizations; Status: ${rsp.statusText}`, 'OK');
+				void window.showErrorMessage(
+					l10n.t('Unable to get organizations; Status: {0}', rsp.statusText),
+					l10n.t('OK'),
+				);
 
-				// Setting to null prevents hitting the API again until you reload
-				this.updateOrganizations(null);
+				if (this._organizations == null) {
+					// Setting to null prevents hitting the API again until you reload
+					this.updateOrganizations(null);
+				}
 				return this._organizations;
 			}
 

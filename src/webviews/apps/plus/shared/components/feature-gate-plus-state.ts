@@ -1,8 +1,11 @@
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { urls } from '../../../../../constants.js';
 import {
 	proFeaturePreviewUsages,
@@ -19,7 +22,7 @@ import type { PromosContext } from '../../../shared/contexts/promos.js';
 import { promosContext } from '../../../shared/contexts/promos.js';
 import { linkStyles } from './vscode.css.js';
 import '../../../shared/components/button.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/promo.js';
 
 declare global {
@@ -60,8 +63,8 @@ export class GlFeatureGatePlusState extends LitElement {
 			}
 
 			/* Collapses the CTA to a block, centered button in narrow default-appearance gates.
-			   A deliberate literal — this threshold is independent of the compact threshold shared
-			   via featureGateCompactThreshold (and of the alert dialog's same-valued width cap). */
+  A deliberate literal — this threshold is independent of the compact threshold shared
+  via featureGateCompactThreshold (and of the alert dialog's same-valued width cap). */
 			@container (max-width: 60rem) {
 				:host([appearance='default']) gl-button:not(.inline) {
 					display: block;
@@ -77,8 +80,8 @@ export class GlFeatureGatePlusState extends LitElement {
 			}
 
 			/* .trial's first paragraph is excluded: wrapping the trailing paragraphs made it a
-			   :first-child, which would newly zero its top margin at every size — full-size
-			   spacing must stay as it was before the wrapper existed. */
+  :first-child, which would newly zero its top margin at every size — full-size
+  spacing must stay as it was before the wrapper existed. */
 			:host([appearance='alert']) p:first-child:not(.trial p) {
 				margin-top: 0;
 			}
@@ -92,7 +95,7 @@ export class GlFeatureGatePlusState extends LitElement {
 			}
 
 			/* Centering lives on the wrapper (not the paragraphs) because the compact mode below
-			   turns the paragraphs inline — text-align only aligns content of block containers. */
+  turns the paragraphs inline — text-align only aligns content of block containers. */
 			.trial {
 				text-align: center;
 			}
@@ -110,9 +113,9 @@ export class GlFeatureGatePlusState extends LitElement {
 			}
 
 			/* Like .actions-row but center-aligned, for a row that mixes a text button with an
-			   icon-only button: their baselines don't match (a text baseline vs the synthesized
-			   bottom edge of the icon button's flex box), so centering the equal-height button
-			   boxes is what lines them up. */
+  icon-only button: their baselines don't match (a text baseline vs the synthesized
+  bottom edge of the icon button's flex box), so centering the equal-height button
+  boxes is what lines them up. */
 			.actions-row-center {
 				display: flex;
 				gap: 0.6em;
@@ -195,7 +198,7 @@ export class GlFeatureGatePlusState extends LitElement {
 						<gl-button
 							class="inline"
 							href="${createCommandLink<Source>('gitlens.plus.resendVerification', this.source)}"
-							>Resend Email</gl-button
+							>${l10n.t('Resend Email')}</gl-button
 						>
 						<gl-button
 							class="inline"
@@ -204,7 +207,9 @@ export class GlFeatureGatePlusState extends LitElement {
 						></gl-button>
 					</p>
 					<hr />
-					<p class="centered">Check your inbox for a verification link, then refresh once you've verified.</p>
+					<p class="centered">
+						${l10n.t("Check your inbox for a verification link, then refresh once you've verified.")}
+					</p>
 				`;
 
 			case SubscriptionState.Community:
@@ -214,40 +219,35 @@ export class GlFeatureGatePlusState extends LitElement {
 
 				return html`<slot name="feature"></slot>
 					<p class="centered">
-						${
-							this.featureRestriction === 'private-repos'
-								? 'Unlock this feature for privately hosted repos with '
-								: 'Unlock this feature with '
-						} <a href="${urls.communityVsPro}">GitLens Pro</a>.
+						${localizedContent(this.featureRestriction === 'private-repos' ? l10n.t('Unlock this feature for privately hosted repos with {pro}.') : l10n.t('Unlock this feature with {pro}.'), { pro: html`<a href=${urls.communityVsPro}>GitLens Pro</a>` })}
 					</p>
 					<p class="actions-row">
 						<gl-button
 							class="inline"
 							href="${createCommandLink<Source>('gitlens.plus.signUp', this.source)}"
-							>&nbsp;Try GitLens Pro&nbsp;</gl-button
+							>&nbsp;${l10n.t('Try GitLens Pro')}&nbsp;</gl-button
 						><span
-							>or
-							<a href="${createCommandLink<Source>('gitlens.plus.login', this.source)}" title="Sign In"
-								>sign in</a
-							></span
+							>${localizedContent(l10n.t('or {signIn}'), {
+								signIn: html`<a
+									href="${createCommandLink<Source>('gitlens.plus.login', this.source)}"
+									title=${l10n.t('Sign In')}
+									>${l10n.t('sign in')}</a
+								>`,
+							})}</span
 						>
 					</p>
 					<hr />
 					<p class="centered">
 						<a href="${urls.communityVsPro}"
-							>Get ${pluralize('day', proTrialLengthInDays)} of GitLens Pro free</a
+							>${l10n.t('Get {0} days of GitLens Pro free', getNumericFormat()(proTrialLengthInDays))}</a
 						>
-						— no credit card required.
+						${l10n.t('— no credit card required.')}
 					</p>`;
 
 			case SubscriptionState.TrialExpired:
 				return html`<slot name="feature"></slot>
 					<p class="centered">
-						${
-							this.featureRestriction === 'private-repos'
-								? 'Unlock this feature for privately hosted repos with '
-								: 'Unlock this feature with '
-						} <a href="${urls.communityVsPro}">GitLens Pro</a>.
+						${localizedContent(this.featureRestriction === 'private-repos' ? l10n.t('Unlock this feature for privately hosted repos with {pro}.') : l10n.t('Unlock this feature with {pro}.'), { pro: html`<a href=${urls.communityVsPro}>GitLens Pro</a>` })}
 					</p>
 					<p class="actions-row">
 						<gl-button
@@ -256,14 +256,13 @@ export class GlFeatureGatePlusState extends LitElement {
 								plan: 'pro',
 								...(this.source ?? { source: 'feature-gate' }),
 							})}"
-							>Upgrade to Pro</gl-button
+							>${l10n.t('Upgrade to Pro')}</gl-button
 						>
 					</p>
 					<hr />
 					<div class="trial">
 						<p>
-							Your trial has ended — upgrade to keep
-							${this.featureWithArticleIfNeeded ?? 'all Pro features'} unlocked.
+							${this.featureWithArticleIfNeeded ? l10n.t('Your trial has ended — upgrade to keep {feature} unlocked.', { feature: this.featureWithArticleIfNeeded }) : l10n.t('Your trial has ended — upgrade to keep all Pro features unlocked.')}
 						</p>
 						<p>${this.renderPromo()}</p>
 					</div>`;
@@ -274,14 +273,12 @@ export class GlFeatureGatePlusState extends LitElement {
 						<gl-button
 							class="inline"
 							href="${createCommandLink<Source>('gitlens.plus.reactivateProTrial', this.source)}"
-							>Continue</gl-button
+							>${l10n.t('Continue')}</gl-button
 						>
 					</p>
 					<hr />
 					<p class="centered">
-						Reactivate your Pro trial to experience
-						${this.featureWithArticleIfNeeded ? `${this.featureWithArticleIfNeeded} and ` : ''}all the new
-						Pro features — free for another ${pluralize('day', proTrialLengthInDays)}.
+						${this.featureWithArticleIfNeeded ? l10n.t('Reactivate your Pro trial to experience {feature} and all the new Pro features — free for another {days} days.', { feature: this.featureWithArticleIfNeeded, days: getNumericFormat()(proTrialLengthInDays) }) : l10n.t('Reactivate your Pro trial to experience all the new Pro features — free for another {0} days.', getNumericFormat()(proTrialLengthInDays))}
 					</p> `;
 		}
 
@@ -295,18 +292,19 @@ export class GlFeatureGatePlusState extends LitElement {
 		if (used === 0) {
 			return html`<slot name="feature"></slot>
 				<p class="actions-row">
-					<gl-button href="${ifDefined(this.featurePreviewCommandLink)}">Continue</gl-button>
+					<gl-button href="${ifDefined(this.featurePreviewCommandLink)}">${l10n.t('Continue')}</gl-button>
 				</p>
 				<hr />
 				<p class="centered">
-					Already have an account?
-					<a href="${createCommandLink<Source>('gitlens.plus.login', this.source)}" title="Sign In">sign in</a
+					${l10n.t('Already have an account?')}
+					<a href="${createCommandLink<Source>('gitlens.plus.login', this.source)}" title=${l10n.t('Sign In')}
+						>${l10n.t('sign in')}</a
 					><br />
 					${appearance !== 'alert' ? html`<br />` : ''}
 					<a href="${createCommandLink<Source>('gitlens.plus.signUp', this.source)}"
-						>Want full access to all Pro features? Start your free ${proTrialLengthInDays}-day Pro trial</a
+						>${l10n.t('Want full access to all Pro features? Start your free {0}-day Pro trial', proTrialLengthInDays)}</a
 					>
-					— no credit card required.
+					${l10n.t('— no credit card required.')}
 				</p> `;
 		}
 
@@ -316,24 +314,39 @@ export class GlFeatureGatePlusState extends LitElement {
 			${this.renderFeaturePreviewStep(featurePreview, used)}
 			<p class="actions-row">
 				<gl-button class="inline" href="${ifDefined(this.featurePreviewCommandLink)}"
-					>Continue Preview</gl-button
+					>${l10n.t('Continue Preview')}</gl-button
 				><span
-					>or
-					<a href="${createCommandLink<Source>('gitlens.plus.login', this.source)}" title="Sign In"
-						>sign in</a
-					></span
+					>${localizedContent(l10n.t('or {signIn}'), {
+						signIn: html`<a
+							href="${createCommandLink<Source>('gitlens.plus.login', this.source)}"
+							title=${l10n.t('Sign In')}
+							>${l10n.t('sign in')}</a
+						>`,
+					})}</span
 				>
 			</p>
 			<hr />
 			<p class="centered">
-				${pluralize('day', left, { infix: ' more ' })} to preview
-				${this.featureWithArticleIfNeeded ? `${this.featureWithArticleIfNeeded} on ` : ''}privately hosted
-				repos.<br />
+				${
+					this.featureWithArticleIfNeeded
+						? formatPlural(
+								l10n.t(
+									'{days, plural, one{{days} more day to preview {feature} on privately hosted repos.} other{{days} more days to preview {feature} on privately hosted repos.}}',
+								),
+								{ days: left, feature: this.featureWithArticleIfNeeded },
+							)
+						: formatPlural(
+								l10n.t(
+									'{0, plural, one{{0} more day to preview privately hosted repos.} other{{0} more days to preview privately hosted repos.}}',
+								),
+								[left],
+							)
+				}<br />
 				${appearance !== 'alert' ? html`<br />` : ''}
 				<a href="${createCommandLink<Source>('gitlens.plus.signUp', this.source)}"
-					>Want full access to all Pro features? Start your free ${proTrialLengthInDays}-day Pro trial</a
+					>${l10n.t('Want full access to all Pro features? Start your free {0}-day Pro trial', proTrialLengthInDays)}</a
 				>
-				— no credit card required.
+				${l10n.t('— no credit card required.')}
 			</p>
 		`;
 	}
@@ -343,31 +356,29 @@ export class GlFeatureGatePlusState extends LitElement {
 			case 'graph':
 				switch (used) {
 					case 1:
-						return html`<p>Try Commit Search</p>
+						return html`<p>${l10n.t('Try Commit Search')}</p>
 							<p>
-								Search for commits in your repo by author, commit message, SHA, file, change, or type.
-								Turn on the commit filter to show only commits that match your query.
+								${l10n.t('Search for commits in your repo by author, commit message, SHA, file, change, or type. Turn on the commit filter to show only commits that match your query.')}
 							</p>
 							<p>
 								<img
 									class="preview-image"
 									src="${this.webroot ?? ''}/media/graph-commit-search.webp"
-									alt="Graph Commit Search"
+									alt=${l10n.t('Graph Commit Search')}
 								/>
 							</p> `;
 
 					case 2:
 						return html`
-							<p>Try the Graph Minimap</p>
+							<p>${l10n.t('Try the Graph Minimap')}</p>
 							<p>
-								Visualize the amount of changes to a repository over time, and inspect specific points
-								in the history to locate branches, stashes, tags and pull requests.
+								${l10n.t('Visualize the amount of changes to a repository over time, and inspect specific points in the history to locate branches, stashes, tags and pull requests.')}
 							</p>
 							<p>
 								<img
 									class="preview-image"
 									src="${this.webroot ?? ''}/media/graph-minimap.webp"
-									alt="Graph Minimap"
+									alt=${l10n.t('Graph Minimap')}
 								/>
 							</p>
 						`;

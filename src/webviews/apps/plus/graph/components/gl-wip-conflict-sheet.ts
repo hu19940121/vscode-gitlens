@@ -1,19 +1,20 @@
+import * as l10n from '@vscode/l10n';
 import type { PropertyValues } from 'lit';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
+import { scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
 import type { Preferences } from '../../../../plus/graph/detailsProtocol.js';
 import type { ConflictDetails, ConflictDetailsCommit, ConflictDetailsSide } from '../../../../rpc/services/types.js';
 import type { FileChangeListItemDetail } from '../../../commitDetails/components/gl-details-base.js';
-import { scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
 import type { CommitRowData } from './gl-commit-row.js';
 import { SheetWrapper } from './sheetWrapper.js';
 import './gl-commit-row-item.js';
 import '../../../shared/components/branch-name.js';
 import '../../../shared/components/chips/action-chip.js';
-import '../../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../../shared/components/commit-sha.js';
 import '../../../shared/components/overlays/detail-sheet.js';
-import '../../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 import '../../../shared/components/split-panel/split-panel.js';
 
 export type ConflictSheetSide = 'current' | 'incoming';
@@ -55,7 +56,7 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 			}
 
 			/* Border-box so the split-panel's height:100% on the slotted pane INCLUDES our padding —
-	   otherwise the pane is taller than its grid cell and bleeds past the divider. */
+otherwise the pane is taller than its grid cell and bleeds past the divider. */
 			* {
 				box-sizing: border-box;
 			}
@@ -90,12 +91,12 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 				min-height: 0;
 
 				/* Thin (1px) divider so the splitter reads as a subtle hairline rather than a 4px gap;
-				   the 8px grab hit-area is unchanged. */
+   the 8px grab hit-area is unchanged. */
 				--gl-split-panel-divider-width: var(--gl-border-width);
 			}
 
 			/* Subtle hairline matching the sheet's own --vscode-widget-border edges (gl-detail-sheet
-			   header/footer). The divider's own :hover/:active states still recolor it on grab. */
+  header/footer). The divider's own :hover/:active states still recolor it on grab. */
 			.sides::part(divider) {
 				background-color: var(--vscode-widget-border, var(--color-foreground--25));
 			}
@@ -157,8 +158,8 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 				overflow: hidden auto;
 
 				/* Per-side scrollbar fade: reuse scrollableBase's thumb mechanic (transparent thumb whose
-		   inset border inherits this element's border-color), but key visibility to THIS side's
-		   pane — not the host — so hovering one side never reveals the other's scrollbar. */
+ inset border inherits this element's border-color), but key visibility to THIS side's
+ pane — not the host — so hovering one side never reveals the other's scrollbar. */
 				border-color: transparent;
 				transition: border-color 1s linear;
 			}
@@ -262,27 +263,31 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 	}
 
 	override render(): unknown {
-		return html`<gl-detail-sheet esc-managed aria-label="Conflict details" close-label="Close">
+		return html`<gl-detail-sheet
+			esc-managed
+			aria-label=${l10n.t('Conflict details')}
+			close-label=${l10n.t('Close')}
+		>
 			<span slot="title" class="title">
 				<code-icon icon="warning"></code-icon>
-				<span class="title__name">Conflict · ${this.fileName}</span>
+				<span class="title__name">${l10n.t('Conflict · {file}', { file: this.fileName })}</span>
 			</span>
 			${
 				this.aiEnabled
 					? html`<gl-action-chip
 							slot="actions"
 							icon="gl-merge"
-							label="Resolve Conflicts (Preview)"
+							label=${l10n.t('Resolve Conflicts (Preview)')}
 							overlay="tooltip"
 							@click=${this.onResolveAi}
-							><span>Resolve Conflicts</span></gl-action-chip
+							><span>${l10n.t('Resolve Conflicts')}</span></gl-action-chip
 						>`
 					: nothing
 			}
 			<gl-action-chip
 				slot="actions"
 				icon="go-to-file"
-				label="Open File"
+				label=${l10n.t('Open File')}
 				overlay="tooltip"
 				@click=${this.onOpenFile}
 			></gl-action-chip>
@@ -291,8 +296,8 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 	}
 
 	private renderContent(): unknown {
-		if (this._loading) return html`<div class="state">Loading conflict details…</div>`;
-		if (this._error) return html`<div class="state">Unable to load conflict details.</div>`;
+		if (this._loading) return html`<div class="state">${l10n.t('Loading conflict details…')}</div>`;
+		if (this._error) return html`<div class="state">${l10n.t('Unable to load conflict details.')}</div>`;
 
 		const details = this._details;
 		if (details == null) return nothing;
@@ -303,26 +308,21 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 			.position=${this._position}
 			@gl-split-panel-change=${this.onSplitChange}
 		>
-			${this.renderSide('current', 'gl-diff-left', 'Current', details.current, details.canStageCurrent, details)}
-			${this.renderSide(
-				'incoming',
-				'gl-diff-right',
-				'Incoming',
-				details.incoming,
-				details.canStageIncoming,
-				details,
-			)}
+			${this.renderSide('current', 'gl-diff-left', details.current, details.canStageCurrent, details)}
+			${this.renderSide('incoming', 'gl-diff-right', details.incoming, details.canStageIncoming, details)}
 		</gl-split-panel>`;
 	}
 
 	private renderSide(
 		side: ConflictSheetSide,
 		icon: string,
-		label: string,
 		data: ConflictDetailsSide,
 		canStage: boolean,
 		details: ConflictDetails,
 	): unknown {
+		const label = side === 'current' ? l10n.t('Current') : l10n.t('Incoming');
+		const openLabel = side === 'current' ? l10n.t('Open Current Changes') : l10n.t('Open Incoming Changes');
+		const stageLabel = side === 'current' ? l10n.t('Stage Current Changes') : l10n.t('Stage Incoming Changes');
 		return html`<div slot=${side === 'current' ? 'start' : 'end'} class="side-pane">
 			<header class="side__head">
 				<code-icon class="side__icon" icon=${icon}></code-icon>
@@ -331,7 +331,7 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 				<div class="side__actions">
 					<gl-action-chip
 						icon="diff-multiple"
-						label="Open ${label} Changes"
+						label=${openLabel}
 						overlay="tooltip"
 						@click=${() => this.emitSide('conflict-open-changes', side)}
 					></gl-action-chip>
@@ -339,7 +339,7 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 						canStage
 							? html`<gl-action-chip
 									icon="check"
-									label="Stage ${label} Changes"
+									label=${stageLabel}
 									overlay="tooltip"
 									@click=${() => this.emitSide('conflict-stage', side)}
 								></gl-action-chip>`
@@ -359,10 +359,10 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 
 	private renderCommits(data: ConflictDetailsSide, hasMergeBase: boolean): unknown {
 		if (!hasMergeBase) {
-			return html`<div class="state">No merge base — commit history unavailable.</div>`;
+			return html`<div class="state">${l10n.t('No merge base — commit history unavailable.')}</div>`;
 		}
 		if (data.commits.length === 0) {
-			return html`<div class="state">No commits changed this file on this side.</div>`;
+			return html`<div class="state">${l10n.t('No commits changed this file on this side.')}</div>`;
 		}
 
 		return html`<ul class="commits">
@@ -373,7 +373,7 @@ export class GlWipConflictSheet extends SheetWrapper(LitElement) {
 							placement="top"
 							.commit=${this.toRow(c)}
 							.preferences=${this.preferences}
-							label="Open Changes for Commit ${c.shortSha}"
+							label=${l10n.t('Open Changes for Commit {revision}', { revision: c.shortSha })}
 							@gl-commit-row-item-select=${() => this.emitCommit(c.sha)}
 						></gl-commit-row-item>
 					</li>`,

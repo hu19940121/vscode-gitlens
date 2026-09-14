@@ -8,18 +8,116 @@
 // IntegrationAuthenticationService, etc.) are not part of the public API and
 // may be refactored without semver bumps.
 
-import { CloudIntegrationService } from './authentication/cloudIntegrationService.js';
-import { ConfiguredIntegrationService } from './authentication/configuredIntegrationService.js';
-import { IntegrationAuthenticationService } from './authentication/integrationAuthenticationService.js';
-import type { IntegrationServiceContext } from './context.js';
-import { IntegrationService } from './integrationService.js';
+import type { Account } from '@gitlens/git/models/author.js';
+import { CacheController } from '@gitlens/utils/promiseCache.js';
+import type { IntegrationIds } from './constants.js';
+import type {
+	AccountProvider,
+	ConfigProvider,
+	HttpProvider,
+	IntegrationCacheProvider,
+	IntegrationServiceHooks,
+	IntegrationStorageProvider,
+	RepositoriesProvider,
+} from './context.js';
+import { createIntegrationService } from './integrationService.js';
+import type { IntegrationManager } from './manager.js';
+
+/** A cached provider value, which may still be resolving. */
+export type IntegrationManagerCacheResult<T> = Promise<T | undefined> | T | undefined;
+
+/** Produces an account value on a cache miss. */
+export type IntegrationManagerCacheLoader<T> = (cacheable: CacheController) => {
+	value: IntegrationManagerCacheResult<T>;
+	expiresAt?: number;
+};
+
+/** Stable integration identity supplied to the consumer-owned account cache. */
+export interface IntegrationAccountCacheDescriptor {
+	readonly id: IntegrationIds;
+	readonly domain?: string;
+}
+
+/** Cache controls attached to a provider account lookup. */
+export interface IntegrationManagerCacheOptions {
+	readonly connectionId?: string;
+	readonly etag?: string;
+	readonly expiryOverride?: boolean | number;
+	readonly expireOnError?: boolean;
+}
 
 /**
- * The public manager — what consumers get back from
- * {@link createIntegrationManager}. Identical shape to {@link IntegrationService}
- * for now (we may narrow this surface in a future major).
+ * Optional consumer-owned cache for values reused by the public manager facade.
+ *
+ * The manager only needs cross-call caching for provider identity lookups. Other caches used by the GitLens
+ * extension host are implementation details and deliberately stay out of this contract.
  */
-export type IntegrationManager = IntegrationService;
+export interface IntegrationManagerCacheProvider {
+	getCurrentAccount(
+		integration: IntegrationAccountCacheDescriptor,
+		cacheable: IntegrationManagerCacheLoader<Account>,
+		options?: IntegrationManagerCacheOptions,
+	): IntegrationManagerCacheResult<Account>;
+}
+
+function loadUncached<T>(loader: IntegrationManagerCacheLoader<T>): IntegrationManagerCacheResult<T> {
+	return loader(new CacheController()).value;
+}
+
+const uncachedIntegrationCacheProvider: IntegrationCacheProvider = {
+	getRepositoryMetadata: (_repo, _integration, loader) => loadUncached(loader),
+	getRepositoryDefaultBranch: (_repo, _integration, loader) => loadUncached(loader),
+	getPullRequestForSha: (_sha, _repo, _integration, loader) => loadUncached(loader),
+	getPullRequestForBranch: (_branch, _repo, _integration, loader) => loadUncached(loader),
+	getPullRequest: (_id, _resource, _integration, loader) => loadUncached(loader),
+	getIssueOrPullRequest: (_id, _type, _resource, _integration, loader) => loadUncached(loader),
+	getIssue: (_id, _resource, _integration, loader) => loadUncached(loader),
+	getCurrentAccount: (_integration, loader) => loadUncached(loader),
+	// Nothing is cached, so there is nothing to evict.
+	deletePullRequests: () => {},
+};
+
+function toIntegrationCacheProvider(cache: IntegrationManagerCacheProvider | undefined): IntegrationCacheProvider {
+	if (cache == null) return uncachedIntegrationCacheProvider;
+
+	return {
+		...uncachedIntegrationCacheProvider,
+		getCurrentAccount: (integration, loader, options) =>
+			cache.getCurrentAccount({ id: integration.id, domain: integration.domain }, loader, options),
+	};
+}
+
+/**
+ * Consumer-facing runtime for {@link createIntegrationManager}.
+ *
+ * External consumers may omit `cache`; reads then execute their loaders directly without cross-call caching.
+ * The extension host's broader integration context remains private to the implementation.
+ */
+export interface IntegrationManagerContext {
+	readonly storage: IntegrationStorageProvider;
+	readonly account: AccountProvider;
+	readonly config: ConfigProvider;
+	readonly http: HttpProvider;
+	readonly cache?: IntegrationManagerCacheProvider;
+	readonly repositories: RepositoriesProvider;
+	readonly hooks?: IntegrationServiceHooks;
+}
+
+export type {
+	ClosedPullRequestSweepOptions,
+	IntegrationManager,
+	ListOrgsOptions,
+	ListProjectsOptions,
+	// Every option shape a caller has to BUILD is exported, not just the ones the manager returns:
+	// `manager.js` is not a public subpath, so a type omitted here can't be named by a consumer at all
+	// (`broadenIssues`' `orgs` needed `ProviderBroadenOrg` and had to be re-declared downstream).
+	ProviderBroadenOrg,
+	ProviderRepositoriesInput,
+	ProviderRepositoryInput,
+	ProviderSweepTarget,
+	ProviderSweepTargetEvent,
+	PullRequestSweepOptions,
+} from './manager.js';
 
 /**
  * Construct an `@gitlens/integrations` manager bound to the supplied runtime.
@@ -33,61 +131,27 @@ export type IntegrationManager = IntegrationService;
  * containing scope) to release every cached integration plus the runtime's
  * own VS Code subscriptions.
  */
-export function createIntegrationManager(ctx: IntegrationServiceContext): IntegrationManager {
-	const configured = new ConfiguredIntegrationService(ctx);
-	// The cloud token-exchange client is a pure package service (needs only `ctx`); construct it here
-	// rather than round-tripping through a host hook.
-	const cloud = new CloudIntegrationService(ctx);
-	// Cloud auth providers need to (re)initiate the connect flow that lives on the service, but the
-	// service is constructed after the auth service (it depends on it). Break the cycle here at the
-	// composition root with a lazy, readonly accessor — preserving constructor injection while
-	// keeping the flow in-package (no host round-trip).
-	let service: IntegrationService;
-	const auth = new IntegrationAuthenticationService(configured, ctx, () => service, cloud);
-	service = new IntegrationService(auth, configured, ctx);
-	// One-time cleanup of storage left behind by integration ids retired in the cloud-only refactor (the
-	// local self-managed `github-enterprise`/`gitlab-self-hosted` providers). Best-effort and guarded so it
-	// runs once; a no-op for consumers that never stored those ids.
-	void purgeRetiredIntegrationStorage(ctx, configured);
-	return service;
-}
-
-const retiredIntegrationsStorageKey = 'integrations:migrated:cloudOnly';
-async function purgeRetiredIntegrationStorage(
-	ctx: IntegrationServiceContext,
-	configured: ConfiguredIntegrationService,
-): Promise<void> {
-	if (ctx.storage.get<boolean>(retiredIntegrationsStorageKey)) return;
-
-	try {
-		await configured.purgeStoredConfiguration(['github-enterprise', 'gitlab-self-hosted']);
-		// Only mark the migration done once the purge fully succeeds. A partial/failed purge stays
-		// un-flagged so it retries (idempotently) on the next startup, rather than orphaning the
-		// retired-id config/secrets forever.
-		await ctx.storage.store(retiredIntegrationsStorageKey, true);
-	} catch {
-		// Best-effort cleanup: swallow so the failure doesn't reject the fire-and-forget caller; the
-		// unset flag guarantees a retry next startup.
-	}
+export function createIntegrationManager(ctx: IntegrationManagerContext): IntegrationManager {
+	return createIntegrationService({
+		...ctx,
+		cache: toIntegrationCacheProvider(ctx.cache),
+	});
 }
 
 // Re-exports for the public API surface.
 export type {
 	AccountProvider,
 	AuthenticationSessionsChangeEvent,
-	IntegrationCacheProvider,
 	ConfigChangeEvent,
 	ConfigProvider,
 	RepositoriesProvider,
 	HttpProvider,
-	IntegrationServiceContext,
+	IntegrationsRemoteConfig,
 	IntegrationServiceHooks,
 	IntegrationStorageProvider,
 } from './context.js';
-export type { ApiClients } from './providers/apiClients.js';
-export type { Source } from './telemetry.js';
+export type { Source, Sources } from './telemetry.js';
 export type { IntegrationIds, SupportedCloudIntegrationIds } from './constants.js';
-export type { ConnectionStateChangeEvent, IntegrationConnectionChangeEvent } from './integrationService.js';
 export type { ConfiguredIntegrationsChangeEvent } from './authentication/configuredIntegrationService.js';
 
 // Authentication contract — what `IntegrationServiceHooks.createAuthenticationProvider`
@@ -110,6 +174,9 @@ export type {
 // Provider-id mapping helpers for consumers bridging their own provider ids to `IntegrationIds`
 // (e.g. mapping multi-account connections from `getConfigured` back to a provider) and vice versa.
 export { toCloudIntegrationType, toIntegrationId } from './authentication/models.js';
+// Domain normalization is part of connection selection and repository resolution; consumers should use the
+// same implementation rather than importing an internal utility subpath or maintaining a divergent copy.
+export { areDomainsOnSameHost, hostFromDomain } from './utils/domain.utils.js';
 
 // Convenience: wrap a static access token (env var, CLI flag, secret manager)
 // as an `IntegrationAuthenticationProvider`. For OAuth/refresh flows, implement
@@ -126,3 +193,38 @@ export {
 	isIntegrationId,
 	isSupportedCloudIntegrationId,
 } from './constants.js';
+
+// Neutral pagination + warning result types the Kepler ProviderBackend adapter maps to its own DTOs.
+// These carry no `@gitkraken/provider-apis` types, so consumers depend only on `@gitkraken/core-gitlens`.
+export type {
+	ConnectionStateChangeEvent,
+	ProviderBroadenResult,
+	ProviderPagedResult,
+	ProviderPageInfo,
+	ProviderResult,
+	ProviderSweepResult,
+	ProviderWarning,
+	ProviderWarningKind,
+	ProviderWarningOmission,
+	ProviderWarningOmissionKind,
+	ProviderWarningOmissionRecovery,
+	ProviderWarningOmissionScope,
+	ProviderOrganization,
+	ProviderRepositoryShape,
+	RepositoryIdentity,
+	RepositoryResolution,
+	RepositoryResolutionStatus,
+	ResolveRepositoryResult,
+} from './results.js';
+// Runtime enums — re-exported as values (not `export type`) so consumers can read their members.
+export { IssueFilter, PullRequestFilter } from './providerFilters.js';
+// The filtered issue search's criteria model and the capability table that says which of it a provider honors.
+// String unions and plain interfaces, so a consumer builds criteria without importing an internal subpath.
+export type { IssueSearchCapabilities, IssueSearchCriteria, IssueSearchRelationship } from './providerFilters.js';
+// Account-wide pull-request search criteria and the per-provider capability table.
+export type { PullRequestSearchCapabilities, PullRequestSearchCriteria } from './providerFilters.js';
+// The count-only issue probe's input and result shapes.
+export type { IssueCountResult, IssueCountScope } from './reads/counts.js';
+// Cross-provider PR/issue state filters (string unions in the git models).
+export type { PullRequestStateFilter } from '@gitlens/git/models/pullRequest.js';
+export type { IssueStateFilter } from '@gitlens/git/models/issue.js';

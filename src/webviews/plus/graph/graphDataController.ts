@@ -1,10 +1,15 @@
+import { isWipRowId } from '@gitkraken/commit-graph/wip/identity.js';
 import type { CancellationToken } from 'vscode';
 import { CancellationTokenSource } from 'vscode';
-import { GitSearchError } from '@gitlens/git/errors.js';
 import type { GitGraph } from '@gitlens/git/models/graph.js';
 import type { GitGraphSearch } from '@gitlens/git/models/graphSearch.js';
-import type { GitGraphSession, GitGraphSessionChangedChannels } from '@gitlens/git/models/graphSession.js';
+import type {
+	GitGraphSession,
+	GitGraphSessionChangedChannels,
+	GitGraphSessionMoreResult,
+} from '@gitlens/git/models/graphSession.js';
 import { uncommitted } from '@gitlens/git/models/revision.js';
+import type { SearchQuery } from '@gitlens/git/models/search.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { CoalescedRun } from '@gitlens/utils/coalescedRun.js';
 import type { Deferrable } from '@gitlens/utils/debounce.js';
@@ -14,24 +19,21 @@ import { count, find, last } from '@gitlens/utils/iterable.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { Stopwatch } from '@gitlens/utils/stopwatch.js';
 import type { Container } from '../../../container.js';
+import { getPresentableErrorMessage } from '../../../errors.js';
 import type { GlRepository } from '../../../git/models/repository.js';
 import { toAbortSignal } from '../../../system/-webview/cancellation.js';
 import { configuration } from '../../../system/-webview/configuration.js';
-import type { IpcParams, IpcResponse } from '../../ipc/handlerRegistry.js';
-import type { IpcNotification } from '../../ipc/models/ipc.js';
 import type { WebviewHost } from '../../webviewProvider.js';
+import { toGraphSearchResultsError } from './graphSearchService.js';
 import type { GraphSyncPublisher } from './graphSyncPublisher.js';
 import { computeAdaptivePageLimit } from './graphWebview.utils.js';
-import { DidChangeNotification, DidSearchNotification, isWipRowId, isWipSelectionSha } from './protocol.js';
+import { isWipSelectionSha } from './protocol.js';
 import type {
 	BranchState,
-	CancelLoadRowCommand,
-	DidSearchParams,
-	GetMoreRowsCommand,
+	DidChangeParams,
+	DidLoadRowParams,
+	GraphSearchResultsError,
 	GraphSelectedRows,
-	GraphSyncResyncCommand,
-	LoadRowRequest,
-	SearchRequest,
 	State,
 } from './protocol.js';
 
@@ -50,7 +52,6 @@ export type GraphDataControllerContext = {
 	// Selection / search / etag reads.
 	getSelectedId: () => string | undefined;
 	getSearch: () => GitGraphSearch | undefined;
-	getSearchIdCounterCurrent: () => number;
 	getEtagRepository: () => number | undefined;
 	getConvertedSelectedRows: () => GraphSelectedRows | undefined;
 
@@ -62,37 +63,49 @@ export type GraphDataControllerContext = {
 	commitSentBranchState: (branchState: BranchState, revision: number) => void;
 
 	// Collaborators the moved bodies invoke (stay on the provider).
-	buildSearchRider: () => DidSearchParams | undefined;
 	buildState: () => Promise<State>;
-	resetSearchState: () => void;
+	clearSearch: () => void;
 	resetRefsMetadata: () => void;
 	resetHoverCache: () => void;
 	clearAvatarProxyCaches: () => void;
 	clearLastSentOverview: () => void;
 	cancelComputeIncludedRefs: () => void;
+	/** Tip shas of the current branches-visibility `includeOnlyRefs` set, newest-first — the wire-format
+	 *  refs carry no sha, so paging toward the next unloaded included ref needs this separately. See
+	 *  `GraphWebviewProvider._includedRefTipShas`. */
+	getIncludedRefTipShas: () => readonly string[] | undefined;
 	replayPendingRefMetadataForGraph: (graph: GitGraph) => void;
-	searchGraphOrContinue: (
-		e: IpcParams<typeof SearchRequest>,
-		progressive: boolean,
-	) => Promise<IpcResponse<typeof SearchRequest>>;
+	/** Silently continues the ACTIVE search in the background (auto-load-more keeping pace with a rows
+	 *  page-in); rethrows a genuine (non-abort) failure. Resolves to whether the search's results/`hasMore`
+	 *  actually changed. */
+	continueSearchInBackground: (query: SearchQuery) => Promise<boolean>;
+	/** Ships the current settled search state — for after a successful `continueSearchInBackground`. */
+	publishSearchState: () => void;
+	/** Shows a search failure that happened outside the search RPC's own call as the current state. */
+	notifySearchError: (query: SearchQuery, results: GraphSearchResultsError) => void;
 	notifyDidChangeOverview: () => void;
 	notifySidebarInvalidated: () => void;
-	notifyDidChangeCanInstallHooks: () => void;
 	resetWipSendState: () => void;
 	clearWipStatusCache: () => void;
-	addPendingNotification: (notification: IpcNotification<any>) => void;
+	/** Fires the `state` full-state-push RPC event. */
+	fireStateChanged: (params: DidChangeParams) => void;
+	/** Defers the full-state push instead of building it while hidden/not-ready — see `_pendingStateRefresh`
+	 *  on the provider. */
+	deferStateRefresh: () => void;
 };
 
 /** Shape of the in-flight page-in dedup entry (owned by the controller). */
 export type GraphPendingRowsQuery = {
-	promise: Promise<void>;
+	/** Resolves with the page's outcome, or `undefined` when the attempt never reached the session at all
+	 *  (cancelled, no session, or the session was swapped mid-flight). */
+	promise: Promise<GitGraphSessionMoreResult | undefined>;
 	cancellable: CancellationTokenSource;
 	id?: string | undefined;
 	search?: GitGraphSearch;
 };
 
 /** Host-side graph data plane, split out of `GraphWebviewProvider` (R3). Owns the session-lifecycle
- *  logic (setGraph / paging / rebuild anchor), the rows-plane publisher marks, the avatars channel, and
+ *  logic (setGraph / paging / rebuild anchor), the rows-plane publisher marks, and
  *  the concurrency-sensitive state-notify coalescer (refresh×paging serialization, session-identity
  *  guards, pending-query cancellation). It also OWNS the data-plane state (session/window, loading, session
  *  store, page-in, rows-stats override, coalescer) and injects the remaining collaborators via
@@ -106,6 +119,8 @@ export class GraphDataController {
 	private _graphLoading: Promise<GitGraph> | undefined;
 	private _rowsStatsLoadingOverride = false;
 	private _pendingRowsQuery: GraphPendingRowsQuery | undefined;
+	private _sessionReady: Promise<void> | undefined;
+	private _resolveSessionReady: (() => void) | undefined;
 
 	private _pendingStateOp: Promise<unknown> | undefined;
 	private _lastStateSentAt: number | undefined;
@@ -117,7 +132,6 @@ export class GraphDataController {
 		() => void this.notifyDidChangeState(),
 	);
 	private _notifyDidChangeStateDebounced: Deferrable<GraphDataController['notifyDidChangeState']> | undefined;
-	private _notifyDidChangeAvatarsDebounced: Deferrable<GraphDataController['notifyDidChangeAvatars']> | undefined;
 
 	constructor(private readonly context: GraphDataControllerContext) {}
 
@@ -151,7 +165,34 @@ export class GraphDataController {
 	}
 	set session(value: GitGraphSession | undefined) {
 		this._graphSession = value;
+		if (value != null) {
+			this._resolveSessionReady?.();
+			this._resolveSessionReady = undefined;
+		}
 	}
+
+	/** Resolves once a session has been adopted, or as soon as `token` cancels. One-shot by design: it
+	 *  covers the cold-open window before the first `getState` has walked a session, and a later clear
+	 *  (repo swap, dispose) must not re-park a caller on a session that may never come back. */
+	whenSessionReady(token: CancellationToken): Promise<void> {
+		if (this._graphSession != null || token.isCancellationRequested) return Promise.resolve();
+
+		const ready = (this._sessionReady ??= new Promise<void>(resolve => {
+			this._resolveSessionReady = resolve;
+		}));
+
+		return new Promise<void>(resolve => {
+			const subscription = token.onCancellationRequested(() => {
+				subscription.dispose();
+				resolve();
+			});
+			void ready.then(() => {
+				subscription.dispose();
+				resolve();
+			});
+		});
+	}
+
 	/** The in-flight (re)walk promise. `getGraph` compares its own boxed promise against this for liveness. */
 	get loading(): Promise<GitGraph> | undefined {
 		return this._graphLoading;
@@ -174,14 +215,17 @@ export class GraphDataController {
 
 	private static readonly stateFreshnessMs = 500;
 
+	/** Bound on {@link retryTargetedSupersededPage}'s retries. Kept small: a repo that keeps rebuilding
+	 *  faster than we can page has to degrade to an honest `'superseded'` failure rather than spin. */
+	private static readonly maxTargetedPageSupersededRetries = 2;
+
 	/** Mark the rows-plane channels dirty so the next publisher flush re-derives each delta from the current
 	 *  graph session. Called wherever new rows land (rebuild via `setGraph(data)`, page-append). The publisher
 	 *  decides REPLACE-vs-append per its `getPaging()` at flush time.
 	 *
-	 *  With `changed` (a refresh reporting exactly which channels it touched) only those channels are marked —
-	 *  `refsMetadata` is intentionally NOT among them: the session doesn't produce it, and its real changes are
-	 *  marked by the host's own enrichment path (`invalidateUpstreamRefsMetadata`/`onGetMissingRefMetadata` →
-	 *  `updateRefsMetadata`), so marking it here would only trigger a redundant reference-scan of the map.
+	 *  Avatars and refsMetadata are NOT rows-plane channels: both are request/response services the app drives
+	 *  (`GraphAvatarsService` / `GraphRefsMetadataService`), so a walk that resolves new avatars needs no mark —
+	 *  the component asks for the emails it lacks and gets them back.
 	 *  Without `changed` (page-append / initial walk / reuse) every channel is marked — the page/initial cases
 	 *  genuinely touch most channels, and reuse is a harmless over-approximation (unchanged channels ship
 	 *  nothing). */
@@ -190,9 +234,7 @@ export class GraphDataController {
 			this._graphSync.mark('rows');
 			this._graphSync.mark('reachability');
 			this._graphSync.mark('rowsStats');
-			this._graphSync.mark('avatars');
 			this._graphSync.mark('downstreams');
-			this._graphSync.mark('refsMetadata');
 			return;
 		}
 
@@ -204,12 +246,12 @@ export class GraphDataController {
 		}
 		if (changed.rowsStats) {
 			if (changed.rowsStatsRecomputed) {
-				this._graphSync.invalidateRowsStats();
+				// Ancestry changed, or recovery must allow for a concurrent change during the async walk.
+				// The splice fingerprint assumes same-sha parents are immutable; replace rows and stats together.
+				this._graphSync.requireSnapshot();
+			} else {
+				this._graphSync.mark('rowsStats');
 			}
-			this._graphSync.mark('rowsStats');
-		}
-		if (changed.avatars) {
-			this._graphSync.mark('avatars');
 		}
 		if (changed.downstreams) {
 			this._graphSync.mark('downstreams');
@@ -230,28 +272,6 @@ export class GraphDataController {
 		void this._notifyDidChangeStateDebounced();
 	}
 
-	@trace()
-	updateAvatars(immediate: boolean = false): void {
-		if (immediate) {
-			this.notifyDidChangeAvatars();
-			return;
-		}
-
-		this._notifyDidChangeAvatarsDebounced ??= debounce(this.notifyDidChangeAvatars.bind(this), 100);
-		this._notifyDidChangeAvatarsDebounced();
-	}
-
-	@trace()
-	private notifyDidChangeAvatars(): void {
-		if (this._graphSession == null) return;
-
-		// The publisher owns the avatars channel (size-watermark delta). New avatars grow the Map, so a
-		// mark ships them; the proxy replaces values without changing size, which `onProxyAvatars` handles
-		// via `invalidateAvatars()`.
-		this._graphSync.mark('avatars');
-		void this._graphSync.flush();
-	}
-
 	/**
 	 * Ships the current rows-plane state (rows splice/append + enrichment deltas) through the publisher,
 	 * with the search-results/selection envelope riding atomically. `setGraph(data)` already marked the
@@ -262,11 +282,10 @@ export class GraphDataController {
 	notifyDidChangeRows(sendSelectedRows: boolean = false): void {
 		if (this._graphSession == null) return;
 
-		// `search` always rides (fresh truth, including undefined-to-clear). The `selectedRows` KEY is
-		// included ONLY when sending selection — `attachRiders` keys off `'selectedRows' in riders`, so
-		// omitting it can't stomp a selection rider a concurrent call left pending.
+		// The `selectedRows` KEY is included ONLY when sending selection — `attachRiders` keys off
+		// `'selectedRows' in riders`, so omitting it can't stomp a selection rider a concurrent call left
+		// pending.
 		this._graphSync.attachRiders({
-			search: this.context.buildSearchRider(),
 			...(sendSelectedRows ? { selectedRows: this.context.getConvertedSelectedRows() } : {}),
 		});
 		void this._graphSync.flush();
@@ -283,7 +302,7 @@ export class GraphDataController {
 	@trace()
 	async notifyDidChangeState(): Promise<boolean> {
 		if (!this.host.ready || !this.host.visible) {
-			this.context.addPendingNotification(DidChangeNotification);
+			this.context.deferStateRefresh();
 			return false;
 		}
 
@@ -349,24 +368,21 @@ export class GraphDataController {
 			// Host-internal — never goes over the wire (see `State.branchStateRevision`).
 			state.branchStateRevision = undefined;
 
-			// `getState` already produced the rows-plane fields in the "skipRows" shape (rows/
-			// reachability/avatars/downstreams/rowsStats/paging = undefined; refsMetadata = the
-			// authoritative full map). Rows always ship via the publisher's channel now, so this is a
-			// plain full-state push — no per-field fingerprint, splice, or reachability delta here.
-			const result = await this.host.notify(DidChangeNotification, { state: state });
+			// `getState` already produced the rows-plane fields in the "skipRows" shape (all undefined —
+			// `refsMetadata` included, it's bootstrap-only now). Rows always ship via the publisher's
+			// channel now, so this is a plain full-state push — no per-field fingerprint, splice, or reachability delta here.
+			this.context.fireStateChanged({ state: state });
 
 			this._lastStateSentAt = performance.now();
-			// Commit only on confirmed delivery, and only value+ordering together: committing a value the
-			// webview never received lets the fast path's dedup suppress every resend of it, leaving the
-			// header blank until the counts change.
-			if (result && state.branchState != null && branchStateRevision != null) {
+			// The fire always "succeeds": a hidden webview's visibility buffer holds the newest push and
+			// replays it on reveal, so delivery is guaranteed-or-superseded rather than silently dropped.
+			// Commit unconditionally — the legacy silent-drop-when-hidden failure mode this guarded
+			// against no longer exists.
+			if (state.branchState != null && branchStateRevision != null) {
 				this.context.commitSentBranchState(state.branchState, branchStateRevision);
 			}
 
-			// Refresh canInstallHooks asynchronously so the bulk push doesn't block on `gk`.
-			// Dedups internally — only fires `DidChangeCanInstallHooks` when the value diverges.
-			this.context.notifyDidChangeCanInstallHooks();
-			return result;
+			return true;
 		} finally {
 			this._pendingStateOp = undefined;
 		}
@@ -442,7 +458,7 @@ export class GraphDataController {
 			this.context.clearAvatarProxyCaches();
 			this.context.resetHoverCache();
 			this.context.resetRefsMetadata();
-			this.context.resetSearchState();
+			this.context.clearSearch();
 			this.context.cancelComputeIncludedRefs();
 			this.context.clearWipStatusCache();
 		} else {
@@ -466,9 +482,9 @@ export class GraphDataController {
 			});
 			this.context.notifyDidChangeOverview();
 
-			// Replay metadata requests buffered during the rebuild window — the graph exists now, so
-			// onGetMissingRefMetadata can fetch. RepoPath-gated so a buffer captured for the prior repo can't
-			// satisfy against this graph.
+			// Replay metadata requests buffered during the rebuild window — the graph exists now, so the
+			// enrichment can run and settle each waiting request. RepoPath-gated so a buffer captured for
+			// the prior repo can't satisfy against this graph.
 			this.context.replayPendingRefMetadataForGraph(graph);
 		}
 	}
@@ -477,7 +493,7 @@ export class GraphDataController {
 		id: string | undefined,
 		search?: GitGraphSearch,
 		limitOverride?: number,
-	): Promise<void> {
+	): Promise<GitGraphSessionMoreResult | undefined> {
 		let superseded;
 		if (this._pendingRowsQuery != null) {
 			const { id: pendingId, search: pendingSearch, cancellable: pendingCancellable } = this._pendingRowsQuery;
@@ -525,7 +541,9 @@ export class GraphDataController {
 				}
 				return this.updateGraphWithMoreRowsCore(id, search, cancellation, loading, limitOverride);
 			})().catch((ex: unknown) => {
-				if (cancellation.isCancellationRequested) return;
+				// A cancelled page reports nothing rather than throwing — and NOT `'superseded'`, which
+				// would have the caller retry a request it deliberately abandoned.
+				if (cancellation.isCancellationRequested) return undefined;
 
 				throw ex;
 			}),
@@ -560,7 +578,7 @@ export class GraphDataController {
 		cancellation: CancellationToken,
 		loading: Promise<unknown> | undefined,
 		limitOverride?: number,
-	) {
+	): Promise<GitGraphSessionMoreResult | undefined> {
 		// A superseded query can be cancelled BEFORE its walk starts (parked below, or before this frame
 		// runs) — `toAbortSignal` of an already-cancelled token yields an already-aborted signal whose
 		// 'abort' listeners never fire, so without this bail the walk would run to completion unabortably.
@@ -569,13 +587,18 @@ export class GraphDataController {
 		const session = this._graphSession;
 		if (session == null) return;
 
-		// Serialize against an in-flight (re)walk: a concurrent getState refresh rebuilds the window this page
-		// would splice onto, so wait it out first (cancellation resolves, never rejects), then re-validate the
-		// captured session identity (a repo swap disposes+replaces it). `loading` was captured SYNCHRONOUSLY
-		// at the caller's entry — awaiting the LIVE field here could await a getState created after this
-		// entry, and since that getState symmetrically awaits `_pendingRowsQuery` (this entry), the two would
-		// deadlock. Captured-at-creation keeps the await graph a creation-ordered DAG: nothing ever awaits a
-		// promise made after itself. (A refresh created later instead awaits THIS entry and re-walks after.)
+		// SEQUENCING, NOT CORRECTNESS. The session is single-writer, so a page fired into an in-flight
+		// (re)walk can never be spliced onto a window being rebuilt — it is REFUSED, because `session.more`
+		// captures the window's generation when it is called and any rebuild moves it. Waiting here is how
+		// the page AVOIDS that refusal: the request below is cut from the window that actually exists, so
+		// the user's scroll advances instead of silently doing nothing. (Cancellation resolves, never
+		// rejects; the session identity is re-validated after, since a repo swap disposes+replaces it.)
+		//
+		// `loading` was captured SYNCHRONOUSLY at the caller's entry — awaiting the LIVE field here could
+		// await a getState created after this entry, and since that getState symmetrically awaits
+		// `_pendingRowsQuery` (this entry), the two would deadlock. Captured-at-creation keeps the await
+		// graph a creation-ordered DAG: nothing ever awaits a promise made after itself. (A refresh created
+		// later instead awaits THIS entry and re-walks after.)
 		if (loading != null) {
 			await loading.catch(() => {});
 			if (cancellation.isCancellationRequested) return;
@@ -584,68 +607,139 @@ export class GraphDataController {
 
 		const { defaultItemLimit, pageItemLimit } = configuration.get('graph');
 
-		// Adaptive page size: scale the base `pageItemLimit` with how deep we're already loaded so the
-		// growing `git log --skip=N` re-walk cost amortizes over fewer, larger pages. Depth = the
-		// ACCUMULATED loaded count (`ids.size`) — `current.rows` is page-scoped after pagination and would
-		// pin the multiplier at one page. Targeted row-load walks pass an explicit `limitOverride`
-		// (0 = uncapped) and keep their exact semantics untouched.
-		let limit =
-			limitOverride ?? computeAdaptivePageLimit(session.current.ids.size, pageItemLimit ?? defaultItemLimit);
-		let targetId = id;
-
 		// Determine the last search result (for auto-loading more search results)
 		const lastSearchResultId = search?.results.size ? last(search.results.keys()) : undefined;
 
-		if (!id && search?.results.size) {
-			// If there are a small number of results and we're filtering, load them all at once
-			if (search.results.size < 50 && search.query.filter) {
-				targetId = lastSearchResultId;
-				limit = 0;
-			} else {
-				// Determine the next unloaded search result (if any)
-				const nextUnloadedResultId = search?.results.size
-					? find(search.results.keys(), sha => !session.current.ids.has(sha))
-					: undefined;
-				targetId = nextUnloadedResultId;
-			}
-		}
+		let pageShape: { limit: number; targetId: string | undefined };
 
-		// The session pages into its window and swaps `current` to the page view; it returns `false` when a
-		// concurrent refresh superseded the page (stale generation — its internal `current !== prior` guard)
-		// or there was nothing to add. A repo swap disposes+replaces the session, caught by the `!==` guard
-		// below. Both cases drop the page: the rebuild re-anchored on the same bottom, `hasMore` still
-		// stands, and the webview re-requests on the next scroll.
-		const gotMore = await session.more(limit, targetId, toAbortSignal(cancellation));
-		if (this._graphSession !== session) return;
+		{
+			// Adaptive page size: scale the base `pageItemLimit` with how deep we're already loaded so the
+			// growing `git log --skip=N` re-walk cost amortizes over fewer, larger pages. Depth = the
+			// ACCUMULATED loaded count (`ids.size`) — `current.rows` is page-scoped after pagination and would
+			// pin the multiplier at one page. Targeted row-load walks pass an explicit `limitOverride`
+			// (0 = uncapped) and keep their exact semantics untouched.
+			// eslint-disable-next-line prefer-const -- both are reassigned by the search/ref-tip steering below
+			let limit =
+				limitOverride ?? computeAdaptivePageLimit(session.current.ids.size, pageItemLimit ?? defaultItemLimit);
+			let targetId = id;
 
-		if (gotMore) {
-			this.setGraph(session.current);
-
-			if (!search?.hasMore || lastSearchResultId == null) return;
-
-			if (session.current.ids.has(lastSearchResultId)) {
-				// Auto-load more search results in the background
-				// Suppress notifications - notifyDidChangeRows will send both
-				// the search results AND the rows together to avoid race conditions
-				try {
-					await this.context.searchGraphOrContinue({ search: search.query, more: true }, false);
-					// Search results are now updated in this._search
-					// notifyDidChangeRows() will send them along with the rows
-				} catch (ex) {
-					if (isCancellationError(ex)) return;
-
-					// Only send error notifications immediately
-					void this.host.notify(DidSearchNotification, {
-						search: search.query,
-						results: {
-							error: ex instanceof GitSearchError ? 'Invalid search pattern' : 'Unexpected error',
-						},
-						partial: false,
-						searchId: this.context.getSearchIdCounterCurrent(),
-					});
+			if (!id && search?.results.size) {
+				// If there are a small number of results and we're filtering, load them all at once
+				if (search.results.size < 50 && search.query.filter) {
+					targetId = lastSearchResultId;
+					limit = 0;
+				} else {
+					// Determine the next unloaded search result (if any)
+					const nextUnloadedResultId = search?.results.size
+						? find(search.results.keys(), sha => !session.current.ids.has(sha))
+						: undefined;
+					targetId = nextUnloadedResultId;
 				}
 			}
+
+			// No search target was chosen — if a branches-visibility mode is narrowing the graph, steer this
+			// page toward the next included ref whose tip isn't loaded yet. Unlike the search-filter case
+			// above, `limit` stays the adaptive page size: the walk still displays the current branch's whole
+			// lineage, and an uncapped walk toward a very old ref tip would walk the entire repo. The
+			// provider's own stop condition (`limit * 10` when the target isn't found) caps the cost and
+			// reports `hasMore: true`, so a shortfall just means another click.
+			if (!id && targetId == null) {
+				const includedRefTipShas = this.context.getIncludedRefTipShas();
+				if (includedRefTipShas?.length) {
+					targetId = includedRefTipShas.find(sha => !session.current.ids.has(sha));
+				}
+			}
+
+			pageShape = { limit: limit, targetId: targetId };
 		}
+
+		// The session pages into its window and swaps `current` to the page view. `'superseded'` means it
+		// REFUSED the page — a refresh/rebind replaced the window this request was cut from.
+		//
+		// BOUNDARY pages (`pageShape.targetId == null`) are REPORTED, never retried here: the only layer
+		// that knows whether those rows are still wanted is the CLIENT, whose paging is edge-triggered. It
+		// re-asks if it is still at the boundary and drops it if the user scrolled away, which is both the
+		// retry and its bound. A host-side retry would be blind to that edge state.
+		//
+		// A TARGETED page's id IS its still-valid intent, and nothing downstream can add to it, so the HOST
+		// retries that one itself — see {@link retryTargetedSupersededPage}.
+		let result = await session.more(pageShape.limit, pageShape.targetId, toAbortSignal(cancellation));
+		if (this._graphSession !== session) return;
+
+		if (result === 'superseded' && pageShape.targetId != null) {
+			const retried = await this.retryTargetedSupersededPage(
+				session,
+				pageShape.targetId,
+				pageShape.limit,
+				cancellation,
+			);
+			if (retried === undefined) return;
+
+			result = retried;
+		}
+
+		if (result !== 'added') return result;
+
+		this.setGraph(session.current);
+
+		if (!search?.hasMore || lastSearchResultId == null) return 'added';
+
+		if (session.current.ids.has(lastSearchResultId)) {
+			// Auto-load more search results in the background, without the per-batch progress noise
+			// a foreground continuation fires — only the settled state is shown. Skip the publish
+			// when nothing changed, so a no-op (or superseded) continuation doesn't re-serialize the
+			// entire accumulated result map for no reason.
+			try {
+				const changed = await this.context.continueSearchInBackground(search.query);
+				if (changed) {
+					this.context.publishSearchState();
+				}
+			} catch (ex) {
+				if (isCancellationError(ex)) return 'added';
+
+				this.context.notifySearchError(search.query, toGraphSearchResultsError(ex));
+			}
+		}
+
+		// The page itself landed, whatever the background search continuation did with its own errors.
+		return 'added';
+	}
+
+	/**
+	 * Retries a TARGETED page (`targetId != null`) the host refused as `'superseded'`; boundary pages never
+	 * reach here.
+	 *
+	 * REVALIDATES first: the session serializes every mutating op, so by the time a queued page is refused
+	 * the replacing refresh/rebind has already completed — `session.current` may already contain the target
+	 * with no walk needed. Otherwise re-runs `more` against that new window with the caller's own
+	 * `limit`/`targetId`, bounded so a repo rebuilding faster than we can page it degrades to an honest
+	 * `'superseded'` instead of spinning.
+	 *
+	 * Returns `undefined` when the session identity changes mid-retry (a repo swap).
+	 */
+	private async retryTargetedSupersededPage(
+		session: GitGraphSession,
+		targetId: string,
+		limit: number,
+		cancellation: CancellationToken,
+	): Promise<GitGraphSessionMoreResult | undefined> {
+		let result: GitGraphSessionMoreResult = 'superseded';
+
+		for (let attempt = 0; attempt < GraphDataController.maxTargetedPageSupersededRetries; attempt++) {
+			if (cancellation.isCancellationRequested || this._graphSession !== session) return undefined;
+
+			// `tainted` means the current window is known-corrupt (a walk failed part-way through mutating
+			// it), and `more` itself refuses a tainted window with `'superseded'` for exactly that reason —
+			// answering `'added'` here would ship the corrupt rows `tainted` exists to keep off screen.
+			if (!session.tainted && session.current.ids.has(targetId)) return 'added';
+
+			result = await session.more(limit, targetId, toAbortSignal(cancellation));
+			if (this._graphSession !== session) return undefined;
+
+			if (result !== 'superseded') return result;
+		}
+
+		return result;
 	}
 
 	/** Pages an explicit real-commit selection target in if a (capped) cold-start `getGraph` walk didn't
@@ -674,15 +768,24 @@ export class GraphDataController {
 		return this._graphSession?.current.ids.has(id) ?? false;
 	}
 
+	/**
+	 * Pages more rows in and resolves only AFTER the rows emission has been posted to the webview.
+	 *
+	 * The resolution contract is what lets the client hold its `loading` lock in a `finally` instead of
+	 * waiting for a rows push that a no-op page never produces: the publisher's `notify` awaits the
+	 * `postMessage` round-trip, and the RPC return rides the SAME webview channel afterwards, so the rows
+	 * are already delivered by the time the caller's `await` resolves.
+	 */
+	@trace()
 	async onGetMoreRows(
-		params: IpcParams<typeof GetMoreRowsCommand>,
+		id?: string,
+		limit?: number,
 		sendSelectedRows: boolean = false,
-	): Promise<void> {
-		// Nothing to page from — including no session at all, which a repo swap mid-flight leaves behind. The
-		// client sets its `loading` lock before sending and clears it only on a rows push, so returning
-		// silently here wedges the lock and with it EVERY later page request; refresh instead, whose
-		// full-state push carries `loading: false`. (A carrier can't serve this: the publisher builds one from
-		// the session, and there isn't one.)
+	): Promise<GitGraphSessionMoreResult | undefined> {
+		// Nothing to page from — including no session at all, which a repo swap mid-flight leaves behind.
+		// Refresh instead: an etag mismatch means the repo moved on since this graph was walked, so the
+		// re-walk `getState` runs is the answer to the page request, and its full-state push re-seeds the
+		// webview. Returning here still settles the caller (the promise resolves), so no lock is wedged.
 		if (
 			this._graphSession?.current.paging == null ||
 			this._graphSession.current.more == null ||
@@ -690,81 +793,94 @@ export class GraphDataController {
 		) {
 			this.updateState(true);
 
-			return;
+			return undefined;
 		}
 
-		// Hold the publisher across the whole page-in so the page rows AND the search/selection riders ship
-		// as ONE atomic emission — `updateGraphWithMoreRows` → setGraph marks the channels and its internal
-		// search-continue await would otherwise let a premature flush ship rows without the search envelope.
+		// Hold the publisher across the whole page-in so the page rows and the selectedRows rider ship as
+		// ONE atomic emission on the sync flush — `updateGraphWithMoreRows` → setGraph marks the rows
+		// channel, and its internal search-continue await would otherwise let a premature flush ship rows
+		// without the selection catching up. Search state is unrelated to this hold: it's published
+		// separately over its own RPC event (`publishSearchState`/`notifySearchError`), not the sync flush.
+		let outcome: GitGraphSessionMoreResult | undefined;
 		this._graphSync.hold();
 		try {
-			await this.updateGraphWithMoreRows(params.id, this._search, params.limit);
+			outcome = await this.updateGraphWithMoreRows(id, this._search, limit);
 		} catch (ex) {
-			// A genuine page-in failure (e.g. a corrupt object) must still ship a rows notification below so
-			// the webview's `loading` flag (reset only by a rows push) doesn't wedge forever. Cancellation
-			// already resolves (the query's inner catch swallows it), so it never lands here.
+			// A genuine page-in failure (e.g. a corrupt object) is swallowed so the caller still settles;
+			// cancellation already resolves (the query's inner catch swallows it), so it never lands here.
 			Logger.error(ex, 'GraphDataController', 'onGetMoreRows');
 		} finally {
-			// Guarantee the push below actually ships: a page that adds nothing (superseded walk, or a failure
-			// above) marks no channel, and with no search rider `attachRiders` leaves nothing pending either, so
-			// `flush` early-returns on an empty dirty set — wedging the client's `loading` lock, which only a
-			// rows push clears, forever. A CARRIER, not `mark('rows')` — see `markCarrier` for why re-shipping
-			// rows here would restart the very prefetch this response is answering.
-			this._graphSync.markCarrier();
-			// Notify BEFORE release so a failed page still ships an (empty-delta) rows push that resets client loading.
+			// Attach the riders BEFORE release so they travel with the emission release drives.
 			this.notifyDidChangeRows(sendSelectedRows);
 			this._graphSync.release();
 		}
+
+		// Await the emission `release` just drove. Single-flight, so this joins the in-flight flush rather
+		// than adding one; it no-ops (resolving immediately) when the page added nothing, when the webview
+		// is hidden, or when an outer `hold` — a concurrent page that superseded this one — still stands.
+		await this._graphSync.flush();
+
+		// Answered, not swallowed: a `'superseded'` page has to reach the client, which is the only layer
+		// that knows whether those rows are still wanted (see `updateGraphWithMoreRowsCore`).
+		return outcome;
 	}
 
-	onSyncResync(params: IpcParams<typeof GraphSyncResyncCommand>): void {
-		// The publisher's single recovery request: a seq gap, splice-guard mismatch, or the post-bootstrap
-		// sync-hello. No-ops when the reported baseline is already reconciled; else re-ships a snapshot.
-		// A genuine divergence (a previously-in-sync webview lost a message) is warn-worthy — storms/soaks
-		// assert zero of these in steady state.
-		const outcome = this._graphSync.onResyncRequest(params.generation, params.seq);
-		if (outcome === 'diverged') {
-			Logger.warn(
-				`GraphSyncPublisher: webview diverged (reported gen=${params.generation}, seq=${params.seq}; publisher gen=${this._graphSync.generation}, seq=${this._graphSync.seq}); re-shipping snapshot`,
-			);
-		}
+	/** `GraphRowsService.resyncRows` — the rows plane's ONE recovery path. The webview calls it when the
+	 *  channel reports a gap it could not heal, or when a splice guard failed; both mean its mirror
+	 *  diverged. Warn-worthy: storms/soaks assert zero of these in steady state. */
+	resyncRows(): Promise<void> {
+		Logger.warn('GraphSyncPublisher: webview requested a rows resync (gap or splice-guard mismatch)');
+		return this._graphSync.resync();
 	}
 
-	/** Cancels the walk started by {@link onLoadRowRequest} for `id`, if it is still the pending query.
-	 *  Deliberately does NOT clear `_pendingRowsQuery`: two walks share one paging closure, so the next
-	 *  caller still has to await this one's wind-down (see `updateGraphWithMoreRows`). */
-	onCancelLoadRow(params: IpcParams<typeof CancelLoadRowCommand>): void {
-		const pending = this._pendingRowsQuery;
-		if (pending == null || pending.id !== params.id) return;
-
-		pending.cancellable.cancel();
-	}
-
-	async onLoadRowRequest(params: IpcParams<typeof LoadRowRequest>): Promise<IpcResponse<typeof LoadRowRequest>> {
+	/**
+	 * Targeted, UNCAPPED row load. Never rejects for a domain reason — every miss comes back as a settled
+	 * {@link DidLoadRowParams} so the webview can name why the jump didn't land.
+	 *
+	 * `signal` withdraws the walk: the host's load is uncapped, so a navigation that is superseded, times
+	 * out, or is aborted has to say so or a repository-wide walk keeps running for a row nobody awaits.
+	 */
+	@trace()
+	async loadRow(id: string, signal?: AbortSignal): Promise<DidLoadRowParams> {
 		if (this._graphSession == null) return { id: undefined, reason: 'notFound' };
 		// WIP rows are synthesized client-side and have no commit behind them, so there is nothing to
 		// load and `updateGraphWithMoreRows` below runs UNCAPPED for the id. The webview guards its own
 		// callers, but this is the boundary that has to hold — search seeds WIP row ids into its results
 		// (`graphSearchService`), and the header's ensure-a-search-result path forwards any id it gets.
-		if (isWipRowId(params.id)) return { id: undefined, reason: 'notFound' };
+		if (isWipRowId(id)) return { id: undefined, reason: 'notFound' };
+		// Born aborted (the caller gave up before the call was dispatched, or the signal arrived aborted
+		// from wire deserialization) — an `abort` listener would never fire, so never start the walk.
+		if (signal?.aborted) return { id: undefined, reason: 'notFound' };
 
 		const repoPath = this._graphSession.repoPath;
 
+		// Cancels the walk this call started, but ONLY while it is still the pending query for this id —
+		// a superseding caller owns the entry by then, and cancelling that would abort someone else's page.
+		// Deliberately does NOT clear `_pendingRowsQuery`: two walks share one paging closure, so the next
+		// caller still has to await this one's wind-down (see `updateGraphWithMoreRows`).
+		const onAbort = (): void => {
+			const pending = this._pendingRowsQuery;
+			if (pending == null || pending.id !== id) return;
+
+			pending.cancellable.cancel();
+		};
+		signal?.addEventListener('abort', onAbort, { once: true });
+
 		try {
-			if (this._graphSession.current.ids.has(params.id)) {
+			if (this._graphSession.current.ids.has(id)) {
 				// The webview only asks for a row it cannot resolve locally. If the host already has it,
 				// the planes have diverged (for example after a lost rows notification); re-ship the
 				// authoritative snapshot so navigation can recover instead of waiting for a row that the
 				// host would otherwise consider already delivered.
 				this._graphSync.requireSnapshot();
 				await this._graphSync.flush();
-				return { id: params.id };
+				return { id: id };
 			}
 
 			// Not present — page it in. Hold the publisher across the page-in AND its notify (mirrors
-			// onGetMoreRows) so a reveal's flush can't silently no-op against a concurrent hold; a rows push
-			// always ships (finally) so a failed page still resets the client loading flag.
-			let id: string | undefined;
+			// onGetMoreRows) so a reveal's flush can't silently no-op against a concurrent hold.
+			let loadedId: string | undefined;
+			let pageOutcome: GitGraphSessionMoreResult | undefined;
 			this._graphSync.hold();
 			try {
 				// Targeted, UNCAPPED load: `more(0, id)` walks until the SHA is found with no
@@ -775,32 +891,45 @@ export class GraphDataController {
 				// (`hasMore` goes false). That cap (added in 0ffbf5d for the scope-anchor pagination
 				// path) caught this select-a-row path collaterally — `limit=0` restores the pre-cap
 				// "find the SHA then select it" behavior for the explicit-target case.
-				await this.updateGraphWithMoreRows(params.id, this._search, 0);
-				if (this._graphSession?.current.ids.has(params.id)) {
-					id = params.id;
+				pageOutcome = await this.updateGraphWithMoreRows(id, this._search, 0);
+				if (this._graphSession?.current.ids.has(id)) {
+					loadedId = id;
 				}
 			} catch (ex) {
-				// A genuine page-in failure must still ship the rows push below (finally) so client loading
-				// resets. Cancellation already resolves (the query's inner catch swallows it).
-				Logger.error(ex, 'GraphDataController', 'onLoadRowRequest');
+				// A genuine page-in failure still settles this call. Cancellation already resolves (the
+				// query's inner catch swallows it).
+				Logger.error(ex, 'GraphDataController', 'loadRow');
 			} finally {
-				// New rows were loaded (heavy: rows + avatars + downstreams + rowsStats + refsMetadata).
+				// New rows were loaded (heavy: rows + downstreams + rowsStats + reachability).
 				// Selection is deliberately client-owned and latest-wins; this request only makes the row
-				// available. Notify before release so an empty delta still settles client paging state.
+				// available. Notify before release so the riders travel with the emission release drives.
 				this.notifyDidChangeRows();
 				this._graphSync.release();
 			}
 
-			if (id != null) return { id: id };
+			// Same contract as `onGetMoreRows`: answer only once the rows emission has been posted, so the
+			// app's deferred select intent has the row in hand by the time this resolves.
+			await this._graphSync.flush();
 
-			return { id: undefined, reason: await this.classifyLoadRowFailure(repoPath, params.id) };
+			if (loadedId != null) return { id: loadedId };
+
+			// The page was REFUSED even after {@link retryTargetedSupersededPage}, so we never walked far
+			// enough to learn whether this commit exists. Classifying now would answer `notFound`, a claim
+			// about the REPOSITORY we have no evidence for — the user would be told their commit is gone
+			// when the graph was merely busy. Answer with no reason instead, which the client renders as
+			// the honest "Couldn't load <target>" and leaves re-triggerable.
+			if (pageOutcome === 'superseded') return { id: undefined };
+
+			return { id: undefined, reason: await this.classifyLoadRowFailure(repoPath, id) };
 		} catch (ex) {
-			Logger.error(ex, 'GraphDataController', 'onLoadRowRequest');
-			return { id: undefined, error: ex instanceof Error ? ex.message : String(ex) };
+			Logger.error(ex, 'GraphDataController', 'loadRow');
+			return { id: undefined, error: getPresentableErrorMessage(ex) };
+		} finally {
+			signal?.removeEventListener('abort', onAbort);
 		}
 	}
 
-	/** Classifies why a targeted {@link onLoadRowRequest} walk failed to find `id`, so the webview can
+	/** Classifies why a targeted {@link loadRow} walk failed to find `id`, so the webview can
 	 *  tell the user why the jump didn't land instead of failing silently. Distinguishes a commit that
 	 *  genuinely doesn't exist from one that exists but is unreachable because the graph only walks
 	 *  first-parent history (`gitlens.graph.onlyFollowFirstParent`) — an unreachable-but-existing commit
@@ -868,9 +997,8 @@ export class GraphDataController {
 		}
 	}
 
-	/** Cancel the state/avatars debounced notifiers (dispose) so a trailing fire can't hit a torn-down host. */
+	/** Cancel the debounced state notifier (dispose) so a trailing fire can't hit a torn-down host. */
 	cancelDebouncedNotifiers(): void {
-		this._notifyDidChangeAvatarsDebounced?.cancel();
 		this._notifyDidChangeStateDebounced?.cancel();
 	}
 

@@ -1,6 +1,8 @@
-import { commands, env, ThemeIcon, window, workspace } from 'vscode';
+import { commands, env, l10n, workspace } from 'vscode';
 import { Logger } from '@gitlens/utils/logger.js';
+import { getAgentTerminalIcon } from '../../agents/utils/-webview/agentIcon.js';
 import { executeCoreCommand } from '../../system/-webview/command.js';
+import { openTerminal } from '../../system/-webview/terminal.js';
 import type { ChatMode } from '../chat/utils/-webview/chat.utils.js';
 import { openChat } from '../chat/utils/-webview/chat.utils.js';
 import type { AgentDescriptor } from './agentDescriptor.js';
@@ -38,8 +40,9 @@ export interface RunAgentResult {
  * Dispatches a rendered prompt to the chosen agent. Re-validates the descriptor at dispatch time —
  * picker-time validation does not guarantee dispatch-time validity (different window / profile / env).
  *
- * On failure, copies the prompt to the system clipboard so the work isn't lost, and returns
- * `success: false` so the caller can surface a toast with retry / pick-another affordances.
+ * On failure, copies the prompt to the system clipboard so the work isn't lost (unless `prompt` is
+ * empty — nothing to preserve), and returns `success: false` so the caller can surface a toast with
+ * retry / pick-another affordances.
  */
 export async function runAgent(
 	descriptor: AgentDescriptor,
@@ -48,11 +51,18 @@ export async function runAgent(
 ): Promise<RunAgentResult> {
 	// Re-validate before dispatch.
 	if (!(await isAgentAvailable(descriptor))) {
+		if (!prompt) {
+			return {
+				success: false,
+				error: new Error(l10n.t("Agent '{0}' is no longer available", descriptor.label)),
+			};
+		}
+
 		await copyPromptAsFallback(prompt);
 		return {
 			success: false,
 			clipboardCopiedAsFallback: true,
-			error: new Error(`Agent '${descriptor.label}' is no longer available`),
+			error: new Error(l10n.t("Agent '{0}' is no longer available", descriptor.label)),
 		};
 	}
 
@@ -70,6 +80,10 @@ export async function runAgent(
 		}
 	} catch (ex) {
 		Logger.error(ex, 'agentDispatch', 'runAgent');
+		if (!prompt) {
+			return { success: false, error: ex instanceof Error ? ex : new Error(String(ex)) };
+		}
+
 		await copyPromptAsFallback(prompt);
 		return {
 			success: false,
@@ -86,18 +100,22 @@ async function dispatchCli(
 ): Promise<void> {
 	const cwd = options?.cwd ?? workspace.workspaceFolders?.[0]?.uri.fsPath;
 	const executable = descriptor.agent.executable;
-	if (executable == null) throw new Error(`CLI agent '${descriptor.label}' has no executable path`);
+	if (executable == null) {
+		throw new Error(l10n.t("CLI agent '{0}' has no executable path", descriptor.label));
+	}
 
-	const terminal = window.createTerminal({
-		name: `GitLens · ${descriptor.label}`,
+	const terminal = openTerminal({
+		name: descriptor.label,
 		cwd: cwd,
-		iconPath: new ThemeIcon('gitlens-gitlens'),
+		iconPath: getAgentTerminalIcon(descriptor.agent.name),
 	});
 	terminal.show();
 
 	// Launch the CLI bare. Multi-line argv is unreliable across shells; deliver the prompt
 	// via paste block once the TUI is ready.
 	terminal.sendText(executable, true);
+	if (!prompt) return;
+
 	await wait(defaultBootDelayMs);
 	terminal.show();
 

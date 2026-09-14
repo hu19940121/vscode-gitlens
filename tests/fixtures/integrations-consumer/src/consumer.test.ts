@@ -1,25 +1,68 @@
-// This fixture proves that `@gitlens/integrations` works as a real external
-// consumer would use it: imports only the public facade (`./index.js`),
-// constructs a runtime out of vanilla Node primitives (no vscode, no
-// Container, no GitLens), instantiates the manager, and exercises a few
-// surfaces.
+// This fixture proves that the flattened `@gitkraken/core-gitlens` artifact
+// works as a real external consumer would use it: imports only published
+// package subpaths, constructs a runtime out of vanilla Node primitives (no
+// vscode, no Container), instantiates the manager, and exercises a few surfaces.
 //
 // If the package ever grows a hidden coupling to VS Code or to GitLens, this
 // fixture will fail to type-check or fail at runtime.
 
 import * as assert from 'node:assert/strict';
+import type { CliGitProvider } from '@gitkraken/core-gitlens/git-cli/cliGitProvider.js';
+import type { Account } from '@gitkraken/core-gitlens/git/models/author.js';
+import type { PullRequestShape } from '@gitkraken/core-gitlens/git/models/pullRequest.js';
+import type { Repository } from '@gitkraken/core-gitlens/git/models/repository.js';
+import type { GitService } from '@gitkraken/core-gitlens/git/service.js';
+import type { OpenAIProvider } from '@gitkraken/core-gitlens/plus/ai/providers/openaiProvider.js';
+import type { GitHubGitProviderInternal } from '@gitkraken/core-gitlens/plus/git-github/providers/githubProvider.js';
 import {
 	createIntegrationManager,
-	createManualTokenAuthProvider,
-	GitCloudHostIntegrationId,
-	GitSelfManagedHostIntegrationId,
-	IssuesCloudHostIntegrationId,
 	type ConfigChangeEvent,
-	type IntegrationServiceContext,
+	GitCloudHostIntegrationId,
+	hostFromDomain,
+	type IntegrationsRemoteConfig,
+	type IntegrationManagerCacheProvider,
+	type IntegrationManagerContext,
 	type IntegrationStorageProvider,
-} from '@gitlens/integrations/index.js';
-import { Emitter } from '@gitlens/utils/event.js';
-import type { Uri } from '@gitlens/utils/uri.js';
+	type ListOrgsOptions,
+	type ListProjectsOptions,
+	type Sources,
+} from '@gitkraken/core-gitlens/plus/integrations/index.js';
+import { Emitter } from '@gitkraken/core-gitlens/utils/event.js';
+import { Logger } from '@gitkraken/core-gitlens/utils/logger.js';
+import { PromiseCache } from '@gitkraken/core-gitlens/utils/promiseCache.js';
+import type { Uri } from '@gitkraken/core-gitlens/utils/uri.js';
+
+// Keep the README's representative imports part of this package-level compile contract.
+type DocumentedCoreExports = [
+	typeof Logger,
+	GitService,
+	Repository,
+	CliGitProvider,
+	GitHubGitProviderInternal,
+	OpenAIProvider,
+	IntegrationsRemoteConfig,
+	ListOrgsOptions,
+	ListProjectsOptions,
+	Sources,
+];
+const documentedCoreExportsTypeChecks: DocumentedCoreExports | undefined = undefined;
+void documentedCoreExportsTypeChecks;
+
+// Kepler consumes this projection from the packaged manager declaration. Keep the
+// reviewed commit reachable without a cast through the flattened Core package.
+function reviewedCommitOids(pr: PullRequestShape): (string | undefined)[] {
+	return pr.latestReviews?.map(review => review.commitOid) ?? [];
+}
+void reviewedCommitOids;
+
+const internalContextStaysPrivate:
+	// @ts-expect-error The extension-host context is deliberately not exported by the consumer facade.
+	import('@gitkraken/core-gitlens/plus/integrations/index.js').IntegrationServiceContext | undefined = undefined;
+const internalCacheStaysPrivate:
+	// @ts-expect-error The full GitLens cache contract is deliberately not exported by the consumer facade.
+	import('@gitkraken/core-gitlens/plus/integrations/index.js').IntegrationCacheProvider | undefined = undefined;
+void internalContextStaysPrivate;
+void internalCacheStaysPrivate;
 
 const failures: string[] = [];
 function check(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -32,10 +75,11 @@ function check(name: string, fn: () => void | Promise<void>): Promise<void> {
 		});
 }
 
-function buildRuntime(): IntegrationServiceContext {
+function buildRuntime(): IntegrationManagerContext {
 	const memory = new Map<string, unknown>();
 	const workspace = new Map<string, unknown>();
 	const secrets = new Map<string, string>();
+	const currentAccounts = new PromiseCache<string, Account | undefined>();
 
 	const storage: IntegrationStorageProvider = {
 		get: <T>(key: string) => memory.get(key) as T | undefined,
@@ -50,6 +94,14 @@ function buildRuntime(): IntegrationServiceContext {
 		getSecret: async (key: string) => secrets.get(key),
 		storeSecret: async (key: string, value: string) => void secrets.set(key, value),
 		deleteSecret: async (key: string) => void secrets.delete(key),
+	};
+	const cache: IntegrationManagerCacheProvider = {
+		getCurrentAccount: (integration, loader, options) => {
+			const key = `${integration.id}:${integration.domain ?? ''}:${options?.connectionId ?? ''}:${options?.etag ?? ''}`;
+			return currentAccounts.getOrCreate(key, async controller => loader(controller).value, {
+				expireOnError: options?.expireOnError,
+			});
+		},
 	};
 
 	return {
@@ -80,103 +132,87 @@ function buildRuntime(): IntegrationServiceContext {
 			},
 			wrapForForcedInsecureSSL: (_, fn) => Promise.resolve(fn()),
 		},
-		cache: {
-			getRepositoryMetadata: undefined as never,
-			getRepositoryDefaultBranch: undefined as never,
-			getPullRequestForSha: undefined as never,
-			getPullRequestForBranch: undefined as never,
-			getPullRequest: () => {
-				throw new Error('not implemented in fixture');
-			},
-			getIssueOrPullRequest: undefined as never,
-			getIssue: () => {
-				throw new Error('not implemented in fixture');
-			},
-			getCurrentAccount: () => {
-				throw new Error('not implemented in fixture');
-			},
-			deletePullRequests: () => {},
-		},
+		cache: cache,
 		repositories: { getOpenRemotes: async () => [] },
 		hooks: {},
 	};
 }
 
 async function main(): Promise<void> {
-	console.log('@gitlens/integrations consumer fixture');
-	console.log('--------------------------------------');
+	console.log('@gitkraken/core-gitlens consumer fixture');
+	console.log('-----------------------------------------');
 
 	await check('manager constructs from a vanilla-Node runtime', () => {
 		const manager = createIntegrationManager(buildRuntime());
+		const providerModelsStayPrivate: 'get' extends keyof typeof manager ? false : true = true;
+		const providerClientsStayPrivate: 'apis' extends keyof typeof manager ? false : true = true;
 		assert.ok(manager);
-		assert.equal(typeof manager.get, 'function');
+		assert.equal(providerModelsStayPrivate, true);
+		assert.equal(providerClientsStayPrivate, true);
+		assert.equal(typeof manager.getConfigured, 'function');
+		assert.equal(typeof manager.listPullRequestsPage, 'function');
+		assert.equal(typeof manager.resolveRepository, 'function');
 		assert.equal(typeof manager.dispose, 'function');
-		manager.dispose();
-	});
-
-	await check('manager.get works for every cloud provider id', async () => {
-		const manager = createIntegrationManager(buildRuntime());
-		const cloudIds = [
-			GitCloudHostIntegrationId.GitHub,
-			GitCloudHostIntegrationId.GitLab,
-			GitCloudHostIntegrationId.Bitbucket,
-			GitCloudHostIntegrationId.AzureDevOps,
-			IssuesCloudHostIntegrationId.Jira,
-			IssuesCloudHostIntegrationId.Linear,
-		];
-		for (const id of cloudIds) {
-			const integration = await manager.get(id);
-			assert.ok(integration, `expected ${id} integration to construct`);
-			assert.equal(integration.id, id);
+		if (false) {
+			// @ts-expect-error A scoped hierarchy selector is ambiguous without its provider.
+			void manager.listOrgs({ connectionId: 'secondary' });
+			// @ts-expect-error A self-managed hierarchy selector is ambiguous without its provider.
+			void manager.listProjects({ domain: 'ghe.example.com' });
 		}
 		manager.dispose();
 	});
 
-	await check('self-managed providers accept an explicit domain', async () => {
+	await check('manager exposes only neutral connection descriptors', () => {
 		const manager = createIntegrationManager(buildRuntime());
-		const integration = await manager.get(
-			GitSelfManagedHostIntegrationId.CloudGitHubEnterprise,
-			'enterprise.example.com',
+		assert.deepEqual(manager.getConfigured(), []);
+		manager.dispose();
+	});
+
+	await check('facade exports the domain normalizer used for connection selection', () => {
+		assert.equal(hostFromDomain('https://ghe.example.com/api/v3/'), 'ghe.example.com');
+		assert.equal(hostFromDomain('ghe.example.com:8443'), 'ghe.example.com:8443');
+	});
+
+	await check('internal integration services are not published package subpaths', async () => {
+		const internalSubpath = '@gitkraken/core-gitlens/plus/integrations/integrationService.js';
+		await assert.rejects(
+			import(internalSubpath),
+			(error: unknown) => {
+				assert.equal((error as NodeJS.ErrnoException).code, 'ERR_PACKAGE_PATH_NOT_EXPORTED');
+				return true;
+			},
+			'integrationService.js must remain unreachable through the public export map',
 		);
-		assert.ok(integration);
+	});
+
+	await check('a paged read reports an integer position for a fractional page', async () => {
+		// `page.currentPage` is a 1-based POSITION, so a consumer keying its next-page request off it must never
+		// be handed a value no read can be asked for again. Checked here rather than only in the unit tests
+		// because this is the field Kepler persists and replays, and it crosses the package boundary: the
+		// packaged artifact reported `2.7` verbatim before the reads normalized it.
+		const manager = createIntegrationManager(buildRuntime());
+		const pullRequests = await manager.listPullRequestsPage({
+			providerId: GitCloudHostIntegrationId.GitHub,
+			page: 2.7,
+		});
+		assert.equal(pullRequests.page.currentPage, 2);
+		const repositories = await manager.listRepos({
+			providerId: GitCloudHostIntegrationId.GitHub,
+			org: 'acme',
+			page: 3.9,
+		});
+		assert.equal(repositories.page.currentPage, 3);
 		manager.dispose();
 	});
 
-	await check('createManualTokenAuthProvider plugs in via the hook', async () => {
-		const ctx = buildRuntime();
-		ctx.hooks!.createAuthenticationProvider = async ({ id }) =>
-			id === GitCloudHostIntegrationId.GitHub
-				? createManualTokenAuthProvider({
-						id: id,
-						token: 'fixture-pat-abc',
-						account: { id: 'me', label: 'Fixture Token' },
-						scopes: ['repo'],
-					})
-				: undefined;
-		const manager = createIntegrationManager(ctx);
-		const integration = await manager.get(GitCloudHostIntegrationId.GitHub);
-		assert.ok(integration);
-		// Manual-token providers always report a session as available.
-		assert.equal(await integration.isConnected(), true);
+	await check('repository resolution classifies malformed input without exposing provider clients', async () => {
+		const manager = createIntegrationManager(buildRuntime());
+		const result = await manager.resolveRepository({ remoteUrl: 'not a remote' });
+		assert.deepEqual(result, { resolution: { status: 'invalid-remote-url' } });
 		manager.dispose();
 	});
 
-	await check('connectCloudIntegrations invokes typed telemetry hooks', async () => {
-		const started: Array<{ integrationIds: readonly string[] | undefined }> = [];
-		const ctx: IntegrationServiceContext = {
-			...buildRuntime(),
-			hooks: { connection: { onStarted: e => started.push({ integrationIds: e.integrationIds }) } },
-		};
-		const manager = createIntegrationManager(ctx);
-		await manager.connectCloudIntegrations(
-			{ integrationIds: [GitCloudHostIntegrationId.GitHub] },
-			{ source: 'fixture' },
-		);
-		assert.ok(started.length >= 1, 'connection.onStarted should fire');
-		manager.dispose();
-	});
-
-	console.log('--------------------------------------');
+	console.log('-----------------------------------------');
 	if (failures.length > 0) {
 		console.error(`FAIL — ${failures.length} check(s) failed:`);
 		for (const f of failures) console.error(`  • ${f}`);

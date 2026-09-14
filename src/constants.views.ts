@@ -1,3 +1,5 @@
+import * as l10n from '@vscode/l10n';
+
 export type CustomEditorTypes = 'rebase';
 export type CustomEditorIds = `gitlens.${CustomEditorTypes}`;
 
@@ -69,23 +71,23 @@ export const groupableViewTypes: readonly GroupableTreeViewTypes[] = [
 
 /** Display labels for the groupable views, keyed the same as {@link groupableViewTypes}. */
 export const groupableViewTypeLabels: Readonly<Record<GroupableTreeViewTypes, string>> = {
-	commits: 'Commits',
-	branches: 'Branches',
-	remotes: 'Remotes',
-	stashes: 'Stashes',
-	tags: 'Tags',
-	worktrees: 'Worktrees',
-	contributors: 'Contributors',
-	repositories: 'Repositories',
-	searchAndCompare: 'Search & Compare',
-	launchpad: 'Launchpad',
-	fileHistory: 'File History',
+	commits: l10n.t('Commits'),
+	branches: l10n.t('Branches'),
+	remotes: l10n.t('Remotes'),
+	stashes: l10n.t('Stashes'),
+	tags: l10n.t('Tags'),
+	worktrees: l10n.t('Worktrees'),
+	contributors: l10n.t('Contributors'),
+	repositories: l10n.t('Repositories'),
+	searchAndCompare: l10n.t('Search & Compare'),
+	launchpad: l10n.t('Launchpad'),
+	fileHistory: l10n.t('File History'),
 };
 
-export type WebviewPanelTypes = 'allowedSigners' | 'graph' | 'patchDetails' | 'settings' | 'timeline';
+export type WebviewPanelTypes = 'allowedSigners' | 'graph' | 'patchDetails' | 'settings' | 'timeline' | 'welcome';
 export type WebviewPanelIds = `gitlens.${WebviewPanelTypes}`;
 
-export type WebviewViewTypes = 'commitDetails' | 'graph' | 'home' | 'patchDetails' | 'timeline' | 'welcome';
+export type WebviewViewTypes = 'commitDetails' | 'graph' | 'patchDetails' | 'timeline' | 'welcome';
 export type WebviewViewIds<T extends WebviewViewTypes = WebviewViewTypes> = `gitlens.views.${T}`;
 
 export type WebviewTypes = CustomEditorTypes | WebviewPanelTypes | WebviewViewTypes;
@@ -127,7 +129,6 @@ export type CoreViewContainerIds = `workbench.view.${CoreViewContainerTypes}`;
 // 	'contributors',
 // 	'fileHistory',
 // 	'graph',
-// 	'home',
 // 	'lineHistory',
 // 	'remotes',
 // 	'repositories',
@@ -149,7 +150,7 @@ export const viewIdsByDefaultContainerId = new Map<ViewContainerIds | CoreViewCo
 		'workbench.view.extension.gitlensInspect',
 		['commitDetails', 'fileHistory', 'lineHistory', 'timeline', 'searchAndCompare'],
 	],
-	['workbench.view.extension.gitlens', ['welcome', 'graph', 'home', 'launchpad', 'drafts', 'workspaces']],
+	['workbench.view.extension.gitlens', ['welcome', 'graph', 'launchpad', 'drafts', 'workspaces']],
 ]);
 
 export type TreeViewRefNodeTypes = 'branch' | 'commit' | 'stash' | 'tag';

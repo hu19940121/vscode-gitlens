@@ -1,18 +1,28 @@
+import type { ColumnMode } from '@gitkraken/commit-graph/zones.js';
 import type { AIReviewDetailResult, AIReviewResult } from '@gitlens/ai/models/results.js';
-import type { GitHealthLever, GitHealthReport } from '@gitlens/git/gitHealth.js';
+import type { GitHealthBannerState, GitHealthLever, GitHealthReport } from '@gitlens/git/gitHealth.js';
 import type { GitDiffFileStats } from '@gitlens/git/models/diff.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
-import type { GitCommitSearchContext } from '@gitlens/git/models/search.js';
+import type { GitGraphRowKind } from '@gitlens/git/models/graph.js';
+import type { GitGraphSessionMoreResult } from '@gitlens/git/models/graphSession.js';
+import type { GitCommitSearchContext, SearchQuery } from '@gitlens/git/models/search.js';
 import type { GitHealthDetails, GitMaintenanceTask, GitOptimizationId } from '@gitlens/git/providers/maintenance.js';
 import type { ConflictKind } from '@gitlens/git/utils/conflictResolution.utils.js';
+import type { GraphBranchesVisibility } from '../../../config.js';
 import type { GlCommands } from '../../../constants.commands.js';
+import type { StoredGraphWipDraft } from '../../../constants.storage.js';
+import type { FeaturePreview } from '../../../features.js';
 import type { ConsultedTool } from '../../../plus/coretools/conflict/consultation.js';
+import type { Subscription } from '../../../plus/gk/models/subscription.js';
 import type { LaunchpadSummaryError, LaunchpadSummaryResult } from '../../../plus/launchpad/launchpadIndicator.js';
+import type { ReferencesQuickPickOptions2 } from '../../../quickpicks/referencePicker.js';
+import type { RunningWorktreeTask } from '../../../worktrees/worktreeTaskService.js';
 import type { ExplainResult } from '../../commitDetails/commitDetailsService.js';
 import type { SharedWebviewServices } from '../../rpc/services/common.js';
 import type { RpcEventSubscription } from '../../rpc/services/types.js';
 import type { WalkthroughProgressPayload } from '../../rpc/walkthroughService.js';
+import type { GetOverviewEnrichmentResponse, GetOverviewWipResponse } from '../../shared/overviewBranches.js';
 import type {
 	ChoosePathParams,
 	DidChoosePathParams,
@@ -23,10 +33,63 @@ import type {
 import type { TreemapConfig, TreemapData, TreemapMode } from '../treemap/protocol.js';
 import type { CommitDetails, CommitFileChange, CompareDiff, Wip } from './detailsProtocol.js';
 import type {
+	DidChangeBranchStateParams,
+	DidChangeParams,
+	DidChangeRepoConnectionParams,
+	DidChooseAuthorParams,
+	DidChooseComparisonParams,
+	DidChooseFileParams,
+	DidChooseRefParams,
+	DidFailRevealParams,
 	DidGetCountParams,
+	DidGetRowHoverParams,
 	DidGetSidebarDataParams,
+	DidLoadRowParams,
+	DidRebindGraphParams,
+	DidRequestActiveSidebarPanelParams,
+	DidRequestGraphActionParams,
+	DidRequestOpenCompareModeParams,
+	DidRequestOpenTimelineScopeParams,
+	DidRequestSearchParams,
+	DidRequestVisualizationParams,
+	DidResolveGraphScopeParams,
+	DidSearchHistoryGetParams,
+	DidSearchRepairParams,
+	GetOverviewParams,
+	GetWipLineStatsResponse,
+	GetWipStatsResponse,
+	GraphAvatars,
+	GraphColumnName,
+	GraphColumnsConfig,
+	GraphColumnsSettings,
+	GraphComponentConfig,
+	GraphDisplayMode,
+	GraphExcludedRef,
+	GraphExcludeRefs,
+	GraphExcludeTypes,
+	GraphIncludeOnlyRef,
+	GraphIncludeOnlyRefs,
+	GraphMissingRefsMetadata,
+	GraphOverviewData,
+	GraphPinnedRef,
+	GraphPullRequestSheetData,
+	GraphRef,
+	GraphRefMetadataItem,
+	GraphRefsMetadata,
+	GraphScope,
+	GraphSearchMode,
+	GraphSearchRelaxation,
+	GraphSearchResults,
+	GraphSearchResultsError,
+	GraphSelectedRows,
+	GraphSelection,
 	GraphSidebarPanel,
 	GraphSidebarPullRequest,
+	GraphWipRowsById,
+	GraphWipStateById,
+	MergePullRequestResult,
+	RowActionParams,
+	SearchParams,
 	SidebarWorktreeChange,
 } from './protocol.js';
 
@@ -94,6 +157,10 @@ export type ResolveResult =
 				/** Present only when seeded from an automatic-rebase escalation — tells the panel the
 				 *  run is mid-rebase so it can offer "Apply & Resume with AI" instead of a plain Apply. */
 				autoRebase?: { sessionId: string; stepNumber?: number; totalSteps?: number };
+				/** Resolver effort summed over the run, for telemetry only — aggregated host-side because
+				 *  the per-file `metrics` never cross the IPC boundary. A count is `undefined` when no
+				 *  resolution reported it, so "not measured" stays distinct from "zero". */
+				metrics?: { steps?: number; toolCalls?: number };
 			};
 	  }
 	| { error: { message: string } }
@@ -169,6 +236,10 @@ export type AutoRebaseRunUpdate = {
 	/** Why automation stopped, when it escalated — lets the panel distinguish a user-requested stop
 	 *  (`stopped`) from a genuine escalation. */
 	escalation?: { reason: string; message: string };
+	/** Whether the branch tip is exactly where it started — only meaningful once `phase` is terminal.
+	 *  Distinguishes a `completed` run that had nothing to rewrite from one that cleanly rewrote
+	 *  every commit. */
+	unchanged: boolean;
 	/** Steps recorded so far — only paused (conflicted/skipped) steps surface; clean picks never do.
 	 *  Files carry no `virtualRef` while running: before/after diffs stay a summary-sheet affordance so
 	 *  no virtual sessions are registered per progress tick. */
@@ -275,6 +346,26 @@ export type ComposeBaseCommit = {
 	/** Selected unpushed commits in topological order (child-first), when `kind` involves commits. */
 	selectedShas?: string[];
 };
+
+/**
+ * Identifies one compose session. The webview supplies the key of the anchor the compose is engaged
+ * on — the same key it scopes run cancellation by — so the host's per-session state partitions the
+ * way the UI does. Opaque to the host: it only ever compares and maps by it.
+ *
+ * Every compose is WIP-anchored today, so this is currently 1:1 with `repoPath`. Keying by it anyway
+ * is what keeps that a webview detail: if compose ever becomes reachable from a second anchor on one
+ * repo, two live sessions stay separate here instead of silently sharing a conversation and evicting
+ * each other's plan.
+ *
+ * A repository path travels alongside it only where the handler needs one — to collect changes, to
+ * apply a plan, or to re-derive the display commits after mutating one. The rest take the session and
+ * cache keys alone.
+ *
+ * Branded, mirroring the webview's own `AnchorKey`, because it travels beside `repoPath` and
+ * `cacheKey` on these RPCs — three bare strings would let a transposition through silently, which is
+ * the exact class of mix-up keying by session instead of repo exists to prevent.
+ */
+export type ComposeSessionKey = string & { readonly __composeSessionKey: unique symbol };
 
 /**
  * Refinement knobs for {@link composeChanges}. Present means "refine the cached plan
@@ -514,6 +605,7 @@ export interface GraphInspectService {
 	pickCoauthors(repoPath: string, currentMessage: string | undefined): Promise<string[] | undefined>;
 	composeChanges(
 		repoPath: string,
+		sessionKey: ComposeSessionKey,
 		scope: ScopeSelection,
 		instructions?: string,
 		excludedFiles?: string[],
@@ -521,7 +613,20 @@ export interface GraphInspectService {
 		signal?: AbortSignal,
 		options?: ComposeChangesOptions,
 	): Promise<ComposeResult>;
-	commitCompose(repoPath: string, plan: ComposeCommitPlan): Promise<CommitResult>;
+	commitCompose(repoPath: string, sessionKey: ComposeSessionKey, plan: ComposeCommitPlan): Promise<CommitResult>;
+	/**
+	 * Ends a compose session the webview has dropped its handle on — Discard, the Restart-then-close
+	 * destroy, and the registry clear on a repository switch. Releases the cached plan and closes the
+	 * session's conversation, which otherwise linger until the next compose on that session or panel
+	 * teardown.
+	 *
+	 * `cacheKey` is the plan the webview believed the session held. The host acts only while that still
+	 * matches what it holds, so a call arriving after the user has started a new compose cannot tear down
+	 * the newer plan or its conversation. Passing `undefined` is a no-op for the same reason: a session
+	 * still waiting on its first generate also holds no plan, so there is nothing to tell those two
+	 * states apart. A session that never produced a plan is continued by a retry or flushed on dispose.
+	 */
+	discardCompose(sessionKey: ComposeSessionKey, cacheKey: string | undefined): Promise<void>;
 	/**
 	 * Regenerate the commit message for a single draft commit in the cached plan identified
 	 * by `cacheKey`. Uses GitLens's internal `ai.actions.generateCommitMessage` against a patch
@@ -534,7 +639,7 @@ export interface GraphInspectService {
 	 * message field changes.
 	 */
 	regenerateProposedCommitMessage(
-		repoPath: string,
+		sessionKey: ComposeSessionKey,
 		cacheKey: string,
 		commitId: string,
 		signal?: AbortSignal,
@@ -546,7 +651,7 @@ export interface GraphInspectService {
 	 * subsequent refine honor the new sequence. Pure in-memory reorder — no AI, no git.
 	 */
 	reorderProposedCommits(
-		repoPath: string,
+		sessionKey: ComposeSessionKey,
 		cacheKey: string,
 		orderedCommitIds: string[],
 	): Promise<ReorderProposedCommitsResult>;
@@ -558,6 +663,7 @@ export interface GraphInspectService {
 	 */
 	moveComposeFile(
 		repoPath: string,
+		sessionKey: ComposeSessionKey,
 		cacheKey: string,
 		fromCommitId: string,
 		toCommitId: string,
@@ -681,7 +787,7 @@ export interface GraphSidebarService {
 	 * "settled, no data" (no status available) — distinct from a rejection, so the tooltip can land on a
 	 * terminal state instead of spinning.
 	 *
-	 * Deliberately NOT `GetWipStatsRequest`: that handler skips the primary repo path and collapses
+	 * Deliberately NOT `wip.getStats`: that handler skips the primary repo path and collapses
 	 * config-off into an empty response, neither of which suits a tooltip the user explicitly opened. This
 	 * goes straight to the shared 10s status cache instead, so it still joins any concurrent read for the
 	 * same worktree. (Those batches no longer cross-cancel — each owns its token — but they still answer a
@@ -691,6 +797,13 @@ export interface GraphSidebarService {
 	/** Looks up one pull request by number, for the Focus pane's search fallback — the panel lists only
 	 *  open PRs, so a pasted URL for a merged or closed one isn't in the loaded set. */
 	findPullRequest(number: string): Promise<GraphSidebarPullRequest | undefined>;
+	/** Everything the pull request sheet renders, in one round trip — one pull request by number, or a
+	 *  whole stack by stack number. Deliberately NOT served off the pull requests panel's list: the sheet
+	 *  needs one pull request and its layers, not the repository's every open pull request, and waiting on
+	 *  that list is what used to make a stacked sheet take seconds or time out. */
+	resolvePullRequestSheet(
+		target: { number: string } | { stackNumber: number },
+	): Promise<GraphPullRequestSheetData | undefined>;
 	toggleLayout(panel: GraphSidebarPanel): void;
 	toggleShowRemoteBranches(): void;
 	refresh(panel: GraphSidebarPanel): void;
@@ -698,6 +811,67 @@ export interface GraphSidebarService {
 
 	onSidebarInvalidated: RpcEventSubscription<undefined>;
 	onWorktreeStateChanged: RpcEventSubscription<{ changes: Record<string, SidebarWorktreeChange | undefined> }>;
+}
+
+/**
+ * Everything the app knows about the active search. Always a COMPLETE snapshot, never a delta —
+ * `onDidChange` is `save-last` buffered, so a hidden webview keeps only the newest emission and a
+ * delta would silently lose the batches in between. `undefined` means no active search.
+ */
+export interface GraphSearchState {
+	query: SearchQuery;
+	results: GraphSearchResults | GraphSearchResultsError | undefined;
+	/** Host still producing results — includes background continuations the app never asked for. */
+	searching: boolean;
+	/** Set when the pattern failed to compile as a regex and the search matched literally instead. */
+	fallback?: { matchedAs: 'literal'; detail?: string };
+	/** Counted broader alternatives, offered when a natural-language search settles with 0 results. */
+	relaxations?: GraphSearchRelaxation[];
+}
+
+/**
+ * A search's answer to the caller that asked for it. `state` is what the search settled on;
+ * `revealSha` is a one-shot instruction to scroll there, deliberately NOT part of {@link GraphSearchState}
+ * — state is replayed on reconnect, and replaying a scroll moves the user somewhere they never asked to go.
+ */
+export interface GraphSearchResponse {
+	state: GraphSearchState;
+	revealSha?: string;
+}
+
+export interface GraphSearchService {
+	/**
+	 * Runs a search, resolving with its final state — or `undefined` when the caller's `signal` aborted,
+	 * which is also how a newer search supersedes an older one (the client owns one signal per search).
+	 * Interim states arrive on {@link onDidChange}.
+	 */
+	search(params: SearchParams, signal?: AbortSignal): Promise<GraphSearchResponse | undefined>;
+	/** The active search, for seeding a freshly connected app. Pull-based, so no emission can be lost
+	 *  to a teardown race the way a pushed one can. */
+	getState(): Promise<GraphSearchState | undefined>;
+	/** Stops the active search's WORK — every host-side operation, including background continuations
+	 *  the data controller runs under its own signal (which aborting `search`'s request signal cannot
+	 *  reach) — while keeping the accumulated results and the resume cursor. The pause behind the search
+	 *  box's stop button; emits nothing, since the pausing app settles its own UI. */
+	cancel(): void;
+	/** Drops the active search and everything accumulated for it. */
+	clear(): void;
+	/** Persists the sticky search preferences. `searchMode: undefined` leaves the mode untouched (and
+	 *  the active search's filter unrewritten) — for an NL-preference change without a mode choice. */
+	setMode(searchMode: GraphSearchMode | undefined, useNaturalLanguage: boolean): void;
+	openInView(search: SearchQuery): void;
+	/** Asks AI to repair a query git refused to compile. */
+	repair(query: string, detail?: string): Promise<DidSearchRepairParams>;
+	getHistory(): Promise<DidSearchHistoryGetParams>;
+	storeHistory(search: SearchQuery): Promise<DidSearchHistoryGetParams>;
+	deleteHistory(query: string): Promise<DidSearchHistoryGetParams>;
+
+	/** Authoritative for host-initiated changes (background continuations, repo swap); advisory during a
+	 *  client-initiated `search`, whose true answer is that call's return value. Both carry the same
+	 *  complete snapshot, so the app applies them identically. */
+	onDidChange: RpcEventSubscription<GraphSearchState | undefined>;
+	/** An external request to run a search in the graph (deep link, command, another surface). */
+	onDidRequestSearch: RpcEventSubscription<DidRequestSearchParams>;
 }
 
 export interface GraphTimelineService {
@@ -733,10 +907,41 @@ export interface GraphTreemapService {
 	 * additional refs, window) so the treemap mirrors what the Graph is currently showing.
 	 *
 	 * Agent activity (used by the Activity mode) is not part of this service — the webview already
-	 * receives `AgentSessionState[]` via `DidChangeAgentSessionsNotification` and reads
+	 * receives `AgentSessionState[]` via `AgentsService.onSessionsChanged` and reads
 	 * `session.fileActivity` directly. No separate streaming RPC is needed.
 	 */
 	getData(repoPath: string, mode: TreemapMode, config: TreemapConfig, signal?: AbortSignal): Promise<TreemapData>;
+
+	/** Fires with the repo path whenever the host's per-repo aggregate cache is dropped (file watcher
+	 *  edits, branch switches, repo unload) — the treemap re-fetches for the current repo/mode. */
+	readonly onDidInvalidate: RpcEventSubscription<{ repoPath: string }>;
+}
+
+/**
+ * Everything the Graph's gating reads: the current subscription, the repo-scoped `allowed` verdict,
+ * and the active graph feature preview. Always a COMPLETE snapshot, never a delta — `onAccessChanged`
+ * is `save-last` buffered, so a hidden webview keeps only the newest emission.
+ *
+ * The three travel together because the app derives two walls from them (`isAccountGated` from
+ * `subscription`, the plan gate from `allowed`) — splitting them across events would let the walls
+ * disagree between paints.
+ */
+export interface GraphAccessState {
+	subscription: Subscription;
+	allowed: boolean;
+	featurePreview: FeaturePreview | undefined;
+}
+
+export interface GraphAccessService {
+	/** The current access snapshot, for seeding a freshly connected app. Pull-based, so no emission
+	 *  can be lost to a subscribe/fetch race. */
+	getAccess(): Promise<GraphAccessState>;
+	/**
+	 * Fires on a subscription change that doesn't warrant a full state rebuild, and on a graph
+	 * feature-preview start. Deliberately silent on the account-access and Pro-access flips: those
+	 * push a full state instead, so un-gating can't land before `repositories` does.
+	 */
+	readonly onAccessChanged: RpcEventSubscription<GraphAccessState>;
 }
 
 export interface GraphWelcomeService {
@@ -744,6 +949,394 @@ export interface GraphWelcomeService {
 	 *  performs the layout move in one causally-ordered handler, so nothing races the webview
 	 *  teardown the move triggers. */
 	continueToGraph(options: { layoutChoice: 'sidebar' | 'panel' | 'dismissed' }): Promise<void>;
+}
+
+/** The active repo's last-fetched snapshot. `lastFetched` is epoch-ms (0 means never fetched), matching
+ *  `Repository.getLastFetched()` — never a `Date`, which would arrive over RPC as an ISO string. */
+export interface GraphRepoStatus {
+	repoPath: string;
+	lastFetched: number;
+}
+
+/**
+ * Repo/branch status plane: the active repo's last-fetched time, the header's fast-path branch state
+ * (ahead/behind/upstream/provider/worktree), and the repositories list refresh on integration
+ * connect/disconnect.
+ */
+export interface GraphRepoStatusService {
+	/** The active repo's last-fetched snapshot, for seeding a freshly connected app. Pull-based, so no
+	 *  emission fired between subscribe and fetch is ever lost. `undefined` when there's no active repo. */
+	getLastFetched(): Promise<GraphRepoStatus | undefined>;
+	/**
+	 * Fires whenever the active repo's last-fetched time changes, including the periodic re-fire that
+	 * only refreshes the relative-time label (`ensureLastFetchedSubscription` in the host). Carries
+	 * `repoPath` so the app can ignore an event for a repo other than the one currently selected —
+	 * without it a fetch completing for a background repo could stamp the display of a different one.
+	 * `save-last`: latest-wins is correct since only the current repo's fetch matters to the app.
+	 */
+	readonly onDidFetch: RpcEventSubscription<GraphRepoStatus>;
+	/** Fast-path header branch state (ahead/behind/upstream/provider/worktree), refreshed independently
+	 *  of the full-state rebuild so push/pull/fetch land in the header immediately. `save-last` is correct
+	 *  because each payload is a complete replacement and only the newest matters to a hidden webview. */
+	readonly onBranchStateChanged: RpcEventSubscription<DidChangeBranchStateParams>;
+	/** Complete repositories list refresh on integration connect/disconnect. `save-last`, complete
+	 *  snapshot: each payload replaces the whole list. */
+	readonly onRepoConnectionChanged: RpcEventSubscription<DidChangeRepoConnectionParams>;
+}
+
+/**
+ * Scope-anchor resolution plane: the merge-base/merge-target lookup behind Focus on Branch and the
+ * row marker. `error` is set (not thrown) when the resolver fails — callers depend on always getting
+ * back a usable `scope`, falling back to the caller-supplied one.
+ */
+export interface GraphScopeService {
+	resolveScope(repoPath: string, scope: GraphScope, signal?: AbortSignal): Promise<DidResolveGraphScopeParams>;
+	/**
+	 * Re-perspectives the live graph session onto `worktreePath` (a worktree of the same repo family)
+	 * without discarding its accumulated window, or restores the home repo binding when `worktreePath`
+	 * is `undefined`. Never rejects for a domain reason: a refusal resolves with `refused` set to WHY, so the
+	 * caller knows whether newer state already owns the UI (`superseded`) or its optimistic UI must be
+	 * rolled back now. A cold-open request parks until the first session exists rather than refusing.
+	 */
+	rebind(params: { worktreePath: string | undefined }): Promise<DidRebindGraphParams>;
+	/**
+	 * Fires whenever refs/config move in a way that may stale a resolved anchor (heads/remotes change,
+	 * repo swap, force-refresh). Carries the repo the change was detected in, but consumers should treat
+	 * an invalidation as repo-agnostic and sweep every cached anchor: like `_sidebarInvalidatedEvent`,
+	 * this is buffered as a coalescing `signal` while the webview is hidden — a hidden webview only ever
+	 * replays ONE pending wake-up per event key, so a second repo's invalidation arriving while hidden
+	 * would otherwise be lost if a consumer scoped its sweep to a single `repoPath`. Over-invalidating is
+	 * cheap; losing an invalidation isn't.
+	 */
+	readonly onScopeAnchorsInvalidated: RpcEventSubscription<{ repoPath: string }>;
+}
+
+/**
+ * Config/display-mode plane: the graph's persisted settings (minimap, auto-fetch, details
+ * location, etc.) and the active Graph/Visualizations/Kanban display mode.
+ */
+export interface GraphConfigurationService {
+	/**
+	 * Persists `changes` to the underlying settings and resolves once every write has landed.
+	 * Resolving does NOT itself push the new config — that arrives separately via
+	 * {@link onDidChange} once the settings watcher observes the write, matching the value a
+	 * `configuration.get` would now return.
+	 */
+	update(changes: Partial<GraphComponentConfig>): Promise<void>;
+	setDisplayMode(mode: GraphDisplayMode): Promise<void>;
+	/** Fires with the complete component config snapshot whenever it changes — a settings write
+	 *  (including one made through {@link update}, once its watcher echo lands) or a relevant
+	 *  workspace/window setting changing out from under the webview. `save-last`: the payload is
+	 *  always a complete snapshot, so a hidden webview only ever needs the newest one. */
+	readonly onDidChange: RpcEventSubscription<GraphComponentConfig>;
+}
+
+/**
+ * Everything the columns + scroll-markers plane pushes: the resolved column settings plus the three
+ * `vscode-context` JSON strings its menus hang off. Always a COMPLETE snapshot, never a delta —
+ * `onDidChange` is `save-last` buffered, so a hidden webview keeps only the newest emission.
+ *
+ * The four travel together because `settingsContext` (the gear menu's context) is derived from the
+ * column settings AND from the scroll-marker settings: two writers, one field. Splitting them across
+ * events would let one writer's push stale the other's.
+ */
+export interface GraphColumnsState {
+	columns: GraphColumnsSettings;
+	/** Column-header right-click context (`gitlens:graph:columns`). */
+	headerContext?: string;
+	/** Gear-menu context (`gitlens:graph:settings`) — derived from columns AND scroll markers. */
+	settingsContext?: string;
+	/** Marker-rail right-click context (`gitlens:graph:scrollMarkers`). */
+	scrollMarkersContext?: string;
+}
+
+/**
+ * Columns + scroll-markers plane: column visibility/width/order/grouping, the Changes column's mode
+ * and stats consent, and the contexts backing the column, gear, and marker-rail menus.
+ */
+export interface GraphColumnsService {
+	/**
+	 * Persists a webview-authored columns write (widths, order, hide/show, grouping), resolving AFTER
+	 * the storage write lands and {@link onDidChange} has fired. Callers use that happens-after edge to
+	 * know their own write is no longer outstanding. `mode` is host-owned and ignored here.
+	 */
+	setColumns(config: GraphColumnsConfig): Promise<void>;
+	/** The Changes header mode picker's pick — a real setting (`graph.changesColumn.mode`), so the write
+	 *  is effective-scoped and its echo arrives via the settings watcher. Other columns are ignored. */
+	setColumnMode(name: GraphColumnName, mode: ColumnMode | undefined): Promise<void>;
+	/** The dormant Changes column's one-time stats consent (`graph.changesColumn.enabled`). */
+	enableChangesColumn(): Promise<void>;
+	readonly onDidChange: RpcEventSubscription<GraphColumnsState>;
+}
+
+/**
+ * Everything the filters plane pushes: branch visibility, the hidden ref/type sets, the resolved
+ * include-only refs, and the pinned ref. Always a COMPLETE snapshot, never a delta — `onDidChange` is
+ * `save-last` buffered, so a hidden webview keeps only the newest emission.
+ *
+ * The pinned ref travels with the rest because all five are rebuilt wholesale from the same
+ * `graph:filtersByRepo` storage record — splitting them across events would let two paints disagree.
+ */
+export interface GraphFiltersState {
+	branchesVisibility: GraphBranchesVisibility;
+	excludeRefs?: GraphExcludeRefs;
+	excludeTypes?: GraphExcludeTypes;
+	includeOnlyRefs?: GraphIncludeOnlyRefs;
+	pinnedRef?: GraphPinnedRef;
+}
+
+/**
+ * Filters plane: which refs the graph shows (branch visibility, hidden refs, hidden types, include-only
+ * refs) plus the pinned ref.
+ *
+ * Every write resolves AFTER its storage write has landed and {@link onDidChange} has fired, so callers
+ * can treat resolution as a happens-after edge. The resulting STATE, however, arrives at the app one
+ * transport hop later on that event — a caller that must re-read settled state after a write still has
+ * to wait for the push.
+ */
+export interface GraphFiltersService {
+	/** Hides (`visible: false`) or un-hides the given refs. Hiding a whole remote (`name: '*'`) replaces
+	 *  any existing wildcard for that owner; un-hiding a branch under an active wildcard excepts it. */
+	setRefsVisibility(refs: GraphExcludedRef[], visible: boolean): Promise<void>;
+	/** Pins a ref to the graph's edge, or clears the pin with `null`. */
+	setPinnedRef(ref: GraphPinnedRef | null): Promise<void>;
+	setExcludeType(key: keyof GraphExcludeTypes, value: boolean): Promise<void>;
+	/** `branchesVisibility: undefined` leaves the mode untouched; `refs: undefined`/empty clears the
+	 *  stored include-only set. */
+	setIncludedRefs(branchesVisibility?: GraphBranchesVisibility, refs?: GraphIncludeOnlyRef[]): Promise<void>;
+	/** Clears every stored filter for the active repo. Fires even when nothing changed — the snapshot is
+	 *  complete, so a redundant push is harmless, and the app's deferred scope clear runs off the push. */
+	reset(): Promise<void>;
+	readonly onDidChange: RpcEventSubscription<GraphFiltersState>;
+}
+
+/**
+ * Overview panel data plane: the active/recent branch composition plus its WIP and PR/issue
+ * enrichment. `getOverview` also accepts an updated `recentThreshold` and older-branches
+ * `olderLimit`, mirroring the legacy request's dual role (read + persist the "Recent" timeframe
+ * and "Load More" paging).
+ */
+export interface GraphOverviewService {
+	getOverview(params?: GetOverviewParams, signal?: AbortSignal): Promise<GraphOverviewData>;
+	/**
+	 * Cheap (dirty/clean only) or full WIP breakdown for the given branches, depending on `cheap`.
+	 * Cache-backed on the host, so repeat calls for branches with a warm entry cost no extra `git status`.
+	 */
+	getWip(branchIds: string[], cheap?: boolean, signal?: AbortSignal): Promise<GetOverviewWipResponse>;
+	/** On-demand fetch of the full WIP breakdown (add/changed/deleted), driven by the rich hover so the
+	 *  eager overview load can stay on the cheap clean/dirty path of {@link getWip}. */
+	getWipDetailed(branchIds: string[], signal?: AbortSignal): Promise<GetOverviewWipResponse>;
+	getEnrichment(branchIds: string[], signal?: AbortSignal): Promise<GetOverviewEnrichmentResponse>;
+	/** Pushed whenever the host recomputes the overview (graph reload, repo/visibility/filter change) —
+	 *  deep-equal deduped on the host, so a hidden webview replays only the latest genuine change. */
+	readonly onOverviewChanged: RpcEventSubscription<GraphOverviewData>;
+}
+
+/**
+ * One working-tree tick for the graph's repo: the full worktree topology, the enumeration state for
+ * every worktree, and the graph's own worktree's status group plus its complete {@link Wip} — every
+ * field projected from the single `git status` the tick ran.
+ */
+export type GraphWorkingTreeChange = {
+	repoPath: string;
+	/** Full worktree topology for the repo (every worktree, primary included) — authoritative, so the
+	 *  client prunes rows this omits. */
+	wipRowsById: GraphWipRowsById;
+	/** Hot-state patch, merged per row id — carries the primary's status group plus the free
+	 *  enumeration fields (`ahead`) for its peers. */
+	wipStateById: GraphWipStateById;
+	/** The graph's own worktree's WIP, so the details panel renders a fresh file list with no extra
+	 *  round-trip. Undefined only when the underlying status read failed. */
+	wip: Wip | undefined;
+};
+
+/**
+ * One background peer-worktree probe result: the same topology, plus the probed `hasChanges`/
+ * `hasUnpushed` bits for peers. Carries NO status group and NO {@link Wip} — the probe deliberately
+ * runs no `git status`.
+ */
+export type GraphWorktreeEnrichment = {
+	repoPath: string;
+	wipRowsById: GraphWipRowsById;
+	wipStateById: GraphWipStateById;
+};
+
+export interface GraphWipService {
+	/** Per-file working-tree line stats for `repoPath`, keyed by repo-relative (normalized) path.
+	 *  Fetched lazily via a single `git diff HEAD --numstat` (incl. untracked) only while the WIP file
+	 *  list is shown — the every-tick `wip` push carries file status only, never line counts. */
+	getLineStats(repoPath: string, signal?: AbortSignal): Promise<GetWipLineStatsResponse | undefined>;
+	/** Per-sha WIP stats (working-tree add/change/delete counts, paused-op status, conflicts) for
+	 *  peer-worktree WIP rows. `force` bypasses the `graph.showWorktreeWipStats` gate — used by the
+	 *  selection-driven fetch so clicking a worktree row still populates stats when the setting is
+	 *  disabled. A missing key in the response means the read failed (or the gate wasn't bypassed);
+	 *  callers must treat that as "keep prior counts", never as zero. */
+	getStats(shas: string[], options?: { force?: boolean }, signal?: AbortSignal): Promise<GetWipStatsResponse>;
+	/** Persists a WIP commit-box draft for `worktreePath` (keyed by the worktree's own fsPath).
+	 *  `draft: null` deletes the slot. Resolves AFTER the storage write lands — callers use that
+	 *  happens-after edge to know their own write is no longer outstanding. */
+	updateDraft(worktreePath: string, draft: StoredGraphWipDraft | null): Promise<void>;
+	/** The complete `graph:wipDrafts` slice for this panel's repo (its worktree plus every peer),
+	 *  pushed whenever the storage record changes — another provider's write, a host-initiated draft
+	 *  (Undo Commit), or this panel's own echo. `save-last` buffered: the payload is always the complete
+	 *  slice, so a hidden webview only ever needs the newest one. */
+	readonly onDraftsChanged: RpcEventSubscription<Record<string, StoredGraphWipDraft> | undefined>;
+	/** Full set of currently-visible secondary WIP shas (plus the selected peer row, if any). The host
+	 *  diffs against its subscription set: opens watchers for newcomers, arms a grace-period disposal
+	 *  timer for departures, cancels a pending disposal for a row back in view. Resolves after the diff
+	 *  has been applied. */
+	syncWatches(shas: string[]): Promise<void>;
+	/**
+	 * Secondary-WIP row ids whose watcher the host has just torn down (grace period elapsed). `save-last`
+	 * buffered, but unlike other `save-last` events the payload is CUMULATIVE rather than a full-state
+	 * snapshot: it's every sha closed since the panel's last {@link syncWatches} call, not just the one
+	 * that triggered this firing. A per-sha payload would lose closures to `save-last`'s buffering — a
+	 * second sha closing before the first firing is delivered would overwrite it. Accumulating means any
+	 * delivered (or replayed) payload is a superset of everything closed since the last sync, so nothing
+	 * is lost. The host resets the accumulated set on every {@link syncWatches} call — a sync proves the
+	 * panel's watch set is current, so shas it still wants were never actually closed and shas it dropped
+	 * it no longer needs to hear about.
+	 */
+	readonly onWatchesClosed: RpcEventSubscription<{ shas: string[] }>;
+	/**
+	 * The graph repo's working tree changed — one fire per filesystem tick that survives the host's
+	 * content dedup (working-tree watchers fire on any write in the repo, so most ticks reproduce the
+	 * prior status verbatim and are suppressed).
+	 *
+	 * Split from {@link onWorktreeEnrichment} by PRODUCER rather than by repo, and that split is what
+	 * makes `save-last` safe here: the two producers carry DISJOINT payloads, so under one shared slot
+	 * an enrichment fire landing behind a tick would drop the tick's `wip` — the details panel's file
+	 * list — with nothing to restore it. Every fire of THIS event is a complete snapshot of what the
+	 * tick knows, so collapsing two of them loses nothing.
+	 *
+	 * Not buffered on the host side: a tick produced while the panel is hidden is dropped and
+	 * RE-PRODUCED on the next visibility/focus regain, so what arrives is a fresh read rather than a
+	 * replay of pre-hide state.
+	 */
+	readonly onWorkingTreeChanged: RpcEventSubscription<GraphWorkingTreeChange>;
+	/**
+	 * Peer-worktree enrichment from the background clean/dirty + unpushed probe. `save-last`, and
+	 * likewise complete for its kind — the client's `mergeWipState` folds these fields into whatever
+	 * anchors it holds and preserves the groups this payload omits. Dropped outright while the panel
+	 * is hidden; the next visible state build past the probe's cooldown re-runs it.
+	 */
+	readonly onWorktreeEnrichment: RpcEventSubscription<GraphWorktreeEnrichment>;
+	/**
+	 * Fresh WIP for a repo whose change the graph's own working-tree watcher can't see: a peer
+	 * worktree's debounced watcher tick, or a host-side conflict-resolution run against a peer's WIP
+	 * row. `save-last` — a superseded payload is by definition an older read of the same worktree, and
+	 * the client orders by `Wip.revision` anyway.
+	 */
+	readonly onWipRefetched: RpcEventSubscription<{ repoPath: string; wip?: Wip }>;
+}
+
+/**
+ * Rows paging + targeted row loading — the plane that answers "give me more history" and "make this
+ * row exist". Both are request/response; the rows themselves still travel on the rows-plane channel.
+ *
+ * {@link getMoreRows} resolves only AFTER the host has posted the rows emission its page produced, so
+ * a caller can hold its own loading affordance in a `finally` instead of watching for a rows push that
+ * a page adding nothing never sends. It resolves (rather than hanging) in every degenerate case: a
+ * superseded page, a repo swap mid-flight, a hidden webview.
+ *
+ * It also REPORTS which of those happened. `'superseded'` means a rebuild replaced the window the page was
+ * cut from — the rows are still there, and the caller re-asks if it still wants them. For a BOUNDARY page
+ * (`id == null`) the client deliberately owns that decision: its paging is edge-triggered, so only it can
+ * tell whether the user is still at the boundary. A TARGETED page (`id != null`) carries stable intent
+ * instead, so the HOST retries it first (revalidate, then a bounded retry) — a `'superseded'` seen here for
+ * a targeted request means that host-side retry was exhausted, not merely refused once.
+ *
+ * {@link loadRow} runs an UNCAPPED walk, so `signal` matters: a navigation that is superseded, times
+ * out, or is aborted must withdraw it or the walk keeps scanning the whole repository. It never
+ * rejects for a domain reason — a miss comes back as a settled result naming why.
+ */
+export interface GraphRowsService {
+	/** `limit` overrides the host's configured page size (`gitlens.graph.pageItemLimit`) for this one
+	 *  call — the embedded Visual History raises it on `All time` so the history burns through in
+	 *  fewer, larger chunks instead of paying per-call overhead on the default 200-row page. */
+	getMoreRows(id?: string, limit?: number): Promise<GitGraphSessionMoreResult | undefined>;
+	loadRow(id: string, signal?: AbortSignal): Promise<DidLoadRowParams>;
+	/**
+	 * The rows plane's ONLY recovery path: bumps the `graph:rows` channel's generation and re-ships a
+	 * full snapshot at seq 0. Called from the webview on a channel gap (`onGap`) or a splice-guard
+	 * mismatch — both mean the webview's mirror diverged and only an authoritative REPLACE fixes it.
+	 * Resolves once the snapshot has been posted (or immediately when the webview is hidden/not ready,
+	 * where the requirement is latched for the next flush instead).
+	 */
+	resyncRows(): Promise<void>;
+	/**
+	 * Re-runs the load after a failed walk left the graph with no rows at all — a resync can't help
+	 * there, since the host has nothing to snapshot. Runs the same full refresh as the `refresh`
+	 * command, re-mounting the iframe and bootstrapping from scratch. Driven by the Retry affordance
+	 * the status overlay shows for {@link onRowsFailed}.
+	 */
+	retryRows(): Promise<void>;
+	/**
+	 * The rows walk failed before shipping anything (`error: true`), or a fresh load started and the
+	 * failure no longer stands (`error: false`). `save-last`: the flag is a complete statement of
+	 * whether the graph is currently wedged, so a hidden webview only ever needs the newest one.
+	 */
+	readonly onRowsFailed: RpcEventSubscription<{ error: boolean }>;
+}
+
+/**
+ * Row hover markdown for the graph's tooltip/peek card. Single-flight on the host — a newer call
+ * (or `signal` aborting) always supersedes an outstanding one; two overlapping calls collapse to the
+ * newer one's result. Never rejects: a rejected RPC promise would leave the hover card waiting
+ * instead of falling back — see the host implementation's outer catch.
+ */
+export interface GraphHoverService {
+	getRowHover(type: GitGraphRowKind, id: string, signal?: AbortSignal): Promise<DidGetRowHoverParams>;
+}
+
+/**
+ * Native quick-pick pickers for the search box's `author:`/`ref:`/`compare:`/`file:`/`folder:`
+ * operators. No `signal` — VS Code's quick-pick APIs don't take a cancellation token, and a picker
+ * is closed by the user, not superseded by another call.
+ */
+export interface GraphPickersService {
+	chooseRef(
+		title: string,
+		placeholder: string,
+		options?: {
+			allowedAdditionalInput?: ReferencesQuickPickOptions2['allowedAdditionalInput'];
+			include?: ReferencesQuickPickOptions2['include'];
+			picked?: string;
+		},
+	): Promise<DidChooseRefParams>;
+	chooseComparison(title: string): Promise<DidChooseComparisonParams>;
+	chooseAuthor(title: string, placeholder: string, picked?: string[]): Promise<DidChooseAuthorParams>;
+	chooseFile(
+		title: string,
+		type: 'file' | 'folder',
+		options?: { openLabel?: string; picked?: string[] },
+	): Promise<DidChooseFileParams>;
+	/** Shows the repository picker and switches the graph to the chosen repo (a no-op if the user
+	 *  cancels). Used by the header's repo selector and the gate's "switch repos" affordance. */
+	chooseRepository(): Promise<void>;
+	/** Runs the `gitlens.gk.switchOrganization` command sourced from the graph. Used by the gate's
+	 *  "switch orgs" affordance. */
+	chooseAccountOrg(): Promise<void>;
+}
+
+export interface GraphPullRequestService {
+	/** `number` is the user-facing PR number (not a provider-internal id). `confirmed` skips the
+	 *  host's own merge-blast-radius quickpick — set when the caller already confirmed in place. */
+	merge(
+		number: string,
+		options?: { confirmed?: boolean; mergeMethod?: 'merge' | 'squash' | 'rebase' },
+	): Promise<MergePullRequestResult>;
+}
+
+/** Row-level graph actions: the row-button menu (open changes, push-to-commit, stash, undo-commit),
+ *  ref pill double-click, and the visualizations treemap's file double-click. */
+export interface GraphRowActionsService {
+	executeRowAction(params: RowActionParams): Promise<void>;
+	handleRefDoubleClick(ref: GraphRef, metadata?: GraphRefMetadataItem): Promise<void>;
+	openTreemapFile(action: 'open' | 'history', repoPath: string, path: string): Promise<void>;
+	/** Tasks started from a worktree's Run Task button that are still running, keyed by worktree path. */
+	getRunningWorktreeTasks(): Promise<Record<string, RunningWorktreeTask>>;
+	onRunningWorktreeTasksChanged: RpcEventSubscription<Record<string, RunningWorktreeTask>>;
 }
 
 /**
@@ -764,20 +1357,167 @@ export interface GraphHealthService {
 	runMaintenance(repoPath: string, signal?: AbortSignal): Promise<{ task: GitMaintenanceTask; ran: boolean }[]>;
 	/** Enables or disables GitLens's automatic commit-graph maintenance for this repo. User-clicked, so failures propagate. */
 	setCommitGraphEnabled(repoPath: string, enabled: boolean, signal?: AbortSignal): Promise<void>;
+	/** Evidence-gated banner state for the graph's Git Health strip and the Visualizations toggle's evidence dot. */
+	getBannerState(repoPath: string, signal?: AbortSignal): Promise<GitHealthBannerState | undefined>;
+	/** Dismisses the Git Health banner strip for a repo. */
+	dismissBanner(repoPath: string): Promise<void>;
+	/** Records a Repository Health view visit for a repo, suppressing the banner and its indicator. */
+	markHealthViewVisited(repoPath: string): Promise<void>;
 
 	/** Fires with the repo path after any probe, apply, revert, or maintenance pass changes that repo's report. */
 	readonly onHealthChanged: RpcEventSubscription<{ repoPath: string }>;
 }
 
+/**
+ * Host→app navigation plane: the WARM pushes that steer an already-open graph — enter a mode, focus a
+ * branch, open compare/timeline, switch visualization or sidebar panel.
+ *
+ * Every event is `save-last`: each carries a complete, self-contained request, so a hidden webview only
+ * ever needs the newest one per event and replaying it on show is exactly right. The five are keyed
+ * SEPARATELY on purpose — two different requests (say an action and a compare) issued while hidden are
+ * unrelated instructions, and one shared slot would silently drop whichever landed first.
+ *
+ * The COLD paths do not live here: a request arriving before the app is ready (or one that switches
+ * repositories) rides the state bootstrap instead — `State.pendingAction`, `State.pendingCompare`,
+ * `State.displayMode`/`visualizationMode`, `State.sidebar.activePanel` — so it lands together with the
+ * repo's state rather than racing it.
+ */
+export interface GraphNavigationService {
+	/** Enter a mode / reveal a row / focus a branch on the open graph. */
+	readonly onRequestAction: RpcEventSubscription<DidRequestGraphActionParams>;
+	readonly onRequestOpenCompareMode: RpcEventSubscription<DidRequestOpenCompareModeParams>;
+	/** Switch the graph into its embedded Visual History mode, scoped to a file/folder. No cold
+	 *  counterpart — the only callers are graph-details items, reachable solely from a visible graph. */
+	readonly onRequestOpenTimelineScope: RpcEventSubscription<DidRequestOpenTimelineScopeParams>;
+	readonly onRequestVisualization: RpcEventSubscription<DidRequestVisualizationParams>;
+	readonly onRequestActiveSidebarPanel: RpcEventSubscription<DidRequestActiveSidebarPanelParams>;
+}
+
+/**
+ * The selection plane, and the only bidirectional one: the app reports what the user selected, the
+ * host reports the reveals it initiates.
+ *
+ * {@link updateSelection} is fire-and-forget and DEBOUNCED on the app side (~50ms trailing, 250ms
+ * max) — a click or arrow-key scrub must never block on an ack, and only the final row of a scrub
+ * matters here. The host keeps the report as a paging hint plus the command-target fallback for
+ * palette invocations; the app owns selection truth, so an empty report is ignored rather than
+ * treated as a clear.
+ *
+ * {@link onSelectionChanged} carries HOST-initiated reveals only (deep links, "Open in Commit Graph",
+ * terminal-link jumps) — a user's own click is never echoed back. `save-last`: the payload is the
+ * complete selection map, so a hidden webview only ever needs the newest one, and `State.selectedRows`
+ * re-seeds it on the next bootstrap regardless.
+ */
+export interface GraphSelectionService {
+	updateSelection(selection: GraphSelection[]): Promise<void>;
+	readonly onSelectionChanged: RpcEventSubscription<GraphSelectedRows>;
+	/** Fires when a host-initiated reveal gave up before ever pushing a selection. `save-last`. */
+	readonly onRevealFailed: RpcEventSubscription<DidFailRevealParams>;
+}
+
+/**
+ * Avatar resolution, request/response only. The host's graph session doubles as the avatar cache, so a
+ * repeat ask for a known email costs nothing; the app merges each response into its own `avatars` map.
+ * Nothing is ever pushed — a scroll that reveals new authors asks, and the answer comes straight back.
+ */
+export interface GraphAvatarsService {
+	/** Resolves avatar URIs for the asked `email → ref` pairs. The response carries ONLY the asked
+	 *  emails that resolved; anything else the app holds is untouched. */
+	getMissingAvatars(emails: GraphAvatars): Promise<Record<string, string>>;
+	/** Re-fetches avatars the webview itself couldn't load (CSP/CORS) as data URIs. Returns only the
+	 *  entries that actually proxied — a permanent failure is remembered host-side and never retried. */
+	proxyAvatars(avatars: Record<string, string>): Promise<Record<string, string>>;
+}
+
+/**
+ * Ref-metadata (upstream ahead/behind, pull requests, issues) enrichment.
+ *
+ * {@link getMissingRefsMetadata} is the ONLY path incremental enrichment takes: the component asks for
+ * the types it's missing on visible rows and the response carries exactly those refs' resolved entries,
+ * which the app spread-merges. An id the host couldn't resolve is OMITTED, which is what re-arms the
+ * component to ask again. A request that arrives mid-rebuild is buffered host-side and its promise
+ * settles LATE (on the next graph), never dropped — a dropped one left the id stuck in the component's
+ * per-id dedup and the pill's counts never returned.
+ *
+ * {@link onRefsMetadataChanged} is RESET-CLASS ONLY — a repo swap, a feature toggle, an integration
+ * connect/disconnect, an issue-cache clear. Its payload is always a COMPLETE snapshot (`null` = feature
+ * off, so the component stops asking at all), which is what makes `save-last` safe: a hidden webview
+ * replays only the newest one and holds exactly what the host holds.
+ */
+export interface GraphRefsMetadataService {
+	getMissingRefsMetadata(metadata: GraphMissingRefsMetadata, signal?: AbortSignal): Promise<GraphRefsMetadata>;
+	readonly onRefsMetadataChanged: RpcEventSubscription<{ metadata: GraphRefsMetadata | null; reset: true }>;
+}
+
+/** The full-state push plane: the host's complete `State` rebuild after graph reloads, repo swaps,
+ *  and config-driven changes. Rows-plane fields travel on the `graph:rows` channel and arrive
+ *  absent here; `save-last` is correct because each push is a complete snapshot. */
+export interface GraphStateService {
+	readonly onStateChanged: RpcEventSubscription<DidChangeParams>;
+}
+
+/** What the Send Feedback dialog submits. `type` mirrors Kepler's feedback categories so both products'
+ *  feedback lands in the same warehouse series. */
+export type GraphFeedbackType = 'general' | 'feature_request' | 'bug_report';
+
+export interface GraphFeedbackInput {
+	type: GraphFeedbackType;
+	message: string;
+}
+
+export interface GraphFeedbackResult {
+	/** Whether the feedback record reached the GitKraken events intake. */
+	sent: boolean;
+	/** Whether a prefilled GitHub issue was opened (bug reports only — opened even when `sent` is false). */
+	issueOpened: boolean;
+}
+
+/** Which entry point asked for the dialog — the header account popover opens it directly, so only the
+ *  VS Code title toolbar rides this event. */
+export interface DidRequestShowFeedbackParams {
+	source: 'toolbar';
+}
+
+/**
+ * The Send Feedback plane. {@link GraphFeedbackService.send} is awaited end-to-end so the dialog can
+ * show a real failure state; {@link GraphFeedbackService.onRequestShow} is the host's "open the
+ * dialog" push for the title-toolbar command. `signal`: the toolbar is only reachable from a visible
+ * graph, so there is no cold/hidden path to buffer for.
+ */
+export interface GraphFeedbackService {
+	send(input: GraphFeedbackInput): Promise<GraphFeedbackResult>;
+	readonly onRequestShow: RpcEventSubscription<DidRequestShowFeedbackParams>;
+}
+
 export interface GraphServices extends SharedWebviewServices {
+	readonly access: GraphAccessService;
+	readonly avatars: GraphAvatarsService;
+	readonly refsMetadata: GraphRefsMetadataService;
+	readonly columns: GraphColumnsService;
+	readonly configuration: GraphConfigurationService;
+	readonly filters: GraphFiltersService;
 	readonly graphInspect: GraphInspectService;
 	readonly graphHealth: GraphHealthService;
+	readonly feedback: GraphFeedbackService;
 	readonly launchpad: GraphLaunchpadService;
+	readonly navigation: GraphNavigationService;
 	readonly walkthrough: GraphWalkthroughService;
 	readonly sidebar: GraphSidebarService;
+	readonly search: GraphSearchService;
+	readonly selection: GraphSelectionService;
 	readonly welcome: GraphWelcomeService;
 	readonly graphTimeline: GraphTimelineService;
 	readonly graphTreemap: GraphTreemapService;
+	readonly repoStatus: GraphRepoStatusService;
+	readonly state: GraphStateService;
+	readonly rows: GraphRowsService;
+	readonly scope: GraphScopeService;
+	readonly overview: GraphOverviewService;
+	readonly wip: GraphWipService;
+	readonly hover: GraphHoverService;
+	readonly pickers: GraphPickersService;
+	readonly pullRequest: GraphPullRequestService;
+	readonly rowActions: GraphRowActionsService;
 }
 
 export interface GraphLaunchpadService {

@@ -1,5 +1,5 @@
 import type { TextDocumentShowOptions } from 'vscode';
-import { Disposable, env, ProgressLocation, Uri, window, workspace } from 'vscode';
+import { Disposable, env, l10n, ProgressLocation, Uri, window, workspace } from 'vscode';
 import { getTempFile } from '@env/platform.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import { GitCommit } from '@gitlens/git/models/commit.js';
@@ -30,6 +30,8 @@ import { generateChangelogAndOpenMarkdownDocument } from '../commands/generateCh
 import type { OpenFileAtRevisionCommandArgs } from '../commands/openFileAtRevision.js';
 import type { OpenOnRemoteCommandArgs } from '../commands/openOnRemote.js';
 import type { RecomposeFromCommitCommandArgs } from '../commands/recomposeFromCommit.js';
+import type { RunTaskOnWorktreeCommandArgs } from '../commands/runTaskOnWorktree.js';
+import type { StartAgentSessionCommandArgs } from '../commands/startAgentSession.js';
 import type { ViewShowBranchComparison } from '../config.js';
 import type { GlCommands } from '../constants.commands.js';
 import { GlyphChars } from '../constants.js';
@@ -67,6 +69,7 @@ import {
 } from '../system/-webview/command.js';
 import { configuration } from '../system/-webview/configuration.js';
 import { getContext, setContext } from '../system/-webview/context.js';
+import { openTerminal } from '../system/-webview/terminal.js';
 import { revealInFileExplorer } from '../system/-webview/vscode.js';
 import type { MergeEditorInputs } from '../system/-webview/vscode/editors.js';
 import { openMergeEditor } from '../system/-webview/vscode/editors.js';
@@ -192,10 +195,10 @@ export class ViewCommands implements Disposable {
 		}
 
 		if (urls.length > 10) {
-			const confirm = { title: 'Open' };
-			const cancel = { title: 'Cancel', isCloseAffordance: true };
+			const confirm = { title: l10n.t('Open') };
+			const cancel = { title: l10n.t('Cancel'), isCloseAffordance: true };
 			const result = await window.showWarningMessage(
-				`Are you sure you want to open ${urls.length} URLs?`,
+				l10n.t('Are you sure you want to open {0} URLs?', String(urls.length)),
 				{ modal: true },
 				confirm,
 				cancel,
@@ -624,22 +627,64 @@ export class ViewCommands implements Disposable {
 
 	@command('gitlens.views.openInTerminal')
 	@debug()
-	private openInTerminal(node: BranchTrackingStatusNode | RepositoryNode | RepositoryFolderNode) {
-		if (!node.isAny('tracking-status', 'repository', 'repo-folder')) return Promise.resolve();
+	private async openInTerminal(
+		node: BranchTrackingStatusNode | RepositoryNode | RepositoryFolderNode,
+	): Promise<void> {
+		if (!node.isAny('tracking-status', 'repository', 'repo-folder')) return;
 
-		return executeCoreCommand('openInTerminal', Uri.file(node.repoPath));
+		await executeCoreCommand('openInTerminal', Uri.file(node.repoPath));
 	}
 
 	@command('gitlens.openInIntegratedTerminal:views')
 	@debug()
 	private openInIntegratedTerminal(
 		node: BranchTrackingStatusNode | RepositoryNode | RepositoryFolderNode | WorktreeNode,
-	) {
+	): Promise<void> {
 		if (!node.isAny('tracking-status', 'repository', 'repo-folder', 'worktree')) return Promise.resolve();
-		// worktree.uri preserves remote-dev schemes, unlike Uri.file(node.repoPath).
-		if (node.is('worktree')) return executeCoreCommand('openInIntegratedTerminal', node.worktree.uri);
 
-		return executeCoreCommand('openInIntegratedTerminal', Uri.file(node.repoPath));
+		// worktree.uri preserves remote-dev schemes, unlike Uri.file(node.repoPath).
+		const uri = node.is('worktree') ? node.worktree.uri : Uri.file(node.repoPath);
+		openTerminal({ cwd: uri }).show();
+		return Promise.resolve();
+	}
+
+	@command('gitlens.views.startAgentSession')
+	@debug()
+	private startAgentSession(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand<StartAgentSessionCommandArgs>('gitlens.startAgentSession', {
+			cwd: node.worktree.uri.fsPath,
+		});
+	}
+
+	@command('gitlens.views.startAgentSessionWith')
+	@debug()
+	private startAgentSessionWith(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand<StartAgentSessionCommandArgs>('gitlens.startAgentSession', {
+			cwd: node.worktree.uri.fsPath,
+			pick: true,
+		});
+	}
+
+	@command('gitlens.runTaskOnWorktree:views')
+	@debug()
+	private runTaskOnWorktree(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand<RunTaskOnWorktreeCommandArgs>('gitlens.runTaskOnWorktree', {
+			worktreePath: node.worktree.uri.fsPath,
+		});
+	}
+
+	@command('gitlens.views.resumeAgentSession')
+	@debug()
+	private resumeAgentSession(node: WorktreeNode) {
+		if (!node.is('worktree')) return Promise.resolve();
+
+		return executeCommand('gitlens.agents.showResumeSessionPicker', { worktreePath: node.worktree.uri.fsPath });
 	}
 
 	@command('gitlens.views.pausedOperation.abort')
@@ -716,7 +761,7 @@ export class ViewCommands implements Disposable {
 		const counts = await ensurePullRequestRefs(
 			pr,
 			repo,
-			{ promptMessage: `Unable to open changes for PR #${pr.id} because of a missing remote.` },
+			{ promptMessage: l10n.t('Unable to open changes for PR #{0} because of a missing remote.', pr.id) },
 			refs,
 		);
 		if (counts == null) return Promise.resolve();
@@ -729,7 +774,7 @@ export class ViewCommands implements Disposable {
 				rhs: refs.head.ref,
 			},
 			{
-				title: `Changes in Pull Request #${pr.id}`,
+				title: l10n.t('Changes in Pull Request #{0}', pr.id),
 			},
 		);
 	}
@@ -749,7 +794,7 @@ export class ViewCommands implements Disposable {
 		const counts = await ensurePullRequestRefs(
 			pr,
 			repo,
-			{ promptMessage: `Unable to open comparison for PR #${pr.id} because of a missing remote.` },
+			{ promptMessage: l10n.t('Unable to open comparison for PR #{0} because of a missing remote.', pr.id) },
 			refs,
 		);
 		if (counts == null) return Promise.resolve();
@@ -1215,7 +1260,7 @@ export class ViewCommands implements Disposable {
 		}
 
 		if (branch == null) {
-			void window.showErrorMessage('Unable to determine branch for commit');
+			void window.showErrorMessage(l10n.t('Unable to determine branch for commit'));
 			return;
 		}
 
@@ -1328,9 +1373,13 @@ export class ViewCommands implements Disposable {
 			this.container,
 			{ repoPath: node.repoPath, lhs: commonAncestor, rhs: node.ref.ref },
 			{
-				title: `Changes between ${branch.ref} (${shortenRevision(commonAncestor)}) ${
-					GlyphChars.ArrowLeftRightLong
-				} ${shortenRevision(node.ref.ref, { strings: { working: 'Working Tree' } })}`,
+				title: l10n.t(
+					'Changes between {0} ({1}) {2} {3}',
+					branch.ref,
+					shortenRevision(commonAncestor),
+					GlyphChars.ArrowLeftRightLong,
+					shortenRevision(node.ref.ref, { strings: { working: l10n.t('Working Tree') } }),
+				),
 			},
 		);
 	}
@@ -1592,7 +1641,11 @@ export class ViewCommands implements Disposable {
 		const nodeUri = await repo.git.getBestRevisionUri(node.file.path, node.ref.ref);
 		if (nodeUri == null) return Promise.resolve();
 
-		const input1: MergeEditorInputs['input1'] = { uri: nodeUri, title: `Incoming`, detail: ` ${node.ref.name}` };
+		const input1: MergeEditorInputs['input1'] = {
+			uri: nodeUri,
+			title: l10n.t('Incoming'),
+			detail: ` ${node.ref.name}`,
+		};
 
 		const [mergeBaseResult, workingUriResult] = await Promise.allSettled([
 			repo.git.refs.getMergeBase(node.ref.ref, 'HEAD'),
@@ -1601,11 +1654,15 @@ export class ViewCommands implements Disposable {
 
 		const workingUri = getSettledValue(workingUriResult);
 		if (workingUri == null) {
-			void window.showWarningMessage('Unable to open the merge editor, no working file found');
+			void window.showWarningMessage(l10n.t('Unable to open the merge editor, no working file found'));
 			return Promise.resolve();
 		}
 
-		const input2: MergeEditorInputs['input2'] = { uri: workingUri, title: 'Current', detail: ' Working Tree' };
+		const input2: MergeEditorInputs['input2'] = {
+			uri: workingUri,
+			title: l10n.t('Current'),
+			detail: ` ${l10n.t('Working Tree')}`,
+		};
 
 		const headUri = await repo.git.getBestRevisionUri(node.file.path, 'HEAD');
 		if (headUri != null) {
@@ -1641,7 +1698,7 @@ export class ViewCommands implements Disposable {
 		return CommitActions.openChanges(
 			node.file,
 			{ repoPath: node.repoPath, lhs: mergeBase, rhs: node.ref1 },
-			{ preserveFocus: true, preview: true, lhsTitle: `${basename(node.uri.fsPath)} (Base)` },
+			{ preserveFocus: true, preview: true, lhsTitle: l10n.t('{0} (Base)', basename(node.uri.fsPath)) },
 		);
 	}
 
@@ -1904,8 +1961,10 @@ export class ViewCommands implements Disposable {
 			const result = await showContributorsPicker(
 				this.container,
 				repo,
-				'Filter Commits',
-				repo.virtual ? 'Choose a contributor to show commits from' : 'Choose contributors to show commits from',
+				l10n.t('Filter Commits'),
+				repo.virtual
+					? l10n.t('Choose a contributor to show commits from')
+					: l10n.t('Choose contributors to show commits from'),
 				{
 					appendReposToTitle: true,
 					clearButton: true,

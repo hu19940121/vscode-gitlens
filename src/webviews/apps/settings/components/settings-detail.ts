@@ -1,11 +1,15 @@
 import { SignalWatcher } from '@lit-labs/signals';
 import { consume } from '@lit/context';
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
+import { boxSizingBase, linkBase, scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import { localizedContent } from '@gitlens/components/localizedContent.js';
 import { createCommandLink } from '../../../../system/commands.js';
 import { linkify } from '../../shared/components/linkify.js';
-import { boxSizingBase, linkBase, scrollableBase } from '../../shared/components/styles/lit/base.css.js';
+import type { SubscriptionContextState } from '../../shared/contexts/subscription.js';
+import { subscriptionContext } from '../../shared/contexts/subscription.js';
 import type { SettingsActions } from '../actions.js';
 import type { SettingDescriptor, SettingsCategory } from '../model.js';
 import { evaluateStateExpression } from '../model.js';
@@ -14,8 +18,7 @@ import { settingsStateContext } from '../state.js';
 import './setting-control.js';
 import './settings-preview.js';
 import './settings-setup.js';
-import '../../plus/shared/components/account-chip.js';
-import '../../shared/components/code-icon.js';
+import '@gitlens/components/components/codeIcon.js';
 import '../../shared/components/feature-badge.js';
 import '../../shared/components/icons/icon-cube.js';
 import '../../shared/components/switch/switch.js';
@@ -38,6 +41,7 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 		scrollableBase,
 		css`
 			:host {
+				position: relative;
 				display: block;
 				overflow-y: auto;
 			}
@@ -93,9 +97,16 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 				color: var(--gl-chip-scoped-color, var(--vscode-charts-yellow));
 			}
 
+			/* Pinned to the top of the detail scroller so the preview stays visible while
+  scrolling a long category. The background mixes against --color-background
+  (the pane's actual backdrop) rather than transparent — visually identical,
+  but opaque so scrolled content can't show through. */
 			.preview {
+				position: sticky;
+				inset-block-start: 0;
+				z-index: 1;
 				padding: 1.6rem 2.6rem;
-				background-color: color-mix(in srgb, var(--vscode-sideBar-background) 60%, transparent);
+				background-color: color-mix(in srgb, var(--vscode-sideBar-background) 60%, var(--color-background));
 				border-bottom: var(--gl-border-width) solid var(--vscode-widget-border, var(--color-foreground--25));
 			}
 
@@ -112,13 +123,6 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 				display: flex;
 				flex-direction: column;
 				gap: 1.8rem;
-				max-width: 64rem;
-				padding: 2rem 2.6rem 2.4rem;
-			}
-
-			/* The account chip carries its own header/CTAs; give it the standard pane
-			   inset and cap its width so the panel matches the other sections. */
-			.account {
 				max-width: 64rem;
 				padding: 2rem 2.6rem 2.4rem;
 			}
@@ -169,6 +173,9 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 
 	@consume({ context: settingsStateContext })
 	private _state!: SettingsState;
+
+	@consume({ context: subscriptionContext, subscribe: true })
+	private _subscription!: SubscriptionContextState;
 
 	@property({ attribute: false })
 	actions?: SettingsActions;
@@ -275,15 +282,20 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 			return html`<section class="no-results" aria-labelledby="no-results-title">
 				<h2 class="no-results__title" id="no-results-title">
 					<code-icon icon="search" aria-hidden="true"></code-icon>
-					No settings match “${query}”
+					${l10n.t('No settings match “{query}”', { query: query })}
 				</h2>
-				<p>Check your spelling, or try a setting name like <code>gitlens.currentLine.format</code>.</p>
 				<p>
-					You can also
-					<a href="command:workbench.action.openSettings?${encodeURIComponent(JSON.stringify(target))}"
-						>open the Settings UI</a
-					>
-					to search every GitLens setting.
+					${localizedContent(l10n.t('Check your spelling, or try a setting name like {setting}.'), {
+						setting: html`<code>gitlens.currentLine.format</code>`,
+					})}
+				</p>
+				<p>
+					${localizedContent(l10n.t('You can also {link} to search every GitLens setting.'), {
+						link: html`<a
+							href="command:workbench.action.openSettings?${encodeURIComponent(JSON.stringify(target))}"
+							>${l10n.t('open the Settings UI')}</a
+						>`,
+					})}
 				</p>
 			</section>`;
 		}
@@ -296,20 +308,6 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 			return html`
 				<section aria-label=${category.name}>
 					<gl-settings-setup .actions=${this.actions}></gl-settings-setup>
-					${category.learnMoreUrl != null ? html`<p class="footer">${this.renderLearnMore(category)}</p>` : nothing}
-				</section>
-			`;
-		}
-
-		// The account section renders the shared account chip inline: it carries its own header
-		// (plan title + actions) and swaps to a sign-in / create-account screen when signed out,
-		// so it replaces the standard category header the same way the launchpad does.
-		if (category.controls.length === 1 && category.controls[0].kind === 'account') {
-			return html`
-				<section aria-label=${category.name}>
-					<div class="account">
-						<gl-account-chip display="panel"></gl-account-chip>
-					</div>
 					${category.learnMoreUrl != null ? html`<p class="footer">${this.renderLearnMore(category)}</p>` : nothing}
 				</section>
 			`;
@@ -331,7 +329,7 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 									category.pro
 										? html`<gl-feature-badge
 												.source=${{ source: 'settings', detail: 'header' } as const}
-												.subscription=${this._state.subscription.get()}
+												.subscription=${this._subscription.subscription.get()}
 											></gl-feature-badge>`
 										: nothing
 								}
@@ -344,10 +342,10 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 										size="large"
 										.checked=${masterOn && !masterDisabledByOrg}
 										?disabled=${masterDisabledByOrg}
-										label="Enable ${category.name}"
+										label=${l10n.t('Enable {category}', { category: category.name })}
 										hint=${ifDefined(
 											masterDisabledByOrg
-												? 'AI features have been disabled by your GitKraken admin.'
+												? l10n.t('AI features have been disabled by your GitKraken admin.')
 												: undefined,
 										)}
 										@gl-change-value=${(e: Event) => {
@@ -364,13 +362,16 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 						category.command != null
 							? html`<p class="header__tip">
 									<code-icon icon="bell" aria-hidden="true"></code-icon>
-									<span
-										>Tip — run
-										<a href=${createCommandLink(category.command.command)}
-											>${category.command.label}</a
-										>
-										to override this for the current window.</span
-									>
+									<span>
+										${localizedContent(
+											l10n.t('Tip — run {command} to override this for the current window.'),
+											{
+												command: html`<a href=${createCommandLink(category.command.command)}
+													>${category.command.label}</a
+												>`,
+											},
+										)}
+									</span>
 								</p>`
 							: nothing
 					}
@@ -378,8 +379,8 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 
 				${
 					category.preview != null
-						? html`<div class="preview" role="region" aria-label="Live preview">
-								<h3 class="preview__label">Live preview</h3>
+						? html`<div class="preview" role="region" aria-label=${l10n.t('Live preview')}>
+								<h3 class="preview__label">${l10n.t('Live preview')}</h3>
 								<gl-settings-preview
 									kind=${category.preview}
 									.actions=${this.actions}
@@ -403,16 +404,20 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 					this.hasSettingsSearch
 						? html`<p class="footer">
 								<code-icon icon="gear" aria-hidden="true"></code-icon>
-								<span
-									>For more options, open the
-									<a
-										href="command:workbench.action.openSettings?${encodeURIComponent(
-											JSON.stringify(this.settingsSearch.split(' or ')[0]),
-										)}"
-										>Settings UI</a
-									>
-									and search for <code>${this.settingsSearch}</code></span
-								>
+								<span>
+									${localizedContent(
+										l10n.t('For more options, open the {settings} and search for {query}'),
+										{
+											settings: html`<a
+												href="command:workbench.action.openSettings?${encodeURIComponent(
+													JSON.stringify(this.settingsSearch.split(' or ')[0]),
+												)}"
+												>${l10n.t('Settings UI')}</a
+											>`,
+											query: html`<code>${this.settingsSearch}</code>`,
+										},
+									)}
+								</span>
 								${this.renderLearnMore(category)}
 							</p>`
 						: category.learnMoreUrl != null
@@ -425,7 +430,11 @@ export class GlSettingsDetail extends SignalWatcher(LitElement) {
 
 	private renderLearnMore(category: SettingsCategory) {
 		if (category.learnMoreUrl == null) return nothing;
-		return html`<a href=${category.learnMoreUrl} aria-label="Learn more about ${category.name}">Learn more</a>`;
+		return html`<a
+			href=${category.learnMoreUrl}
+			aria-label=${l10n.t('Learn more about {category}', { category: category.name })}
+			>${l10n.t('Learn more')}</a
+		>`;
 	}
 
 	/**

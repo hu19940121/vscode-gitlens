@@ -41,16 +41,20 @@ function makeConfigJson(flags: Record<string, Record<string, unknown>>): string 
 }
 
 function createMockContainer(flags?: FeatureFlagMap, onStore?: () => void): any {
-	let f = flags;
+	const stored = new Map<string, unknown>();
+	if (flags != null) {
+		stored.set('featureFlags:flags', flags);
+	}
+
 	return {
 		urls: { getGkApiUrl: (...segments: string[]) => `https://api.test.com/${segments.join('/')}` },
 		env: 'production',
 		debugging: false,
 		prereleaseOrDebugging: false,
 		storage: {
-			get: sinon.stub().callsFake(() => f),
-			store: sinon.stub().callsFake((_key: string, v: FeatureFlagMap) => {
-				f = v;
+			get: sinon.stub().callsFake((key: string) => stored.get(key)),
+			store: sinon.stub().callsFake((key: string, v: unknown) => {
+				stored.set(key, v);
 				onStore?.();
 			}),
 		},
@@ -75,18 +79,18 @@ suite('FeatureFlagService Test Suite', () => {
 	suite('getFlag', () => {
 		test('returns default values when no flags are cached', () => {
 			const s = new ConfigCatFeatureFlagService(createMockContainer());
-			assert.strictEqual(s.getFlag(FeatureFlagKey.WelcomeTitleVariant, true), true);
-			assert.strictEqual(s.getFlag(FeatureFlagKey.WelcomeTitleVariant, false), false);
-			assert.strictEqual(s.getFlag(FeatureFlagKey.WelcomeTitleVariant, 'fallback'), 'fallback');
-			assert.strictEqual(s.getFlag(FeatureFlagKey.WelcomeTitleVariant, 99), 99);
+			assert.strictEqual(s.getFlag(FeatureFlagKey.GraphGateIntroVideo, true), true);
+			assert.strictEqual(s.getFlag(FeatureFlagKey.GraphGateIntroVideo, false), false);
+			assert.strictEqual(s.getFlag(FeatureFlagKey.GraphGateIntroVideo, 'fallback'), 'fallback');
+			assert.strictEqual(s.getFlag(FeatureFlagKey.GraphGateIntroVideo, 99), 99);
 			s.dispose();
 		});
 
 		test('returns cached value over default', () => {
 			const s = new ConfigCatFeatureFlagService(
-				createMockContainer({ [FeatureFlagKey.WelcomeTitleVariant]: 'variant-a' }),
+				createMockContainer({ [FeatureFlagKey.GraphGateIntroVideo]: 'variant-a' }),
 			);
-			assert.strictEqual(s.getFlag(FeatureFlagKey.WelcomeTitleVariant, 'control'), 'variant-a');
+			assert.strictEqual(s.getFlag(FeatureFlagKey.GraphGateIntroVideo, 'control'), 'variant-a');
 			s.dispose();
 		});
 	});
@@ -99,7 +103,7 @@ suite('FeatureFlagService Test Suite', () => {
 		});
 
 		test('returns cached flag map', () => {
-			const flags: FeatureFlagMap = { [FeatureFlagKey.WelcomeTitleVariant]: true };
+			const flags: FeatureFlagMap = { [FeatureFlagKey.GraphGateIntroVideo]: true };
 			const s = new ConfigCatFeatureFlagService(createMockContainer(flags));
 			assert.deepStrictEqual(s.getAllFlags(), flags);
 			s.dispose();
@@ -118,12 +122,12 @@ suite('FeatureFlagService Test Suite', () => {
 
 			for (const { type, value, expected } of cases) {
 				const configJson = makeConfigJson({
-					[FeatureFlagKey.WelcomeTitleVariant]: { t: type, v: value, i: 'var-1' },
+					[FeatureFlagKey.GraphGateIntroVideo]: { t: type, v: value, i: 'var-1' },
 				});
 				const result: FeatureFlagMap | undefined = await (s as any).evaluateFlags(configJson);
 
 				assert.ok(result != null, `evaluateFlags should return a flag map for type ${type}`);
-				assert.strictEqual(result[FeatureFlagKey.WelcomeTitleVariant], expected);
+				assert.strictEqual(result[FeatureFlagKey.GraphGateIntroVideo], expected);
 			}
 
 			s.dispose();
@@ -131,7 +135,7 @@ suite('FeatureFlagService Test Suite', () => {
 
 		test('ignores flags with keys not in FeatureFlagKey', async () => {
 			const configJson = makeConfigJson({
-				[FeatureFlagKey.WelcomeTitleVariant]: { t: 0, v: { b: true }, i: 'var-1' },
+				[FeatureFlagKey.GraphGateIntroVideo]: { t: 0, v: { b: true }, i: 'var-1' },
 				unknownFlag: { t: 1, v: { s: 'should-be-ignored' }, i: 'var-x' },
 			});
 
@@ -139,7 +143,7 @@ suite('FeatureFlagService Test Suite', () => {
 			const result: FeatureFlagMap | undefined = await (s as any).evaluateFlags(configJson);
 
 			assert.ok(result != null);
-			assert.strictEqual(result[FeatureFlagKey.WelcomeTitleVariant], true);
+			assert.strictEqual(result[FeatureFlagKey.GraphGateIntroVideo], true);
 			assert.strictEqual(Object.keys(result).length, 1, 'should only contain known flag keys');
 			s.dispose();
 		});
@@ -148,9 +152,9 @@ suite('FeatureFlagService Test Suite', () => {
 	suite('evaluateFlags — targeting rules with hashed comparisons', () => {
 		// Comparator 16: Identifier IS ONE OF (hashed)
 		test('identifier equals (hashed) — positive match', async () => {
-			const hash = configCatHash(testMachineId, FeatureFlagKey.WelcomeTitleVariant);
+			const hash = configCatHash(testMachineId, FeatureFlagKey.GraphGateIntroVideo);
 			const configJson = makeConfigJson({
-				[FeatureFlagKey.WelcomeTitleVariant]: {
+				[FeatureFlagKey.GraphGateIntroVideo]: {
 					t: 0,
 					r: [
 						{
@@ -167,14 +171,14 @@ suite('FeatureFlagService Test Suite', () => {
 			const result = await (s as any).evaluateFlags(configJson);
 
 			assert.ok(result != null);
-			assert.strictEqual(result[FeatureFlagKey.WelcomeTitleVariant], true, 'should match the targeting rule');
+			assert.strictEqual(result[FeatureFlagKey.GraphGateIntroVideo], true, 'should match the targeting rule');
 			s.dispose();
 		});
 
 		test('identifier equals (hashed) — negative, no match', async () => {
-			const wrongHash = configCatHash('some-other-machine-id', FeatureFlagKey.WelcomeTitleVariant);
+			const wrongHash = configCatHash('some-other-machine-id', FeatureFlagKey.GraphGateIntroVideo);
 			const configJson = makeConfigJson({
-				[FeatureFlagKey.WelcomeTitleVariant]: {
+				[FeatureFlagKey.GraphGateIntroVideo]: {
 					t: 0,
 					r: [
 						{
@@ -191,16 +195,16 @@ suite('FeatureFlagService Test Suite', () => {
 			const result = await (s as any).evaluateFlags(configJson);
 
 			assert.ok(result != null);
-			assert.strictEqual(result[FeatureFlagKey.WelcomeTitleVariant], false, 'should fall through to default');
+			assert.strictEqual(result[FeatureFlagKey.GraphGateIntroVideo], false, 'should fall through to default');
 			s.dispose();
 		});
 
 		// Comparator 22: Identifier STARTS WITH ANY OF (hashed)
 		// testMachineId = 'test-machine-id', prefix 'test-' = 5 bytes
 		test('identifier starts with (hashed) — positive match', async () => {
-			const prefixHash = configCatHashPrefix(testMachineId, 5, FeatureFlagKey.WelcomeTitleVariant);
+			const prefixHash = configCatHashPrefix(testMachineId, 5, FeatureFlagKey.GraphGateIntroVideo);
 			const configJson = makeConfigJson({
-				[FeatureFlagKey.WelcomeTitleVariant]: {
+				[FeatureFlagKey.GraphGateIntroVideo]: {
 					t: 0,
 					r: [
 						{
@@ -217,14 +221,14 @@ suite('FeatureFlagService Test Suite', () => {
 			const result = await (s as any).evaluateFlags(configJson);
 
 			assert.ok(result != null);
-			assert.strictEqual(result[FeatureFlagKey.WelcomeTitleVariant], true, 'should match the starts-with rule');
+			assert.strictEqual(result[FeatureFlagKey.GraphGateIntroVideo], true, 'should match the starts-with rule');
 			s.dispose();
 		});
 
 		test('identifier starts with (hashed) — negative, no match', async () => {
-			const wrongPrefixHash = configCatHashPrefix('other-prefix-id', 6, FeatureFlagKey.WelcomeTitleVariant);
+			const wrongPrefixHash = configCatHashPrefix('other-prefix-id', 6, FeatureFlagKey.GraphGateIntroVideo);
 			const configJson = makeConfigJson({
-				[FeatureFlagKey.WelcomeTitleVariant]: {
+				[FeatureFlagKey.GraphGateIntroVideo]: {
 					t: 0,
 					r: [
 						{
@@ -241,25 +245,25 @@ suite('FeatureFlagService Test Suite', () => {
 			const result = await (s as any).evaluateFlags(configJson);
 
 			assert.ok(result != null);
-			assert.strictEqual(result[FeatureFlagKey.WelcomeTitleVariant], false, 'should fall through to default');
+			assert.strictEqual(result[FeatureFlagKey.GraphGateIntroVideo], false, 'should fall through to default');
 			s.dispose();
 		});
 	});
 
 	suite('flags lifecycle', () => {
 		test('serves flags from storage immediately, before fetch completes', () => {
-			const storedFlags: FeatureFlagMap = { [FeatureFlagKey.WelcomeTitleVariant]: 'cached-value' };
+			const storedFlags: FeatureFlagMap = { [FeatureFlagKey.GraphGateIntroVideo]: 'cached-value' };
 			const s = new ConfigCatFeatureFlagService(createMockContainer(storedFlags));
 
 			// These are available synchronously — no await needed
-			assert.strictEqual(s.getFlag(FeatureFlagKey.WelcomeTitleVariant, 'default'), 'cached-value');
+			assert.strictEqual(s.getFlag(FeatureFlagKey.GraphGateIntroVideo, 'default'), 'cached-value');
 			assert.deepStrictEqual(s.getAllFlags(), storedFlags);
 			s.dispose();
 		});
 
 		test('fetchAndCacheFlags stores evaluated flags to storage', async () => {
 			const configJson = makeConfigJson({
-				[FeatureFlagKey.WelcomeTitleVariant]: { t: 1, v: { s: 'new-value' }, i: 'var-1' },
+				[FeatureFlagKey.GraphGateIntroVideo]: { t: 1, v: { s: 'new-value' }, i: 'var-1' },
 			});
 
 			// Spin up a local HTTP server that serves the config JSON
@@ -275,7 +279,7 @@ suite('FeatureFlagService Test Suite', () => {
 				let onStored: () => void;
 				const stored = new Promise<void>(resolve => (onStored = resolve));
 
-				const container = createMockContainer({ [FeatureFlagKey.WelcomeTitleVariant]: 'old-value' }, () =>
+				const container = createMockContainer({ [FeatureFlagKey.GraphGateIntroVideo]: 'old-value' }, () =>
 					onStored(),
 				);
 				// Point the URL at our local server so the real fetch hits it
@@ -292,22 +296,26 @@ suite('FeatureFlagService Test Suite', () => {
 				);
 				await Promise.race([stored, timeout]);
 
-				// Verify storage received the evaluated flags
-				assert.ok(container.storage.store.calledOnce, 'storage.store should have been called');
-				const storedFlags = container.storage.store.firstCall.args[1] as FeatureFlagMap;
+				// Verify storage received the evaluated flags (the fetch also records its completion
+				// under `featureFlags:fetched`, so look up the flags call by key)
+				assert.ok(container.storage.store.calledWith('featureFlags:flags'), 'should have stored the flags');
+				const storedFlags = container.storage.store
+					.getCalls()
+					.find((c: sinon.SinonSpyCall) => c.args[0] === 'featureFlags:flags')!.args[1] as FeatureFlagMap;
 				assert.strictEqual(
-					storedFlags[FeatureFlagKey.WelcomeTitleVariant],
+					storedFlags[FeatureFlagKey.GraphGateIntroVideo],
 					'new-value',
 					'should store the evaluated flag value',
 				);
 
-				// s1 still serves the old flags — new ones are for the next activation
-				assert.strictEqual(s1.getFlag(FeatureFlagKey.WelcomeTitleVariant, 'default'), 'old-value');
+				// Once the fetch completes, s1 serves the freshly evaluated flags in this session
+				await s1.whenReady;
+				assert.strictEqual(s1.getFlag(FeatureFlagKey.GraphGateIntroVideo, 'default'), 'new-value');
 
 				// A new service instance reads the updated storage
 				sandbox.stub(ConfigCatFeatureFlagService.prototype as any, 'fetchAndCacheFlags').resolves();
 				const s2 = new ConfigCatFeatureFlagService(container);
-				assert.strictEqual(s2.getFlag(FeatureFlagKey.WelcomeTitleVariant, 'default'), 'new-value');
+				assert.strictEqual(s2.getFlag(FeatureFlagKey.GraphGateIntroVideo, 'default'), 'new-value');
 
 				s1.dispose();
 				s2.dispose();
@@ -316,22 +324,83 @@ suite('FeatureFlagService Test Suite', () => {
 			}
 		});
 
-		test('flags are frozen at construction and unaffected by later storage changes', () => {
-			const oldFlags: FeatureFlagMap = { [FeatureFlagKey.WelcomeTitleVariant]: 'old-value' };
+		test('flags are unaffected by direct storage changes (only fetchAndCacheFlags updates them)', () => {
+			const oldFlags: FeatureFlagMap = { [FeatureFlagKey.GraphGateIntroVideo]: 'old-value' };
 			const container = createMockContainer(oldFlags);
 			const s = new ConfigCatFeatureFlagService(container);
 
 			// Simulate storage being updated (as fetchAndCacheFlags would do)
-			container.storage.store('featureFlags:flags', { [FeatureFlagKey.WelcomeTitleVariant]: 'new-value' });
+			container.storage.store('featureFlags:flags', { [FeatureFlagKey.GraphGateIntroVideo]: 'new-value' });
 
 			// Service still returns the flags it read at construction
 			assert.strictEqual(
-				s.getFlag(FeatureFlagKey.WelcomeTitleVariant, 'default'),
+				s.getFlag(FeatureFlagKey.GraphGateIntroVideo, 'default'),
 				'old-value',
 				'should still serve flags from initial storage read',
 			);
 			assert.deepStrictEqual(s.getAllFlags(), oldFlags);
 			s.dispose();
+		});
+	});
+
+	suite('hasEverFetched', () => {
+		test('false on a genuine first run (nothing stored)', () => {
+			const s = new ConfigCatFeatureFlagService(createMockContainer());
+			assert.strictEqual(s.hasEverFetched, false);
+			s.dispose();
+		});
+
+		test('true when a previous fetch cached a flag map — even an empty one', () => {
+			const s = new ConfigCatFeatureFlagService(createMockContainer({}));
+			assert.strictEqual(s.hasEverFetched, true);
+			s.dispose();
+		});
+
+		test('true after a fetch completes without caching (failed response)', async () => {
+			// A local server answering 500 exercises the `!response.ok` early return — a completed
+			// fetch that caches nothing — deterministically (an unroutable address could hang instead)
+			const server = http.createServer((_req, res) => {
+				res.writeHead(500);
+				res.end();
+			});
+			await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+			const port = (server.address() as import('net').AddressInfo).port;
+
+			try {
+				const container = createMockContainer();
+				container.urls.getGkApiUrl = () => `http://127.0.0.1:${port}/feature-flags/config`;
+
+				// Let the real fetchAndCacheFlags run
+				(ConfigCatFeatureFlagService.prototype as any).fetchAndCacheFlags.restore();
+
+				const s1 = new ConfigCatFeatureFlagService(container);
+				assert.strictEqual(s1.hasEverFetched, false, 'first run should not be marked before the fetch');
+
+				// Bounded to avoid CI stalls
+				const timeout = new Promise<never>((_, reject) =>
+					setTimeout(() => reject(new Error('Timed out waiting for the fetch to complete')), 5000),
+				);
+				await Promise.race([s1.whenReady, timeout]);
+
+				assert.ok(
+					container.storage.store.calledWith('featureFlags:fetched', true),
+					'a completed (even failed) fetch should be recorded',
+				);
+				assert.ok(
+					!container.storage.store.calledWith('featureFlags:flags'),
+					'no flags should have been cached',
+				);
+
+				// The next "activation" sees the marker and skips the first-run wait
+				sandbox.stub(ConfigCatFeatureFlagService.prototype as any, 'fetchAndCacheFlags').resolves();
+				const s2 = new ConfigCatFeatureFlagService(container);
+				assert.strictEqual(s2.hasEverFetched, true);
+
+				s1.dispose();
+				s2.dispose();
+			} finally {
+				await new Promise<void>(resolve => server.close(() => resolve()));
+			}
 		});
 	});
 });

@@ -8,6 +8,8 @@ export type GitCoreConfigKeys =
 	| 'core.excludesFile'
 	| 'diff.guitool'
 	| 'diff.tool'
+	/** `fetch.prune` — whether `git fetch` removes remote-tracking branches that no longer exist on the remote */
+	| 'fetch.prune'
 	| 'gpg.format'
 	| 'gpg.program'
 	| 'gpg.ssh.program'
@@ -15,14 +17,20 @@ export type GitCoreConfigKeys =
 	| 'init.defaultBranch'
 	/** `merge.autoStash` — whether `git merge` (and so a merging `git pull`) stashes and reapplies uncommitted changes */
 	| 'merge.autoStash'
+	/** `merge.ff` — whether `git merge` fast-forwards when possible; also accepts `'only'` to require it */
+	| 'merge.ff'
 	/** `pull.autoStash` — overrides `merge.autoStash`/`rebase.autoStash` for `git pull`, in either mode */
 	| 'pull.autoStash'
 	/** `pull.rebase` — whether `git pull` rebases instead of merging; also accepts `merges`/`interactive` */
 	| 'pull.rebase'
 	/** `rebase.autoStash` — whether `git rebase` (and so a rebasing `git pull`) stashes and reapplies uncommitted changes */
 	| 'rebase.autoStash'
+	/** `rebase.autosquash` — whether `git rebase` automatically folds `fixup!`/`squash!` commits into the commits they target */
+	| 'rebase.autosquash'
 	/** `rebase.updateRefs` — whether `git rebase` also updates branches pointing to the rebased commits */
 	| 'rebase.updateRefs'
+	/** `remote.pushDefault` — the remote `git push` targets when a branch has no explicit push remote configured */
+	| 'remote.pushDefault'
 	| 'user.email'
 	| 'user.name'
 	| 'user.signingkey';
@@ -78,7 +86,16 @@ export type GkConfigKeys =
 	| 'gk.applied.backgroundMaintenance'
 	| 'gk.applied.maintenanceAuto'
 	/** `git maintenance register` sets `maintenance.strategy` too, and `unregister` does NOT restore it. */
-	| 'gk.applied.maintenanceStrategy';
+	| 'gk.applied.maintenanceStrategy'
+	/**
+	 * Write-ahead records for direct Git Health config mutations. A pending record is finalized into the
+	 * corresponding `gk.applied.*` marker only after the local config write succeeds; interrupted records are
+	 * reconciled on the next probe so a crash cannot silently lose ownership or claim a failed write.
+	 */
+	| 'gk.pending.untrackedCache'
+	| 'gk.pending.fsmonitor'
+	| 'gk.pending.manyFiles'
+	| 'gk.pending.skipHash';
 
 export type DeprecatedGkConfigKeys = `branch.${string}.gk-target-base`;
 

@@ -1,10 +1,12 @@
+import * as l10n from '@vscode/l10n';
 import { css, html, LitElement, nothing } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import type { CandidateSigner, SignerProvider } from '../../../allowedSigners/protocol.js';
 import type { Checkbox } from '../../shared/components/checkbox/checkbox.js';
 import '../../shared/components/checkbox/checkbox.js';
-import '../../shared/components/code-icon.js';
-import '../../shared/components/overlays/tooltip.js';
+import '@gitlens/components/components/codeIcon.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 @customElement('gl-signer-row')
 export class GlSignerRow extends LitElement {
@@ -16,8 +18,8 @@ export class GlSignerRow extends LitElement {
 		.row {
 			display: grid;
 			grid-template-columns: auto auto 1fr auto;
-			align-items: center;
 			gap: 1rem;
+			align-items: center;
 			padding: 0.8rem 1.2rem;
 			cursor: pointer;
 		}
@@ -38,8 +40,8 @@ export class GlSignerRow extends LitElement {
 		.avatar {
 			width: 2.4rem;
 			height: 2.4rem;
-			border-radius: 50%;
 			color: var(--vscode-descriptionForeground);
+			border-radius: 50%;
 		}
 
 		.identity {
@@ -50,34 +52,34 @@ export class GlSignerRow extends LitElement {
 		}
 
 		.name {
-			font-weight: 600;
-			white-space: nowrap;
 			overflow: hidden;
 			text-overflow: ellipsis;
+			font-weight: 600;
+			white-space: nowrap;
 		}
 
 		.email {
-			color: var(--vscode-descriptionForeground);
-			font-size: 1.2rem;
-			white-space: nowrap;
 			overflow: hidden;
 			text-overflow: ellipsis;
+			font-size: 1.2rem;
+			color: var(--vscode-descriptionForeground);
+			white-space: nowrap;
 		}
 
 		.keyinfo {
+			max-width: 100%;
+			overflow: hidden;
+			text-overflow: ellipsis;
 			font-family: var(--vscode-editor-font-family, monospace);
 			font-size: 1.1rem;
 			color: var(--vscode-descriptionForeground);
 			white-space: nowrap;
-			overflow: hidden;
-			text-overflow: ellipsis;
-			max-width: 100%;
 		}
 
 		.details {
 			display: flex;
-			align-items: center;
 			gap: 0.8rem;
+			align-items: center;
 			font-size: 1.1rem;
 			color: var(--vscode-descriptionForeground);
 			white-space: nowrap;
@@ -140,7 +142,9 @@ export class GlSignerRow extends LitElement {
 		const registered = this.signer.provenance === 'provider' || this.signer.provenance === 'both';
 		if (registered) {
 			const name = this.provider?.name;
-			return html`<gl-tooltip .content=${name ? `Registered with ${name}` : 'Registered with a provider'}>
+			return html`<gl-tooltip
+				.content=${name ? l10n.t('Registered with {0}', name) : l10n.t('Registered with a provider')}
+			>
 				<code-icon
 					class="provider-icon"
 					icon=${this.provider != null ? `gl-provider-${this.provider.icon}` : 'verified'}
@@ -149,8 +153,8 @@ export class GlSignerRow extends LitElement {
 		}
 
 		const content = this.integrationConnected
-			? 'Not registered with a provider'
-			: 'Connect an integration to verify registration';
+			? l10n.t('Not registered with a provider')
+			: l10n.t('Connect an integration to verify registration');
 		return html`<gl-tooltip .content=${content}>
 			<code-icon class="provider-icon provider-icon--unverified" icon="unverified"></code-icon>
 		</gl-tooltip>`;
@@ -164,7 +168,7 @@ export class GlSignerRow extends LitElement {
 					? html`<code-icon
 							class="in-file-icon"
 							icon="pass-filled"
-							title="Already in your allowed_signers"
+							title=${l10n.t('Already in your allowed_signers')}
 						></code-icon>`
 					: html`<gl-checkbox
 							.checked=${this.included}
@@ -186,7 +190,10 @@ export class GlSignerRow extends LitElement {
 				${
 					s.commitCount
 						? html`<span class="count"
-								>${s.commitCount} signed commit${s.commitCount === 1 ? '' : 's'}</span
+								>${formatPlural(
+									l10n.t('{0, plural, one{{0} signed commit} other{{0} signed commits}}'),
+									[s.commitCount],
+								)}</span
 							>`
 						: nothing
 				}

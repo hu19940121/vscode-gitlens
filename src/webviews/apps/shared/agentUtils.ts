@@ -1,7 +1,15 @@
-import type { PastAgentSessionsResult } from '../../../agents/models/agentSessionState.js';
-import type { AgentSessionPhase } from '../../../agents/provider.js';
+import * as l10n from '@vscode/l10n';
+import { getAgentCapabilities, getAgentCapabilitiesByProviderId } from '@gitlens/agents/agentCapabilities.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
+import type {
+	AgentSessionState,
+	PastAgentSessionsResult,
+	PastAgentSessionState,
+} from '../../../agents/models/agentSessionState.js';
+import { getAgentSessionIdentityKey } from '../../../agents/models/agentSessionState.js';
+import type { AgentSessionPhase, AgentSessionResumeTarget } from '../../../agents/provider.js';
 import { createCommandLink } from '../../../system/commands.js';
-import type { AgentSessionState } from '../../home/protocol.js';
+import type { WebviewItemContext } from '../../../system/webview.js';
 import type { OverviewBranch } from '../../shared/overviewBranches.js';
 
 const phaseRank: Record<AgentSessionPhase, number> = {
@@ -9,16 +17,22 @@ const phaseRank: Record<AgentSessionPhase, number> = {
 	working: 1,
 	idle: 2,
 	// Terminal sessions sort last so live agents always lead the list.
-	completed: 3,
+	ended: 3,
 };
 
-export type AgentSessionCategory = 'working' | 'needs-input' | 'idle' | 'completed';
+export type AgentSessionCategory = 'working' | 'needs-input' | 'idle' | 'ended';
+
+/** Keep the initial history footprint small; explicit paging expands the inline management surface. */
+export const initialPastAgentSessionLimit = 3;
+
+/** Number of additional transcript-backed sessions requested by each inline paging action. */
+export const pastAgentSessionPageSize = 15;
 
 export const agentPhaseToCategory: Record<AgentSessionPhase, AgentSessionCategory> = {
 	working: 'working',
 	waiting: 'needs-input',
 	idle: 'idle',
-	completed: 'completed',
+	ended: 'ended',
 };
 
 /** Whether a surface may offer Allow / Deny for this session's ask.
@@ -34,89 +48,318 @@ export function canResolvePermission(
 	return category === 'needs-input' && permission != null && permission.resolvable !== false;
 }
 
+/** Identity glyph for the agent's provider. Rendered PLAIN — never phase-coloured, never carrying a
+ *  badge: a logomark is a thin, radial thing (Claude's asterisk, Gemini's spark) and comes apart the
+ *  moment something is punched through it or laid over it. Phase belongs on `gl-agent-mark`; this
+ *  only says who.
+ *
+ *  Both id namespaces are tried, since callers pass either a `providerId` (`claudeCode`) or the CLI's
+ *  hook-client id (`claude-code`). `cursor` — relayed by the CLI but with no descriptor GitLens can
+ *  consume (see `areHooksOfferedForAgent`) — keeps its explicit glyph. An unknown id lands on the
+ *  robot rather than falling back to the raw id the way the label does: a bogus label still reads as
+ *  something, whereas a glyph name in neither font renders as tofu. */
+export function agentProviderIcon(providerId: string | undefined): string {
+	if (!providerId) return 'robot';
+
+	const capabilities = getAgentCapabilitiesByProviderId(providerId) ?? getAgentCapabilities(providerId);
+	if (capabilities != null) return toWebviewIconName(capabilities.icon);
+
+	if (providerId === 'cursor') return 'cursor';
+
+	return 'robot';
+}
+
+/** Converts a host `ThemeIcon` id from `AgentCapabilities.icon` into the `<code-icon>` name for the
+ *  same glyph: a GitLens-contributed mark swaps its LEADING `gitlens-` for `gl-`, which is how
+ *  `code-icon.ts` selects the glicons font. A leading-token swap, not a strip —
+ *  `gitlens-gitlens-inspect` is a real contributed id whose bare name is `gitlens-inspect`.
+ *
+ *  Safe because the two namespaces are 1:1 by construction, not convention:
+ *  `scripts/applyIconsContribution.mjs` writes `contributes.icons` and `glicons-map.ts` from one
+ *  generated source in the same pass, so neither name can exist without the other. */
+function toWebviewIconName(icon: string): string {
+	return icon.startsWith('gitlens-') ? `gl-${icon.slice('gitlens-'.length)}` : icon;
+}
+
+/** Text label for the coding harness. Used ONLY where a glyph alone can't carry identity — an agent
+ *  with no descriptor falls through to {@link agentProviderIcon}'s generic robot, so those surfaces
+ *  must name the harness in TEXT.
+ *
+ *  `AgentSessionState.providerName` is the table's same `displayName`, so reading the table here is
+ *  what keeps a past row and a live row from disagreeing about the same agent.
+ *
+ *  Both id namespaces are tried because callers pass either: `providerId` (`claudeCode`) off a
+ *  session, or the CLI's hook-client id (`claude-code`) off a hook event. `cursor` — relayed by the
+ *  CLI but with no descriptor GitLens can consume (see `areHooksOfferedForAgent`) — keeps its
+ *  explicit name; anything else falls back to the raw id (still informative) or `''`. */
+export function getAgentProviderLabel(providerId: string | undefined): string {
+	if (!providerId) return '';
+
+	const capabilities = getAgentCapabilitiesByProviderId(providerId) ?? getAgentCapabilities(providerId);
+	if (capabilities != null) return capabilities.displayName;
+
+	if (providerId === 'cursor') return 'Cursor';
+
+	return providerId;
+}
+
 export function getAgentCategoryLabel(category: AgentSessionCategory): string {
 	switch (category) {
 		case 'needs-input':
-			return 'Needs input';
+			return l10n.t('Needs input');
 		case 'working':
-			return 'Working';
+			return l10n.t('Working');
 		case 'idle':
-			return 'Idle';
-		case 'completed':
-			return 'Completed';
+			return l10n.t('Idle');
+		case 'ended':
+			return l10n.t('Past');
 	}
 }
 
-/** Corner-badge glyph overlaid on the `robot` identity icon. `idle` has no badge — the bare robot
- *  in its color carries the meaning. Shared by the graph's WIP row indicator and the file tree's
- *  agent decoration so both read the same. Callers holding an `AgentSessionPhase` must map through
- *  {@link agentPhaseToCategory} first (`waiting` → `needs-input`). Pair `working`'s `sync` with
- *  `modifier="spin"`. */
-export function agentSuffixIconFor(category: AgentSessionCategory): string | undefined {
-	switch (category) {
-		case 'needs-input':
-			return 'warning';
-		case 'working':
-			return 'sync';
-		case 'idle':
-			return undefined;
-		case 'completed':
-			return 'pass';
-	}
-}
-
-/** The "open" affordance for an agent session — `Open Session` for every live phase, `Resume
- *  Session` for a completed one that has a directory to resume into. */
+/** The "open" affordance for an agent session — `Open Session` for every live phase, one `Resume`
+ *  action per destination ({@link AgentSessionResumeTarget}) for an ended one that carries a
+ *  resume action. */
 export type AgentSessionOpenAction =
 	| {
-			label: 'Open Session';
+			label: string;
 			icon: 'link-external';
 			command: 'gitlens.agents.openSession';
 			/** Args exactly as the command receives them — the sidebar passes this array straight
 			 *  through; the href surfaces feed `args[0]` to `createCommandLink`. */
-			args: [string];
+			args: [{ sessionId: string; providerId: string }];
 	  }
 	| {
-			label: 'Resume Session';
-			icon: 'debug-restart';
+			label: string;
+			icon: string;
 			command: 'gitlens.agents.resumeSession';
-			args: [{ sessionId: string; cwd: string }];
+			target: AgentSessionResumeTarget;
+			args: [{ sessionId: string; providerId: string; cwd: string; target: AgentSessionResumeTarget }];
 	  };
 
-/** Picks between `Open Session` (there's a live process to attach to) and `Resume Session`
- *  (the process is gone, but the transcript can be replayed into a fresh one). Only a completed
- *  session with a resolvable cwd gets `Resume Session` — a completed session with nowhere to
- *  resume from has nothing to offer but the openSession modal's terminal fallback.
- *
- *  cwd resolution mirrors {@link toResumableSessionRef}'s cascade (`claudeResume.ts`): live `cwd`
- *  wins over `initialCwd` because Claude migrates the transcript file to follow the session's
- *  current directory, not its launch directory. */
-export function getAgentSessionOpenAction(session: AgentSessionState): AgentSessionOpenAction {
-	if (session.phase === 'completed') {
-		const cwd = session.cwd ?? session.initialCwd ?? session.worktreePath ?? session.workspacePath;
-		if (cwd != null) {
-			return {
-				label: 'Resume Session',
-				icon: 'debug-restart',
-				command: 'gitlens.agents.resumeSession',
-				args: [{ sessionId: session.id, cwd: cwd }],
-			};
-		}
-	}
+const openSessionActionLabel = l10n.t('Open Session');
+const openSessionActionIcon = 'link-external';
 
-	return { label: 'Open Session', icon: 'link-external', command: 'gitlens.agents.openSession', args: [session.id] };
+function resumeAction(
+	session: { id: string; providerId: string },
+	cwd: string,
+	target: AgentSessionResumeTarget,
+): AgentSessionOpenAction {
+	const label =
+		target === 'extension'
+			? l10n.t('Resume in {provider} Extension', { provider: getAgentProviderLabel(session.providerId) })
+			: l10n.t('Resume in Terminal');
+	const icon = target === 'extension' ? agentProviderIcon(session.providerId) : 'terminal';
+
+	return {
+		label: label,
+		icon: icon,
+		command: 'gitlens.agents.resumeSession',
+		target: target,
+		args: [{ sessionId: session.id, providerId: session.providerId, cwd: cwd, target: target }],
+	};
 }
 
-/** `createCommandLink` form of {@link getAgentSessionOpenAction}, for `href=` surfaces. The two
- *  commands take asymmetric arg shapes: openSession's existing link form passes the session id as
- *  a bare JSON-stringified string, while resumeSession passes the `{ sessionId, cwd }` object
- *  directly (see `gl-details-agent-status.ts`'s past-row resume chip). */
-export function createAgentSessionOpenHref(session: AgentSessionState): string {
-	const action = getAgentSessionOpenAction(session);
-	if (action.command === 'gitlens.agents.resumeSession') return createCommandLink(action.command, action.args[0]);
+/** Live sessions: `[Open Session]` while live; for an ended session, one resume action per
+ *  `actions.resume.targets` entry, in order; `[Open Session]` when it has no resume action —
+ *  the openSession modal's terminal fallback covers that case instead. */
+export function getAgentSessionOpenActions(session: AgentSessionState): AgentSessionOpenAction[] {
+	const resume = session.phase === 'ended' ? session.actions?.resume : undefined;
+	if (resume != null) {
+		return resume.targets.map(target => resumeAction(session, resume.cwd, target));
+	}
 
-	// A bare string reaches the command link unquoted, which isn't valid JSON for the arg parser.
-	return createCommandLink(action.command, JSON.stringify(action.args[0]));
+	return [
+		{
+			label: openSessionActionLabel,
+			icon: openSessionActionIcon,
+			command: 'gitlens.agents.openSession',
+			args: [{ sessionId: session.id, providerId: session.providerId }],
+		},
+	];
+}
+
+/** Past rows: one resume action per `actions.resume.targets` entry, in order; empty when the row
+ *  carries no resume action. */
+export function getPastAgentSessionResumeActions(session: PastAgentSessionState): AgentSessionOpenAction[] {
+	const resume = session.actions.resume;
+	if (resume == null) return [];
+
+	return resume.targets.map(target => resumeAction(session, resume.cwd, target));
+}
+
+/** `createCommandLink` form of each of {@link getAgentSessionOpenActions}, for `href=` surfaces. */
+export function createAgentSessionOpenHrefs(
+	session: AgentSessionState,
+): { label: string; icon: string; href: string }[] {
+	return getAgentSessionOpenActions(session).map(action => ({
+		label: action.label,
+		icon: action.icon,
+		href: createCommandLink(action.command, action.args[0]),
+	}));
+}
+
+export interface AgentSessionArchiveAction {
+	label: string;
+	icon: 'archive';
+	command: 'gitlens.agents.archiveSession';
+	args: [{ sessionId: string; providerId: string }];
+}
+
+/** The minimal shape {@link getAgentSessionArchiveAction} needs — structurally satisfied by both
+ *  {@link AgentSessionState} (where `actions` is optional) and {@link PastAgentSessionState} (where
+ *  `actions` is required but `archive` inside it is optional), so one gate serves both live and
+ *  past rows without either side needing a cast. */
+interface ArchivableAgentSession {
+	id: string;
+	providerId: string;
+	actions?: { readonly archive?: boolean };
+}
+
+/** Archive affordance for a session row, or `undefined` when the provider didn't advertise it.
+ *  Serves both live (`AgentSessionState`) and past rows — the gate and command shape live here so
+ *  the several rendering sites can't drift. Callers own the phase gate (archive is only offered on
+ *  terminal rows); this helper owns the capability gate. */
+export function getAgentSessionArchiveAction(session: ArchivableAgentSession): AgentSessionArchiveAction | undefined {
+	if (session.actions?.archive !== true) return undefined;
+
+	return {
+		label: l10n.t('Archive Session'),
+		icon: 'archive',
+		command: 'gitlens.agents.archiveSession',
+		args: [{ sessionId: session.id, providerId: session.providerId }],
+	};
+}
+
+/** `createCommandLink` form of {@link getAgentSessionArchiveAction}, for `href=` surfaces. */
+export function createAgentSessionArchiveHref(session: ArchivableAgentSession): string | undefined {
+	const action = getAgentSessionArchiveAction(session);
+	if (action == null) return undefined;
+
+	return createCommandLink(action.command, action.args[0]);
+}
+
+/** Value carried by a `gitlens:agent-session…` webview-item context — see {@link buildAgentSessionContext}
+ *  and {@link buildPastAgentSessionContext}. Kept intentionally small: the host resolves the rest of a
+ *  LIVE session by `sessionId` where it needs to; `cwd`/`lastPrompt`/`planFilePath` ride along only for
+ *  what a host-side lookup can't recover on its own (a past row has no tracked session to look up, and
+ *  the clipboard commands read straight off the context to avoid a round trip). */
+export interface AgentSessionContextValue {
+	sessionId: string;
+	providerId?: string;
+	worktreePath?: string;
+	/** Resolved resume directory — present only when the context also carries `+resumable`. */
+	cwd?: string;
+	lastPrompt?: string;
+	/** Present only when the context also carries `+plan`. */
+	planFilePath?: string;
+}
+
+/**
+ * Builds the `gitlens:agent-session…` webview-item context for a live session — the single source of the
+ * right-click vocabulary shared by the sidebar Agents panel rows and the WIP details panel's session
+ * cards, so the two surfaces' context menus can't drift apart. Computed entirely client-side: unlike the
+ * graph's row contexts, agent sessions don't flow through a host-serialized `contexts.row`, so every flag
+ * here is derived from fields already present on the serialized {@link AgentSessionState}.
+ *
+ * Flag grammar (see `contributions.json`'s `gitlens:agent-session` entries for the menu `when` clauses):
+ *  - `+live` / `+ended` — mutually exclusive category flags.
+ *  - `+resolvable` — {@link canResolvePermission} is true (an Allow/Deny-able ask).
+ *  - `+alwaysallow` — resolvable AND the ask is a plain tool permission with suggestions (mirrors the
+ *    row's alt-action condition in `sidebar-panel.ts`'s `toAgentLeaf`).
+ *  - `+plan` — a needs-input `plan` ask with a `planFilePath` — independent of `+resolvable`, matching
+ *    `toAgentLeaf`'s View Plan action (an unroutable plan ask still gets "View Plan").
+ *  - `+resumable` — the host attached a resume action (`session.actions.resume`).
+ *  - `+resumableInExtension` — additionally, that action's `targets` includes `'extension'`.
+ *  - `+worktree` — the session has a `worktreePath`.
+ *  - `+prompt` — the session has a `lastPrompt`.
+ */
+export function buildAgentSessionContext(
+	session: AgentSessionState,
+	category: AgentSessionCategory,
+): WebviewItemContext<AgentSessionContextValue> {
+	const permission = session.pendingPermission;
+
+	let resolvable = false;
+	let alwaysAllow = false;
+	if (canResolvePermission(category, permission)) {
+		resolvable = true;
+		alwaysAllow = permission.kind === 'tool' && permission.suggestions != null && permission.suggestions.length > 0;
+	}
+
+	const isPlan = category === 'needs-input' && permission?.kind === 'plan' && permission.planFilePath != null;
+
+	const resume = session.actions?.resume;
+
+	let webviewItem = `gitlens:agent-session+${category === 'ended' ? 'ended' : 'live'}`;
+	if (resolvable) {
+		webviewItem += '+resolvable';
+	}
+	if (alwaysAllow) {
+		webviewItem += '+alwaysallow';
+	}
+	if (isPlan) {
+		webviewItem += '+plan';
+	}
+	if (resume != null) {
+		webviewItem += '+resumable';
+	}
+	if (resume?.targets.includes('extension')) {
+		webviewItem += '+resumableInExtension';
+	}
+	if (session.worktreePath != null) {
+		webviewItem += '+worktree';
+	}
+	if (session.lastPrompt) {
+		webviewItem += '+prompt';
+	}
+	if (session.actions?.archive === true) {
+		webviewItem += '+archivable';
+	}
+
+	return {
+		webviewItem: webviewItem,
+		webviewItemValue: {
+			sessionId: session.id,
+			providerId: session.providerId,
+			worktreePath: session.worktreePath,
+			cwd: resume?.cwd,
+			lastPrompt: session.lastPrompt,
+			planFilePath: isPlan ? permission?.planFilePath : undefined,
+		},
+	};
+}
+
+/**
+ * Reduced counterpart of {@link buildAgentSessionContext} for a {@link PastAgentSessionState} row — there's
+ * no process, so none of the permission/phase-derived flags apply. `providerId` lets Archive Session route
+ * a recovered transcript directly to the provider even when it is no longer in the tracked session list.
+ */
+export function buildPastAgentSessionContext(
+	session: PastAgentSessionState,
+): WebviewItemContext<AgentSessionContextValue> {
+	let webviewItem = 'gitlens:agent-session+ended+past';
+	if (session.actions.resume != null) {
+		webviewItem += '+resumable';
+	}
+	if (session.actions.resume?.targets.includes('extension')) {
+		webviewItem += '+resumableInExtension';
+	}
+	if (session.actions.archive === true) {
+		webviewItem += '+archivable';
+	}
+	if (session.lastPrompt) {
+		webviewItem += '+prompt';
+	}
+
+	return {
+		webviewItem: webviewItem,
+		webviewItemValue: {
+			sessionId: session.id,
+			providerId: session.providerId,
+			cwd: session.actions.resume?.cwd,
+			lastPrompt: session.lastPrompt,
+		},
+	};
 }
 
 /** Kind-aware label for a needs-input phase. Surfaces "Plan ready" / "Question" / "Input needed"
@@ -131,51 +374,56 @@ export function getAgentPhaseLabel(
 
 	switch (permission.kind) {
 		case 'plan':
-			return 'Plan ready';
+			return l10n.t('Plan ready');
 		case 'question':
-			return 'Question';
+			return l10n.t('Question');
 		case 'elicitation':
-			return 'Input needed';
+			return l10n.t('Input needed');
 		case 'tool':
 		default:
-			return 'Permission';
+			return l10n.t('Permission');
 	}
 }
 
 /** "Last active …" granularity helper used by the graph details panel and the graph agents
- *  sidebar panel — short-and-stable formatting (no seconds past 1 minute). Accepts either a
- *  `Date` (the wire-shape's `phaseSince`/`lastActivity` fields) or a numeric timestamp. Rolls the
- *  top unit over as it crosses each boundary (`m → h → d → w`) so an hours-old completed session
- *  reads `2d 3h` rather than `51h`. The agent-status pill has its own slightly more granular
- *  variant inline. `now` defaults to `Date.now()`; pass it to pin the instant (a caller deriving
- *  `value` from its own clock read otherwise sits one unpredictable tick away from the bucket it
- *  expects). */
-export function formatAgentElapsed(value: Date | number | undefined, now: number = Date.now()): string | undefined {
+ *  sidebar panel — short-and-stable formatting (no seconds past 1 minute). Takes an epoch-ms
+ *  timestamp (the wire-shape's `phaseSince`/`lastActivity` fields). Rolls the top unit over as
+ *  it crosses each boundary (`m → h → d → w`) so an hours-old ended session reads `2d 3h`
+ *  rather than `51h`. The agent-status pill has its own slightly more granular variant inline.
+ *  `now` defaults to `Date.now()`; pass it to pin the instant (a caller deriving `value` from its
+ *  own clock read otherwise sits one unpredictable tick away from the bucket it expects). */
+export function formatAgentElapsed(value: number | undefined, now: number = Date.now()): string | undefined {
 	if (value == null) return undefined;
 
-	const timestamp = typeof value === 'number' ? value : value.getTime();
-	const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
-	if (seconds < 60) return `${seconds}s`;
+	const format = getNumericFormat();
+	const seconds = Math.max(0, Math.floor((now - value) / 1000));
+	if (seconds < 60) return l10n.t('{seconds}s', { seconds: format(seconds) });
 
 	const minutes = Math.floor(seconds / 60);
-	if (minutes < 60) return `${minutes}m`;
+	if (minutes < 60) return l10n.t('{minutes}m', { minutes: format(minutes) });
 
 	const hours = Math.floor(minutes / 60);
 	if (hours < 24) {
 		const remainingMinutes = minutes % 60;
-		return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+		return remainingMinutes > 0
+			? l10n.t('{hours}h {minutes}m', { hours: format(hours), minutes: format(remainingMinutes) })
+			: l10n.t('{hours}h', { hours: format(hours) });
 	}
 
 	// Past sessions can be days or weeks old; keep rolling so "3d" beats "72h".
 	const days = Math.floor(hours / 24);
 	if (days < 7) {
 		const remainingHours = hours % 24;
-		return remainingHours > 0 ? `${days}d ${remainingHours}h` : `${days}d`;
+		return remainingHours > 0
+			? l10n.t('{days}d {hours}h', { days: format(days), hours: format(remainingHours) })
+			: l10n.t('{days}d', { days: format(days) });
 	}
 
 	const weeks = Math.floor(days / 7);
 	const remainingDays = days % 7;
-	return remainingDays > 0 ? `${weeks}w ${remainingDays}d` : `${weeks}w`;
+	return remainingDays > 0
+		? l10n.t('{weeks}w {days}d', { weeks: format(weeks), days: format(remainingDays) })
+		: l10n.t('{weeks}w', { weeks: format(weeks) });
 }
 
 /** Per-session "what is it doing" line. Mirrors the contract used by the graph details panel:
@@ -205,7 +453,7 @@ export function describeAgentSession(
 
 	if (idleFallback === 'lastActive') {
 		const lastActive = formatAgentElapsed(session.lastActivity);
-		if (lastActive != null) return `Last active ${lastActive} ago`;
+		if (lastActive != null) return l10n.t('Last active {duration} ago', { duration: lastActive });
 	}
 
 	return session.lastPrompt || undefined;
@@ -221,29 +469,60 @@ function describePendingPermission(
 ): string {
 	switch (permission.kind) {
 		case 'plan':
-			return permission.planSummary
-				? `${awaitingPrefix === 'long' ? 'Plan ready:' : 'Plan:'} ${permission.planSummary}`
-				: 'Plan ready for review';
+			if (!permission.planSummary) return l10n.t('Plan ready for review');
+
+			return awaitingPrefix === 'long'
+				? l10n.t('Plan ready: {summary}', { summary: permission.planSummary })
+				: l10n.t('Plan: {summary}', { summary: permission.planSummary });
 		case 'question': {
-			const text = permission.questionText ?? 'Awaiting your answer';
+			const text = permission.questionText ?? l10n.t('Awaiting your answer');
 			const count = permission.questionCount ?? 0;
-			if (count > 1) return `${awaitingPrefix === 'long' ? 'Question:' : 'Q:'} ${text} (1 of ${count})`;
-			return `${awaitingPrefix === 'long' ? 'Question:' : 'Q:'} ${text}`;
+			if (count > 1) {
+				return awaitingPrefix === 'long'
+					? l10n.t('Question: {question} ({current} of {count})', {
+							question: text,
+							current: getNumericFormat()(1),
+							count: getNumericFormat()(count),
+						})
+					: l10n.t('Q: {question} ({current} of {count})', {
+							question: text,
+							current: getNumericFormat()(1),
+							count: getNumericFormat()(count),
+						});
+			}
+			return awaitingPrefix === 'long'
+				? l10n.t('Question: {question}', { question: text })
+				: l10n.t('Q: {question}', { question: text });
 		}
 		case 'elicitation':
-			return permission.toolName ? `Awaiting input: ${permission.toolName}` : 'Awaiting input';
+			return permission.toolName
+				? l10n.t('Awaiting input: {tool}', { tool: permission.toolName })
+				: l10n.t('Awaiting input');
 		case 'tool':
 		default: {
-			if (!permission.toolName) return 'Awaiting permission';
+			if (!permission.toolName) return l10n.t('Awaiting permission');
 
-			const prefix = awaitingPrefix === 'long' ? 'Awaiting permission:' : 'Awaiting:';
-			return `${prefix} ${permission.toolName}${permission.toolDescription ? ` — ${permission.toolDescription}` : ''}`;
+			if (awaitingPrefix === 'long') {
+				return permission.toolDescription
+					? l10n.t('Awaiting permission: {tool} — {description}', {
+							tool: permission.toolName,
+							description: permission.toolDescription,
+						})
+					: l10n.t('Awaiting permission: {tool}', { tool: permission.toolName });
+			}
+
+			return permission.toolDescription
+				? l10n.t('Awaiting: {tool} — {description}', {
+						tool: permission.toolName,
+						description: permission.toolDescription,
+					})
+				: l10n.t('Awaiting: {tool}', { tool: permission.toolName });
 		}
 	}
 }
 
 /** Canonical sort order for agent sessions across every UI surface. Category-actionability first
- *  (needs-input → working → idle → completed), then most-recent phase entry within a category, then
+ *  (needs-input → working → idle → ended), then most-recent phase entry within a category, then
  *  alphabetical by name. Applied once at each state-entry point so all consumers — banners,
  *  pills, cards, hovers — render the same order. Actionable always wins: a fresh idle session
  *  never outranks a session that's actually waiting on you.
@@ -261,8 +540,8 @@ export function sortAgentSessions(sessions: readonly AgentSessionState[]): Agent
 			return ra - rb;
 		}
 
-		const ta = a.phaseSince.getTime();
-		const tb = b.phaseSince.getTime();
+		const ta = a.phaseSince;
+		const tb = b.phaseSince;
 		if (ta !== tb) {
 			return tb - ta;
 		}
@@ -271,12 +550,17 @@ export function sortAgentSessions(sessions: readonly AgentSessionState[]): Agent
 	});
 }
 
+/** Sessions with a process the UI can open in place; ended sessions are resumable history. */
+export function filterLiveAgentSessions(sessions: readonly AgentSessionState[] | undefined): AgentSessionState[] {
+	return sessions?.filter(s => s.phase !== 'ended') ?? [];
+}
+
 /** Identifies the worktree the matcher should resolve sessions for. `repoPath` is the workspace's
  *  selected-repo path (main-repo path in most cases, but can be a worktree path if the workspace
  *  opens a worktree directly). `worktreePath` is the worktree's full normalized path; `undefined`
- *  and `worktreePath === repoPath` both denote the default worktree (Home keeps the path on
- *  `OverviewBranch.worktree`; Graph strips the default from its `worktreesByBranch` map to
- *  preserve `+checkedout` vs `+worktree` semantics, so it surfaces as `undefined`). */
+ *  and `worktreePath === repoPath` both denote the default worktree (Graph strips the default
+ *  from its `worktreesByBranch` map to preserve `+checkedout` vs `+worktree` semantics, so it
+ *  surfaces as `undefined`). */
 export interface AgentSessionWorktreeTarget {
 	repoPath: string;
 	worktreePath?: string;
@@ -304,10 +588,27 @@ function sessionWorktreeKey(session: AgentSessionState): string | undefined {
 	return session.worktreePath;
 }
 
+/** Whether `worktreePath` is the session's CURRENT worktree, as opposed to one merely visited in
+ *  the past (see {@link AgentSessionState.visitedWorktreePaths}). `false` when either side is
+ *  missing — an unresolved session is never "current" for any path. */
+export function isAgentSessionCurrentForWorktree(
+	session: AgentSessionState,
+	worktreePath: string | undefined,
+): boolean {
+	if (session.worktreePath == null || worktreePath == null) return false;
+
+	return session.worktreePath === worktreePath;
+}
+
 /** Builds a lookup index for batch matching across many worktrees in one render (overview cards).
  *  Single-shot consumers can call {@link matchAgentSessionsForWorktree} directly with the array.
  *  Keyed by the session's effective worktree path so the lookup is robust to whether the agent's
- *  workspace folder is the main repo or the worktree itself. */
+ *  workspace folder is the main repo or the worktree itself.
+ *
+ *  Also indexed under every entry of {@link AgentSessionState.visitedWorktreePaths} so a lookup for
+ *  a visited-but-not-current worktree still finds the session — see
+ *  {@link matchAgentSessionsForWorktree}'s `includeVisited` option, which consumes those ghost
+ *  entries. A key that coincides with the session's current key is only pushed once. */
 export function indexAgentSessionsByRepoAndWorktree(
 	sessions: readonly AgentSessionState[] | undefined,
 ): AgentSessionWorktreeIndex | undefined {
@@ -315,14 +616,23 @@ export function indexAgentSessionsByRepoAndWorktree(
 
 	const index: AgentSessionWorktreeIndex = new Map();
 	for (const session of sessions) {
-		const key = sessionWorktreeKey(session);
-		if (key == null) continue;
+		const keys = new Set<string>();
+		const currentKey = sessionWorktreeKey(session);
+		if (currentKey != null) {
+			keys.add(currentKey);
+		}
 
-		const existing = index.get(key);
-		if (existing != null) {
-			existing.push(session);
-		} else {
-			index.set(key, [session]);
+		for (const visited of session.visitedWorktreePaths ?? []) {
+			keys.add(visited);
+		}
+
+		for (const key of keys) {
+			const existing = index.get(key);
+			if (existing != null) {
+				existing.push(session);
+			} else {
+				index.set(key, [session]);
+			}
 		}
 	}
 	return index;
@@ -335,24 +645,104 @@ export function indexAgentSessionsByRepoAndWorktree(
  *  is intentionally not consulted: it's a synthesized field that holds either the matching
  *  VS Code workspace folder or the common-path fallback, depending on Claude Code's launch dir.
  *  Sessions whose worktree hasn't been resolved yet (cold-cache window) won't match — narrow in
- *  practice since `resolveGitInfo` runs on the first hook. */
+ *  practice since `resolveGitInfo` runs on the first hook.
+ *
+ *  Default behavior (no `options`) is unchanged: current-worktree-only, exactly as before
+ *  `visitedWorktreePaths` existed. Pass `{ includeVisited: true }` to also return sessions that
+ *  merely *visited* this worktree in the past — the index (built by
+ *  {@link indexAgentSessionsByRepoAndWorktree}) stores those under the visited key too, so the
+ *  Map branch re-filters back to current-only when the option is off. */
 export function matchAgentSessionsForWorktree(
 	source: readonly AgentSessionState[] | AgentSessionWorktreeIndex | undefined,
 	target: AgentSessionWorktreeTarget,
+	options?: { includeVisited?: boolean },
 ): AgentSessionState[] | undefined {
 	if (source == null) return undefined;
 
 	const targetKey = targetWorktreeKey(target);
+	const includeVisited = options?.includeVisited === true;
 
 	if (source instanceof Map) {
 		const found = source.get(targetKey);
-		return found != null && found.length > 0 ? found : undefined;
+		if (found == null) return undefined;
+
+		const matches = includeVisited ? found : found.filter(session => sessionWorktreeKey(session) === targetKey);
+		return matches.length > 0 ? matches : undefined;
 	}
 
 	if (!source.length) return undefined;
 
-	const matches = source.filter(session => sessionWorktreeKey(session) === targetKey);
+	const matches = source.filter(
+		session =>
+			sessionWorktreeKey(session) === targetKey ||
+			(includeVisited && (session.visitedWorktreePaths?.includes(targetKey) ?? false)),
+	);
 	return matches.length > 0 ? matches : undefined;
+}
+
+/** Filters sessions down to those belonging to `family` (`repo.commonPath ?? repo.path` — the
+ *  repo's common root plus every worktree of it). Display-only: session ingestion stays
+ *  machine-global, this decides what the graph's agent-session surfaces render.
+ *
+ *  A session matches when: `session.commonPath === family` (fast path — `commonPath` is backfilled
+ *  host-side, `agentSessionState.ts:183`); OR `worktreePath` is the family root or one of the
+ *  family's known worktrees (`familyWorktreePaths`, when the caller has them) — covers cold-cache
+ *  sessions where `commonPath` hasn't resolved yet; OR any entry of `visitedWorktreePaths` is the
+ *  family root or one of its known worktrees — a session that once ran in this family still belongs
+ *  to it even after `cd`ing elsewhere, REGARDLESS of what `commonPath` now says (a non-matching
+ *  `commonPath` falls through to this check rather than excluding the session outright). A session
+ *  matching none of these is excluded — deliberate, an unresolved (or genuinely unrelated) session
+ *  isn't known to belong to this family. `family == null` (no selected repo resolved) returns `[]` —
+ *  show nothing rather than everything. */
+export function filterAgentSessionsForFamily(
+	sessions: readonly AgentSessionState[] | undefined,
+	family: string | undefined,
+	familyWorktreePaths?: ReadonlySet<string>,
+): AgentSessionState[] {
+	if (family == null || sessions == null || sessions.length === 0) return [];
+
+	return sessions.filter(session => {
+		if (session.commonPath === family) return true;
+
+		if (session.worktreePath === family) return true;
+
+		if (
+			familyWorktreePaths != null &&
+			session.worktreePath != null &&
+			familyWorktreePaths.has(session.worktreePath)
+		) {
+			return true;
+		}
+
+		return (session.visitedWorktreePaths ?? []).some(
+			path => path === family || (familyWorktreePaths?.has(path) ?? false),
+		);
+	});
+}
+
+/** Whether a session's CURRENT identity (`commonPath`/`worktreePath`) — not merely a visited
+ *  history — belongs to `family`. Same core test {@link filterAgentSessionsForFamily} applies to
+ *  those two fields, without the `visitedWorktreePaths` fallback that also admits a ghost (a
+ *  session `filterAgentSessionsForFamily` keeps because it once visited this family, but whose
+ *  CURRENT location is a foreign repo). Used wherever "counts as this family's live activity"
+ *  must exclude ghosts — the treemap's file-activity attribution, the kanban's ghost-card test —
+ *  while the wider filter still surfaces those sessions for display (dimmed). `family == null`
+ *  is never current for anything. An in-family `worktreePath` counts as current even alongside a
+ *  mismatched non-null `commonPath` — peer-merge can carry a stale foreign `commonPath` next to
+ *  an already-moved worktree, and the sidebar tree's placement gate treats that as current, so
+ *  this must too or the surfaces disagree. */
+export function isAgentSessionCurrentInFamily(
+	session: AgentSessionState,
+	family: string | undefined,
+	familyWorktreePaths?: ReadonlySet<string>,
+): boolean {
+	if (family == null) return false;
+	if (session.commonPath === family) return true;
+
+	return (
+		session.worktreePath === family ||
+		(session.worktreePath != null && (familyWorktreePaths?.has(session.worktreePath) ?? false))
+	);
 }
 
 /** Reverse of {@link matchAgentSessionsForWorktree}: given a session, find the `OverviewBranch`
@@ -482,11 +872,11 @@ export interface StickyDetailResolver {
 	 *  session through a code path that bypasses {@link resolveLiveTool} (e.g., the needs-input
 	 *  permission renderer) — otherwise the cached working-phase entry survives the permission
 	 *  round-trip and re-paints as soon as the session returns to `working` without a fresh tool. */
-	evict(sessionId: string): void;
+	evict(session: AgentSessionState): void;
 	/** Removes cache entries for sessions whose ids are NOT in {@link liveIds}. Call after each
 	 *  render pass so the cache stays bounded by the live session count instead of growing across
 	 *  session lifecycles (start/stop/restart). */
-	prune(liveIds: Iterable<string>): void;
+	prune(liveSessions: Iterable<AgentSessionState>): void;
 	/** Test/diagnostic accessor — current cache size. Not part of the production contract. */
 	readonly size: number;
 }
@@ -496,7 +886,7 @@ export function createStickyDetailResolver(options?: { holdMs?: number }): Stick
 	const cache = new Map<string, StickyToolEntry>();
 
 	const resolveLiveTool = (session: AgentSessionState): string | undefined => {
-		const cacheKey = session.id;
+		const cacheKey = getAgentSessionIdentityKey(session.providerId, session.id);
 		// `performance.now()` is monotonic — Date.now() drifts on NTP sync / DST / suspend-resume,
 		// any of which could pin a cache entry as "still fresh" past its real TTL or evict it
 		// prematurely after a backward clock jump. Monotonic time is the only correct choice
@@ -531,19 +921,21 @@ export function createStickyDetailResolver(options?: { holdMs?: number }): Stick
 		return undefined;
 	};
 
-	const prune = (liveIds: Iterable<string>): void => {
+	const prune = (liveSessions: Iterable<AgentSessionState>): void => {
 		if (cache.size === 0) return;
 
-		const live = liveIds instanceof Set ? liveIds : new Set(liveIds);
-		for (const id of cache.keys()) {
-			if (!live.has(id)) {
-				cache.delete(id);
+		const live = new Set(
+			Array.from(liveSessions, session => getAgentSessionIdentityKey(session.providerId, session.id)),
+		);
+		for (const key of cache.keys()) {
+			if (!live.has(key)) {
+				cache.delete(key);
 			}
 		}
 	};
 
-	const evict = (sessionId: string): void => {
-		cache.delete(sessionId);
+	const evict = (session: AgentSessionState): void => {
+		cache.delete(getAgentSessionIdentityKey(session.providerId, session.id));
 	};
 
 	return {
@@ -556,22 +948,23 @@ export function createStickyDetailResolver(options?: { holdMs?: number }): Stick
 	};
 }
 
-/** Reconciles a cached past-session list against the live session list — see
+/** Reconciles a cached past-session list against the tracked session list — see
  *  {@link createPastAgentSessionsResolver}. */
 export interface PastAgentSessionsResolver {
 	/** The past result to both gate visibility on and render, with rows dropped for sessions that
-	 *  are currently tracked and for those that have departed the tracked set. `total` is reduced by
-	 *  what was dropped so the "N more" footer stays honest. Side-effecting: records departures. */
+	 *  are currently rendered separately and for those that have departed the tracked set. `total`
+	 *  is reduced by what was dropped so the "N more" footer stays honest. Side-effecting: records
+	 *  departures. */
 	resolve(
 		past: PastAgentSessionsResult | undefined,
-		live: readonly AgentSessionState[] | undefined,
+		tracked: readonly AgentSessionState[] | undefined,
 	): PastAgentSessionsResult | undefined;
 }
 
 /**
  * Past sessions are a pull-only resource, fetched once per worktree — the host never re-pushes them
  * when the session list changes. So a session that leaves the tracked set (archived, or a pruned
- * record) is still in the cached list, and the live-id dedup that had been masking it stops the
+ * record) is still in the cached list, and the tracked-id dedup that had been masking it stops the
  * instant it departs — painting a just-archived session as a "Past" row, which reads as the archive
  * having failed.
  *
@@ -582,14 +975,17 @@ export interface PastAgentSessionsResolver {
  * Departures are tracked against the FULL tracked set rather than a worktree-matched subset, so
  * changing which worktree is displayed isn't mistaken for sessions disappearing. A freshly
  * delivered result (the host filters archived ids at fetch time) retires every suppression.
+ * Tracked ended ids remain in the full set used to recognize real archives, but are omitted from the
+ * live-id set because every terminal session is normalized into the past result and rendered there.
  */
 export function createPastAgentSessionsResolver(): PastAgentSessionsResolver {
 	let seenIds: Set<string> | undefined;
+	let visibleIds: Set<string> | undefined;
 	let lastPast: PastAgentSessionsResult | undefined;
 	const departed = new Set<string>();
 
 	return {
-		resolve: (past, live) => {
+		resolve: (past, tracked) => {
 			if (past !== lastPast) {
 				lastPast = past;
 				departed.clear();
@@ -599,8 +995,8 @@ export function createPastAgentSessionsResolver(): PastAgentSessionsResolver {
 			// which is NOT the same as "no sessions". Treating it as an empty set would retire every
 			// seen id as departed and permanently suppress the matching Past rows, so hold the prior
 			// snapshot and only diff against a real list.
-			if (live != null) {
-				const nextIds = new Set(live.map(s => s.id));
+			if (tracked != null) {
+				const nextIds = new Set(tracked.map(s => getAgentSessionIdentityKey(s.providerId, s.id)));
 				if (seenIds != null) {
 					for (const id of seenIds) {
 						if (!nextIds.has(id)) {
@@ -609,17 +1005,74 @@ export function createPastAgentSessionsResolver(): PastAgentSessionsResolver {
 					}
 				}
 				seenIds = nextIds;
+				visibleIds = new Set(
+					tracked.filter(s => s.phase !== 'ended').map(s => getAgentSessionIdentityKey(s.providerId, s.id)),
+				);
 			}
-			const liveIds = seenIds;
 
 			if (past == null) return undefined;
 
-			const sessions = past.sessions.filter(p => !liveIds?.has(p.id) && !departed.has(p.id));
+			const sessions = past.sessions.filter(p => {
+				const key = getAgentSessionIdentityKey(p.providerId, p.id);
+				return !visibleIds?.has(key) && !departed.has(key);
+			});
 			const dropped = past.sessions.length - sessions.length;
 			// Preserve reference identity when nothing was dropped — the common case.
 			if (dropped === 0) return past;
 
 			return { sessions: sessions, total: Math.max(0, past.total - dropped) };
+		},
+	};
+}
+
+/** Host hooks {@link createPastAgentSessionsPager} reads/drives current committed state through —
+ *  each of the details panel and the branch sheet pane express their own paging/loading/staleness
+ *  bookkeeping as these closures rather than duplicating the pager's policy. */
+export interface PastAgentSessionsPagerHost {
+	/** Currently committed page limit. */
+	getLimit(): number;
+	/** True while a page fetch is in flight. */
+	isLoading(): boolean;
+	/** False once the surface moved on (different worktree/row) — stale completions are dropped. */
+	isCurrent(): boolean;
+	/** Fetches (and commits) a page at `limit`; owns its own staleness handling on completion. */
+	fetch(limit: number): Promise<void>;
+	archiveSession(sessionId: string, providerId: string): Promise<boolean>;
+}
+
+export interface PastAgentSessionsPager {
+	more(requestedLimit: number): Promise<void>;
+	archive(sessionId: string, providerId: string): Promise<void>;
+}
+
+/**
+ * Centralizes the "Show More" / "Archive then refetch" policy shared by the graph details panel and
+ * the branch sheet pane's past-agent-sessions sections — both re-implemented this with subtly
+ * divergent guards (the details panel widened a lower "more" request up to the current limit
+ * instead of no-opping it; see `gl-graph-details-panel.ts`). A single source of truth means a future
+ * paging/archive-race fix has to land once, not be ported by hand to both surfaces.
+ *
+ * `more` is a no-op unless the requested limit is strictly larger than the current one, no fetch is
+ * already in flight, and the surface is still current — otherwise it awaits `host.fetch(requestedLimit)`.
+ *
+ * `archive` no-ops once the surface has moved on. It awaits `host.archiveSession(...)`; only when that
+ * resolved `true` AND the surface is still current does it await `host.fetch(host.getLimit())` — a
+ * refetch at the SAME limit, so the archived row drops out of the page without changing its size.
+ */
+export function createPastAgentSessionsPager(host: PastAgentSessionsPagerHost): PastAgentSessionsPager {
+	return {
+		more: async (requestedLimit: number): Promise<void> => {
+			if (requestedLimit <= host.getLimit() || host.isLoading() || !host.isCurrent()) return;
+
+			await host.fetch(requestedLimit);
+		},
+		archive: async (sessionId: string, providerId: string): Promise<void> => {
+			if (!host.isCurrent()) return;
+
+			const archived = await host.archiveSession(sessionId, providerId);
+			if (!archived || !host.isCurrent()) return;
+
+			await host.fetch(host.getLimit());
 		},
 	};
 }

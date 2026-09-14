@@ -2,7 +2,11 @@ import * as assert from 'node:assert/strict';
 import { suite, test } from 'mocha';
 import { ConfiguredIntegrationService } from '../authentication/configuredIntegrationService.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
-import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
+import {
+	GitCloudHostIntegrationId,
+	GitSelfManagedHostIntegrationId,
+	IssuesCloudHostIntegrationId,
+} from '../constants.js';
 import { createFakeRuntime } from './fakeRuntime.js';
 
 function cloudSession(id: string, overrides?: Partial<ProviderAuthenticationSession>): ProviderAuthenticationSession {
@@ -44,6 +48,35 @@ suite('ConfiguredIntegrationService — multi-account (#5430)', () => {
 		);
 	});
 
+	test('rehydrates a Trello session preserving the appKey (#5438)', async () => {
+		const runtime = createFakeRuntime();
+		// A stored Trello cloud session carries the app key its client needs alongside the token.
+		await runtime.storage.store('integrations:configured', {
+			trello: [{ id: 'trello.com', cloud: true, integrationId: 'trello', scopes: '' }],
+		});
+		await runtime.storage.storeSecret(
+			'integration.auth.cloud:trello|trello.com',
+			JSON.stringify({
+				id: 'trello.com',
+				accessToken: 'tok',
+				scopes: [],
+				cloud: true,
+				type: 'oauth',
+				domain: 'trello.com',
+				appKey: 'my-app-key',
+			}),
+		);
+
+		const service = new ConfiguredIntegrationService(runtime);
+		const session = await service.getStoredSession(IssuesCloudHostIntegrationId.Trello, {
+			domain: 'trello.com',
+			scopes: [],
+		});
+
+		assert.ok(session != null, 'stored Trello session resolves');
+		assert.equal(session.appKey, 'my-app-key', 'the appKey survives rehydration (without it every read no-ops)');
+	});
+
 	test('hydration backfills the connection id from the canonical domain (never empty)', async () => {
 		const runtime = createFakeRuntime();
 		await runtime.storage.store('integrations:configured', {
@@ -83,6 +116,44 @@ suite('ConfiguredIntegrationService — multi-account (#5430)', () => {
 
 		assert.ok(session != null, 'self-managed session resolves');
 		assert.equal(session.accessToken, 'ent');
+	});
+
+	test('reads a legacy self-managed full-url session by host while normalizing the configured domain', async () => {
+		const runtime = createFakeRuntime();
+		await runtime.storage.store('integrations:configured', {
+			'cloud-github-enterprise': [
+				{
+					cloud: true,
+					integrationId: 'cloud-github-enterprise',
+					domain: 'https://gh.example.com/api/v3',
+					scopes: 'repo',
+				},
+			],
+		});
+		await runtime.storage.storeSecret(
+			'integration.auth.cloud:cloud-github-enterprise|https://gh.example.com/api/v3',
+			JSON.stringify({
+				id: 'https://gh.example.com/api/v3',
+				accessToken: 'ent',
+				scopes: ['repo'],
+				cloud: true,
+				type: 'oauth',
+				domain: 'https://gh.example.com/api/v3',
+			}),
+		);
+
+		const service = new ConfiguredIntegrationService(runtime);
+		const session = await service.getStoredSession(GitSelfManagedHostIntegrationId.CloudGitHubEnterprise, {
+			domain: 'gh.example.com',
+			scopes: ['repo'],
+		});
+
+		assert.ok(session != null, 'legacy full-url session resolves from the normalized host scope');
+		assert.equal(session.accessToken, 'ent');
+		assert.equal(
+			service.getConfigured(GitSelfManagedHostIntegrationId.CloudGitHubEnterprise)[0].domain,
+			'gh.example.com',
+		);
 	});
 
 	test('getConfiguredConnectionId returns undefined for a legacy self-managed connection keyed by domain', async () => {

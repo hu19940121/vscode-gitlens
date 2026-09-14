@@ -5,10 +5,13 @@ import type { GlCommands } from '../../../../../constants.commands.js';
 import type { GraphSidebarService } from '../../../../plus/graph/graphService.js';
 import type {
 	DidGetSidebarDataParams,
+	GraphPullRequestSheetData,
 	GraphSidebarPanel,
 	GraphSidebarPullRequest,
 	SidebarWorktreeChange,
 } from '../../../../plus/graph/protocol.js';
+import { isConnectionClosedError } from '../../../shared/actions/rpc.js';
+import { waitForFocusSettled } from '../../../shared/focus.js';
 import type { Resource } from '../../../shared/state/resource.js';
 import { createResource } from '../../../shared/state/resource.js';
 
@@ -72,6 +75,10 @@ export interface SidebarActions {
 	requestWorktreeWipStats(path: string): Promise<void>;
 	invalidateAll(): void;
 	refresh(panel: GraphSidebarPanel): void;
+	/** Re-runs the panel's last fetch, keeping whatever it already holds — what a failed load's
+	 *  "Try Again" offers. Unlike {@link refresh}, it never blanks the panel, so a retry that fails
+	 *  again leaves the stale list on screen rather than replacing it with a skeleton. */
+	retry(panel: GraphSidebarPanel): void;
 	toggleLayout(panel: GraphSidebarPanel): void;
 	toggleShowRemoteBranches(): void;
 	executeAction(command: GlCommands, context?: string, args?: unknown[]): void;
@@ -79,6 +86,12 @@ export interface SidebarActions {
 	 *  scope popover's Focus pane. Resolves `undefined` when the service isn't wired yet or the
 	 *  provider has no such pull request. */
 	findPullRequest(number: string): Promise<GraphSidebarPullRequest | undefined>;
+	/** Everything the pull request sheet needs for `target`, resolved host-side in one round trip —
+	 *  the pull request (or the whole stack, by stack number) with its layers alongside. Resolves
+	 *  `undefined` when the service isn't wired yet or the pull request can't be resolved. */
+	resolvePullRequestSheet(
+		target: { number: string } | { stackNumber: number },
+	): Promise<GraphPullRequestSheetData | undefined>;
 	applyWorktreeChanges(changes: Record<string, SidebarWorktreeChange | undefined>): void;
 	dispose(): void;
 }
@@ -96,8 +109,10 @@ export function createSidebarActions(): SidebarActions {
 	const worktreeWipStatsInFlight = new Map<string, Promise<void>>();
 
 	// Held as a local (not read off `actions`) so the panel-resource factories below can capture it without
-	// referencing `actions` before it's defined.
-	let sidebarShowing = true;
+	// referencing `actions` before it's defined. Starts `false`, not `true`: the panel component seeds the
+	// real value when it mounts, and until then nothing is on screen — so a service that connects first
+	// must not treat "unknown" as "visible" and fetch a panel nobody can see (see `refreshOnReveal`).
+	let sidebarShowing = false;
 
 	let service: GraphSidebarService | undefined;
 	let unsubscribeConfig: (() => void) | undefined;
@@ -239,7 +254,10 @@ export function createSidebarActions(): SidebarActions {
 
 			actions.fetchCounts();
 
-			if (actions.activePanel != null) {
+			// Only while the sidebar is on screen. A collapsed sidebar's panel is fetched by `refreshOnReveal`
+			// the moment it opens, so fetching it here would just spend the round trip early — and for the
+			// pull requests panel that round trip is the provider's whole open-PR list.
+			if (actions.activePanel != null && sidebarShowing) {
 				actions.fetchPanel(actions.activePanel);
 			}
 		},
@@ -250,9 +268,10 @@ export function createSidebarActions(): SidebarActions {
 			void panels[panel].fetch();
 		},
 
-		/** Called by the sidebar-panel component when the sidebar becomes visible. Unconditional and cheap —
-		 *  it exists to warm the per-worktree enrichment that was suppressed host-side while hidden, since
-		 *  the panel data itself never went stale. */
+		/** Called by the sidebar-panel component when the sidebar becomes visible. This is the ONLY fetch a
+		 *  hidden sidebar's active panel ever gets: the boot fetch and `invalidateAll` both skip a hidden
+		 *  sidebar (and `invalidateAll` resets its panels), so the reveal is what loads it — and, when the
+		 *  panel was already loaded, what warms the per-worktree enrichment suppressed host-side while hidden. */
 		refreshOnReveal: function () {
 			if (actions.activePanel != null) {
 				actions.fetchPanel(actions.activePanel);
@@ -283,6 +302,13 @@ export function createSidebarActions(): SidebarActions {
 					// Leave the entry ABSENT so the next open retries — recording `null` would make a one-off
 					// failure permanent. Resolving (not rethrowing) is what unsticks the tooltip: it waits on
 					// this promise, not on the missing entry, to decide whether anything is still coming.
+					if (isConnectionClosedError(ex)) {
+						Logger.debug(
+							`Worktree WIP stats fetch for '${path}' dropped by deliberate connection teardown`,
+						);
+						return;
+					}
+
 					Logger.warn(`Unable to get worktree WIP stats for '${path}': ${String(ex)}`);
 				})
 				.finally(() => {
@@ -307,15 +333,15 @@ export function createSidebarActions(): SidebarActions {
 		},
 
 		invalidateAll: function () {
-			// Deliberately NOT gated on sidebar visibility. Fetching panel data while hidden is ~7ms of
-			// in-memory assembly; the expensive part was the per-worktree git fan-out, and that is now
-			// suppressed host-side via the `displayed` flag on the request itself. Gating here instead would
-			// mean the client's data freshness depended on a visibility bit staying in sync across every
-			// lifecycle edge — and a wrong bit could leave a visible panel stale, or blank via `refresh()`'s
-			// own reset. Keeping one code path means panel data is always correct; only the enrichment is
-			// conditional, and its worst case is a missing dirty-pill until the next displayed fetch.
+			// Gated on sidebar visibility. A hidden sidebar's panels are all reset — the active one included —
+			// and nothing is fetched: `refreshOnReveal` fetches the active panel the moment the sidebar opens,
+			// so a hidden fetch only spends the round trip early, and for the pull requests panel that round
+			// trip is the provider's whole open-PR list on every graph open and every invalidation. Resetting
+			// the active panel too (rather than leaving its stale list in place) means the reveal shows a
+			// loading state and then fresh rows, never a stale list first. The `displayed` flag on each
+			// request still suppresses the per-worktree fan-out host-side for the rare hidden fetch.
 			for (const [panel, r] of Object.entries(panels)) {
-				if (panel === actions.activePanel) continue;
+				if (panel === actions.activePanel && sidebarShowing) continue;
 
 				// reset(), not mutate(undefined) — mutate marks the resource as resolved, so it
 				// reports status 'success' while holding no data. Consumers that gate on a settled
@@ -325,9 +351,9 @@ export function createSidebarActions(): SidebarActions {
 			}
 			actions.fetchCounts();
 
-			// Always refetch the active panel — Resource's cancelPrevious
-			// handles dedup, and this ensures recovery if a prior fetch got stuck
-			if (actions.activePanel != null) {
+			// Refetch the visible active panel — Resource's cancelPrevious handles dedup, and this ensures
+			// recovery if a prior fetch got stuck.
+			if (actions.activePanel != null && sidebarShowing) {
 				actions.fetchPanel(actions.activePanel);
 			}
 		},
@@ -340,8 +366,18 @@ export function createSidebarActions(): SidebarActions {
 			service?.refresh(panel);
 		},
 
+		retry: function (panel: GraphSidebarPanel) {
+			// refetch(), not reset()+fetch — the resource keeps its value across a reload, so a retry
+			// that fails again leaves the last good list on screen. It replays the arguments of the
+			// fetch that failed, which the failure itself guarantees are recorded.
+			void panels[panel].refetch();
+		},
+
 		findPullRequest: async function (number: string) {
 			return service?.findPullRequest(number);
+		},
+		resolvePullRequestSheet: async function (target: { number: string } | { stackNumber: number }) {
+			return service?.resolvePullRequestSheet(target);
 		},
 		toggleLayout: function (panel: GraphSidebarPanel) {
 			if (panel === 'agents') {
@@ -357,7 +393,13 @@ export function createSidebarActions(): SidebarActions {
 		},
 
 		executeAction: function (command: GlCommands, context?: string, args?: unknown[]) {
-			service?.executeAction(command, context, args);
+			// Wait for a pending click focus grant to land before the host opens a quick pick —
+			// opening one mid-grant races the webview regaining focus after it shows, which
+			// dismisses it (see `waitForFocusSettled`). Callers here are fire-and-forget.
+			void (async () => {
+				await waitForFocusSettled();
+				service?.executeAction(command, context, args);
+			})();
 		},
 
 		applyWorktreeChanges: function (changes: Record<string, SidebarWorktreeChange | undefined>) {

@@ -2,11 +2,12 @@ import { readdir, realpath } from 'fs';
 import { homedir } from 'os';
 import { resolve as resolvePath } from 'path';
 import type { Disposable, WorkspaceFolder } from 'vscode';
-import { extensions, FileType, Uri, window, workspace } from 'vscode';
+import { extensions, FileType, l10n, Uri, window, workspace } from 'vscode';
 import { fetch } from '@env/fetch.js';
 import { isLinux, isWindows } from '@env/platform.js';
 import type { CliGitProviderOptions } from '@gitlens/git-cli/cliGitProvider.js';
 import { CliGitProvider } from '@gitlens/git-cli/cliGitProvider.js';
+import { slowCallWarningThreshold } from '@gitlens/git-cli/exec/git.js';
 import type { GitLocation } from '@gitlens/git-cli/exec/locator.js';
 import { findGitPath, InvalidGitConfigError, UnableToFindGitError } from '@gitlens/git-cli/exec/locator.js';
 import type { Cache } from '@gitlens/git/cache.js';
@@ -54,6 +55,7 @@ import type { APIState, GitExtension, API as ScmGitApi } from '../../../@types/v
 import { Schemes } from '../../../constants.js';
 import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
+import { getPresentableErrorMessage } from '../../../errors.js';
 import type { Features } from '../../../features.js';
 import { gitMinimumVersion } from '../../../features.js';
 import type {
@@ -273,10 +275,21 @@ export class GlCliGitProvider implements GlGitProvider {
 						});
 					},
 					onSlowCommand: info => {
+						// An event-loop stall inflates the measured duration (the exit event sat undelivered),
+						// so only count samples that would still be slow with the entire stall discounted —
+						// health evidence drives maintenance recommendations, and a starved host must not
+						// manufacture "slow repository" evidence.
+						if (info.duration - (info.eventLoopDelay ?? 0) <= slowCallWarningThreshold) return;
+
 						// Feed the Git Health passive-slowness counters. Resolution stays in-memory only
 						// (`getRepository`) — never invoke git here, or we'd recurse through the exec layer
 						// that just fired this hook.
-						container.gitHealth.recordSlowCommand(info.cwd ?? '', info.duration, info.operation);
+						container.gitHealth.recordSlowCommand(
+							info.cwd ?? '',
+							info.duration,
+							info.operation,
+							info.slownessCategory,
+						);
 					},
 				},
 			},
@@ -534,9 +547,12 @@ export class GlCliGitProvider implements GlGitProvider {
 			} else if (ex instanceof UnableToFindGitError) {
 				void showGitMissingErrorMessage();
 			} else {
+				// oxlint-disable-next-line @gitlens/no-raw-error-message -- emptiness check only; the notification below uses getPresentableErrorMessage
 				const msg: string = ex?.message ?? '';
 				if (msg && !options?.silent) {
-					void window.showErrorMessage(`Unable to initialize Git; ${msg}`);
+					void window.showErrorMessage(
+						l10n.t('Unable to initialize Git; {0}', getPresentableErrorMessage(ex)),
+					);
 				}
 			}
 
@@ -983,9 +999,11 @@ export class GlCliGitProvider implements GlGitProvider {
 				if (!isAbsolute(base)) {
 					debugger;
 					void window.showErrorMessage(
-						`Unable to get absolute uri between ${
-							typeof pathOrUri === 'string' ? pathOrUri : pathOrUri.toString(true)
-						} and ${base}; Base path '${base}' must be an absolute path`,
+						l10n.t(
+							"Unable to get absolute uri between {0} and {1}; Base path '{1}' must be an absolute path",
+							typeof pathOrUri === 'string' ? pathOrUri : pathOrUri.toString(true),
+							base,
+						),
 					);
 					throw new Error(`Base path '${base}' must be an absolute path`);
 				}
@@ -1033,12 +1051,23 @@ export class GlCliGitProvider implements GlGitProvider {
 
 		// If the ref is the index, then try to create a Uri using the Git extension, but if we can't find a repo for it, then generate our own Uri
 		if (isUncommittedStaged(rev)) {
+			// If the repoPath is a canonical path, then we need to remap it to the real path, because the vscode.git extension always uses the real path
+			const realUri = this.fromCanonicalMap.get(repoPath);
+
 			let scmRepo = await this.getScmRepository(repoPath);
+			if (scmRepo == null && realUri != null) {
+				scmRepo = await this.getScmRepository(realUri.fsPath);
+			}
+
 			if (scmRepo == null) {
-				// If the repoPath is a canonical path, then we need to remap it to the real path, because the vscode.git extension always uses the real path
-				const realUri = this.fromCanonicalMap.get(repoPath);
-				if (realUri != null) {
-					scmRepo = await this.getScmRepository(realUri.fsPath);
+				// Not registered — or only an ancestor is, e.g. a worktree nested inside another repo — so
+				// force-register it: the built-in Stage/Unstage Hunk gutter actions only appear for `git:`
+				// index Uris the Git extension can resolve. Verify the root, since `openRepository`
+				// discovers the root from the path itself
+				const uri = realUri ?? Uri.file(repoPath);
+				const opened = await this.getOrOpenScmRepository(uri);
+				if (opened != null && arePathsEqual(opened.rootUri.fsPath, uri.fsPath)) {
+					scmRepo = opened;
 				}
 			}
 
@@ -1060,9 +1089,11 @@ export class GlCliGitProvider implements GlGitProvider {
 				if (!isAbsolute(base)) {
 					debugger;
 					void window.showErrorMessage(
-						`Unable to get relative path between ${
-							typeof pathOrUri === 'string' ? pathOrUri : pathOrUri.toString(true)
-						} and ${base}; Base path '${base}' must be an absolute path`,
+						l10n.t(
+							"Unable to get relative path between {0} and {1}; Base path '{1}' must be an absolute path",
+							typeof pathOrUri === 'string' ? pathOrUri : pathOrUri.toString(true),
+							base,
+						),
 					);
 					throw new Error(`Base path '${base}' must be an absolute path`);
 				}
@@ -1201,12 +1232,14 @@ export class GlCliGitProvider implements GlGitProvider {
 		} catch (ex) {
 			const msg: string = ex?.toString() ?? '';
 			if (patch && /patch does not apply/i.test(msg)) {
+				const retry = { title: l10n.t('Yes') };
+				const cancel = { title: l10n.t('No'), isCloseAffordance: true };
 				const result = await window.showWarningMessage(
-					'Unable to apply changes cleanly. Retry and allow conflicts?',
-					{ title: 'Yes' },
-					{ title: 'No', isCloseAffordance: true },
+					l10n.t('Unable to apply changes cleanly. Retry and allow conflicts?'),
+					retry,
+					cancel,
 				);
-				if (result?.title !== 'Yes') return;
+				if (result !== retry) return;
 
 				try {
 					await this.provider.patch.apply(root, patch, { threeWay: true });
@@ -1219,7 +1252,7 @@ export class GlCliGitProvider implements GlGitProvider {
 			}
 
 			scope?.error(ex);
-			void showGenericErrorMessage('Unable to apply changes');
+			void showGenericErrorMessage(l10n.t('Unable to apply changes'));
 		}
 	}
 
@@ -1231,7 +1264,7 @@ export class GlCliGitProvider implements GlGitProvider {
 			return await this.provider.clone?.(url, parentPath);
 		} catch (ex) {
 			scope?.error(ex);
-			void showGenericErrorMessage(`Unable to clone '${url}'`);
+			void showGenericErrorMessage(l10n.t("Unable to clone '{0}'", url));
 		}
 
 		return undefined;
@@ -1634,7 +1667,26 @@ export class GlCliGitProvider implements GlGitProvider {
 		const scope = getScopedLogger();
 		try {
 			const gitApi = await this.getScmGitApi();
-			return gitApi?.getRepository(Uri.file(repoPath)) ?? undefined;
+			const repo = gitApi?.getRepository(Uri.file(repoPath));
+			if (repo == null) return undefined;
+
+			// `getRepository` returns any opened repository that "contains" the path, so a worktree or
+			// nested repo living inside an opened repo resolves to that ancestor instead. Callers mean
+			// this exact repo: they build `git:` Uris for it (which carry no repo, so the Git extension
+			// re-resolves them by path against the ancestor, where the path isn't in the index) or they
+			// write to its SCM input box (landing the text in the ancestor's box). Both fail silently,
+			// so require the roots to match. `arePathsEqual` normalizes separators and drive casing,
+			// which a Uri/string comparison would trip over on Windows.
+			if (!arePathsEqual(repo.rootUri.fsPath, repoPath)) {
+				scope?.info(
+					`no SCM repository for '${repoPath}'; closest match is the containing repository '${repo.rootUri.toString(
+						true,
+					)}'`,
+				);
+				return undefined;
+			}
+
+			return repo;
 		} catch (ex) {
 			scope?.error(ex);
 			return undefined;

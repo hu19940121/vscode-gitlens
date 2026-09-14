@@ -1,11 +1,18 @@
+import { l10n } from 'vscode';
 import type { GitBranchReference } from '@gitlens/git/models/reference.js';
+import { parseGitBoolean } from '@gitlens/git/utils/config.utils.js';
 import { getReferenceLabel, isBranchReference } from '@gitlens/git/utils/reference.utils.js';
 import { isStringArray } from '@gitlens/utils/array.js';
 import { fromNow } from '@gitlens/utils/date.js';
+import { getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
+import { getSettledValue } from '@gitlens/utils/promise.js';
 import { pad } from '@gitlens/utils/string.js';
 import { GlyphChars } from '../../constants.js';
 import type { Container } from '../../container.js';
 import type { GlRepository } from '../../git/models/repository.js';
+import { createQuickPickSeparator } from '../../quickpicks/items/common.js';
+import type { DirectiveQuickPickItem } from '../../quickpicks/items/directive.js';
+import { createConfirmToggleQuickPickItem } from '../../quickpicks/items/directive.js';
 import type { FlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import { createFlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import type { ViewsWithRepositoryFolders } from '../../views/viewBase.js';
@@ -26,7 +33,8 @@ import {
 	appendReposToTitle,
 	assertStepState,
 	canPickStepContinue,
-	createConfirmStep,
+	confirmOptionsSeparatorLabel,
+	refreshConfirmStepItems,
 } from '../quick-wizard/utils/steps.utils.js';
 
 const Steps = {
@@ -56,7 +64,9 @@ export interface FetchGitCommandArgs {
 
 export class FetchGitCommand extends QuickCommand<State> {
 	constructor(container: Container, args?: FetchGitCommandArgs) {
-		super(container, 'fetch', 'fetch', 'Fetch', { description: 'fetches changes from one or more remotes' });
+		super(container, 'fetch', 'fetch', l10n.t('Fetch'), {
+			description: l10n.t('fetches changes from one or more remotes'),
+		});
 
 		this.initialState = { confirm: args?.confirm, ...args?.state };
 	}
@@ -70,6 +80,10 @@ export class FetchGitCommand extends QuickCommand<State> {
 			all: state.flags.includes('--all'),
 			prune: state.flags.includes('--prune'),
 		});
+	}
+
+	protected override get supportsSkipConfirmToggle(): boolean {
+		return true;
 	}
 
 	protected createContext(context?: StepsContext<any>): Context {
@@ -148,50 +162,130 @@ export class FetchGitCommand extends QuickCommand<State> {
 		if (state.repos.length === 1) {
 			const lastFetched = await state.repos[0].getLastFetched();
 			if (lastFetched !== 0) {
-				lastFetchedOn = `${pad(GlyphChars.Dot, 2, 2)}Last fetched ${fromNow(new Date(lastFetched))}`;
+				lastFetchedOn = l10n.t(
+					'{0}Last fetched {1}',
+					pad(GlyphChars.Dot, 2, 2),
+					fromNow(new Date(lastFetched)),
+				);
 			}
 		}
 
-		let step: QuickPickStep<FlagsQuickPickItem<Flags>>;
+		let step: QuickPickStep<FlagsQuickPickItem<Flags> | DirectiveQuickPickItem>;
 
 		if (state.repos.length === 1 && isBranchReference(state.reference)) {
 			step = this.createConfirmStep(
-				appendReposToTitle(`Confirm ${context.title}`, state, context, lastFetchedOn),
+				appendReposToTitle(l10n.t('Confirm Fetch'), state, context, lastFetchedOn),
 				[
 					createFlagsQuickPickItem<Flags>(state.flags, [], {
 						label: this.title,
-						detail: `Will fetch ${getReferenceLabel(state.reference)}`,
+						detail: l10n.t('Will fetch {0}', getReferenceLabel(state.reference)),
 					}),
 				],
+				l10n.t('Confirm Fetch'),
 			);
 		} else {
-			const reposToFetch =
-				state.repos.length === 1 ? `$(repo) ${state.repos[0].name}` : `${state.repos.length} repos`;
+			const repoCount = state.repos.length;
 
-			step = createConfirmStep(
-				appendReposToTitle(`Confirm ${this.title}`, state, context, lastFetchedOn),
-				[
-					createFlagsQuickPickItem<Flags>(state.flags, [], {
+			// A seeded wizard flag wins; otherwise, for a single repo in scope, the `fetch.prune` config
+			// decides, so the toggle reflects what git will actually do if left untouched. Multi-repo
+			// fetches skip the config read (repos can disagree) and default the toggle unchecked.
+			let prune = state.flags.includes('--prune');
+			// Name the remote a plain fetch will actually hit, so the row contrasts meaningfully with
+			// Fetch All Remotes; multi-repo fetches keep the generic sentence
+			let remoteName: string | undefined;
+			if (state.repos.length === 1) {
+				const [repo] = state.repos;
+				const [pruneResult, branchResult] = await Promise.allSettled([
+					prune ? undefined : repo.git.config.getConfig?.('fetch.prune'),
+					repo.git.branches.getBranch(),
+				]);
+				if (!prune) {
+					prune = parseGitBoolean(getSettledValue(pruneResult)) ?? false;
+				}
+
+				const upstream = getSettledValue(branchResult)?.upstream?.name;
+				remoteName = upstream != null ? getRemoteNameFromBranchName(upstream) : 'origin';
+			}
+
+			// Folds the live toggle value into each item's flags and detail — the accepted item's flags are
+			// the whole contract with `execute()` — so the list says what will actually happen.
+			const buildItems = (): FlagsQuickPickItem<Flags>[] => {
+				const fetchDetail =
+					state.repos.length === 1
+						? remoteName == null
+							? prune
+								? l10n.t(
+										'Will fetch $(repo) {0}, pruning stale remote-tracking branches',
+										state.repos[0].name,
+									)
+								: l10n.t('Will fetch $(repo) {0}', state.repos[0].name)
+							: prune
+								? l10n.t(
+										'Will fetch {0} of $(repo) {1}, pruning stale remote-tracking branches',
+										remoteName,
+										state.repos[0].name,
+									)
+								: l10n.t('Will fetch {0} of $(repo) {1}', remoteName, state.repos[0].name)
+						: prune
+							? l10n.t('Will fetch {0} repos, pruning stale remote-tracking branches', repoCount)
+							: l10n.t('Will fetch {0} repos', repoCount);
+				const fetchAllDetail =
+					state.repos.length === 1
+						? prune
+							? l10n.t(
+									'Will fetch all remotes of $(repo) {0}, pruning stale remote-tracking branches',
+									state.repos[0].name,
+								)
+							: l10n.t('Will fetch all remotes of $(repo) {0}', state.repos[0].name)
+						: prune
+							? l10n.t(
+									'Will fetch all remotes of {0} repos, pruning stale remote-tracking branches',
+									repoCount,
+								)
+							: l10n.t('Will fetch all remotes of {0} repos', repoCount);
+				return [
+					createFlagsQuickPickItem<Flags>(state.flags, prune ? ['--prune'] : [], {
 						label: this.title,
-						detail: `Will fetch ${reposToFetch}`,
+						detail: fetchDetail,
+						picked: !state.flags.includes('--all'),
 					}),
-					createFlagsQuickPickItem<Flags>(state.flags, ['--prune'], {
-						label: `${this.title} & Prune`,
-						description: '--prune',
-						detail: `Will fetch and prune ${reposToFetch}`,
-					}),
-					createFlagsQuickPickItem<Flags>(state.flags, ['--all'], {
-						label: `${this.title} All`,
+					createFlagsQuickPickItem<Flags>(state.flags, prune ? ['--all', '--prune'] : ['--all'], {
+						label: l10n.t('Fetch All Remotes'),
 						description: '--all',
-						detail: `Will fetch all remotes of ${reposToFetch}`,
+						detail: fetchAllDetail,
+						picked: state.flags.includes('--all'),
 					}),
-					createFlagsQuickPickItem<Flags>(state.flags, ['--all', '--prune'], {
-						label: `${this.title} All & Prune`,
-						description: '--all --prune',
-						detail: `Will fetch and prune all remotes of ${reposToFetch}`,
-					}),
-				],
-				context,
+				];
+			};
+
+			let items = buildItems();
+
+			// Takes the toggle row rather than closing over it so this can be declared before the toggle
+			// itself, which needs `buildRows` in its handler.
+			const buildRows = (
+				toggle: DirectiveQuickPickItem,
+			): (FlagsQuickPickItem<Flags> | DirectiveQuickPickItem)[] => [
+				...items,
+				createQuickPickSeparator(confirmOptionsSeparatorLabel),
+				toggle,
+			];
+
+			const pruneToggle = createConfirmToggleQuickPickItem({
+				label: l10n.t('Prune'),
+				description: '--prune',
+				detail: l10n.t('Also remove remote-tracking branches that no longer exist on the remote'),
+				checked: prune,
+				onDidChange: item => {
+					prune = item.checked;
+					items = buildItems();
+					refreshConfirmStepItems(step, buildRows(item));
+				},
+			});
+
+			step = this.createConfirmStep(
+				appendReposToTitle(l10n.t('Confirm Fetch'), state, context, lastFetchedOn),
+				buildRows(pruneToggle),
+				l10n.t('Confirm Fetch'),
 			);
 		}
 

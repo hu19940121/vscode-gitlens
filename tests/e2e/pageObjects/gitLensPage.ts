@@ -23,7 +23,7 @@ export class GitLensPage extends VSCodePage {
 	 */
 	async startSubscriptionSimulation(
 		state: SimulationState = { state: 6 /*SubscriptionState.Paid*/, planId: 'pro' },
-	): Promise<{ success: boolean } & Disposable> {
+	): Promise<{ success: boolean } & Disposable & AsyncDisposable> {
 		if (!(await this.waitForCommand('gitlens.plus.simulate.subscription'))) {
 			throw new Error('gitlens.plus.simulate.subscription command not found');
 		}
@@ -33,22 +33,23 @@ export class GitLensPage extends VSCodePage {
 		await this.page.waitForTimeout(ShortTimeout);
 		return {
 			success: success,
-			[Symbol.dispose]: async () => {
-				await this.stopSubscriptionSimulation();
+			// `using` calls the SYNC disposer and drops whatever it returns, so teardown can't be awaited
+			// through it — `asyncDispose` below is the awaited path. What the sync one has to guarantee is
+			// that its floating promise never surfaces as an UNHANDLED rejection: the worker fixture
+			// force-kills the editor before closing it, so a late `evaluate()` lands on a dead HTTP server
+			// and rejects with `SocketError: other side closed`. Unhandled, that takes the whole worker
+			// down — Playwright reports it as "errors were not a part of any test", turning a run whose
+			// every test passed into a red one. Swallowing is right here precisely because this path can't
+			// report anyway; callers that need to know use the async disposer.
+			[Symbol.dispose]: () => {
+				void this.stopSubscriptionSimulation().catch(() => {});
 			},
+			[Symbol.asyncDispose]: () => this.stopSubscriptionSimulation(),
 		};
 	}
 
 	async stopSubscriptionSimulation(): Promise<void> {
 		await this.executeCommand('gitlens.plus.simulate.subscription', { state: null });
-	}
-
-	/**
-	 * Get the count of GitLens-related tabs in the activity bar
-	 * Should be 2: GitLens and GitLens Inspect
-	 */
-	async getActivityBarTabCount(): Promise<number> {
-		return this.activityBar.countTabs(/GitLens/);
 	}
 
 	/**
@@ -91,20 +92,6 @@ export class GitLensPage extends VSCodePage {
 	// ============================================================================
 	// GitLens Sidebar Views
 	// ============================================================================
-
-	/** Home section in GitLens sidebar */
-	get homeViewSection(): Locator {
-		return this.sidebar.getSection(/Home Section/i);
-	}
-
-	/** Home webview in GitLens sidebar */
-	get homeViewWebview(): Promise<FrameLocator | null> {
-		return this.getGitLensWebview('Home', 'webviewView');
-	}
-
-	async showHomeView(): Promise<void> {
-		await this.executeCommand('gitlens.showHomeView');
-	}
 
 	/** Launchpad section in GitLens sidebar */
 	get launchpadViewSection(): Locator {
@@ -360,7 +347,7 @@ export class GitLensPage extends VSCodePage {
 	 * 1. The outer iframe src containing extensionId=eamodio.gitlens and purpose=webviewView/webviewPanel
 	 * 2. The inner iframe#active-frame having the specified title attribute
 	 *
-	 * @param title - The title of the webview (e.g., "Graph", "Graph Details", "Home")
+	 * @param title - The title of the webview (e.g., "Graph", "Graph Details", "Timeline")
 	 * @param purpose - The purpose of the webview (e.g., "webviewView", "webviewPanel")
 	 * @param timeout - Timeout in ms
 	 * @returns A FrameLocator for the matching webview content, or null if not found

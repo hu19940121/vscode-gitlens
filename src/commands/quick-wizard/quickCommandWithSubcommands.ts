@@ -1,4 +1,4 @@
-import { QuickInputButtons } from 'vscode';
+import { l10n, QuickInputButtons } from 'vscode';
 import type { Container } from '../../container.js';
 import type { QuickPickItemOfT } from '../../quickpicks/items/common.js';
 import type {
@@ -93,6 +93,10 @@ export abstract class QuickCommandWithSubcommands<
 		const command = this.subcommands.get(name);
 		if (command == null) throw new Error(`Subcommand '${name}' not registered`);
 
+		// Children compute their own `skipConfirmKey` (`{childKey}:{startedFrom}`) — hand down how this
+		// command was started so `:command` vs `:menu` resolves the same way as the parent's key
+		command.startedFrom = this.startedFrom;
+
 		return command.getSteps(state, this.createContext(context));
 	}
 
@@ -138,15 +142,20 @@ export abstract class QuickCommandWithSubcommands<
 
 	protected *pickSubcommandStep(state: PartialStepState<TState>): StepResultGenerator<TSubcommand> {
 		const items: QuickPickItemOfT<TSubcommand>[] = Array.from(this.subcommands, ([name, command]) => ({
-			label: name,
-			description: command.description,
+			// The internal subcommand key remains in the description for typed muscle memory while the
+			// visible command title follows the VS Code display language.
+			label: command.title,
+			description: name,
+			detail: command.description,
 			picked: state.subcommand === name,
 			item: name,
 		}));
 
 		const step = createPickStep<QuickPickItemOfT<TSubcommand>>({
 			title: this.title,
-			placeholder: `Choose a ${this.label} command`,
+			placeholder: l10n.t('Choose a {0} command', this.label),
+			// The raw key lives in the description — without this, typing it wouldn't filter
+			matchOnDescription: true,
 			items: items,
 			buttons: [QuickInputButtons.Back],
 		});

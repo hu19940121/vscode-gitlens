@@ -2,7 +2,11 @@ import type { Remote } from '@eamodio/supertalk';
 import type { AutolinkConfig, Config, CustomRemoteType, RemotesUrlsConfig } from '../../../config.js';
 import { isCustomConfigKey } from '../../protocol.js';
 import type { ScopedAiModelInfo } from '../../rpc/services/types.js';
-import type { SettingsServices, SettingsUpdateParams } from '../../settings/settingsService.js';
+import type {
+	GenerateFormatPreviewResult,
+	SettingsServices,
+	SettingsUpdateParams,
+} from '../../settings/settingsService.js';
 import { anchorToCategory } from './categories/index.js';
 import type { CheckDescriptor, SettingsKey } from './model.js';
 import { setPath } from './model.js';
@@ -92,7 +96,7 @@ export class SettingsActions {
 		}
 	}
 
-	// ── Shared services (subscription/integrations/AI) ──
+	// ── Shared services (integrations/AI) ──
 
 	/**
 	 * Populates the shared-service signals progressively — the panels show
@@ -104,13 +108,13 @@ export class SettingsActions {
 		// A superseded attempt's late failure must not flip an in-flight retry
 		// back to the error state
 		const generation = ++this._servicesLoadGeneration;
-		s.serviceErrors.set({ subscription: false, integrations: false, ai: false, agents: false });
+		s.serviceErrors.set({ integrations: false, ai: false, agents: false });
 
 		// A superseded attempt's late resolution must touch neither the error flags
 		// nor the data signals, or it could overwrite fresher data from the retry
 		const current = () => generation === this._servicesLoadGeneration;
 
-		const failed = (...services: ('subscription' | 'integrations' | 'ai' | 'agents')[]) => {
+		const failed = (...services: ('integrations' | 'ai' | 'agents')[]) => {
 			if (!current()) return;
 
 			const errors = { ...s.serviceErrors.get() };
@@ -120,32 +124,22 @@ export class SettingsActions {
 			s.serviceErrors.set(errors);
 		};
 
-		let subscription;
 		let integrations;
 		let ai;
 		let agents;
 		try {
 			// Resolving the sub-service handles is itself an RPC round-trip that
 			// can reject — without this, a retry could silently skeleton forever
-			[subscription, integrations, ai, agents] = await Promise.all([
-				this.services.subscription,
+			[integrations, ai, agents] = await Promise.all([
 				this.services.integrations,
 				this.services.ai,
 				this.services.agents,
 			]);
 		} catch {
-			failed('subscription', 'integrations', 'ai', 'agents');
+			failed('integrations', 'ai', 'agents');
 			return;
 		}
 
-		void subscription.getSubscription().then(
-			sub => {
-				if (current()) {
-					s.subscription.set(sub);
-				}
-			},
-			() => failed('subscription'),
-		);
 		void integrations.getIntegrationStates().then(
 			states => {
 				if (current()) {
@@ -271,12 +265,27 @@ export class SettingsActions {
 		await this.refreshAiModels();
 	}
 
+	/**
+	 * Asks the host to re-fetch the GitKraken AI allowance — the Account card's Retry after it resolved
+	 * unavailable. The host owns that signal end to end: it flips it back to its loading state and
+	 * republishes, so there is nothing to set locally.
+	 *
+	 * Never rejects: the call site fires this from a click handler, so an escaping rejection would land as
+	 * an unhandled rejection. A failed retry needs no local handling either — the host publishes `null`
+	 * again, which is exactly the state the user is already looking at.
+	 */
+	async retryAiUsage(): Promise<void> {
+		try {
+			const subscription = await this.services.subscription;
+			await subscription.refreshAiUsage();
+		} catch {}
+	}
+
 	// ── Config writes ──
 
 	/**
 	 * Applies a set of changes at the current scope. Entries with an
-	 * `undefined` value are sent as removals (mirrors the legacy
-	 * `UpdateConfigurationCommand` semantics). Resolves `true` when the write
+	 * `undefined` value are sent as removals. Resolves `true` when the write
 	 * lands and `false` when it fails (rolled back) — so callers that promote
 	 * local state on a confirmed write can await the outcome.
 	 */
@@ -407,9 +416,9 @@ export class SettingsActions {
 		return this.apply(changes);
 	}
 
-	/** Applies a select/segmented change with legacy boolean/null coercion. */
+	/** Applies a select/segmented change with scalar coercion (boolean/null/number). */
 	applyOption(key: SettingsKey, value: string): Promise<boolean> {
-		return this.apply({ [key]: ensureIfBooleanOrNull(value) });
+		return this.apply({ [key]: coerceOptionValue(value) });
 	}
 
 	/** Applies a text input commit; an empty value falls back to `defaultValue`, else `null`. */
@@ -526,16 +535,21 @@ export class SettingsActions {
 		type: 'commit' | 'commit-uncommitted' | 'file',
 		format: string,
 		markdown?: boolean,
-	): Promise<string> {
+	): Promise<GenerateFormatPreviewResult> {
 		return this.settings.generateFormatPreview({ key: key, type: type, format: format, markdown: markdown });
 	}
 }
 
-/** Legacy select-value coercion: 'true'/'false' → boolean, 'null' → null, else the string. */
-export function ensureIfBooleanOrNull(value: string): string | boolean | null {
+/**
+ * Select/segmented option-value coercion: 'true'/'false' → boolean, 'null' → null (legacy
+ * `data-value` semantics), a numeric string → number (for `number | string` settings like the
+ * Commit Graph pill caps, whose enum mixes 1–10 with 'auto'), else the string.
+ */
+export function coerceOptionValue(value: string): string | number | boolean | null {
 	if (value === 'true') return true;
 	if (value === 'false') return false;
 	if (value === 'null') return null;
+	if (value !== '' && !Number.isNaN(Number(value))) return Number(value);
 	return value;
 }
 

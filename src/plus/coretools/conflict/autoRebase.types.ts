@@ -1,5 +1,5 @@
 import type { ConsultedTool } from './consultation.js';
-import type { Resolution } from './types.js';
+import type { Resolution, ResolutionDescriptionKind } from './types.js';
 
 /**
  * Lifecycle of an automatic rebase session.
@@ -62,8 +62,10 @@ export interface AutoRebaseFileRecord {
 	path: string;
 	strategy: Resolution['strategy'];
 	confidence: number;
-	/** The AI's rationale for the resolution */
+	/** The canonical rationale for the resolution; also used as model context for later steps. */
 	description: string;
+	/** Identifies a canonical GitLens-authored description that can be localized at presentation. */
+	descriptionKind?: ResolutionDescriptionKind;
 	note?: string;
 	/** Working-tree content (with conflict markers) snapshotted before the resolution was applied */
 	conflictedContent?: string;
@@ -141,7 +143,12 @@ export interface EscalatedStepSnapshot {
 	/** Working-tree (marker) snapshots of the step's files, keyed by path — the "before" side */
 	conflictedContents: Map<string, string>;
 	/** The AI's attempted resolutions for the step (strategy + rationale), informational */
-	resolutions: { filePath: string; strategy: Resolution['strategy']; description: string }[];
+	resolutions: {
+		filePath: string;
+		strategy: Resolution['strategy'];
+		description: string;
+		descriptionKind?: ResolutionDescriptionKind;
+	}[];
 }
 
 /** Context passed to the loop when resuming an escalated run so the human-resolved escalated step
@@ -153,6 +160,11 @@ export interface AutoRebaseResumeContext {
 	 *  consistently with what the original run decided (the same guarantee a single continuous run
 	 *  gives). */
 	previousResolutions?: Resolution[];
+	/** The step (msgnum) the rebase sat paused at when the user explicitly initiated or resumed
+	 *  automation. Their click IS the consent the loop otherwise lacks for a non-conflict pause —
+	 *  a pause at this step with nothing staged continues instead of escalating. Later non-conflict
+	 *  pauses (an `edit`/`break` the run encounters mid-flight) still escalate. */
+	consentStepNumber?: number;
 }
 
 /** One-shot payload handed to the Resolve panel when automation escalates mid-step. */
@@ -206,4 +218,11 @@ export interface AutoRebaseChangeEvent {
 	repoPath: string;
 	/** `undefined` when the session was dismissed */
 	session: AutoRebaseSession | undefined;
+}
+
+/** Whether a terminal run left the branch tip exactly where it started — distinguishes a `completed`
+ *  run that had nothing to rewrite from one that cleanly rewrote every commit. `false` before the run
+ *  reaches a terminal phase (`postRun` unset). */
+export function isAutoRebaseUnchanged(session: AutoRebaseSession): boolean {
+	return session.postRun?.headSha === session.preRun.headSha;
 }

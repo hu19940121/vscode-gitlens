@@ -12,6 +12,7 @@ import type { ExplainCommitCommandArgs } from '../../commands/explainCommit.js';
 import type { ExplainStashCommandArgs } from '../../commands/explainStash.js';
 import type { InspectTelemetryContext, InspectWebviewTelemetryContext, Sources } from '../../constants.telemetry.js';
 import type { Container } from '../../container.js';
+import { getPresentableErrorMessage } from '../../errors.js';
 import type { CommitSelectedEvent } from '../../eventBus.js';
 import { executeGitCommand } from '../../git/actions.js';
 import { showDetailsQuickPick } from '../../git/actions/commit.js';
@@ -21,8 +22,8 @@ import { executeCommand, executeCoreCommand, registerWebviewCommand } from '../.
 import { getWebviewCommand } from '../../system/decorators/command.js';
 import type { LinesChangeEvent } from '../../trackers/lineTracker.js';
 import type { ShowInCommitGraphCommandArgs } from '../plus/graph/registration.js';
-import type { EventVisibilityBuffer, SubscriptionTracker } from '../rpc/eventVisibilityBuffer.js';
-import { bufferEventHandler } from '../rpc/eventVisibilityBuffer.js';
+import type { EventRegistration, EventVisibilityBuffer, SubscriptionTracker } from '../rpc/eventVisibilityBuffer.js';
+import { bufferEventHandler, trackRpcRegistration } from '../rpc/eventVisibilityBuffer.js';
 import { createSharedServices } from '../rpc/services/common.js';
 import { proxyServices } from '../rpc/services/proxy.js';
 import type { WebviewHost, WebviewProvider, WebviewShowingArgs } from '../webviewProvider.js';
@@ -93,6 +94,7 @@ export class CommitDetailsWebviewProvider implements WebviewProvider<State, Stat
 
 	// View-specific event emitters — support multiple subscribers
 	private readonly _onCommitSelected = new EventEmitter<CommitSelectionEvent>();
+	private readonly _commitSelectedRegistrations = new Set<EventRegistration>();
 
 	constructor(
 		private readonly container: Container,
@@ -481,7 +483,7 @@ export class CommitDetailsWebviewProvider implements WebviewProvider<State, Stat
 			return { result: { summary: '', body: '' } };
 		} catch (ex) {
 			debugger;
-			return { error: { message: ex.message } };
+			return { error: { message: getPresentableErrorMessage(ex) } };
 		}
 	}
 
@@ -607,15 +609,9 @@ export class CommitDetailsWebviewProvider implements WebviewProvider<State, Stat
 	 * service-oriented interface for the webview to call.
 	 */
 	getRpcServices(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): CommitDetailsServices {
-		const shared = createSharedServices(
-			this.container,
-			this.host,
-			context => {
-				this._telemetryContext = context as InspectWebviewTelemetryContext;
-			},
-			buffer,
-			tracker,
-		);
+		const shared = createSharedServices(this.container, this.host, buffer, tracker, context => {
+			this._telemetryContext = context as InspectWebviewTelemetryContext;
+		});
 
 		return proxyServices({
 			...shared,
@@ -630,24 +626,29 @@ export class CommitDetailsWebviewProvider implements WebviewProvider<State, Stat
 					this.ensureTrackers();
 					const pendingKey = Symbol('commitSelected');
 					const buffered = bufferEventHandler(buffer, pendingKey, callback, 'save-last');
-					const disposable = this._onCommitSelected.event(buffered);
+					const session = tracker?.callerSession;
+					const tracked = trackRpcRegistration(this._commitSelectedRegistrations, tracker, () => {
+						const disposable = this._onCommitSelected.event(buffered);
+						return () => {
+							buffer?.removePending(pendingKey);
+							disposable.dispose();
+						};
+					});
 
-					// Replay cached selection so webview gets the current commit
-					// even if the event fired before subscription was ready.
-					const commitRef = this.resolveCurrentCommitRef();
-					if (commitRef != null) {
-						callback({
-							repoPath: commitRef.repoPath,
-							sha: commitRef.sha,
-							passive: true,
-						});
+					// Replay cached selection so webview gets the current commit even if the event fired
+					// before subscription was ready — but not to an already-released straggler session.
+					if (tracker?.isSessionReleased(session) !== true) {
+						const commitRef = this.resolveCurrentCommitRef();
+						if (commitRef != null) {
+							callback({
+								repoPath: commitRef.repoPath,
+								sha: commitRef.sha,
+								passive: true,
+							});
+						}
 					}
 
-					const unsubscribe = () => {
-						buffer?.removePending(pendingKey);
-						disposable.dispose();
-					};
-					return tracker != null ? tracker.track(unsubscribe) : unsubscribe;
+					return tracked;
 				},
 
 				// ── Initialization ──

@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import { html, LitElement } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { splitPanelStyles } from './split-panel.css.js';
@@ -71,8 +72,8 @@ export class GlSplitPanel extends LitElement {
 	 * an anchored pixel width is worth preserving across container resizes — a mount-time or
 	 * programmatic position may be a transient mid-layout measurement, and preserving THAT would
 	 * fossilize an accidental size instead of an intended one. The `position` setter clears this
-	 * (a consumer-bound position makes the percentage authoritative again); the gesture paths set
-	 * it back to true after writing through the setter.
+	 * unless {@link anchoredPosition} is set (a consumer-bound position makes the percentage
+	 * authoritative again); the gesture paths set it back to true after writing through the setter.
 	 */
 	private _pxAnchored = false;
 	private _dragAc: AbortController | undefined;
@@ -94,9 +95,12 @@ export class GlSplitPanel extends LitElement {
 		// Only a value that actually MOVES the divider counts as a consumer override. Consumers
 		// re-bind `.position` from the state a gesture just wrote, and that echo arrives here as a
 		// fresh value (Lit's committed value is the pre-gesture one) — clearing the anchor on it
-		// would drop the pixel width the drag just established.
-		if (next !== this._position) {
+		// would drop the pixel width the drag just established. With `anchoredPosition`, bound values
+		// are deliberate sizes, so they anchor rather than clear.
+		if (next !== this._position && !this.anchoredPosition) {
 			this._pxAnchored = false;
+		} else if (next !== this._position && this._size > 0) {
+			this._pxAnchored = true;
 		}
 
 		this._position = next;
@@ -111,6 +115,17 @@ export class GlSplitPanel extends LitElement {
 		}
 		this.requestUpdate('position', old);
 	}
+
+	/**
+	 * Treats consumer-bound positions as deliberate sizes: each distinct bound value re-anchors the
+	 * primary panel's pixel width for preservation across container resizes, instead of clearing the
+	 * anchor like {@link _pxAnchored}'s default rule does. For consumers whose persisted position is
+	 * already an intentional size (e.g. a pixel-policy-driven pane), this keeps that pixel height
+	 * held across unrelated resizes without requiring a fresh gesture after every remount or
+	 * visibility toggle.
+	 */
+	@property({ type: Boolean, reflect: true })
+	anchoredPosition = false;
 
 	/** Layout orientation. `horizontal` splits left/right, `vertical` splits top/bottom. */
 	@property({ reflect: true })
@@ -166,11 +181,11 @@ export class GlSplitPanel extends LitElement {
 	@property({ type: Boolean, attribute: 'animate', reflect: true })
 	animated = false;
 
-	/** The primary panel fills the container, as a sticky STATE rather than a position write — driving
-	 *  `position` to the edge instead would cache the fill as the primary's pixel size, which the
-	 *  resize-hold branch then preserves when the container grows, eroding the fill. While maximized,
-	 *  `position` (and the cached pixel size) are untouched underneath, so restoring is exact even
-	 *  after resizes. Consumers should disable the divider alongside this. */
+	/** The end panel overlays the entire container as a sticky STATE rather than a position write.
+	 *  Purely visual — the grid tracks are untouched, so the start panel (e.g. the graph behind the
+	 *  details pane) keeps its exact size and never reflows; `position` (and the cached pixel size)
+	 *  stay untouched too, so restoring is exact even after resizes. Consumers should disable the
+	 *  divider alongside this. */
 	@property({ type: Boolean, reflect: true })
 	maximized = false;
 
@@ -304,6 +319,14 @@ export class GlSplitPanel extends LitElement {
 			// no closed edge; seed as `false` to unlock the gate while keeping the setter's
 			// `computeClosed` always returning `false` (no transitions will ever fire).
 			this._closedState = this.primary != null ? this.computeClosed(this._position) : false;
+			// Anchored-position consumers treat their bound value as deliberate — anchor it now that
+			// the size is known, so the very first container resize preserves pixels. Without this the
+			// anchor only engages on a later distinct bound value (the setter skips anchoring while
+			// `_size` is still 0 during initial property setup), leaving the mount-time position riding
+			// resizes as a percentage.
+			if (this.anchoredPosition) {
+				this._pxAnchored = true;
+			}
 			// Re-apply snap now that container size is known so pixel-aware snap
 			// functions can clamp initial position (from restored/default percentage).
 			const snapped = this.applySnap(this._position, 'layout');
@@ -324,9 +347,28 @@ export class GlSplitPanel extends LitElement {
 		this._dragAc = undefined;
 	}
 
+	/** Re-applies the snap policy to the current position (source 'layout'), e.g. after slotted
+	 *  content changed the constraints a custom snap function derives. Non-persisting, like a resize
+	 *  — does NOT update the cached pixel width, and refuses an open→closed transition (mirrors the
+	 *  ResizeObserver's pixel-anchored branch in `connectedCallback`). */
+	refreshSnap(): void {
+		if (this._size <= 0) return;
+
+		const snapped = this.applySnap(this._position, 'layout');
+		if (snapped === this._position) return;
+
+		const wasClosed = this._closedState === true;
+		if (!wasClosed && this.computeClosed(snapped)) return;
+
+		this._position = snapped;
+		this.requestUpdate();
+	}
+
 	protected override willUpdate(): void {
-		const startSize = this.maximized ? (this.primary === 'start' ? '100%' : '0%') : `${this._position}%`;
-		this.style.setProperty('--_start-size', startSize);
+		// Maximize no longer touches the track sizes — the [maximized] CSS overlays the end panel
+		// across the container instead, leaving the start panel's layout (and anything rendering
+		// inside it) completely unaffected.
+		this.style.setProperty('--_start-size', `${this._position}%`);
 	}
 
 	protected override updated(): void {
@@ -349,7 +391,7 @@ export class GlSplitPanel extends LitElement {
 				aria-valuenow=${Math.max(0, Math.min(100, Math.round(this._position)))}
 				aria-valuemin="0"
 				aria-valuemax="100"
-				aria-label="Resize"
+				aria-label=${l10n.t('Resize')}
 				@keydown=${this.handleKeyDown}
 				@pointerdown=${this.handlePointerDown}
 			>
@@ -447,7 +489,16 @@ export class GlSplitPanel extends LitElement {
 		}
 
 		this.toggleAttribute('dragging', true);
-		this.dividerEl.setPointerCapture(e.pointerId);
+
+		// A pointer can vanish between `pointerdown` and here (pen lift, touch cancel, synthetic
+		// events) making `setPointerCapture` throw — an unguarded throw here would leave the panel
+		// wedged in [dragging] with no listeners attached and no way to recover.
+		try {
+			this.dividerEl.setPointerCapture(e.pointerId);
+		} catch {
+			this.toggleAttribute('dragging', false);
+			return;
+		}
 
 		this._dragAc?.abort();
 		const ac = new AbortController();

@@ -2,6 +2,7 @@ import { graphql, GraphqlResponseError } from '@octokit/graphql';
 import { request } from '@octokit/request';
 import { RequestError } from '@octokit/request-error';
 import type { Endpoints, RequestParameters } from '@octokit/types';
+import * as l10n from '@vscode/l10n';
 import {
 	AuthenticationError,
 	AuthenticationErrorReason,
@@ -11,21 +12,31 @@ import {
 } from '@gitlens/git/errors.js';
 import type { Account, UnidentifiedAuthor } from '@gitlens/git/models/author.js';
 import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
-import type { Issue, IssueShape } from '@gitlens/git/models/issue.js';
+import type { Issue, IssueSearchCriteria, IssueShape, IssueSorting } from '@gitlens/git/models/issue.js';
+import { defaultIssueSort } from '@gitlens/git/models/issue.js';
 import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.js';
-import type { PullRequest, PullRequestStateFilter } from '@gitlens/git/models/pullRequest.js';
-import { PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
+import type {
+	PullRequest,
+	PullRequestSearchCriteria,
+	PullRequestShape,
+	PullRequestState,
+	PullRequestStateFilter,
+} from '@gitlens/git/models/pullRequest.js';
+import { defaultPullRequestSort, PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
 import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import type { GitRevisionRange } from '@gitlens/git/models/revision.js';
 import type { GitUser } from '@gitlens/git/models/user.js';
 import type { RepositoryVisibility } from '@gitlens/git/providers/types.js';
 import { getGitHubNoReplyAddressParts } from '@gitlens/git/remotes/github.js';
+import { effectiveIssueSort, getIssueComparator } from '@gitlens/git/utils/issue.utils.js';
+import { getPullRequestComparator } from '@gitlens/git/utils/pullRequest.utils.js';
 import {
 	createRevisionRange,
 	getRevisionRangeParts,
 	isRevisionRange,
 	isSha,
+	isUncommitted,
 } from '@gitlens/git/utils/revision.utils.js';
 import { chunk } from '@gitlens/utils/array.js';
 import { base64 } from '@gitlens/utils/base64.js';
@@ -66,9 +77,26 @@ import {
 	fromGitHubPullRequestLite,
 } from '../models.js';
 import type { GitHubApiConfig } from './config.js';
+import { githubSearchResultLimit } from './config.js';
+import {
+	gitHubIssueSearchRelationships,
+	toGitHubIssueSearchQualifiers,
+	toGitHubIssueSearchScopeQualifiers,
+	toGitHubIssueSortQualifier,
+} from './issueSearchQuery.js';
+import { toGitHubPullRequestSearchFacets } from './pullRequestSearchQuery.js';
 import type { GitHubTokenInfo } from './token.js';
 
 const emptyPagedResult: PagedResult<any> = Object.freeze({ values: [] });
+/**
+ * What an issue-search cursor records when the caller asked for no ordering at all.
+ *
+ * A sentinel rather than an omitted field, because omitted already means something else and more important: a
+ * cursor persisted before ordering existed. Distinguishing the two is what lets an old cursor keep resuming while
+ * a genuine change from unordered to ordered is still refused. Not an `IssueSorting`, so it can never collide
+ * with one.
+ */
+const unsortedCursorSort = 'unsorted' as const;
 const emptyBlameResult: GitHubBlame = Object.freeze({ ranges: [] });
 
 // Transient gateway/network failures (e.g. an upstream `502 Bad Gateway`) are worth a few quick
@@ -82,6 +110,21 @@ const requestRetryMaxDelay = 2000; // ms
 
 /** How many email->login user searches to alias into a single GraphQL request (keeps query cost within limits). */
 const accountResolveBatchSize = 25;
+
+// Pull-request search selects the full PR fragment (reviews, requests, refs, commits, etc.),
+// which makes GitHub reject broad 100-node searches with `Resource limits for this query
+// exceeded` on large repositories. Thirty keeps the default within that GraphQL cost budget;
+// the 100-node maximum the connection accepts is for the lite shape, whose per-node cost is a
+// fraction of it. The budget is per DOCUMENT, and one document holds every relationship × state
+// facet, so the worst case scales with the facet count (five relationships × three states = 15;
+// `all` subsumes the concrete states).
+const defaultPullRequestSearchPageSize = 30;
+const maxPullRequestSearchPageSize = 100;
+// Pages `searchMyPullRequests` drains for a caller that wants a whole list rather than a page.
+// Four reduced pages cover more than the single 100-node page this read served before it paged,
+// so the smaller page costs coverage nowhere; it bounds an unbounded drain on a read whose
+// consumers (Launchpad, the Graph pull-request panel) block on it.
+const maxMyPullRequestSearchPages = 4;
 
 function isRetryableTransientError(ex: unknown): ex is RequestError {
 	// An aborted request is rethrown as the original `AbortError` (not a `RequestError`), so it is
@@ -101,11 +144,77 @@ function isRetryableTransientError(ex: unknown): ex is RequestError {
 	}
 }
 
+/**
+ * When a rate-limited request may be retried, as a UTC epoch in seconds, or `undefined` when the response says
+ * nothing useful. Header precedence follows GitHub's own guidance
+ * (docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api): `retry-after` wins when present —
+ * it is the only one a secondary limit reliably sets — and `x-ratelimit-reset` covers the primary limit.
+ */
+function rateLimitResetAt(ex: RequestError): number | undefined {
+	const headers = ex.response?.headers;
+	if (headers == null) return undefined;
+
+	// `retry-after` is a delay in seconds, not an epoch, so it has to be added to now to compare with `resetAt`.
+	const retryAfter = toPositiveInt(headers['retry-after']);
+	if (retryAfter != null) return Math.floor(Date.now() / 1000) + retryAfter;
+
+	return toPositiveInt(headers['x-ratelimit-reset']);
+}
+
+function toPositiveInt(value: string | number | undefined): number | undefined {
+	if (value == null) return undefined;
+
+	const parsed = typeof value === 'number' ? value : parseInt(value, 10);
+	// Rejects NaN and a nonsensical negative/zero, either of which would present as an already-elapsed reset.
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 function getRequestRetryDelay(attempt: number): number {
 	// Exponential backoff with equal jitter, capped — spreads retries so a brief upstream blip
 	// isn't hammered by every in-flight request landing on the same schedule.
 	const backoff = Math.min(requestRetryMaxDelay, requestRetryBaseDelay * 2 ** (attempt - 1));
 	return Math.round(backoff / 2 + Math.random() * (backoff / 2));
+}
+
+/** One aliased `search` field in a multi-search issue request; see {@link GitHubApi.searchIssuesByAlias}. */
+interface AliasedIssueSearch {
+	/** GraphQL alias, also the key this search's cursor is stored under. Must not be `page` or `truncated`. */
+	alias: string;
+	/** The fully-composed GitHub search query, qualifiers included. */
+	query: string;
+}
+
+/** One page of a multi-search issue request, with its composite cursor across every alias. */
+export interface AliasedIssueSearchResult {
+	values: IssueShape[];
+	/** Opaque composite cursor; absent when every alias is exhausted. */
+	cursor?: string;
+	hasMore: boolean;
+	page: number;
+	/** True when the read cannot return everything — GitHub's search ceiling, or an unusable continuation. */
+	truncated: boolean;
+	/**
+	 * The largest `issueCount` any single alias reported, which is what {@link githubSearchResultLimit} applies
+	 * to (the ceiling is per search, not per request). Absent when no request was made — every alias was already
+	 * exhausted — so `undefined` means "not reported", never zero matches.
+	 */
+	totalCount?: number;
+}
+
+/** One page of the filtered pull-request search. */
+export interface PullRequestSearchResult {
+	values: PullRequestShape[];
+	/** Opaque cursor carrying each active facet continuation plus the positional page. */
+	cursor?: string;
+	hasMore: boolean;
+	page: number;
+	/** True at GitHub's search ceiling or when GitHub advertises a page without a usable cursor. */
+	truncated: boolean;
+	/**
+	 * The largest pre-ceiling `issueCount` any relationship × state facet reported, which is what
+	 * {@link githubSearchResultLimit} applies to. Never the number of rows reachable after that ceiling.
+	 */
+	totalCount?: number;
 }
 
 // Matches a GraphQL document whose operation is definitely a read query — the `query` keyword as
@@ -211,6 +320,7 @@ author {
 	avatarUrl(size: $avatarSize)
 	url
 }
+body
 baseRefName
 baseRefOid
 headRefName
@@ -239,6 +349,24 @@ repository {
 	viewerPermission
 }
 `;
+/**
+ * One review's fields, shared by `latestReviews` and `viewerLatestReview`. The two selections must stay
+ * identical: `fromGitHubPullRequest` merges the viewer's review into the capped `latestReviews` window and
+ * dedups by `id`, so a field present in only one of them would produce rows that differ by where they came
+ * from rather than by what they are.
+ */
+const gqlPullRequestReviewFragment = `
+id
+author {
+	login
+	avatarUrl(size: $avatarSize)
+	url
+}
+state
+commit {
+	oid
+}
+`;
 const gqlPullRequestFragment = `
 ${gqlPullRequestLiteFragment}
 additions
@@ -249,7 +377,6 @@ assignees(first: 25) {
 		url
 	}
 }
-body
 changedFiles
 checksUrl
 deletions
@@ -260,13 +387,11 @@ mergedBy {
 reviewDecision
 latestReviews(first: 25) {
 	nodes {
-		author {
-			login
-			avatarUrl(size: $avatarSize)
-			url
-		}
-		state
+		${gqlPullRequestReviewFragment}
 	}
+}
+viewerLatestReview {
+	${gqlPullRequestReviewFragment}
 }
 reviewRequests(first: 25) {
 	nodes {
@@ -448,6 +573,9 @@ export class GitHubApi {
 	): Promise<Account | UnidentifiedAuthor | undefined> {
 		const scope = getScopedLogger();
 
+		// GitHub's `GitObjectID` scalar rejects anything but a full sha, so don't spend a request on one
+		if (!isSha(rev) || isUncommitted(rev)) return undefined;
+
 		interface QueryResult {
 			repository:
 				| {
@@ -537,9 +665,6 @@ export class GitHubApi {
 			};
 		} catch (ex) {
 			if (ex instanceof RequestNotFoundError) return undefined;
-			if (ex.message.includes('Variable $rev of type GitObjectID! was provided invalid value')) {
-				return undefined;
-			}
 
 			throw this.handleException(ex, provider, scope);
 		}
@@ -960,7 +1085,7 @@ export class GitHubApi {
 ) {
 	repository(name: $repo, owner: $owner) {
 		pullRequest(number: $number) {
-			${gqlPullRequestFragment}
+			${gqlPullRequestLiteFragment}
 			${gqlPullRequestStackFragmentFor(options)}
 		}
 	}
@@ -1109,6 +1234,8 @@ export class GitHubApi {
 		cancellation?: AbortSignal,
 	): Promise<PullRequest | undefined> {
 		const scope = getScopedLogger();
+
+		if (!isSha(rev) || isUncommitted(rev)) return undefined;
 
 		interface QueryResult {
 			repository:
@@ -3417,22 +3544,18 @@ export class GitHubApi {
 			case 410: // Gone
 			case 422: // Unprocessable Entity
 				throw new RequestNotFoundError(ex);
-			// case 429: //Too Many Requests
+			case 429: // Too Many Requests
+				// GitHub returns "a `403` or `429` response" for BOTH its primary and secondary rate limits
+				// (docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api). 429 is unambiguous —
+				// unlike 403, it is never a permission failure — so it needs no message check.
+				throw new RequestRateLimitError(ex, accessToken, rateLimitResetAt(ex));
 			case 401: // Unauthorized
 				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Unauthorized, ex);
 			case 403: // Forbidden
+				// The other status the rate limits arrive on, but 403 is also a plain permission failure, so here
+				// the message is the discriminant.
 				if (ex.message.includes('rate limit')) {
-					let resetAt: number | undefined;
-
-					const reset = ex.response?.headers?.['x-ratelimit-reset'];
-					if (reset != null) {
-						resetAt = parseInt(reset, 10);
-						if (Number.isNaN(resetAt)) {
-							resetAt = undefined;
-						}
-					}
-
-					throw new RequestRateLimitError(ex, accessToken, resetAt);
+					throw new RequestRateLimitError(ex, accessToken, rateLimitResetAt(ex));
 				}
 				throw new AuthenticationError(tokenInfo, AuthenticationErrorReason.Forbidden, ex);
 			case 500: // Internal Server Error
@@ -3441,11 +3564,12 @@ export class GitHubApi {
 					provider?.trackRequestException();
 					this.config.onRequestError?.(
 						provider,
-						`${provider?.name ?? 'GitHub'} failed to respond and might be experiencing issues.${
-							provider == null || provider.id === 'github'
-								? ' Please visit the [GitHub status page](https://githubstatus.com) for more information.'
-								: ''
-						}`,
+						provider == null || provider.id === 'github'
+							? l10n.t(
+									'{0} failed to respond and might be experiencing issues. Please visit the [GitHub status page](https://githubstatus.com) for more information.',
+									provider?.name ?? 'GitHub',
+								)
+							: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
 					);
 				}
 				return;
@@ -3463,11 +3587,12 @@ export class GitHubApi {
 				provider?.trackRequestException();
 				this.config.onRequestError?.(
 					provider,
-					`${provider?.name ?? 'GitHub'} failed to respond and might be experiencing issues.${
-						provider == null || provider.id === 'github'
-							? ' Please visit the [GitHub status page](https://githubstatus.com) for more information.'
-							: ''
-					}`,
+					provider == null || provider.id === 'github'
+						? l10n.t(
+								'{0} failed to respond and might be experiencing issues. Please visit the [GitHub status page](https://githubstatus.com) for more information.',
+								provider?.name ?? 'GitHub',
+							)
+						: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
 				);
 				return;
 			default:
@@ -3551,6 +3676,171 @@ export class GitHubApi {
 		return `https://avatars.githubusercontent.com/u/e?email=${encodeURIComponent(email)}&s=${avatarSize}`;
 	}
 
+	/**
+	 * One page of the current user's pull requests, filtered by state and optionally by an explicit
+	 * relationship qualifier. Backs the PR sweeps, which drain it page by page.
+	 *
+	 * Ordering is part of the contract, not an option: always `sort:updated` (most recently updated first), which is
+	 * {@link searchPullRequestsPage}'s DEFAULT rather than its only order — that read takes a `criteria.sort`, this
+	 * one does not, because a sweep's recency window is what its page budget is defined against. A caller that stops
+	 * before `hasMore` clears — every sweep with a
+	 * page budget — therefore retains a well-defined recency window instead of an arbitrary slice of GitHub's
+	 * relevance ranking.
+	 */
+	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
+	async searchMyPullRequestsPage(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		options?: {
+			search?: string;
+			user?: string;
+			repos?: string[];
+			baseUrl?: string;
+			avatarSize?: number;
+			silent?: boolean;
+			state?: PullRequestStateFilter;
+			cursor?: string;
+			/**
+			 * Uses the lightweight PR fragment while retaining identity, body, author, repository, and branch refs.
+			 * Intended for aggregate/list surfaces that do not consume review, check, or diff statistics.
+			 */
+			summary?: boolean;
+			/**
+			 * Adds GitHub's provider-native `involves:@me` relationship. Disable when `search` already carries
+			 * an explicit relationship qualifier such as `author:@me` or `review-requested:@me`.
+			 */
+			includeDefaultInvolvement?: boolean;
+		},
+		cancellation?: AbortSignal,
+	): Promise<{ values: PullRequest[]; cursor?: string; hasMore: boolean; truncated: boolean }> {
+		const scope = getScopedLogger();
+		// The page follows the projection rather than being a separate decision: the full fragment is what GitHub
+		// rejects at 100 nodes (see `defaultPullRequestSearchPageSize`), so every read that selects it pages at the
+		// reduced size, and only the lite shape asks for the maximum. A caller that wants a whole list pages for it
+		// — see `searchMyPullRequests`.
+		const configuredLimit = this.config.getLaunchpadQueryLimit?.() ?? maxPullRequestSearchPageSize;
+		const limit = Math.min(
+			options?.summary === true ? maxPullRequestSearchPageSize : defaultPullRequestSearchPageSize,
+			configuredLimit,
+		);
+
+		try {
+			interface SearchResult {
+				search: {
+					issueCount: number;
+					pageInfo: {
+						endCursor?: string | null;
+						hasNextPage: boolean;
+					};
+					nodes: GitHubPullRequest[];
+				};
+			}
+
+			const query = `query searchMyPullRequests(
+		$search: String!
+		$cursor: String
+		$avatarSize: Int
+	) {
+		search(first: ${limit}, after: $cursor, query: $search, type: ISSUE) {
+			issueCount
+			pageInfo {
+				endCursor
+				hasNextPage
+			}
+			nodes {
+				...on PullRequest {
+					${options?.summary ? gqlPullRequestLiteFragment : gqlPullRequestFragment}
+					${gqlPullRequestStackFragmentFor(options)}
+				}
+			}
+		}
+	}`;
+
+			let search = options?.search?.trim() ?? '';
+
+			if (options?.user) {
+				search += ` user:${options.user}`;
+			}
+
+			if (options?.repos?.length) {
+				search += ` repo:${options.repos.join(' repo:')}`;
+			}
+
+			const ignoredRepos = this.config.getLaunchpadIgnoredRepositories?.() ?? [];
+			if (ignoredRepos.length) {
+				search += ` -repo:${ignoredRepos.join(' -repo:')}`;
+			}
+
+			const enabledOrgs = this.config.getLaunchpadIncludedOrganizations?.() ?? [];
+			if (enabledOrgs.length) {
+				search += ` org:${enabledOrgs.join(' org:')}`;
+			} else {
+				const ignoredOrgs = this.config.getLaunchpadIgnoredOrganizations?.() ?? [];
+				if (ignoredOrgs.length) {
+					search += ` -org:${ignoredOrgs.join(' -org:')}`;
+				}
+			}
+
+			const stateQualifier =
+				options?.state === 'closed'
+					? 'is:closed is:unmerged'
+					: options?.state === 'merged'
+						? 'is:merged'
+						: options?.state === 'all'
+							? ''
+							: 'is:open';
+
+			const relationshipQualifier =
+				options?.includeDefaultInvolvement === false
+					? 'is:pr archived:false'
+					: 'is:pr involves:@me archived:false';
+			// Ordering is part of the contract, not an option — same as `searchPullRequestsPage`. Without it
+			// GitHub answers in `best-match` (relevance) order, so any result set the caller stops short of
+			// draining is an arbitrary sample rather than "the N most recent": which rows land inside a page
+			// budget can then shift with GitHub's ranking even when nothing changed upstream. Consumers that
+			// cap the walk depend on this to make their window deterministic and time-bounded.
+			const rsp = await this.graphql<SearchResult>(
+				provider,
+				token,
+				query,
+				{
+					search: [stateQualifier, relationshipQualifier, search, 'sort:updated']
+						.filter(Boolean)
+						.join(' ')
+						.trim(),
+					cursor: options?.cursor,
+					baseUrl: options?.baseUrl,
+					avatarSize: options?.avatarSize,
+				},
+				scope,
+				cancellation,
+			);
+			if (rsp == null) return { values: [], hasMore: false, truncated: false };
+
+			const results: PullRequest[] = rsp.search.nodes.map(pr =>
+				options?.summary ? fromGitHubPullRequestLite(pr, provider) : fromGitHubPullRequest(pr, provider),
+			);
+			return {
+				values: results,
+				cursor: rsp.search.pageInfo.endCursor ?? undefined,
+				hasMore: rsp.search.pageInfo.hasNextPage,
+				truncated: rsp.search.issueCount > githubSearchResultLimit,
+			};
+		} catch (ex) {
+			throw this.handleException(ex, provider, scope, options?.silent);
+		}
+	}
+
+	/**
+	 * The whole list rather than a page: this read has no cursor to hand back (its `IntegrationResult<T[]>` return
+	 * has no paging channel at all), so it drains up to {@link maxMyPullRequestSearchPages} pages itself.
+	 *
+	 * Draining instead of taking one page is what lets the full projection page at the reduced size everywhere
+	 * (see the `limit` in {@link searchMyPullRequestsPage}): a single page would otherwise have to ask for 100
+	 * nodes of the selection GitHub rejects at that size, purely because this caller cannot resume. Ordering is
+	 * `sort:updated`, so the pages compose into a defined window rather than a shifting relevance ranking, and the
+	 * drain stops as soon as GitHub reports no next page.
+	 */
 	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
 	async searchMyPullRequests(
 		provider: Provider,
@@ -3566,123 +3856,45 @@ export class GitHubApi {
 		},
 		cancellation?: AbortSignal,
 	): Promise<PullRequest[]> {
-		const scope = getScopedLogger();
+		const values: PullRequest[] = [];
+		// The searches behind one page can overlap (a PR can be authored by and review-requested from the same
+		// user), and a later page can repeat a row an earlier one already served if the PR was updated mid-drain.
+		const seen = new Set<string>();
+		let cursor: string | undefined;
 
-		const limit = Math.min(100, this.config.getLaunchpadQueryLimit?.() ?? 100);
-
-		try {
-			interface SearchResult {
-				search: {
-					issueCount: number;
-					nodes: GitHubPullRequest[];
-				};
-				viewer: {
-					login: string;
-				};
-			}
-
-			const query = `query searchMyPullRequests(
-	$search: String!
-	$avatarSize: Int
-) {
-	search(first: ${limit}, query: $search, type: ISSUE) {
-		issueCount
-		nodes {
-			...on PullRequest {
-				${gqlPullRequestFragment}
-				${gqlPullRequestStackFragmentFor(options)}
-			}
-		}
-	}
-	viewer {
-		login
-	}
-}`;
-
-			let search = options?.search?.trim() ?? '';
-
-			if (options?.user) {
-				search += ` user:${options.user}`;
-			}
-
-			if (options?.repos?.length) {
-				search += ` repo:${options.repos.join(' repo:')}`;
-			}
-
-			// Hack for now, ultimately this should be passed in
-			const ignoredRepos = this.config.getLaunchpadIgnoredRepositories?.() ?? [];
-			if (ignoredRepos.length) {
-				search += ` -repo:${ignoredRepos.join(' -repo:')}`;
-			}
-
-			// Hack for now, ultimately this should be passed in
-			const enabledOrgs = this.config.getLaunchpadIncludedOrganizations?.() ?? [];
-			if (enabledOrgs.length) {
-				search += ` org:${enabledOrgs.join(' org:')}`;
-			} else {
-				// Hack for now, ultimately this should be passed in
-				const ignoredOrgs = this.config.getLaunchpadIgnoredOrganizations?.() ?? [];
-				if (ignoredOrgs.length) {
-					search += ` -org:${ignoredOrgs.join(' -org:')}`;
-				}
-			}
-
-			// Map the requested state to a GitHub search qualifier; `all` omits it, default stays open-only.
-			// `is:closed` alone also matches merged PRs, so pair it with `is:unmerged` to keep `closed` and
-			// `merged` disjoint (mirroring the paginated path's states=[Closed], which excludes merged).
-			const stateQualifier =
-				options?.state === 'closed'
-					? 'is:closed is:unmerged'
-					: options?.state === 'merged'
-						? 'is:merged'
-						: options?.state === 'all'
-							? ''
-							: 'is:open';
-
-			const rsp = await this.graphql<SearchResult>(
+		for (let page = 0; page < maxMyPullRequestSearchPages; page++) {
+			const result = await this.searchMyPullRequestsPage(
 				provider,
 				token,
-				query,
-				{
-					search: [stateQualifier, 'is:pr involves:@me archived:false', search]
-						.filter(Boolean)
-						.join(' ')
-						.trim(),
-					baseUrl: options?.baseUrl,
-					avatarSize: options?.avatarSize,
-				},
-				scope,
+				{ ...options, cursor: cursor },
 				cancellation,
 			);
-			if (rsp == null) return [];
+			for (const pr of result.values) {
+				if (seen.has(pr.url)) continue;
 
-			const viewer = rsp.viewer.login;
-
-			function toQueryResult(pr: GitHubPullRequest): PullRequest {
-				const reasons = [];
-				if (pr.author?.login === viewer) {
-					reasons.push('authored');
-				}
-				if (pr.assignees.nodes.some(a => a.login === viewer)) {
-					reasons.push('assigned');
-				}
-				if (pr.reviewRequests.nodes.some(r => r.requestedReviewer?.login === viewer)) {
-					reasons.push('review-requested');
-				}
-				if (reasons.length === 0) {
-					reasons.push('mentioned');
-				}
-
-				return fromGitHubPullRequest(pr, provider);
+				seen.add(pr.url);
+				values.push(pr);
 			}
 
-			const results: PullRequest[] = rsp.search.nodes.map(pr => toQueryResult(pr));
-			return results;
-		} catch (ex) {
-			throw this.handleException(ex, provider, scope, options?.silent);
+			// A missing or repeated cursor with `hasMore` would loop on the same page forever.
+			if (!result.hasMore || result.cursor == null || result.cursor === cursor) break;
+
+			cursor = result.cursor;
 		}
+
+		return values;
 	}
 
+	/**
+	 * The current user's issues: authored ∪ assigned ∪ mentioned, each its own aliased search behind one composite
+	 * cursor. Bound to `@me` by construction, unlike {@link searchIssuesPage}.
+	 *
+	 * Ordering is OPT-IN here, and that asymmetry with {@link searchIssuesPage} is deliberate: this read has never
+	 * requested a sort, so GitHub has always answered it in relevance order. Emitting a default would change which
+	 * issues its already-shipped consumers see, so an omitted `sort` still emits no `sort:` qualifier at all and
+	 * keeps today's result. Pass one to get a defined order — which is also what makes a page budget meaningful,
+	 * since relevance ranking can shift under an unchanged upstream.
+	 */
 	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
 	async searchMyIssues(
 		provider: Provider,
@@ -3694,57 +3906,24 @@ export class GitHubApi {
 			baseUrl?: string;
 			avatarSize?: number;
 			includeBody?: boolean;
+			includeAllAssignees?: boolean;
+			cursor?: string;
+			/** Requested order. Omitted leaves GitHub's relevance order, which is what this read has always served. */
+			sort?: IssueSorting;
+			/**
+			 * Which of the three "my issues" searches to run. Omitted runs all three (GitHub's own definition of
+			 * "mine": authored ∪ assigned ∪ mentioned). Supplied, only the `true` ones run — so a caller wanting
+			 * `assignee:@me` parity asks for `{ assigned: true }` instead of filtering the union client-side (which
+			 * can't work: the dropped items still counted toward this page, so `hasMore`/`cursor` would describe a
+			 * different result set than `values`).
+			 *
+			 * At least one must be `true`; an all-`false` set reads nothing rather than silently widening back to
+			 * the union. The facade never sends one (an empty filter set means "unfiltered" there).
+			 */
+			categories?: { authored?: boolean; assigned?: boolean; mentioned?: boolean };
 		},
 		cancellation?: AbortSignal,
-	): Promise<IssueShape[] | undefined> {
-		const scope = getScopedLogger();
-
-		// A partial-data response can null an alias, and search nodes are nullable — a match that isn't an
-		// `Issue` comes back as `{}` because the inline fragment selects nothing
-		type SearchNodes = { nodes: (GitHubIssue | null)[] | null } | null;
-		interface SearchResult {
-			authored: SearchNodes;
-			assigned: SearchNodes;
-			mentioned: SearchNodes;
-		}
-
-		const issueFragement = `${gqIssueFragment}${
-			options?.includeBody
-				? `
-			body
-			`
-				: ''
-		}`;
-
-		const query = `query searchMyIssues(
-				$authored: String!
-				$assigned: String!
-				$mentioned: String!
-				$avatarSize: Int
-			) {
-				authored: search(first: 100, query: $authored, type: ISSUE) {
-					nodes {
-						... on Issue {
-							${issueFragement}
-						}
-					}
-				}
-				assigned: search(first: 100, query: $assigned, type: ISSUE) {
-					nodes {
-						... on Issue {
-							${issueFragement}
-						}
-					}
-				}
-				mentioned: search(first: 100, query: $mentioned, type: ISSUE) {
-					nodes {
-						... on Issue {
-							${issueFragement}
-						}
-					}
-				}
-			}`;
-
+	): Promise<AliasedIssueSearchResult | undefined> {
 		let search = options?.search?.trim() ?? '';
 
 		if (options?.user) {
@@ -3756,47 +3935,830 @@ export class GitHubApi {
 			search += `${repo}${options.repos.join(repo)}`;
 		}
 
-		const baseFilters = 'type:issue is:open archived:false';
+		// A requested sort goes through the same table `searchIssuesPage` uses, so the two GitHub issue reads can't
+		// diverge the first time a key is added. Omitted appends nothing — see this method's contract above.
+		const sortQualifier = toGitHubIssueSortQualifier(options?.sort);
+		const baseFilters = ['type:issue is:open archived:false', sortQualifier].filter(Boolean).join(' ');
+		// `includeAllAssignees` broadens the assigned category from "assigned to me" to "assigned to anyone"
+		// (`assignee:*` is GitHub's has-any-assignee qualifier). Authored/mentioned stay bound to `@me` — they're
+		// user-relative by definition, so an all-assignees read still only surfaces the current user's authored
+		// and mentioned issues plus every assigned-to-anyone issue.
+		//
+		// NOTE: `assignee:*` requires a SCOPE to be meaningful, but any scope will do — one repository, several,
+		// or an org (measured: `repo:a repo:b … assignee:*` returns exactly the sum of the two per-repo counts).
+		// It is only the UNSCOPED form that is meaningless, matching millions of issues across all of GitHub, so
+		// callers must supply `repos` (or an org qualifier via `search`); the facade refuses the unscoped case.
+		const assignedQualifier = options?.includeAllAssignees ? 'assignee:*' : 'assignee:@me';
+
+		// A category is read when the caller asked for it AND it hasn't been exhausted (a `null` cursor slot,
+		// which `searchIssuesByAlias` maintains). An excluded category needs no cursor bookkeeping: a missing
+		// response category reads back as `null`, so it stays excluded across continuations on its own.
+		const categories = options?.categories;
+		const requested = {
+			authored: categories?.authored ?? categories == null,
+			assigned: categories?.assigned ?? categories == null,
+			mentioned: categories?.mentioned ?? categories == null,
+		};
+
+		// Two things are fixed here rather than incidental:
+		// - the alias names are this read's persisted cursor keys, so they can't be renamed;
+		// - the ORDER is assigned → mentioned → authored, which is the order the union is emitted in and, because
+		//   the dedupe keeps the first occurrence of a url, also the precedence between the three. An issue that
+		//   is both assigned to and authored by the user surfaces as the assigned one.
+		const searches: AliasedIssueSearch[] = [];
+		if (requested.assigned) {
+			searches.push({ alias: 'assigned', query: `${search} ${baseFilters} ${assignedQualifier}`.trim() });
+		}
+		if (requested.mentioned) {
+			searches.push({ alias: 'mentioned', query: `${search} ${baseFilters} mentions:@me`.trim() });
+		}
+		if (requested.authored) {
+			searches.push({ alias: 'authored', query: `${search} ${baseFilters} author:@me`.trim() });
+		}
+
+		// Field by field, like `searchIssuesPage`: `options` also carries `repos`/`includeAllAssignees`/`categories`,
+		// already folded into `searches[].query` above and undeclared by the callee.
+		return this.searchIssuesByAlias(
+			provider,
+			token,
+			searches,
+			{
+				baseUrl: options?.baseUrl,
+				avatarSize: options?.avatarSize,
+				includeBody: options?.includeBody,
+				cursor: options?.cursor,
+				sort: options?.sort,
+				// This read emitted no `sort:` qualifier at all before ordering existed, so a cursor with no
+				// recorded key came out of a relevance-ordered walk.
+				legacySort: unsortedCursorSort,
+			},
+			cancellation,
+		);
+	}
+
+	/**
+	 * The filtered issue search: issues matching structured criteria over a repository/org scope, with no forced
+	 * relationship to the current user. The issue counterpart of {@link searchMyPullRequestsPage}, and distinct
+	 * from {@link searchMyIssues}, which is permanently bound to `@me`.
+	 *
+	 * Ordering is `criteria.sort`, defaulting to most-recently-updated-first — the order this read served before
+	 * ordering was an option, so an omitted `sort` emits the identical query. What is NOT optional is that SOME
+	 * order is always requested: without one GitHub answers in relevance order, and at the result ceiling that
+	 * makes which rows are reachable a function of GitHub's ranking rather than of the request. A key GitHub can't
+	 * express (`closed`, `priority`, …) is refused by the facade before the request, not silently downgraded.
+	 *
+	 * With more than one relationship the page is a UNION of several searches, each ordered by the provider; the
+	 * merged page is re-sorted here so the whole page honors the requested key. Across pages the order is still
+	 * per-alias — see {@link searchIssuesByAlias}.
+	 *
+	 * Each requested relationship becomes its own aliased search, unioned and deduped by url; with none, a single
+	 * search runs over the scope alone. `criteria.text` and the other free-form values are sanitized so user input
+	 * cannot inject a qualifier and re-scope the search — see {@link toGitHubIssueSearchQualifiers}.
+	 */
+	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
+	async searchIssuesPage(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		options?: {
+			repos?: string[];
+			org?: string;
+			criteria?: IssueSearchCriteria;
+			baseUrl?: string;
+			avatarSize?: number;
+			includeBody?: boolean;
+			cursor?: string;
+			pageSize?: number;
+		},
+		cancellation?: AbortSignal,
+	): Promise<AliasedIssueSearchResult | undefined> {
+		// Resolved once: the emitted qualifier, the merged page's comparator and the cursor's fingerprint must all
+		// be the same key, which is what `effectiveIssueSort` exists to guarantee.
+		const sort = effectiveIssueSort(options?.criteria?.sort);
+		const base = [
+			...toGitHubIssueSearchScopeQualifiers(options?.org, options?.repos),
+			...toGitHubIssueSearchQualifiers(options?.criteria, sort),
+		].join(' ');
+
+		// One aliased search per relationship, OR-ed by union. They can't be one query: GitHub AND-s qualifiers,
+		// so `author:@me assignee:@me` would return the intersection — issues the user both opened and is assigned
+		// to — instead of either set. With no relationship the scope + criteria are already the whole query.
+		const relationships = options?.criteria?.relationships;
+		const searches: AliasedIssueSearch[] = relationships?.length
+			? relationships.map(r => ({
+					alias: gitHubIssueSearchRelationships[r].alias,
+					query: `${base} ${gitHubIssueSearchRelationships[r].qualifier}`.trim(),
+				}))
+			: [{ alias: 'matched', query: base }];
+
+		// Forwarded field by field rather than spread: `options` also carries `repos`/`org`/`criteria`, which are
+		// already baked into `searches[].query` above and which the callee declares nothing about. `sort` is the
+		// EFFECTIVE key, since the merged page and the cursor's fingerprint must both use the one the query used.
+		return this.searchIssuesByAlias(
+			provider,
+			token,
+			searches,
+			{
+				baseUrl: options?.baseUrl,
+				avatarSize: options?.avatarSize,
+				includeBody: options?.includeBody,
+				cursor: options?.cursor,
+				pageSize: options?.pageSize,
+				sort: sort,
+				// This read has always emitted `sort:updated`, which is `defaultIssueSort` — so a cursor with no
+				// recorded key came out of a walk under exactly that key, and only a caller asking for a
+				// different one has to restart.
+				legacySort: defaultIssueSort,
+			},
+			cancellation,
+		);
+	}
+
+	/**
+	 * Counts issues for several scopes in ONE request, transferring no issues at all — each scope is an aliased
+	 * `search` selecting only `issueCount`, with `first: 0` so no nodes are fetched.
+	 *
+	 * This is what makes a "this will fetch ~N issues" preview affordable: measured against the live API, 30
+	 * aliased counts cost a single rate-limit point. It is still a network request per chunk, so a caller is
+	 * expected to debounce and cache.
+	 *
+	 * Returns counts positionally — one per input scope, same order — because a caller-supplied key must never
+	 * reach the GraphQL document (it would break it); the aliases are generated. `undefined` in a slot means the
+	 * response omitted that alias, which the caller reports as "not counted" rather than as zero.
+	 */
+	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
+	async countIssues(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		scopes: readonly { repos?: string[]; org?: string; criteria?: IssueSearchCriteria }[],
+		options?: { baseUrl?: string },
+		cancellation?: AbortSignal,
+	): Promise<(number | undefined)[]> {
+		const scope = getScopedLogger();
+		if (scopes.length === 0) return [];
+
+		const queries = scopes.map(s => {
+			// The same resolved key the search would use, so the count previews the query it previews. Ordering
+			// cannot change a total, but emitting a DIFFERENT qualifier string than the search does would break the
+			// parity this probe is for.
+			const qualifiers = [
+				...toGitHubIssueSearchScopeQualifiers(s.org, s.repos),
+				...toGitHubIssueSearchQualifiers(s.criteria, effectiveIssueSort(s.criteria?.sort)),
+			];
+
+			// A relationship set is OR-ed across searches, which a single count can't express — the facade splits
+			// such a scope into one count per relationship before calling, so at most one is present here.
+			const relationship = s.criteria?.relationships?.[0];
+			if (relationship != null) {
+				qualifiers.push(gitHubIssueSearchRelationships[relationship].qualifier);
+			}
+			return qualifiers.join(' ');
+		});
+
+		// Aliases are positional and generated (`s0`, `s1`, …): a caller's key is arbitrary text and would break
+		// the document, so the caller maps results back by index.
+		const params = queries.map((_, i) => `$q${i}: String!`).join('\n\t\t\t\t');
+		// `first: 0` is what makes this cheap — `issueCount` alone, no nodes over the wire.
+		const fields = queries
+			.map((_, i) => `s${i}: search(query: $q${i}, type: ISSUE, first: 0) { issueCount }`)
+			.join('\n\t\t\t\t');
+		const query = `query countIssues(
+				${params}
+			) {
+				${fields}
+			}`;
+
+		const variables: Record<string, unknown> = { baseUrl: options?.baseUrl };
+		queries.forEach((q, i) => {
+			variables[`q${i}`] = q;
+		});
+
 		try {
-			const rsp = await this.graphql<SearchResult>(
+			const rsp = await this.graphql<Record<string, { issueCount?: number } | undefined>>(
 				provider,
 				token,
 				query,
-				{
-					authored: `${search} ${baseFilters} author:@me`.trim(),
-					assigned: `${search} ${baseFilters} assignee:@me`.trim(),
-					mentioned: `${search} ${baseFilters} mentions:@me`.trim(),
-					baseUrl: options?.baseUrl,
-					avatarSize: options?.avatarSize,
-				},
+				variables,
 				scope,
 				cancellation,
 			);
+			if (rsp == null) return queries.map(() => undefined);
 
-			if (rsp == null) return [];
+			return queries.map((_, i) => rsp[`s${i}`]?.issueCount);
+		} catch (ex) {
+			throw this.handleException(ex, provider, scope);
+		}
+	}
+
+	/**
+	 * The PR twin of {@link countIssues}: counts pull requests for several scopes in ONE request via aliased
+	 * `search` fields selecting only `issueCount` with `first: 0`. Same positional/undefined contract as the issue
+	 * count.
+	 *
+	 * The one difference is states. {@link toGitHubPullRequestSearchFacets} fans a scope's states out into one
+	 * `search` each, so this reports the count the SAME way {@link searchPullRequestsPage} reports its total — the
+	 * LARGEST facet's `issueCount`, not their sum: the result ceiling applies per search, so the max is what
+	 * `exceedsProviderLimit` compares against, and summing would claim a total the read never surfaces. Relationships
+	 * are OR-ed and can't be a single count; the facade refuses a multi-relationship scope, so at most one is here.
+	 */
+	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
+	async countPullRequests(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		scopes: readonly { repos?: string[]; org?: string; criteria?: PullRequestSearchCriteria }[],
+		options?: { baseUrl?: string },
+		cancellation?: AbortSignal,
+	): Promise<(number | undefined)[]> {
+		const scope = getScopedLogger();
+		if (scopes.length === 0) return [];
+
+		// Each scope expands to one query string per state facet (all sharing its single relationship, which the
+		// facade guarantees). A scope's count is the MAX across its facets — mirroring searchPullRequestsPage's
+		// totalCount — so the aliases stay grouped by scope and are reduced after the response.
+		const scopeQueries = scopes.map(s => {
+			const scopeQualifiers = toGitHubIssueSearchScopeQualifiers(s.org, s.repos);
+			return toGitHubPullRequestSearchFacets(s.criteria).map(f =>
+				[...scopeQualifiers, ...f.qualifiers].join(' '),
+			);
+		});
+
+		// Aliases are positional and generated (`s${scope}f${facet}`): a caller's key is arbitrary text and would
+		// break the document, so results are reduced back to one count per scope by index.
+		const aliased = scopeQueries.flatMap((queries, si) =>
+			queries.map((query, fi) => ({ alias: `s${si}f${fi}`, query: query })),
+		);
+		const params = aliased.map(a => `$${a.alias}: String!`).join('\n\t\t\t\t');
+		// `first: 0` is what makes this cheap — `issueCount` alone, no nodes over the wire.
+		const fields = aliased
+			.map(a => `${a.alias}: search(query: $${a.alias}, type: ISSUE, first: 0) { issueCount }`)
+			.join('\n\t\t\t\t');
+		const query = `query countPullRequests(
+				${params}
+			) {
+				${fields}
+			}`;
+
+		const variables: Record<string, unknown> = { baseUrl: options?.baseUrl };
+		for (const a of aliased) {
+			variables[a.alias] = a.query;
+		}
+
+		try {
+			const rsp = await this.graphql<Record<string, { issueCount?: number } | undefined>>(
+				provider,
+				token,
+				query,
+				variables,
+				scope,
+				cancellation,
+			);
+			if (rsp == null) return scopes.map(() => undefined);
+
+			return scopeQueries.map((queries, si) => {
+				let max: number | undefined;
+				for (let fi = 0; fi < queries.length; fi++) {
+					const count = rsp[`s${si}f${fi}`]?.issueCount;
+					if (count != null) {
+						max = max == null ? count : Math.max(max, count);
+					}
+				}
+				return max;
+			});
+		} catch (ex) {
+			throw this.handleException(ex, provider, scope);
+		}
+	}
+
+	/**
+	 * The aliased-search engine behind every GitHub issue search: one GraphQL request carrying N independently
+	 * cursored `search` fields, `@include`-gated so an exhausted or unrequested one costs nothing.
+	 *
+	 * It exists as one implementation because the properties that make it correct are subtle and must not be
+	 * reproduced per read: each alias advances on its OWN cursor and is dropped from the request once exhausted
+	 * (so a finished search is never re-queried, which would re-emit its first page); results are mapped
+	 * node-by-node so one unmappable issue can't discard the page; the union is deduped by `url` rather than by
+	 * `IssueShape.id`, which for some providers is a per-repository number; and a provider that claims another
+	 * page while withholding its `endCursor` is reported as truncated instead of paged forever.
+	 *
+	 * {@link searchMyIssues} is one configuration of it (its three `@me` categories), and its alias names are
+	 * that read's published cursor keys.
+	 *
+	 * `searches` must have unique aliases, each a valid GraphQL name that is none of `page`, `truncated` or
+	 * `sort` — the composite cursor keys aliases at its top level, alongside those three reserved fields.
+	 *
+	 * `sort` is the order the caller asked for, which this does two things with. Each alias comes back ordered by
+	 * it (the qualifier is already in `searches[].query`), but the UNION of several aliases is not, so the merged
+	 * page is re-sorted here; and the key is recorded in the cursor, so a continuation that changed it THROWS
+	 * rather than serving a sequence with gaps and repeats. Omitted means the caller asked for no order at all
+	 * ({@link searchMyIssues}'s default), which re-sorts nothing and pins nothing.
+	 *
+	 * `legacySort` is the order the calling read produced BEFORE this field existed, and is what a cursor with no
+	 * recorded key is compared against — such a cursor is not of unknown order, it is of that read's old one.
+	 */
+	private async searchIssuesByAlias(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		searches: readonly AliasedIssueSearch[],
+		options: {
+			baseUrl?: string;
+			avatarSize?: number;
+			includeBody?: boolean;
+			cursor?: string;
+			pageSize?: number;
+			sort?: IssueSorting;
+			legacySort: IssueSorting | typeof unsortedCursorSort;
+		},
+		cancellation?: AbortSignal,
+	): Promise<AliasedIssueSearchResult | undefined> {
+		const scope = getScopedLogger();
+
+		type SearchCategory = {
+			issueCount: number;
+			pageInfo?: { endCursor?: string | null; hasNextPage: boolean };
+			nodes: (GitHubIssue | null)[] | null;
+		};
+		/**
+		 * Aliases are keyed at the TOP LEVEL, alongside `page` and `truncated` — the format
+		 * {@link searchMyIssues} has always published, so it stays flat rather than nesting the aliases: a
+		 * consumer's persisted cursor has to keep resuming where it left off.
+		 *
+		 * A slot of `null` means exhausted and a missing slot means never requested; both keep that alias out of
+		 * the next request.
+		 */
+		interface SearchCursor {
+			page?: number;
+			truncated?: boolean;
+			/**
+			 * The order this cursor's pages were produced under: an `IssueSorting`, or `unsortedCursorSort` when
+			 * the caller asked for none. Written as a value rather than left absent in the no-order case
+			 * specifically so that ABSENT keeps meaning "cursor from before ordering existed", which is accepted
+			 * and sealed instead of refused — a consumer's persisted cursor has to keep working across this change.
+			 *
+			 * Those three cases are the whole domain, so it is typed as them rather than as `string`: a foreign
+			 * cursor carrying something else is caught by the mismatch check either way.
+			 */
+			sort?: IssueSorting | typeof unsortedCursorSort;
+			[alias: string]: string | number | boolean | null | undefined;
+		}
+
+		// Enforced, not just documented: aliases share the cursor's top level with `page` and `truncated`, so an
+		// alias colliding with either would overwrite it — and the failure would be SILENT, a page number replaced
+		// by a cursor string that reads back as page 1, restarting the walk with no error and no truncation flag.
+		// Cheap to check, and it fails at the one call that introduced the collision rather than in a consumer's
+		// persisted cursor.
+		const reserved = searches.filter(s => s.alias === 'page' || s.alias === 'truncated' || s.alias === 'sort');
+		if (reserved.length > 0) {
+			throw new Error(
+				`Issue search alias(es) ${reserved.map(s => `'${s.alias}'`).join(', ')} collide with the composite cursor's reserved keys`,
+			);
+		}
+
+		// A key GitHub cannot express emits no `sort:` qualifier, so each alias would come back in RELEVANCE order
+		// while the union below is sorted by that key and the cursor sealed under it: an arbitrary subset,
+		// presented as ordered, resumable only into more of the same. Refused here rather than downgraded, which
+		// is the rule the whole feature is built on. Unreachable through the facade — no `supportedIssueSorts`
+		// table declares a key without a qualifier — so this guards the direct callers of the two public reads,
+		// where `title` is expressible enough to have a comparator and not enough to be a GitHub search qualifier.
+		if (options.sort != null && toGitHubIssueSortQualifier(options.sort) == null) {
+			throw new Error(`GitHub cannot order an issue search by '${options.sort}'`);
+		}
+
+		let cursor: SearchCursor | undefined;
+		if (options?.cursor != null) {
+			try {
+				cursor = JSON.parse(options.cursor) as SearchCursor;
+			} catch {}
+		}
+		// The order this request is being made under, as the cursor records it.
+		const requestedSort = options.sort ?? unsortedCursorSort;
+		// A cursor produced under a DIFFERENT order can't be resumed: every alias would continue from a position in
+		// a differently-ordered result set, so the continuation re-emits rows already seen and skips rows never
+		// seen. REFUSED rather than silently restarted from page 1, because a restart cannot be reported honestly
+		// from here: this read is cursor-only, so `resolveCurrentPage` has no page of its own to trust and echoes
+		// the `page` the caller supplied alongside the cursor — page 1's rows would be published as page N, which
+		// is the very confusion the fingerprint exists to prevent. Refusing surfaces a warning + `fetchFailed`, and
+		// the remedy ("drop the cursor") is the caller's to apply.
+		//
+		// A cursor with NO recorded sort predates this field — which is not the same as being of unknown order.
+		// Each read produced exactly one order before ordering was an option (`sort:updated` for the filtered
+		// search, relevance for `searchMyIssues`), so an absent key reads as THAT one, `legacySort`. Compared
+		// rather than waved through: the facade now resolves an omitted key to `defaultIssueSort`, so the
+		// account-wide read's query gained a `sort:updated` qualifier it did not have, and resuming a
+		// relevance-ordered cursor inside it advances each alias through a re-ordered result set — the gaps and
+		// repeats this check exists to prevent, arriving through the very case meant to keep working. A cursor
+		// whose implied key matches the request still resumes, and is sealed with the current one.
+		const cursorSort = cursor?.sort ?? options.legacySort;
+		if (cursor != null && cursorSort !== requestedSort) {
+			throw new Error(
+				`Issue search cursor was produced under sort '${cursorSort}' but '${requestedSort}' was requested; restart the read without a cursor`,
+			);
+		}
+
+		const page = Math.max(1, Math.trunc(cursor?.page ?? 1));
+		// A slot is a continuation string, `null` (exhausted), or absent. Anything else came from a malformed or
+		// foreign cursor, and is read as absent rather than threaded back into the request as a continuation.
+		const slotFor = (alias: string): string | null | undefined => {
+			const slot = cursor?.[alias];
+			return slot === null || typeof slot === 'string' ? slot : undefined;
+		};
+		// Every requested search is in the document; an exhausted one is switched OFF by its `@include` gate
+		// rather than removed, so a continuation's request keeps the shape of the first one and GitHub's
+		// query-document cache still recognizes it. `active` is what actually runs.
+		const isActive = (s: AliasedIssueSearch) => slotFor(s.alias) !== null;
+		const active = searches.filter(isActive);
+		// Reading nothing is the honest answer to "every requested search is exhausted (or none was requested)":
+		// widening back to the full set would return items the caller excluded, or re-emit a finished page.
+		if (active.length === 0) {
+			return { values: [], hasMore: false, page: page, truncated: cursor?.truncated === true };
+		}
+
+		// GitHub's search caps a page at 100 regardless of what is asked for.
+		const pageSize = Math.min(100, Math.max(1, Math.trunc(options?.pageSize ?? 100)));
+		// `includeAssigned` etc. — the same variable names the read published before the aliases were made
+		// data-driven, so a recorded/asserted request shape stays recognizable.
+		const includeVar = (alias: string) => `include${alias.charAt(0).toUpperCase()}${alias.slice(1)}`;
+		const params = searches.flatMap(s => [
+			`$${s.alias}: String!`,
+			`$${s.alias}Cursor: String`,
+			`$${includeVar(s.alias)}: Boolean!`,
+		]);
+		const fields = searches.map(
+			s => `${s.alias}: search(first: ${pageSize}, after: $${s.alias}Cursor, query: $${s.alias}, type: ISSUE)
+					@include(if: $${includeVar(s.alias)}) {
+					issueCount
+					pageInfo {
+						endCursor
+						hasNextPage
+					}
+					nodes {
+						... on Issue {
+							${gqIssueFragment}
+							${options?.includeBody ? 'body' : ''}
+						}
+					}
+				}`,
+		);
+		const query = `query searchIssues(
+				${params.join('\n\t\t\t\t')}
+				$avatarSize: Int
+			) {
+				${fields.join('\n\t\t\t\t')}
+			}`;
+
+		const variables: Record<string, unknown> = {
+			baseUrl: options?.baseUrl,
+			avatarSize: options?.avatarSize,
+		};
+		for (const s of searches) {
+			variables[s.alias] = s.query;
+			variables[`${s.alias}Cursor`] = slotFor(s.alias) ?? undefined;
+			variables[includeVar(s.alias)] = isActive(s);
+		}
+
+		try {
+			const rsp = await this.graphql<Record<string, SearchCategory | undefined>>(
+				provider,
+				token,
+				query,
+				variables,
+				scope,
+				cancellation,
+			);
+			if (rsp == null) return { values: [], hasMore: false, page: page, truncated: false };
 
 			// Map node-by-node so one unmappable issue can't discard the whole result set
 			const issues: IssueShape[] = [];
-			for (const node of [
-				...(rsp.assigned?.nodes ?? []),
-				...(rsp.mentioned?.nodes ?? []),
-				...(rsp.authored?.nodes ?? []),
-			]) {
-				if (node?.id == null) continue;
+			for (const s of active) {
+				for (const node of rsp[s.alias]?.nodes ?? []) {
+					if (node?.id == null) continue;
 
-				try {
-					issues.push(fromGitHubIssue(node, provider));
-				} catch (ex) {
-					scope?.warn(`skipped unmappable issue; id=${node.id}, url=${node.url}, ex=${ex}`);
+					try {
+						issues.push(fromGitHubIssue(node, provider));
+					} catch (ex) {
+						scope?.warn(`skipped unmappable issue; id=${node.id}, url=${node.url}, ex=${ex}`);
+					}
 				}
 			}
 
-			const results: IterableIterator<IssueShape> = uniqueBy(
-				issues,
-				r => r.url,
-				(original, _current) => original,
+			// Dedupe by `url`, not `IssueShape.id`: for some providers `id` is a per-repository number, so an
+			// id-keyed map would collapse distinct issues across repositories.
+			const deduped = [
+				...uniqueBy(
+					issues,
+					r => r.url,
+					(original, _current) => original,
+				),
+			];
+
+			// Each alias arrived ordered by the server; their concatenation is not, so the merged page is ordered
+			// here. AFTER the dedupe, not before, and that ordering is load-bearing: the alias order is also the
+			// dedupe's precedence (an issue both assigned to and authored by the user surfaces as the assigned one,
+			// per `searchMyIssues`), and sorting first would hand `uniqueBy` a different first occurrence and
+			// silently change which copy wins. The pull-request path sorts BEFORE its dedupe because its facets
+			// carry no such precedence — the difference is deliberate, not an inconsistency to tidy up.
+			//
+			// A comparator is always available for a key GitHub declares (`created`/`updated`/`comments`/
+			// `reactions` are all on `IssueShape`), so `undefined` here means the capability table has outrun this
+			// read; leave the provider's per-alias order rather than inventing one.
+			//
+			// Counted over `active`, not `searches`: continuations exhaust aliases one at a time, so a later page of
+			// a three-category walk can come from ONE surviving search — already ordered by the server. Re-sorting
+			// it could only reproduce that order, while hiding a provider that ignored the qualifier.
+			const comparator = options?.sort != null ? getIssueComparator(options.sort) : undefined;
+			if (comparator != null && active.length > 1) {
+				deduped.sort(comparator);
+			}
+
+			// Every alias gets a slot, so an inactive one keeps its `null` and stays out of the next request. A
+			// missing slot would be read as "never requested", which for a `searches` set that still lists it
+			// would restart it from its first page.
+			// The order is pinned on the way out too, so the next round can refuse a changed key (see above).
+			const next: SearchCursor = { page: page + 1, sort: requestedSort };
+			let hasMore = false;
+			let continuationMissing = false;
+			let maxIssueCount = 0;
+			for (const s of searches) {
+				const category = rsp[s.alias];
+				const endCursor =
+					category?.pageInfo?.hasNextPage && category.pageInfo.endCursor ? category.pageInfo.endCursor : null;
+				next[s.alias] = endCursor;
+				if (endCursor != null) {
+					hasMore = true;
+				}
+				if (category?.pageInfo?.hasNextPage === true && category.pageInfo.endCursor == null) {
+					continuationMissing = true;
+				}
+				maxIssueCount = Math.max(maxIssueCount, category?.issueCount ?? 0);
+			}
+
+			// GitHub search exposes at most `githubSearchResultLimit` results PER SEARCH, so the ceiling is
+			// reached as soon as any one alias exceeds it. Paging removes the old 100-item truncation; only that
+			// upstream ceiling or an unusable continuation leaves the read incomplete.
+			const truncated =
+				cursor?.truncated === true || maxIssueCount > githubSearchResultLimit || continuationMissing;
+			next.truncated = truncated || undefined;
+			return {
+				values: deduped,
+				cursor: hasMore ? JSON.stringify(next) : undefined,
+				hasMore: hasMore,
+				page: page,
+				truncated: truncated,
+				totalCount: maxIssueCount,
+			};
+		} catch (ex) {
+			throw this.handleException(ex, provider, scope);
+		}
+	}
+
+	/**
+	 * Searches pull requests over a repository/org or current-user relationship scope. One GraphQL document carries
+	 * every active relationship × state facet, so one HTTP request serves one page even when the logical search is
+	 * a union. The cursor preserves each facet's continuation plus the positional page.
+	 *
+	 * Ordering is `criteria.sort`, defaulting to most-recently-updated-first — the order this read served before it
+	 * was expressible. It is requested of the provider AND re-applied to the merged page, because the page is a
+	 * union of facets and no per-facet server order describes it. The sort is part of the cursor fingerprint, so
+	 * changing it invalidates a threaded cursor exactly as changing the text or the scope does. User text is
+	 * sanitized before it reaches the provider query. See {@link toGitHubPullRequestSearchFacets}.
+	 */
+	@trace({ args: (provider, token) => ({ provider: provider.name, token: `<token:${token.microHash}>` }) })
+	async searchPullRequestsPage(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		options?: {
+			repos?: string[];
+			org?: string;
+			criteria?: PullRequestSearchCriteria;
+			baseUrl?: string;
+			avatarSize?: number;
+			cursor?: string;
+			pageSize?: number;
+			/**
+			 * Uses the lightweight PR fragment, retaining identity, body, author, repository, branch refs, and stack
+			 * info while omitting review, check, and diff statistics. It also raises the default page budget, which
+			 * multi-facet searches share across their active facets.
+			 */
+			summary?: boolean;
+		},
+		cancellation?: AbortSignal,
+	): Promise<PullRequestSearchResult | undefined> {
+		const scope = getScopedLogger();
+
+		const facets = toGitHubPullRequestSearchFacets(options?.criteria);
+		const facetAliases = facets.map(f => f.alias).sort();
+		const scopeQualifiers = toGitHubIssueSearchScopeQualifiers(options?.org, options?.repos);
+		const facetSearches = new Map(
+			facets.map(f => [f.alias, [...scopeQualifiers, ...f.qualifiers].join(' ')] as const),
+		);
+		// Bind a cursor to every qualifier without publishing the user text/scope inside the opaque cursor. FNV-1a
+		// is a compact drift key, not a security primitive: a mismatch only degrades safely to page 1.
+		let cursorKeyHash = 0x811c9dc5;
+		for (const value of [...facetSearches.entries()].sort(([a], [b]) => a.localeCompare(b)).flat()) {
+			for (let i = 0; i < value.length; i++) {
+				cursorKeyHash ^= value.charCodeAt(i);
+				cursorKeyHash = Math.imul(cursorKeyHash, 0x01000193);
+			}
+			cursorKeyHash ^= 0;
+			cursorKeyHash = Math.imul(cursorKeyHash, 0x01000193);
+		}
+		const cursorKey = (cursorKeyHash >>> 0).toString(36);
+
+		type SearchCategory = {
+			issueCount: number;
+			pageInfo?: { endCursor?: string | null; hasNextPage: boolean };
+			nodes: (GitHubPullRequest | null)[] | null;
+		};
+		interface SearchCursor {
+			key: string;
+			page: number;
+			facets: Record<string, string | null>;
+			truncated?: boolean;
+			totalCount?: number;
+		}
+
+		let cursor: SearchCursor | undefined;
+		if (options?.cursor != null) {
+			try {
+				const parsed = JSON.parse(options.cursor) as Partial<SearchCursor>;
+				const parsedFacets = parsed.facets;
+				if (parsedFacets != null && typeof parsedFacets === 'object' && !Array.isArray(parsedFacets)) {
+					const parsedAliases = Object.keys(parsedFacets).sort();
+					const sameFacets =
+						parsedAliases.length === facetAliases.length &&
+						parsedAliases.every((alias, index) => alias === facetAliases[index]);
+					const usableSlots = Object.values(parsedFacets).every(
+						slot => slot === null || (typeof slot === 'string' && slot.length > 0),
+					);
+					if (parsed.key === cursorKey && sameFacets && usableSlots) {
+						cursor = {
+							key: cursorKey,
+							page:
+								typeof parsed.page === 'number' && Number.isFinite(parsed.page)
+									? Math.max(1, Math.trunc(parsed.page))
+									: 1,
+							facets: parsedFacets,
+							truncated: parsed.truncated === true,
+							totalCount:
+								typeof parsed.totalCount === 'number' && Number.isFinite(parsed.totalCount)
+									? Math.max(0, Math.trunc(parsed.totalCount))
+									: undefined,
+						};
+					}
+				}
+			} catch {}
+		}
+		const page = cursor?.page ?? 1;
+		const isActive = (alias: string): boolean => cursor?.facets[alias] !== null;
+		const activeFacets = facets.filter(f => isActive(f.alias));
+		if (activeFacets.length === 0) {
+			return {
+				values: [],
+				hasMore: false,
+				page: page,
+				truncated: cursor?.truncated === true,
+				totalCount: cursor?.totalCount,
+			};
+		}
+
+		// Each active facet selects its own page in the same GraphQL document. Share the lite projection's
+		// 100-node default across those selections; an explicit page size remains a per-facet request.
+		const defaultSize =
+			options?.summary === true
+				? Math.max(1, Math.floor(maxPullRequestSearchPageSize / activeFacets.length))
+				: defaultPullRequestSearchPageSize;
+		const pageSize = Math.min(
+			maxPullRequestSearchPageSize,
+			Math.max(1, Math.trunc(options?.pageSize ?? defaultSize)),
+		);
+
+		const includeVar = (alias: string): string => `include${alias.charAt(0).toUpperCase()}${alias.slice(1)}`;
+		const params = facets.flatMap(f => [
+			`$${f.alias}Search: String!`,
+			`$${f.alias}Cursor: String`,
+			`$${includeVar(f.alias)}: Boolean!`,
+		]);
+		const fields = facets.map(
+			f => `${f.alias}: search(first: ${pageSize}, after: $${f.alias}Cursor, query: $${f.alias}Search, type: ISSUE)
+				@include(if: $${includeVar(f.alias)}) {
+				issueCount
+				pageInfo {
+					endCursor
+					hasNextPage
+				}
+				nodes {
+					... on PullRequest {
+						${options?.summary ? gqlPullRequestLiteFragment : gqlPullRequestFragment}
+						${gqlPullRequestStackFragmentFor(options)}
+					}
+				}
+			}`,
+		);
+		const query = `query searchPullRequestsPage(
+			${params.join('\n\t\t\t')}
+			$avatarSize: Int
+		) {
+			${fields.join('\n\t\t\t')}
+		}`;
+
+		const variables: Record<string, unknown> = {
+			baseUrl: options?.baseUrl,
+			avatarSize: options?.avatarSize,
+		};
+		for (const facet of facets) {
+			variables[`${facet.alias}Search`] = facetSearches.get(facet.alias);
+			variables[`${facet.alias}Cursor`] = cursor?.facets[facet.alias] ?? undefined;
+			variables[includeVar(facet.alias)] = isActive(facet.alias);
+		}
+
+		try {
+			const rsp = await this.graphql<Record<string, SearchCategory | undefined>>(
+				provider,
+				token,
+				query,
+				variables,
+				scope,
+				cancellation,
 			);
-			return [...results];
+			if (rsp == null) return { values: [], hasMore: false, page: page, truncated: false };
+
+			const pullRequests: PullRequestShape[] = [];
+			for (const facet of activeFacets) {
+				for (const node of rsp[facet.alias]?.nodes ?? []) {
+					if (node?.id == null) continue;
+
+					try {
+						// Must follow the projection: the lite fragment does not select reviews, checks or diff
+						// stats, and the full mapper reads them — mapping a lite node with it would silently
+						// report "no reviewers"/"no checks" as FACTS rather than as unselected.
+						pullRequests.push(
+							options?.summary
+								? fromGitHubPullRequestLite(node, provider)
+								: fromGitHubPullRequest(node, provider),
+						);
+					} catch (ex) {
+						scope?.warn(`skipped unmappable pull request; id=${node.id}, url=${node.url}, ex=${ex}`);
+					}
+				}
+			}
+			// The PR path re-sorts the merged page rather than trusting the per-facet server order — GitHub's
+			// server-side PR sort has been unreliable (the per-branch path re-sorts for the same reason), and the
+			// union of several facets is unordered regardless. The key was validated against
+			// `githubPullRequestSearchCapabilities.sorts` upstream, so its comparator is always defined for a PR
+			// shape; the guard only guards the unreachable case rather than inventing an order for it.
+			const comparator = getPullRequestComparator(options?.criteria?.sort ?? defaultPullRequestSort);
+			if (comparator != null) {
+				pullRequests.sort(comparator);
+			}
+			const values = [
+				...uniqueBy(
+					pullRequests,
+					pr => pr.url,
+					(original, _current) => original,
+				),
+			];
+
+			const nextFacets: Record<string, string | null> = {};
+			let hasMore = false;
+			let continuationMissing = false;
+			let totalCount = cursor?.totalCount ?? 0;
+			let providerLimitReached = false;
+			for (const facet of facets) {
+				if (!isActive(facet.alias)) {
+					nextFacets[facet.alias] = null;
+					continue;
+				}
+
+				const category = rsp[facet.alias];
+				const endCursor =
+					category?.pageInfo?.hasNextPage === true && category.pageInfo.endCursor
+						? category.pageInfo.endCursor
+						: null;
+				nextFacets[facet.alias] = endCursor;
+				if (endCursor != null) {
+					hasMore = true;
+				}
+				if (category?.pageInfo?.hasNextPage === true && category.pageInfo.endCursor == null) {
+					continuationMissing = true;
+				}
+				totalCount = Math.max(totalCount, category?.issueCount ?? 0);
+				providerLimitReached ||= (category?.issueCount ?? 0) > githubSearchResultLimit;
+			}
+			const truncated = cursor?.truncated === true || providerLimitReached || continuationMissing;
+			const next: SearchCursor = {
+				key: cursorKey,
+				page: page + 1,
+				facets: nextFacets,
+				truncated: truncated || undefined,
+				totalCount: totalCount,
+			};
+
+			return {
+				values: values,
+				cursor: hasMore ? JSON.stringify(next) : undefined,
+				hasMore: hasMore,
+				page: page,
+				truncated: truncated,
+				totalCount: totalCount,
+			};
 		} catch (ex) {
 			throw this.handleException(ex, provider, scope);
 		}
@@ -3806,13 +4768,27 @@ export class GitHubApi {
 	async searchPullRequests(
 		provider: Provider,
 		token: GitHubTokenInfo,
-		options?: { search?: string; user?: string; repos?: string[]; baseUrl?: string; avatarSize?: number },
+		options?: {
+			search?: string;
+			user?: string;
+			repos?: string[];
+			baseUrl?: string;
+			avatarSize?: number;
+			include?: PullRequestState[];
+		},
 		cancellation?: AbortSignal,
 	): Promise<PullRequest[]> {
 		const scope = getScopedLogger();
+		const pageSize = 10;
+		const include = options?.include?.length ? options.include : undefined;
+		const requiresPagination = shouldPaginateGitHubSearchState(include);
 
 		interface SearchResult {
 			search: {
+				pageInfo: {
+					endCursor?: string | null;
+					hasNextPage: boolean;
+				};
 				nodes: GitHubPullRequest[];
 			};
 		}
@@ -3820,9 +4796,14 @@ export class GitHubApi {
 		try {
 			const query = `query searchPullRequests(
 	$searchQuery: String!
+		$cursor: String
 	$avatarSize: Int
 ) {
-	search(first: 10, query: $searchQuery, type: ISSUE) {
+		search(first: ${pageSize}, after: $cursor, query: $searchQuery, type: ISSUE) {
+			pageInfo {
+				endCursor
+				hasNextPage
+			}
 		nodes {
 			...on PullRequest {
 				${gqlPullRequestFragment}
@@ -3843,22 +4824,44 @@ export class GitHubApi {
 				search += `${repo}${options.repos.join(repo)}`;
 			}
 
-			const rsp = await this.graphql<SearchResult>(
-				provider,
-				token,
-				query,
-				{
-					searchQuery: `is:pr is:open archived:false ${search.trim()}`,
-					baseUrl: options?.baseUrl,
-					avatarSize: options?.avatarSize,
-				},
-				scope,
-				cancellation,
-			);
-			if (rsp == null) return [];
+			const searchQuery = ['is:pr', toGitHubSearchStateQualifier(include), 'archived:false', search.trim()]
+				.filter(Boolean)
+				.join(' ');
 
-			const results = rsp.search.nodes.map(pr => fromGitHubPullRequest(pr, provider));
-			return results;
+			// Bound the paginated case with a defensive page backstop like the other paged provider drains, so a
+			// large, low-match result set can't fan out into an unbounded request loop.
+			const maxSearchPages = 20;
+			let cursor: string | undefined;
+			const results: PullRequest[] = [];
+			for (let page = 0; page < maxSearchPages; page++) {
+				const rsp = await this.graphql<SearchResult>(
+					provider,
+					token,
+					query,
+					{
+						searchQuery: searchQuery,
+						cursor: cursor,
+						baseUrl: options?.baseUrl,
+						avatarSize: options?.avatarSize,
+					},
+					scope,
+					cancellation,
+				);
+				if (rsp == null) return results;
+
+				const pageResults = filterPullRequestsBySearchState(
+					rsp.search.nodes.map(pr => fromGitHubPullRequest(pr, provider)),
+					include,
+				);
+				results.push(...pageResults);
+
+				cursor = rsp.search.pageInfo.endCursor ?? undefined;
+				if (!requiresPagination || results.length >= pageSize || !rsp.search.pageInfo.hasNextPage) {
+					break;
+				}
+			}
+
+			return results.slice(0, pageSize);
 		} catch (ex) {
 			throw this.handleException(ex, provider, scope);
 		}
@@ -4097,4 +5100,46 @@ export class GitHubApi {
 
 function isGitHubDotCom(options?: { baseUrl?: string }) {
 	return options?.baseUrl == null || options.baseUrl === 'https://api.github.com';
+}
+
+// Translates the requested PR states into a GitHub search state qualifier. GitHub search treats
+// `is:closed` as closed-or-merged, `is:merged` as its subset, and `is:unmerged` as open + closed
+// (not-merged), so `closed` and `merged` (distinct in our model) map to `is:closed is:unmerged` and
+// `is:merged`. `undefined` preserves the historical open-only default.
+export function toGitHubSearchStateQualifier(include: PullRequestState[] | undefined): string {
+	if (include == null) return 'is:open';
+
+	const opened = include.includes('opened');
+	const closed = include.includes('closed');
+	const merged = include.includes('merged');
+
+	if (opened && closed && merged) return ''; // all states -> no qualifier
+	if (opened && closed) return 'is:unmerged';
+	if (closed && merged) return 'is:closed';
+	// `opened && merged` isn't expressible as a single AND qualifier; omit it here and post-filter.
+	if (opened && merged) return '';
+	if (opened) return 'is:open';
+	if (merged) return 'is:merged';
+	if (closed) return 'is:closed is:unmerged';
+	return 'is:open'; // empty include -> default
+}
+
+export function filterPullRequestsBySearchState<T extends { state: PullRequestState }>(
+	pullRequests: T[],
+	include: PullRequestState[] | undefined,
+): T[] {
+	const states = include?.length ? include : (['opened'] satisfies PullRequestState[]);
+	const allowedStates = new Set<PullRequestState>(states);
+	// There are only 3 possible states, so a full set means every state is allowed; use the deduped set
+	// size rather than the raw length so duplicates (e.g. `['opened', 'opened', 'closed']`) don't skip filtering.
+	if (allowedStates.size === 3) return pullRequests;
+
+	return pullRequests.filter(pr => allowedStates.has(pr.state));
+}
+
+function shouldPaginateGitHubSearchState(include: PullRequestState[] | undefined): boolean {
+	if (include == null || include.length === 0) return false;
+
+	const uniqueStates = new Set<PullRequestState>(include);
+	return uniqueStates.size === 2 && uniqueStates.has('opened') && uniqueStates.has('merged');
 }

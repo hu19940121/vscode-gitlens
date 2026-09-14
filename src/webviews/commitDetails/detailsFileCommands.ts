@@ -1,18 +1,19 @@
 import type { TextDocumentShowOptions } from 'vscode';
-import { env, window } from 'vscode';
+import { EndOfLine, env, l10n, window, workspace, WorkspaceEdit } from 'vscode';
 import { CheckoutError } from '@gitlens/git/errors.js';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitFileChange } from '@gitlens/git/models/fileChange.js';
 import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
 import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
 import type { GitWorktree } from '@gitlens/git/models/worktree.js';
-import { splitCommitMessage } from '@gitlens/git/utils/commit.utils.js';
 import { getFileDiffPathspecs } from '@gitlens/git/utils/fileStatus.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import { isUncommitted } from '@gitlens/git/utils/revision.utils.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
+import { Logger } from '@gitlens/utils/logger.js';
 import { basename } from '@gitlens/utils/path.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
+import { splitMessage } from '@gitlens/utils/string.js';
 import type { CopyDeepLinkCommandArgs, CopyFileDeepLinkCommandArgs } from '../../commands/copyDeepLink.js';
 import type { DiffWithCommandArgs } from '../../commands/diffWith.js';
 import type { OpenFileOnRemoteCommandArgs } from '../../commands/openFileOnRemote.js';
@@ -20,6 +21,7 @@ import type { OpenOnRemoteCommandArgs } from '../../commands/openOnRemote.js';
 import type { CreatePatchCommandArgs } from '../../commands/patches.js';
 import type { ShowQuickFileHistoryCommandArgs } from '../../commands/showQuickFileHistory.js';
 import type { Container } from '../../container.js';
+import { getPresentableErrorMessage } from '../../errors.js';
 import type { EventBusSource } from '../../eventBus.js';
 import {
 	applyChanges,
@@ -48,6 +50,14 @@ import type { ComparisonContext, ResolvedDetailsFile } from './commitDetailsWebv
 const { command, getCommands } = createCommandDecorator<string>();
 const { command: multiCommand, getCommands: getMultiCommands } = createCommandDecorator<string>();
 export { getCommands as getDetailsFileCommands, getMultiCommands as getDetailsFileMultiCommands };
+
+// Anchored with a leading `/` so the pattern ignores the selected file rather than that name
+// anywhere in the repo — which also keeps a name starting with `#` or `!` from being read as a
+// comment or a negation. Glob metacharacters and a trailing space (which git would otherwise
+// strip) are escaped so the pattern matches only the file that was picked.
+export function toGitignorePattern(relativePath: string): string {
+	return `/${relativePath.replace(/[*?[]| $/g, '\\$&')}`;
+}
 
 export class DetailsFileCommands {
 	// Reuse the WIP discard service (its confirm + trash + restore core) so the context-menu Discard
@@ -234,8 +244,8 @@ export class DetailsFileCommands {
 	): Promise<void> {
 		const worktree = await this.pickReachableWorktree(
 			commit,
-			'Open File (Worktree)',
-			`Choose which worktree to open ${basename(file.path)} from`,
+			l10n.t('Open File (Worktree)'),
+			l10n.t('Choose which worktree to open {0} from', basename(file.path)),
 		);
 		if (worktree == null) return;
 
@@ -261,8 +271,8 @@ export class DetailsFileCommands {
 	): Promise<void> {
 		const worktree = await this.pickReachableWorktree(
 			commit,
-			'Open Changes with Working File (Worktree)',
-			`Choose which worktree to compare ${basename(file.path)} against`,
+			l10n.t('Open Changes with Working File (Worktree)'),
+			l10n.t('Choose which worktree to compare {0} against', basename(file.path)),
 		);
 		if (worktree == null) return;
 
@@ -339,6 +349,70 @@ export class DetailsFileCommands {
 		// `includeUntracked` so an untracked selected file is stashed too; the stash wizard confirms.
 		await StashActions.push(file.repoPath, [file.uri], undefined, true);
 	}
+
+	@command('gitlens.addToGitignore:')
+	@debug()
+	async addToGitignore(_commit: GitCommit, file: GitFileChange): Promise<void> {
+		const relativePath = this.container.git.getRelativePath(file.uri, file.repoPath);
+		await this.appendToGitignore(file.repoPath, [relativePath], `'${relativePath}'`);
+	}
+
+	/** Appends the given repo-relative paths to the repo root's `.gitignore`, creating it when missing. */
+	private async appendToGitignore(repoPath: string, relativePaths: string[], subject: string): Promise<void> {
+		const gitignoreUri = this.container.git.getAbsoluteUri('.gitignore', repoPath);
+		const entries = relativePaths.map(toGitignorePattern);
+
+		try {
+			let exists = true;
+			try {
+				await workspace.fs.stat(gitignoreUri);
+			} catch {
+				exists = false;
+			}
+
+			// A missing .gitignore has no document to open yet, so create it with its entries in place
+			if (!exists) {
+				await workspace.fs.writeFile(gitignoreUri, new TextEncoder().encode(`${entries.join('\n')}\n`));
+			}
+
+			const document = await workspace.openTextDocument(gitignoreUri);
+
+			// Reveal it before editing, as the built-in Git extension's "Add to .gitignore" does: the
+			// only signal the user gets about what was written is the file itself, and the pattern is
+			// anchored and escaped, so it isn't always the bare path that was picked
+			await window.showTextDocument(document, { preview: false });
+
+			if (exists) {
+				// Append through the text document rather than `workspace.fs` so an open — possibly
+				// dirty — editor stays in sync: a write behind its back strands the buffer, and the
+				// user's next save either raises a conflict or silently drops the entries. Saving
+				// commits their unsaved edits along with ours, and the append is undoable.
+				const eol = document.eol === EndOfLine.CRLF ? '\r\n' : '\n';
+				const lastLine = document.lineAt(document.lineCount - 1);
+
+				const edit = new WorkspaceEdit();
+				edit.insert(
+					document.uri,
+					lastLine.range.end,
+					`${lastLine.text.length ? eol : ''}${entries.join(eol)}${eol}`,
+				);
+				if (!(await workspace.applyEdit(edit))) throw new Error('the edit could not be applied');
+
+				// `save()` also answers false for a document that isn't dirty (auto-save can beat us
+				// to it), so only a dirty document that refuses to save is a failure. The document is
+				// already revealed, so a pending edit isn't left dirty out of sight.
+				if (document.isDirty && !(await document.save())) {
+					throw new Error('the edit could not be saved');
+				}
+			}
+		} catch (ex) {
+			Logger.error(ex, `Unable to add ${subject} to .gitignore`);
+			void window.showErrorMessage(
+				l10n.t('Unable to add {0} to .gitignore\n{1}', subject, getPresentableErrorMessage(ex)),
+			);
+		}
+	}
+
 	@command('gitlens.views.applyChanges:')
 	@debug()
 	applyChanges(
@@ -369,7 +443,7 @@ export class DetailsFileCommands {
 			if (CheckoutError.is(ex)) {
 				void showGitErrorMessage(ex);
 			} else {
-				void showGitErrorMessage(ex, 'Unable to restore file');
+				void showGitErrorMessage(ex, l10n.t('Unable to restore file'));
 			}
 		}
 	}
@@ -399,7 +473,7 @@ export class DetailsFileCommands {
 
 		const input1: MergeEditorInputs['input1'] = {
 			uri: nodeUri,
-			title: `Incoming`,
+			title: l10n.t('Incoming'),
 			detail: ` ${commit.shortSha}`,
 		};
 
@@ -410,14 +484,14 @@ export class DetailsFileCommands {
 
 		const workingUri = getSettledValue(workingUriResult);
 		if (workingUri == null) {
-			void window.showWarningMessage('Unable to open the merge editor, no working file found');
+			void window.showWarningMessage(l10n.t('Unable to open the merge editor, no working file found'));
 			return;
 		}
 
 		const input2: MergeEditorInputs['input2'] = {
 			uri: workingUri,
-			title: 'Current',
-			detail: ' Working Tree',
+			title: l10n.t('Current'),
+			detail: l10n.t(' Working Tree'),
 		};
 
 		const headUri = await svc.getBestRevisionUri(file.path, 'HEAD');
@@ -544,7 +618,7 @@ export class DetailsFileCommands {
 			args = {
 				repoPath: commit.repoPath,
 				to: to,
-				title: to === uncommittedStaged ? 'Staged Changes' : 'Uncommitted Changes',
+				title: to === uncommittedStaged ? l10n.t('Staged Changes') : l10n.t('Uncommitted Changes'),
 				uris: getFileDiffPathspecs(file),
 			};
 		} else {
@@ -552,7 +626,7 @@ export class DetailsFileCommands {
 				await GitCommit.ensureFullDetails(commit);
 			}
 
-			const { summary: title, body: description } = splitCommitMessage(commit.message);
+			const { summary: title, body: description } = splitMessage(commit.message);
 
 			args = {
 				repoPath: commit.repoPath,
@@ -708,7 +782,7 @@ export class DetailsFileCommands {
 				await GitCommit.ensureFullDetails(commit);
 			}
 
-			const { summary: title, body: description } = splitCommitMessage(commit.message);
+			const { summary: title, body: description } = splitMessage(commit.message);
 
 			void executeCommand<CreatePatchCommandArgs>('gitlens.createCloudPatch', {
 				to: commit.ref,
@@ -809,6 +883,18 @@ export class DetailsFileCommands {
 		);
 	}
 
+	@multiCommand('gitlens.addToGitignore.multi:')
+	@debug()
+	async addToGitignoreMulti(items: ResolvedDetailsFile[]): Promise<void> {
+		// Union-gated - the menu shows if ANY selected file is untracked
+		const files = items.filter(i => i.webviewItem?.includes('+untracked'));
+		if (!files.length) return;
+
+		const repoPath = files[0].file.repoPath;
+		const relativePaths = files.map(i => this.container.git.getRelativePath(i.file.uri, repoPath));
+		await this.appendToGitignore(repoPath, relativePaths, 'the selected files');
+	}
+
 	@multiCommand('gitlens.copyPatchToClipboard.multi:')
 	@debug()
 	copyPatchMulti(items: ResolvedDetailsFile[]): void {
@@ -846,7 +932,7 @@ export class DetailsFileCommands {
 			repoPath: files[0].file.repoPath,
 			to: to,
 			from: from,
-			title: to === uncommittedStaged ? 'Staged Changes' : 'Uncommitted Changes',
+			title: to === uncommittedStaged ? l10n.t('Staged Changes') : l10n.t('Uncommitted Changes'),
 			uris: files.flatMap(i => getFileDiffPathspecs(i.file)),
 		};
 		void executeCommand<CreatePatchCommandArgs>('gitlens.copyPatchToClipboard', args);
@@ -872,7 +958,7 @@ export class DetailsFileCommands {
 				lhs: 'HEAD',
 				rhs: '',
 				wip: true,
-				title: 'Working Changes',
+				title: l10n.t('Working Changes'),
 			};
 		} else if (comparison != null) {
 			args = { files: files, repoPath: commit.repoPath, lhs: comparison.sha, rhs: commit.sha };
@@ -882,7 +968,7 @@ export class DetailsFileCommands {
 				repoPath: commit.repoPath,
 				lhs: commit.parents[0] ?? '',
 				rhs: commit.sha,
-				title: `Changes in ${commit.shortSha}`,
+				title: l10n.t('Changes in {0}', commit.shortSha),
 			};
 		}
 		await this._files.openMultipleChanges(args);

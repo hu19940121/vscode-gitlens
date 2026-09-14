@@ -1,5 +1,5 @@
 import type { Disposable as VsCodeDisposable } from 'vscode';
-import { env, version, window } from 'vscode';
+import { env, l10n, version, window } from 'vscode';
 import { fetch as envFetch, wrapForForcedInsecureSSL } from '@env/fetch.js';
 import { getPlatform, isWeb } from '@env/platform.js';
 import type {
@@ -107,10 +107,14 @@ function createConfigAdapter(disposables: VsCodeDisposable[]): ConfigProvider {
 		}),
 		getRemoteConfigs: (): readonly IntegrationsRemoteConfig[] =>
 			(configuration.get('remotes') ?? [])
-				.filter(r => r.domain != null)
+				// Require a non-empty domain or regex: an empty string passes `!= null` but would match
+				// everything downstream (including the `ignoreSSLErrors` regex test), applying settings too broadly.
+				.filter(r => Boolean(r.domain) || Boolean(r.regex))
 				.map(r => ({
 					type: r.type,
-					domain: r.domain,
+					domain: r.domain || undefined,
+					regex: r.regex || undefined,
+					protocol: r.protocol || undefined,
 					ignoreSSLErrors: r.ignoreSSLErrors,
 				})),
 		onDidChange: onDidChange.event,
@@ -140,18 +144,21 @@ function createStorageAdapter(container: Container): IntegrationStorageProvider 
 function createIntegrationServiceHooks(container: Container): IntegrationServiceHooks {
 	return {
 		onReauthenticationRequired: async message => {
-			const confirm = { title: 'Reauthenticate' };
+			const confirm = { title: l10n.t('Reauthenticate') };
 			return (await window.showErrorMessage(message, confirm)) === confirm;
 		},
 
 		onConfirmDisconnect: async ({ integrationName, offerSignOut }) => {
-			const disable = { title: 'Disable' };
-			const disableAndSignOut = { title: 'Disable & Sign Out' };
-			const cancel = { title: 'Cancel', isCloseAffordance: true };
+			const disable = { title: l10n.t('Disable') };
+			const disableAndSignOut = { title: l10n.t('Disable & Sign Out') };
+			const cancel = { title: l10n.t('Cancel'), isCloseAffordance: true };
 			const result = await window.showWarningMessage(
 				offerSignOut
-					? `Are you sure you want to disable the rich integration with ${integrationName}?\n\nNote: signing out clears the saved authentication.`
-					: `Are you sure you want to disable the rich integration with ${integrationName}?`,
+					? l10n.t(
+							'Are you sure you want to disable the rich integration with {0}?\n\nNote: signing out clears the saved authentication.',
+							integrationName,
+						)
+					: l10n.t('Are you sure you want to disable the rich integration with {0}?', integrationName),
 				{ modal: true },
 				...(offerSignOut ? [disable, disableAndSignOut, cancel] : [disable, cancel]),
 			);

@@ -292,23 +292,35 @@ Example output structure:
 Based on the provided commit messages and associated issues, create a set of markdown changelog entries following the instructions above. Do not include any explanatory text or metadata`,
 };
 
+/** Example output block shared by the {@link generateSearchQuery} template and its structural-retry prompt */
+export const generateSearchQueryExampleJson = `{
+   "query": "[search operators here]",
+   "explanation": "[one short sentence describing the interpretation]",
+   "mode": "highlight",
+   "alternates": []
+}`;
+
 export const generateSearchQuery: PromptTemplate<'generate-searchQuery'> = {
-	id: 'generate-searchQuery_v2',
+	id: 'generate-searchQuery_v4',
 	variables: ['query', 'date', 'context', 'instructions'],
 	template: `You are an advanced AI assistant that converts natural language queries into structured Git search operators. Your task is to analyze a user's natural language query about their Git repository history and convert it into the appropriate search operators.
 
 Available search operators:
 - 'message:' - Search in commit messages (e.g. 'message:fix bug'); maps to \`git log --extended-regexp --grep=<value>\`
+- '-message:' - Exclude commits whose message contains a term (e.g. '-message:wip'); maps to \`git log --invert-grep --grep=<value>\`. Never mix 'message:' and '-message:' in the same query -- git's --invert-grep applies to every --grep pattern in the command, so combining included and excluded message terms is invalid.
 - 'author:' - Search by a specific author (e.g. 'author:eamodio' or use '@me' for current user); maps to \`git log --author=<value>\`
+- 'committer:' - Search by a specific committer (e.g. 'committer:eamodio' or use '@me' for current user); maps to \`git log --committer=<value>\`. There is no way to exclude an author or committer -- only to include one; if the user asks to exclude one, explain that limitation in the explanation field and omit the filter rather than inventing syntax.
 - 'commit:' - Search by a specific commit SHA (e.g. 'commit:4ce3a')
 - 'file:' - Search by file path (e.g. 'file:"package.json"', 'file:"*.ts"'); maps to \`git log -- <value>\`
 - 'change:' - Search by specific code changes using regular expressions (e.g. 'change:"function.*auth"', 'change:"import.*react"'); maps to \`git log -G<value>\`
-- 'type:' - Search by type -- supports stash, tip, and wip (e.g. 'type:stash', 'type:tip', 'type:wip'). Use 'type:wip' for queries about work in progress, uncommitted changes, or pending changes across worktrees.
+- 'type:' - Search by type -- supports stash, tip, merge, and wip (e.g. 'type:stash', 'type:tip', 'type:merge', 'type:wip'). Use 'type:merge' for merge commits only, and 'type:wip' for queries about work in progress, uncommitted changes, or pending changes across worktrees.
 - 'ref:' - Search for commits reachable by a reference (branch, tag, commit) or reference range. Supports single refs (e.g. 'ref:main', 'ref:v1.0'), two-dot ranges (e.g. 'ref:main..feature' for commits in feature but not in main), three-dot ranges (e.g. 'ref:main...feature' for symmetric difference), and relative refs (e.g. 'ref:HEAD~5..HEAD'); maps to \`git log <ref>\`
 - 'after:' - Search for commits after a certain date or range (e.g. 'after:2023-01-01', 'after:"6 months ago"', 'after:"last Tuesday"', 'after:"noon"', 'after:"1 month 2 days ago"'); maps to \`git log --since=<value>\`
 - 'before:' - Search for commits before a certain date or range (e.g. 'before:2023-01-01', 'before:"6 months ago"', 'before:"yesterday"', 'before:"3PM GMT"'); maps to \`git log --until=<value>\`
 
-File and change values should be double-quoted. You can use multiple message, author, file, change, and ref operators at the same time if needed.
+File and change values should be double-quoted. You can use multiple message, author, committer, file, change, and ref operators at the same time if needed.
+
+The values of 'message:', '-message:', 'author:', and 'committer:' are compiled as case-insensitive POSIX extended regular expressions (ERE). Any regex metacharacters in the user's intended literal text -- \`( ) [ ] { } . * + ? | ^ $ \\\` -- MUST be escaped with a backslash unless they are intentionally being used as regex.
 
 Use 'ref:' when the query involves exploring commit history within or between specific references. Use temporal operators ('after:', 'before:') for date-based filtering. These operators can be combined when appropriate.
 
@@ -320,11 +332,57 @@ Temporal queries leverage Git's 'approxidate' parser, which understands relative
 The current date is \${date}
 \${context}
 
+When repository refs (branches, worktrees) are listed in the context above, only use ref: values from that list — never invent a ref name.
+If the context above includes a previously failed query and the error it produced, return a corrected query that fixes that error while preserving the original intent.
+
 User Query: \${query}
 
 \${instructions}
 
-Convert the user's natural language query into the appropriate search operators. Return only the search query string without any explanatory text. If the query cannot be converted to search operators, return the original query as a message search. For complex temporal expressions that might be ambiguous, prefer simpler, more reliable relative date formats.`,
+Convert the user's natural language query into the appropriate search operators.
+
+Respond ONLY with a JSON object in this exact shape:
+- "query": the converted search query using the operators above, as a single string
+- "explanation": one short sentence, in the user's own terms, describing how their query was interpreted
+- "mode": one of "highlight", "filter", or "select" — "highlight" is the default (find and mark matches); use "filter" when the user asks to see ONLY matching commits (e.g. "only my commits", "just show", "filter to"); use "select" when the user asks to be taken to a specific commit or location (e.g. "take me to", "jump to", "what commit is X at", "where is")
+- "alternates": an array of 0-2 alternative queries for the same intent — one broader, one narrower, whichever make sense; use an empty array if none do
+
+If the query cannot be converted to search operators, put the original text in "query" as a message search with all regex metacharacters escaped, and explain that in "explanation".
+
+For complex temporal expressions that might be ambiguous, prefer simpler, more reliable relative date formats.
+
+Example output structure:
+${generateSearchQueryExampleJson}
+
+Return only the JSON object and no other text — no code fences, no explanatory text.`,
+};
+
+/** Schema counterpart of the {@link generateSearchQuery} template's described output shape */
+export const generateSearchQuerySchema: AIResponseFormat = {
+	name: 'generate_search_query',
+	schema: {
+		type: 'object',
+		additionalProperties: false,
+		required: ['query', 'explanation', 'mode', 'alternates'],
+		properties: {
+			query: { type: 'string', description: 'The converted search query using the documented operators' },
+			explanation: {
+				type: 'string',
+				description: "One short sentence, in the user's own terms, describing how the query was interpreted",
+			},
+			mode: {
+				type: 'string',
+				enum: ['highlight', 'filter', 'select'],
+				description:
+					'How the query should be applied: highlight matches, filter to only matches, or select/jump to a specific commit',
+			},
+			alternates: {
+				type: 'array',
+				items: { type: 'string' },
+				description: 'Up to 2 alternative queries for the same intent; empty array if none make sense',
+			},
+		},
+	},
 };
 
 /** Example output block shared by the {@link generateCommits} template and its structural-retry prompt */

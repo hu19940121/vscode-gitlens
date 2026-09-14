@@ -1,5 +1,5 @@
 import { css } from 'lit';
-import { scrollableBase } from '../../../shared/components/styles/lit/base.css.js';
+import { scrollableBase } from '@gitlens/components/components/styles/lit/base.css.js';
 
 export const panelHostStyles = [
 	scrollableBase,
@@ -92,7 +92,7 @@ export const panelActionInputStyles = css`
 `;
 
 /* Resume bar — full-width clickable surface that replaces the older "Resume Last …" chip.
-   Mirrors the visual language of `.compose-plan__header` / `.review-header` so the bar
+   Mirrors the visual language of `.compose-plan__header` so the bar
    reads as a preview of the destination. Shared by review + compose panels. */
 export const resumeBarStyles = css`
 	.resume-bar {

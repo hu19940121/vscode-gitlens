@@ -13,7 +13,6 @@ import type {
 import type { GitCommandPriority } from '@gitlens/git/run.types.js';
 import {
 	formatDetachedHeadName,
-	getBranchId,
 	getLocalBranchByUpstream,
 	isDetachedHead,
 	isRemoteHEAD,
@@ -29,6 +28,7 @@ import { ensureArray, filterMap } from '@gitlens/utils/array.js';
 import { CancellationError, isCancellationError } from '@gitlens/utils/cancellation.js';
 import { debounce } from '@gitlens/utils/decorators/debounce.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
+import { getBranchId } from '@gitlens/utils/gitRefs.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import type { PagedResult, PagingOptions } from '@gitlens/utils/paging.js';
@@ -938,13 +938,21 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 				});
 			}
 
-			throw new BranchError(
-				{
-					action: options?.force ? 'force delete' : 'delete',
-					branch: branches.join(', '),
-					gitCommand: { repoPath: repoPath, args: args },
-				},
+			// Classify the failure (e.g. not fully merged) so consumers like the delete wizard can offer a
+			// force retry — without this the reason would be undefined and every failure reads as 'other'.
+			throw getGitCommandError(
+				'branch',
 				ex,
+				reason =>
+					new BranchError(
+						{
+							reason: reason ?? 'other',
+							action: options?.force ? 'force delete' : 'delete',
+							branch: branches.join(', '),
+							gitCommand: { repoPath: repoPath, args: args },
+						},
+						ex,
+					),
 			);
 		}
 	}
@@ -1022,9 +1030,21 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 				});
 			}
 
-			throw new BranchError(
-				{ action: 'delete', branch: branches.join(', '), gitCommand: { repoPath: repoPath, args: args } },
+			// Classify against the underlying `git push -d` failure modes; map the "remote ref does not
+			// exist" case onto BranchError's noRemoteReference so consumers get an actionable reason.
+			throw getGitCommandError(
+				'push',
 				ex,
+				reason =>
+					new BranchError(
+						{
+							reason: reason === 'rejectedRefDoesNotExist' ? 'noRemoteReference' : 'other',
+							action: 'delete',
+							branch: branches.join(', '),
+							gitCommand: { repoPath: repoPath, args: args },
+						},
+						ex,
+					),
 			);
 		}
 	}
@@ -1258,8 +1278,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 			repoPath,
 			cacheKey,
 			async (_cacheable, signal) => {
-				// Requires Git v2.33+
-				if (!(await this.git.supports('git:merge-tree'))) {
+				if (!(await this.git.supports('git:merge-tree:write-tree'))) {
 					return createConflictDetectionError('unsupported');
 				}
 
@@ -1330,7 +1349,8 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		cancellation?: AbortSignal,
 	): Promise<ConflictDetectionResult> {
 		// Requires Git v2.38+ for --write-tree with 3-arg form
-		if (!(await this.git.supports('git:merge-tree:write-tree'))) {
+		// `runMergeTreeStep` relies on `--merge-base`
+		if (!(await this.git.supports('git:merge-tree:merge-base'))) {
 			return createConflictDetectionError('unsupported');
 		}
 
@@ -1456,7 +1476,8 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		const scope = getScopedLogger();
 
 		// Requires Git v2.38+ for --write-tree with 3-arg form
-		if (!(await this.git.supports('git:merge-tree:write-tree'))) {
+		// `runMergeTreeStep` relies on `--merge-base`
+		if (!(await this.git.supports('git:merge-tree:merge-base'))) {
 			return createConflictDetectionError('unsupported');
 		}
 

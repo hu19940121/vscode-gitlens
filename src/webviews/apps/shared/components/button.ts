@@ -2,10 +2,10 @@ import type { PropertyValueMap } from 'lit';
 import { css, html, LitElement } from 'lit';
 import { customElement, property, query } from 'lit/decorators.js';
 import { ifDefined } from 'lit/directives/if-defined.js';
-import type { GlTooltip } from './overlays/tooltip.js';
-import { focusOutlineButton } from './styles/lit/a11y.css.js';
-import { elementBase } from './styles/lit/base.css.js';
-import './overlays/tooltip.js';
+import type { GlTooltip } from '@gitlens/components/components/overlays/tooltip.js';
+import { focusOutlineButton } from '@gitlens/components/components/styles/lit/a11y.css.js';
+import { boxSizingBase } from '@gitlens/components/components/styles/lit/base.css.js';
+import '@gitlens/components/components/overlays/tooltip.js';
 
 declare global {
 	interface HTMLElementTagNameMap {
@@ -45,7 +45,7 @@ export class GlButton extends LitElement {
 	};
 
 	static override styles = [
-		elementBase,
+		boxSizingBase,
 		css`
 			:host {
 				/* Base color variables - can be overridden by variant */
@@ -128,7 +128,7 @@ export class GlButton extends LitElement {
 				white-space: nowrap;
 			}
 
-			:host(:hover) {
+			:host(:not([disabled]):hover) {
 				background: var(--button-hover-background);
 			}
 
@@ -171,7 +171,7 @@ export class GlButton extends LitElement {
 				width: max-content;
 			}
 
-			:host([appearance='alert']:hover) {
+			:host([appearance='alert']:not([disabled]):hover) {
 				--button-foreground: var(--vscode-button-foreground);
 			}
 
@@ -187,12 +187,12 @@ export class GlButton extends LitElement {
 				border-radius: 0;
 			}
 
-			:host([appearance='link']:hover) {
+			:host([appearance='link']:not([disabled]):hover) {
 				--button-foreground: var(--vscode-textLink-activeForeground);
 			}
 
 			/* Underline only the text label on hover — leave prefix/suffix icon slots undecorated */
-			:host([appearance='link']:hover) .label {
+			:host([appearance='link']:not([disabled]):hover) .label {
 				text-decoration: underline;
 			}
 
@@ -274,8 +274,8 @@ export class GlButton extends LitElement {
 			}
 
 			/* Give solid-filled buttons a bit more horizontal breathing room. Exposed via a
-	   CSS var so consumers (e.g. compose-mode commit checkbox) can collapse to a
-	   square icon button. */
+CSS var so consumers (e.g. compose-mode commit checkbox) can collapse to a
+square icon button. */
 			:host(:not([appearance])) .control,
 			:host([appearance='secondary']) .control {
 				padding-inline: var(--button-padding-inline, 0.8rem);
@@ -302,6 +302,20 @@ export class GlButton extends LitElement {
 				pointer-events: none;
 				cursor: not-allowed;
 				opacity: 0.4;
+			}
+
+			/* Keep the tooltip hoverable on a disabled button: the host's pointer-events: none
+			   removes the whole subtree from hit-testing, and a natively disabled control emits
+			   no mouse events anyway. The tooltip wrapper (a real box here — see the gl-tooltip
+			   rule below) opts back in while the control opts out, so hover events originate on
+			   the wrapper and reach gl-tooltip's own listeners; onTooltipClick keeps the clicks
+			   the wrapper now catches from leaking to consumers. */
+			:host([disabled]) gl-tooltip {
+				pointer-events: auto;
+			}
+
+			:host([disabled]) .control {
+				pointer-events: none;
 			}
 
 			:host([disabled][aria-checked='true']) {
@@ -420,13 +434,16 @@ export class GlButton extends LitElement {
 
 	protected override render(): unknown {
 		if (this.tooltip) {
-			return html`<gl-tooltip .content=${this.tooltip} placement=${ifDefined(this.tooltipPlacement)}
+			return html`<gl-tooltip
+				.content=${this.tooltip}
+				placement=${ifDefined(this.tooltipPlacement)}
+				@click=${this.onTooltipClick}
 				>${this.renderControl()}</gl-tooltip
 			>`;
 		}
 
 		if (this.querySelectorAll('[slot="tooltip"]').length > 0) {
-			return html`<gl-tooltip placement=${ifDefined(this.tooltipPlacement)}>
+			return html`<gl-tooltip placement=${ifDefined(this.tooltipPlacement)} @click=${this.onTooltipClick}>
 				${this.renderControl()}
 				<slot name="tooltip" slot="content"></slot>
 			</gl-tooltip>`;
@@ -461,6 +478,15 @@ export class GlButton extends LitElement {
 		if (e.key === ' ') {
 			this.control.click();
 		}
+	}
+
+	/** While disabled, the tooltip wrapper is the hover (and thus click) target in place of the
+	 *  inert control — swallow those clicks so consumers never see activation from a disabled button. */
+	private onTooltipClick(e: MouseEvent) {
+		if (!this.disabled) return;
+
+		e.preventDefault();
+		e.stopPropagation();
 	}
 
 	override focus(options?: FocusOptions): void {

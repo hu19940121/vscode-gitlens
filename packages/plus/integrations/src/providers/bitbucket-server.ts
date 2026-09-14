@@ -8,9 +8,13 @@ import type {
 	PullRequestState,
 	PullRequestStateFilter,
 } from '@gitlens/git/models/pullRequest.js';
+import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
+import { CancellationError } from '@gitlens/utils/cancellation.js';
 import { md5 } from '@gitlens/utils/crypto.js';
 import type { Emitter } from '@gitlens/utils/event.js';
+import type { PagedResult } from '@gitlens/utils/paging.js';
+import { nonnullSettled } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type {
@@ -21,12 +25,26 @@ import { toTokenWithInfo } from '../authentication/models.js';
 import { GitSelfManagedHostIntegrationId } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
+import type { SearchMyPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type { IntegrationKey } from '../models/integration.js';
 import type { BitbucketRepositoryDescriptor } from './bitbucket/models.js';
-import type { ProviderRepository } from './models.js';
-import { fromProviderPullRequest, providersMetadata, toProviderPullRequestStates } from './models.js';
+import type { ProviderPullRequest, ProviderRepository } from './models.js';
+import {
+	fromProviderPullRequest,
+	providerPullRequestMatchesSearch,
+	ProviderPullRequestReviewState,
+	providersMetadata,
+	PullRequestFilter,
+	toProviderPullRequestStates,
+} from './models.js';
 import type { ProvidersApi } from './providersApi.js';
+import {
+	collectProviderPagedResult,
+	flatSettledOrThrow,
+	parsePageCursor,
+	toPageCursor,
+} from './utils/providerPaging.js';
 
 const metadata = providersMetadata[GitSelfManagedHostIntegrationId.BitbucketServer];
 const authProvider = Object.freeze({ id: metadata.id, scopes: metadata.scopes });
@@ -174,10 +192,18 @@ export class BitbucketServerIntegration extends GitHostIntegration<
 		);
 	}
 
-	public override async getRepoInfo(repo: { owner: string; name: string }): Promise<ProviderRepository | undefined> {
+	public override async getRepoInfo(repo: {
+		owner: string;
+		name: string;
+		project?: string;
+		connectionId?: string;
+	}): Promise<ProviderRepository | undefined> {
 		const api = await this.getProvidersApi();
-		const tokenOptInfo = this._session ? toTokenWithInfo(this.id, this._session) : { providerId: this.id };
-		return api.getRepo(tokenOptInfo, repo.owner, repo.name, undefined, {
+		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
+		const session = await this.resolveReadSession(repo.connectionId, undefined);
+		if (session == null) return undefined;
+
+		return api.getRepo(toTokenWithInfo(this.id, session), repo.owner, repo.name, repo.project, {
 			baseUrl: this.apiBaseUrl,
 		});
 	}
@@ -227,6 +253,7 @@ export class BitbucketServerIntegration extends GitHostIntegration<
 		_cancellation?: AbortSignal,
 		_silent?: boolean,
 		state?: PullRequestStateFilter,
+		_options?: SearchMyPullRequestsOptions,
 	): Promise<PullRequest[] | undefined> {
 		if (repos != null) {
 			// TODO: implement repos version
@@ -243,7 +270,123 @@ export class BitbucketServerIntegration extends GitHostIntegration<
 			this.apiBaseUrl,
 			{ states: toProviderPullRequestStates(state) },
 		);
-		return prs?.map(pr => fromProviderPullRequest(pr, this));
+		return prs?.data.map(pr => fromProviderPullRequest(pr, this));
+	}
+
+	protected override async getProviderMyPullRequestsForUser(
+		session: ProviderAuthenticationSession,
+		options?: { state?: PullRequestStateFilter[]; cursor?: string; filters?: PullRequestFilter[] },
+	): Promise<PagedResult<ProviderPullRequest> | undefined> {
+		const api = await this.getProvidersApi();
+		const states = toProviderPullRequestStates(options?.state);
+		// provider-apis translates the public 1-based `page` to Bitbucket Server's `start` offset and normalizes
+		// `nextPageStart` back to the next page number. Thread that number inside our opaque cursor so the
+		// ProviderBackend sweep drives the drain (bounded by its maxPages).
+		const page = parsePageCursor(options?.cursor);
+		const result = await api.getBitbucketServerPullRequestsForCurrentUser(
+			toTokenWithInfo(this.id, session),
+			this.apiBaseUrl,
+			{ states: states, page: page },
+		);
+		if (result == null) return undefined;
+
+		const account = options?.filters?.length ? await this.getProviderCurrentAccount(session) : undefined;
+		const identifiers = new Set([account?.id, account?.username].filter((id): id is string => id != null));
+		if (options?.filters?.length && identifiers.size === 0) {
+			throw new Error(
+				'Unable to resolve the current Bitbucket Data Center account for the requested pull request filters.',
+			);
+		}
+
+		const values = options?.filters?.length
+			? result.data.filter(pr => {
+					const isCurrentUser = (user: { id?: string | null; username?: string | null } | null | undefined) =>
+						user != null &&
+						((user.id != null && identifiers.has(user.id)) ||
+							(user.username != null && identifiers.has(user.username)));
+					const isAuthor = isCurrentUser(pr.author);
+					const isRequestedReviewer = pr.reviews?.some(
+						review =>
+							isCurrentUser(review.reviewer) &&
+							review.state === ProviderPullRequestReviewState.ReviewRequested,
+					);
+					return (
+						(options.filters!.includes(PullRequestFilter.Author) && isAuthor) ||
+						(options.filters!.includes(PullRequestFilter.ReviewRequested) && isRequestedReviewer)
+					);
+				})
+			: result.data;
+
+		return {
+			values: values,
+			paging: {
+				more: result.hasMore,
+				cursor: result.hasMore && result.nextPage != null ? toPageCursor(result.nextPage) : '{}',
+			},
+		};
+	}
+
+	protected override async searchProviderPullRequests(
+		session: ProviderAuthenticationSession,
+		searchQuery: string,
+		repos?: BitbucketRepositoryDescriptor[],
+		cancellation?: AbortSignal,
+		options?: { include?: PullRequestState[] },
+	): Promise<PullRequest[] | undefined> {
+		if (cancellation?.aborted) throw new CancellationError();
+
+		const api = await this.getProvidersApi();
+		if (!api) return undefined;
+
+		const repoInputs =
+			repos != null
+				? repos.map(r => ({ name: r.name, namespace: r.owner }))
+				: await this.getWorkspaceRepoInputs();
+		if (cancellation?.aborted) throw new CancellationError();
+		// An explicitly-empty `repos` means "search these zero repos" -> no results; reserve `undefined`
+		// ("scope couldn't be determined") for when no repos were requested and none were discovered.
+		if (repoInputs.length === 0) return repos != null ? [] : undefined;
+
+		const token = toTokenWithInfo(this.id, session);
+		const states = toProviderPullRequestStates(options?.include);
+		const providerPullRequests = await flatSettledOrThrow(
+			repoInputs.map(async repo => {
+				const result = await collectProviderPagedResult(cursor => {
+					if (cancellation?.aborted) throw new CancellationError();
+
+					return api.getPullRequestsForRepo(token, repo, {
+						baseUrl: this.apiBaseUrl,
+						cursor: cursor,
+						states: states,
+					});
+				});
+				return result.values;
+			}),
+		);
+		if (cancellation?.aborted) throw new CancellationError();
+
+		return providerPullRequests
+			.filter(pr => providerPullRequestMatchesSearch(pr, searchQuery))
+			.map(pr => fromProviderPullRequest(pr, this));
+	}
+
+	private async getWorkspaceRepoInputs(): Promise<{ name: string; namespace: string }[]> {
+		const remotes = await this.ctx.repositories.getOpenRemotes();
+		const inputs = await nonnullSettled(
+			remotes.map(async (r: GitRemote) => {
+				const integration = await this.authenticationService.getByRemote(r);
+				if (integration !== this) return undefined;
+
+				// Use the remote provider's parsing so the Bitbucket Server `scm/<project>/<repo>` prefix is
+				// stripped; a raw `path.split('/')` would yield namespace=`scm`, name=`<project>`.
+				const namespace = r.provider?.owner;
+				const name = r.provider?.repoName;
+				return namespace != null && name != null ? { name: name, namespace: namespace } : undefined;
+			}),
+		);
+		// Dedupe: a repo with multiple remotes (e.g. `origin` + `upstream`) can map to the same input,
+		// which would otherwise fetch and return the same PRs more than once.
+		return [...new Map(inputs.map(i => [`${i.namespace}/${i.name}`, i])).values()];
 	}
 
 	protected override async searchProviderMyIssues(
@@ -251,6 +394,19 @@ export class BitbucketServerIntegration extends GitHostIntegration<
 		_repos?: BitbucketRepositoryDescriptor[],
 	): Promise<IssueShape[] | undefined> {
 		return Promise.resolve(undefined);
+	}
+
+	/**
+	 * Bitbucket Data Center exposes no issue tracker at all (issues live in Jira), so — like Bitbucket Cloud,
+	 * whose own tracker is deprecated — it is not an issue provider on the ProviderBackend surface. Without this
+	 * the facade would take `supportsIssues`' default `true` and route the read to a provider that registers no
+	 * issue client: the repo-scoped path fails with the SDK's `does not support function: getIssuesForReposFn`
+	 * as an opaque `kind: 'other'` warning, and `broadenIssues` first drains every repo of the org before hitting
+	 * the same failure. Its metadata already declares no issue filters, so this keeps both halves of the
+	 * capability answer consistent.
+	 */
+	override get supportsIssues(): boolean {
+		return false;
 	}
 
 	private readonly storagePrefix = 'bitbucket-server';

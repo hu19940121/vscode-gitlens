@@ -1,3 +1,4 @@
+import * as l10n from '@vscode/l10n';
 import type { Cache } from '@gitlens/git/cache.js';
 import type { GitConflictCommand, GitServiceContext } from '@gitlens/git/context.js';
 import {
@@ -698,6 +699,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			editor?: string;
 			interactive?: boolean;
 			programmaticEditor?: boolean;
+			autosquash?: boolean;
 			messageEditor?: string;
 			onto?: string;
 			updateRefs?: boolean;
@@ -727,6 +729,16 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			if (options.programmaticEditor) {
 				configs.push('-c', 'rebase.autosquash=false', '-c', 'rebase.abbreviateCommands=false');
 			}
+		}
+
+		if (options?.autosquash != null) {
+			if (options.autosquash && options.programmaticEditor) {
+				throw new Error(l10n.t('rebase: autosquash cannot be combined with programmaticEditor'));
+			}
+
+			// `--no-autosquash` is passed explicitly when `false` — omitting the flag would let a
+			// `rebase.autosquash=true` git config fold fixups anyway.
+			args.push(options.autosquash ? '--autosquash' : '--no-autosquash');
 		}
 
 		// Drive per-commit message editing (the combined message a `squash` produces, or a `reword`).

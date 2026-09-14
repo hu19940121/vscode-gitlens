@@ -19,25 +19,44 @@
 
 /**
  * Auto-tier maintenance tasks. `commit-graph` runs a DIRECT `git commit-graph write --reachable --split`
- * (2.24+); `loose-objects`/`incremental-repack` run `git maintenance run --task=…` (2.30+).
+ * (2.24+); the others run their native `git maintenance run --task=…` implementations.
  */
-export type GitMaintenanceTask = 'commit-graph' | 'loose-objects' | 'incremental-repack';
+export type GitMaintenanceTask = 'commit-graph' | 'loose-objects' | 'incremental-repack' | 'pack-refs';
 
 /** The uniform apply/revert surface for every optimization lever (auto + ask). */
-export type GitOptimizationId = 'untrackedCache' | 'fsmonitor' | 'backgroundMaintenance' | 'manyFiles';
+export type GitOptimizationId = 'untrackedCache' | 'fsmonitor' | 'backgroundMaintenance' | 'manyFiles' | 'sparseIndex';
 
 /**
  * Cheap per-session shape probe — filesystem stats + config reads only, no expensive git walks. Shared
  * across worktrees (keyed by common path). Everything here is derivable without inflating objects.
  */
 export interface GitHealthSnapshot {
-	/** Presence + mtime of `objects/info/commit-graph` (or the split `commit-graphs/` chain), and changed-path Bloom filter coverage. */
+	/** Repository shape that changes how the remaining measurements should be interpreted. */
+	readonly repository: {
+		/** Whether local history stops at an intentional shallow boundary; `undefined` when detection failed. */
+		readonly shallow: boolean | undefined;
+		/** Whether missing objects may be supplied by a promisor remote; `undefined` when detection failed. */
+		readonly partial: boolean | undefined;
+		/** Whether the worktree is populated from a sparse specification; `undefined` when config was unreadable. */
+		readonly sparseCheckout: boolean | undefined;
+		/** Whether sparse checkout uses directory-based cone mode; `undefined` when config was unreadable. */
+		readonly sparseCheckoutCone: boolean | undefined;
+		/** Whether the index is configured to use sparse-directory entries; `undefined` when config was unreadable. */
+		readonly sparseIndex: boolean | undefined;
+		/** Whether this worktree uses a split index; `undefined` when detection failed. */
+		readonly splitIndex: boolean | undefined;
+		/** Reference storage selected by the repository format. */
+		readonly refFormat: 'files' | 'reftable' | 'unknown';
+	};
+	/** Bounded loose-reference count for the files ref backend; exact unless the probe reached its cap. */
+	readonly looseRefs: { readonly count: number; readonly exact: boolean };
+	/** Presence + mtime of `objects/info/commit-graph` (or the split `commit-graphs/` chain), and changed-path Bloom filter state. */
 	readonly commitGraph: {
 		readonly present: boolean;
 		readonly mtime: number | undefined;
 		/** Whether the NEWEST graph layer carries changed-path Bloom filters (`BIDX` chunk). */
 		readonly changedPaths: boolean;
-		/** Whether this git can write them (the 2.31 gate) — lets the view promise "filters build over time" honestly. */
+		/** Whether this repo can write them (Git 2.31+ and not a partial clone). */
 		readonly changedPathsSupported: boolean;
 		/** `true` once the user disabled GitLens's automatic commit-graph maintenance for this repo (`gk.commitGraphDisabled`). */
 		readonly disabled: boolean;
@@ -48,18 +67,31 @@ export interface GitHealthSnapshot {
 		 */
 		readonly readDisabled: boolean;
 	};
-	/** Presence of `objects/pack/multi-pack-index`. */
+	/** Presence of a classic or incremental multi-pack-index. */
 	readonly multiPackIndex: boolean;
+	/** Whether Git is configured to read/write the multi-pack-index; `undefined` when config was unreadable. */
+	readonly multiPackIndexEnabled: boolean | undefined;
 	/** Count of `*.pack` files in `objects/pack`. */
 	readonly packCount: number;
+	/** Pack files not represented by the active multi-pack-index; `undefined` when it could not be established. */
+	readonly packsOutsideMultiPackIndex: number | undefined;
+	/** Effective `maintenance.incremental-repack.auto` threshold; `undefined` when invalid or unreadable. */
+	readonly incrementalRepackAutoThreshold: number | undefined;
 	/** Total bytes of all `*.pack` files. */
 	readonly packBytes: number;
 	/** Raw loose-object sample (a handful of the 256 fanout dirs); the host extrapolates the estimate. */
 	readonly looseObjects: { readonly objectsInSampledDirs: number; readonly dirsSampled: number };
-	/** Size of the worktree's `.git/index` in bytes (a tracked-file-count proxy). */
+	/** Size of the worktree index in bytes (including the largest shared base for a split index). */
 	readonly indexBytes: number;
-	/** Exact entry count from the index header (`DIRC`, version, count — all big-endian). `undefined` when the index is missing or the header is unreadable/not `DIRC`. */
+	/**
+	 * Entry count from the index header (`DIRC`, version, count — all big-endian). For a normal index this is
+	 * the exact tracked-file count; for a sparse index it counts the populated working set plus sparse-directory
+	 * entries. It is deliberately `undefined` for a split index, whose header covers only its mutable layer,
+	 * and during conflicts, whose stage entries duplicate paths.
+	 */
 	readonly indexEntryCount: number | undefined;
+	/** How {@link indexEntryCount} should be interpreted. */
+	readonly indexEntryCountType: 'full' | 'sparse' | 'split' | 'conflicted' | 'unavailable';
 	/** Current state of the config levers this feature toggles. */
 	readonly config: {
 		readonly fsmonitor: boolean;
@@ -93,9 +125,13 @@ export interface GitHealthSnapshot {
 		readonly fsmonitor: boolean;
 		readonly manyFiles: boolean;
 		readonly backgroundMaintenance: boolean;
+		/** Worktree-scoped ownership; sparse indexes are not shared between linked worktrees. */
+		readonly sparseIndex: boolean;
 	};
 	/** Whether the installed git supports `git maintenance run` (2.30+) — gates the auto-tier tasks. */
 	readonly supportsMaintenanceRun: boolean;
+	/** Whether the installed git includes the `pack-refs` maintenance task (2.31+). */
+	readonly supportsPackRefsMaintenance: boolean;
 }
 
 /** On-demand detail computed only when the Git Health view opens (cheap-ish git walks). */
@@ -138,12 +174,14 @@ export interface GitMaintenanceSubProvider {
 	/** Availability of each optimization lever (git version + platform gated). */
 	getCapabilities(repoPath: string): Promise<GitOptimizationCapability[]>;
 	/**
-	 * Fire-and-forget hint that a task's cache is worth refreshing now, applying that task's cadence policy.
+	 * Hint that a task's cache is worth refreshing now, applying that task's cadence policy. Callers normally
+	 * ignore the returned promise; consumers that need freshness may await it. It resolves `true` only when a
+	 * write completed and `false` when a supported request was gated or failed, and never rejects.
 	 * `commit-graph` runs the demand cadence (minutes throttle + single-flight, both keyed by common git dir),
 	 * fully gated on the auto-tier switches; `loose-objects`/`incremental-repack` are no-ops here (the daily
-	 * pass owns them). Never throws, never blocks — the service decides whether anything actually runs.
+	 * pass owns them) and return `undefined`.
 	 */
-	request(repoPath: string, task: GitMaintenanceTask): void;
+	request(repoPath: string, task: GitMaintenanceTask): Promise<boolean> | undefined;
 	/**
 	 * Atomically claims the once-per-`intervalMs` maintenance pass for this repo, stamping the shared
 	 * `gk.maintenanceLastRun` if and only if the claim succeeds. Returns `false` when another window already
@@ -152,12 +190,16 @@ export interface GitMaintenanceSubProvider {
 	 */
 	claimMaintenancePass(repoPath: string, intervalMs: number): Promise<boolean>;
 	/**
-	 * Runs a single maintenance task now (the explicit "Run Maintenance Now" path). Resolves `true` when the
-	 * task ran, `false` when the installed git can't run it (not-applicable). A genuine command failure
-	 * THROWS the git error so the ask-tier UI can surface it. `commit-graph` writes directly (2.24+);
-	 * `loose-objects`/`incremental-repack` go through `git maintenance run --task=…` (2.30+).
+	 * Runs a single maintenance task. Resolves `true` when a supported invocation completed and `false` when
+	 * it is not applicable. With `auto`, Git evaluates its native condition and may intentionally do no work.
+	 * A genuine command failure THROWS. `commit-graph` writes directly (2.24+); other tasks go through
+	 * `git maintenance run --task=…` (2.30+).
 	 */
-	runMaintenanceTask(repoPath: string, task: GitMaintenanceTask, cancellation?: AbortSignal): Promise<boolean>;
+	runMaintenanceTask(
+		repoPath: string,
+		task: GitMaintenanceTask,
+		options?: { readonly auto?: boolean; readonly cancellation?: AbortSignal },
+	): Promise<boolean>;
 	/**
 	 * Applies an optimization lever. Returns `true` when it took effect; `false` for a legitimate
 	 * not-applicable outcome (e.g. the FSMonitor daemon wouldn't start, or the untracked cache failed git's

@@ -15,6 +15,7 @@
  *   for a commit/WIP that has since been replaced by a newer fetch
  */
 import type { Remote } from '@eamodio/supertalk';
+import * as l10n from '@vscode/l10n';
 import type { AIReviewFinding } from '@gitlens/ai/models/results.js';
 import type { GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
 import type { GitFileConflictStatus } from '@gitlens/git/models/fileStatus.js';
@@ -26,11 +27,15 @@ import type { GitCommitReachability } from '@gitlens/git/providers/commits.js';
 import { appendCoauthorsToMessage } from '@gitlens/git/utils/contributor.utils.js';
 import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
 import { areEqual } from '@gitlens/utils/array.js';
+import { getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { LruMap } from '@gitlens/utils/lruMap.js';
 import { normalizePath } from '@gitlens/utils/path.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
-import type { PastAgentSessionsResult } from '../../../../../agents/models/agentSessionState.js';
+import type {
+	PastAgentSessionDetail,
+	PastAgentSessionsResult,
+} from '../../../../../agents/models/agentSessionState.js';
 import type { Autolink } from '../../../../../autolinks/models/autolinks.js';
 import type { ViewFilesLayout } from '../../../../../config.js';
 import type {
@@ -53,6 +58,7 @@ import type {
 	BranchComparisonSide,
 	BranchComparisonSummary,
 	ComposeResult,
+	ComposeSessionKey,
 	ConflictSide,
 	GraphServices,
 	ReresolveFileResult,
@@ -79,16 +85,18 @@ import * as fileActions from '../../../shared/actions/file.js';
 import * as prActions from '../../../shared/actions/pr.js';
 import {
 	enrichmentGuard,
-	fireAndForget,
 	guardedEnrich,
 	isAbortError,
+	isConnectionClosedError,
 	noop,
 	noopUnlessReal,
+	notifyService,
 } from '../../../shared/actions/rpc.js';
 import { subscribeAll } from '../../../shared/events/subscriptions.js';
-import { getRemoteNameFromBranchName } from '../../../shared/git-utils.js';
+import { waitForFocusSettled } from '../../../shared/focus.js';
 import type { Resource } from '../../../shared/state/resource.js';
 import type { AppState } from '../context.js';
+import { compareSides } from './detailsState.js';
 import type { DetailsState } from './detailsState.js';
 import type { ScopeItem } from './gl-commits-scope-pane.js';
 
@@ -160,9 +168,10 @@ export function getReviewDiffEndpoints(scope: ScopeSelection | undefined): { lhs
 }
 
 type ResolvedSubService<K extends keyof GraphServices> = Awaited<Remote<GraphServices>[K]>;
+type DeferredSubService<K extends keyof GraphServices> = Remote<GraphServices>[K];
 
 export interface ResolvedServices {
-	readonly agents: ResolvedSubService<'agents'>;
+	readonly agents: DeferredSubService<'agents'>;
 	readonly files: ResolvedSubService<'files'>;
 	readonly drafts: ResolvedSubService<'drafts'>;
 	readonly graphInspect: ResolvedSubService<'graphInspect'>;
@@ -182,8 +191,13 @@ export interface ResolvedServices {
 export interface DetailsResources {
 	readonly commit: Resource<CommitDetails | undefined, [string, string]>;
 	readonly wip: Resource<{ wip: Wip } | undefined, [string, boolean?]>;
-	/** Past (resumable) agent sessions for a worktree — top-3, keyed on `worktreePath`. */
-	readonly pastAgentSessions: Resource<PastAgentSessionsResult | undefined, [string]>;
+	/** Past (resumable) agent sessions for a worktree, keyed on `worktreePath` + cumulative limit. */
+	readonly pastAgentSessions: Resource<PastAgentSessionsResult | undefined, [string, number?]>;
+	/** On-demand past-session enrichment (titles + first/last prompt), keyed on `(sessionId, providerId, cwd)`. */
+	readonly pastAgentSessionDetail: Resource<
+		PastAgentSessionDetail | undefined,
+		[string, string | undefined, string | undefined]
+	>;
 	readonly compare: Resource<CompareDiff | undefined, [string, string, string]>;
 	/** Phase 1 — counts + All Files. Keyed on `(repoPath, leftRef, rightRef, options)`. */
 	readonly branchCompareSummary: Resource<
@@ -199,7 +213,7 @@ export interface DetailsResources {
 	readonly review: Resource<ReviewResult, [string, ScopeSelection, string | undefined, string[] | undefined]>;
 	readonly compose: Resource<
 		ComposeResult,
-		[string, ScopeSelection, string | undefined, string[] | undefined, string[] | undefined]
+		[string, ComposeSessionKey, ScopeSelection, string | undefined, string[] | undefined, string[] | undefined]
 	>;
 	/** AI conflict-resolution result. Keyed on `(repoPath, focusedFilePaths, instructions)` — focused
 	 *  paths scope the run to specific conflicted files; `undefined` resolves all conflicts. */
@@ -298,7 +312,7 @@ export class DetailsActions {
 		name: keyof TelemetryEvents,
 		data?: Record<string, string | number | boolean | undefined>,
 	): void {
-		fireAndForget(this.services.telemetry.sendEvent(name, data));
+		notifyService(this.services.telemetry, 'telemetry/sendEvent', svc => svc.sendEvent(name, data));
 	}
 
 	/** Builds the shared scope/AI/instructions payload for graph-details mode telemetry events.
@@ -360,20 +374,16 @@ export class DetailsActions {
 	private clearBranchCompareData(): void {
 		this.state.branchCompareAheadCount.set(0);
 		this.state.branchCompareBehindCount.set(0);
-		this.state.branchCompareAheadCommits.set([]);
-		this.state.branchCompareBehindCommits.set([]);
+		for (const side of compareSides) {
+			this.state.branchCompareCommitsBySide[side].set([]);
+			this.state.branchCompareFilesBySide[side].set([]);
+			this.state.branchCompareLoadedBySide[side].set(false);
+			this.state.branchCompareHasMoreBySide[side].set(false);
+			this.state.branchCompareLimitBySide[side].set(100);
+			this.state.branchCompareLoadingMoreBySide[side].set(false);
+		}
 		this.state.branchCompareAllFiles.set([]);
 		this.state.branchCompareAllFilesCount.set(0);
-		this.state.branchCompareAheadFiles.set([]);
-		this.state.branchCompareBehindFiles.set([]);
-		this.state.branchCompareAheadLoaded.set(false);
-		this.state.branchCompareBehindLoaded.set(false);
-		this.state.branchCompareAheadHasMore.set(false);
-		this.state.branchCompareBehindHasMore.set(false);
-		this.state.branchCompareAheadLimit.set(100);
-		this.state.branchCompareBehindLimit.set(100);
-		this.state.branchCompareAheadLoadingMore.set(false);
-		this.state.branchCompareBehindLoadingMore.set(false);
 		this.state.branchCompareRightRefWorktreePath.set(undefined);
 		this.state.branchCompareMergeBase.set(undefined);
 	}
@@ -409,6 +419,7 @@ export class DetailsActions {
 		this.resources.commit.dispose();
 		this.resources.wip.dispose();
 		this.resources.pastAgentSessions.dispose();
+		this.resources.pastAgentSessionDetail.dispose();
 		this.resources.compare.dispose();
 		this.resources.branchCompareSummary.dispose();
 		this.resources.branchCompareSide.dispose();
@@ -474,7 +485,7 @@ export class DetailsActions {
 	 */
 	resetRepoScopedStateOnSwitch(repoPath?: string): void {
 		if (this._lastFetchedRepoPath === repoPath) return;
-		if (this.state.compareSheetOpen.get() || this.state.compareAsPanel.get()) return;
+		if (this.state.comparePresentation.get() !== 'closed') return;
 		if (this.state.activeMode.get() != null) return;
 
 		this.resetRepoScopedState(repoPath);
@@ -729,6 +740,7 @@ export class DetailsActions {
 	 *  the prior plan or, after partial apply, the retained continuation cacheKey). */
 	startCompose(
 		repoPath: string,
+		sessionKey: ComposeSessionKey,
 		scope: ScopeSelection,
 		instructions: string | undefined,
 		excludedFiles: string[] | undefined,
@@ -738,6 +750,7 @@ export class DetailsActions {
 	): Promise<ComposeResult> {
 		return this.services.graphInspect.composeChanges(
 			repoPath,
+			sessionKey,
 			scope,
 			instructions,
 			excludedFiles,
@@ -845,7 +858,7 @@ export class DetailsActions {
 				void this.fetchDetails(sha, repoPath);
 			}
 		} catch {
-			this.resources.resolve.mutate({ error: { message: 'Failed to apply conflict resolutions.' } });
+			this.resources.resolve.mutate({ error: { message: l10n.t('Failed to apply conflict resolutions.') } });
 		} finally {
 			this.state.resolveApplying.set(false);
 		}
@@ -1565,7 +1578,7 @@ export class DetailsActions {
 				return;
 			}
 
-			this.state.explain.set({ error: { message: 'Failed to explain commit' } });
+			this.state.explain.set({ error: { message: l10n.t('Failed to explain commit') } });
 			this.sendTelemetryEvent('graphDetails/commit/explain/failed', telemetryData);
 		}
 	}
@@ -1932,19 +1945,18 @@ export class DetailsActions {
 
 	refreshBranchCompare(repoPath: string | undefined): void {
 		this.state.branchCompareStale.set(false);
-		this.state.branchCompareAheadLoaded.set(false);
-		this.state.branchCompareBehindLoaded.set(false);
-		this.state.branchCompareAheadHasMore.set(false);
-		this.state.branchCompareBehindHasMore.set(false);
-		this.state.branchCompareAheadLimit.set(100);
-		this.state.branchCompareBehindLimit.set(100);
+		for (const side of compareSides) {
+			this.state.branchCompareLoadedBySide[side].set(false);
+			this.state.branchCompareHasMoreBySide[side].set(false);
+			this.state.branchCompareLimitBySide[side].set(100);
+		}
 		this.state.branchCompareSelectedCommitShaByTab.set(new Map());
 		this.clearBranchCompareEnrichmentCaches();
 		void this.refreshCompare(repoPath);
 	}
 
 	markBranchCompareStale(): void {
-		const compareOpen = this.state.compareSheetOpen.get() || this.state.compareAsPanel.get();
+		const compareOpen = this.state.comparePresentation.get() !== 'closed';
 		if (!compareOpen || !this.state.branchCompareIncludeWorkingTree.get()) return;
 
 		this.state.branchCompareStale.set(true);
@@ -1988,16 +2000,16 @@ export class DetailsActions {
 		this.state.branchCompareRightRefWorktreePath.set(result.rightRefWorktreePath);
 		this.state.branchCompareMergeBase.set(result.mergeBase);
 
-		if (result.aheadCount !== prevAhead && this.state.branchCompareAheadLoaded.get()) {
-			this.state.branchCompareAheadLoaded.set(false);
+		if (result.aheadCount !== prevAhead && this.state.branchCompareLoadedBySide.ahead.get()) {
+			this.state.branchCompareLoadedBySide.ahead.set(false);
 			// Per-scope enrichment caches are keyed by the (now-stale) commit set; evict the
 			// 'ahead' entries so contributors and autolinks refetch from the new commits. Also
 			// evict 'all' because it's the symmetric union of both sides.
 			this.invalidateBranchCompareScopeCaches('ahead');
 			this.invalidateBranchCompareScopeCaches('all');
 		}
-		if (result.behindCount !== prevBehind && this.state.branchCompareBehindLoaded.get()) {
-			this.state.branchCompareBehindLoaded.set(false);
+		if (result.behindCount !== prevBehind && this.state.branchCompareLoadedBySide.behind.get()) {
+			this.state.branchCompareLoadedBySide.behind.set(false);
 			this.invalidateBranchCompareScopeCaches('behind');
 			this.invalidateBranchCompareScopeCaches('all');
 		}
@@ -2018,8 +2030,7 @@ export class DetailsActions {
 		const rightRef = this.state.branchCompareRightRef.get();
 		if (!repoPath || !leftRef || !rightRef) return;
 
-		const limit =
-			side === 'ahead' ? this.state.branchCompareAheadLimit.get() : this.state.branchCompareBehindLimit.get();
+		const limit = this.state.branchCompareLimitBySide[side].get();
 		const options: BranchComparisonOptions = {
 			includeWorkingTree: this.state.branchCompareIncludeWorkingTree.get(),
 			limit: limit,
@@ -2040,17 +2051,10 @@ export class DetailsActions {
 		const result = this.resources.branchCompareSide.value.get();
 		if (!result) return;
 
-		if (side === 'ahead') {
-			this.state.branchCompareAheadCommits.set(result.commits);
-			this.state.branchCompareAheadFiles.set(result.files);
-			this.state.branchCompareAheadLoaded.set(true);
-			this.state.branchCompareAheadHasMore.set(result.hasMore);
-		} else {
-			this.state.branchCompareBehindCommits.set(result.commits);
-			this.state.branchCompareBehindFiles.set(result.files);
-			this.state.branchCompareBehindLoaded.set(true);
-			this.state.branchCompareBehindHasMore.set(result.hasMore);
-		}
+		this.state.branchCompareCommitsBySide[side].set(result.commits);
+		this.state.branchCompareFilesBySide[side].set(result.files);
+		this.state.branchCompareLoadedBySide[side].set(true);
+		this.state.branchCompareHasMoreBySide[side].set(result.hasMore);
 
 		// Side commits arrived → re-seed enrichment for the active scope (autolinks may pick up
 		// new shas, contributors view may need refresh).
@@ -2062,9 +2066,7 @@ export class DetailsActions {
 
 	/** Phase 2 only if not already loaded for the current refs/wip. Cheap to call defensively. */
 	async fetchCompareSideIfNeeded(repoPath: string | undefined, side: 'ahead' | 'behind'): Promise<void> {
-		const loaded =
-			side === 'ahead' ? this.state.branchCompareAheadLoaded.get() : this.state.branchCompareBehindLoaded.get();
-		if (loaded) return;
+		if (this.state.branchCompareLoadedBySide[side].get()) return;
 
 		await this.fetchCompareSide(repoPath, side);
 	}
@@ -2084,15 +2086,11 @@ export class DetailsActions {
 	async loadMoreCompareCommits(side: 'ahead' | 'behind', repoPath: string | undefined): Promise<void> {
 		if (!repoPath) return;
 
-		const loadingMoreSignal =
-			side === 'ahead' ? this.state.branchCompareAheadLoadingMore : this.state.branchCompareBehindLoadingMore;
-		const hasMoreSignal =
-			side === 'ahead' ? this.state.branchCompareAheadHasMore : this.state.branchCompareBehindHasMore;
-		const limitSignal = side === 'ahead' ? this.state.branchCompareAheadLimit : this.state.branchCompareBehindLimit;
-		const loadedSignal =
-			side === 'ahead' ? this.state.branchCompareAheadLoaded : this.state.branchCompareBehindLoaded;
-		const commitsSignal =
-			side === 'ahead' ? this.state.branchCompareAheadCommits : this.state.branchCompareBehindCommits;
+		const loadingMoreSignal = this.state.branchCompareLoadingMoreBySide[side];
+		const hasMoreSignal = this.state.branchCompareHasMoreBySide[side];
+		const limitSignal = this.state.branchCompareLimitBySide[side];
+		const loadedSignal = this.state.branchCompareLoadedBySide[side];
+		const commitsSignal = this.state.branchCompareCommitsBySide[side];
 
 		if (loadingMoreSignal.get() || !hasMoreSignal.get() || !loadedSignal.get()) return;
 
@@ -2118,21 +2116,27 @@ export class DetailsActions {
 	async changeCompareRef(side: 'left' | 'right', repoPath: string | undefined): Promise<void> {
 		if (!repoPath) return;
 
-		// Clear the rightRef's worktree path synchronously so the IWT toggle doesn't briefly flash
-		// for the old worktree while the user picks a new ref. `mergeBase` is intentionally NOT
-		// cleared here — keeping the prior value means a click during picker open still produces
-		// a coherent file context (against the OLD, unchanged comparison) instead of falling
-		// through to the 2-dot fallback and producing a diff that mismatches the visible file
-		// list. On picker confirm, `clearBranchCompareData()` below wipes mergeBase + everything.
+		// Clear the rightRef's worktree path synchronously (before the first await) so the IWT
+		// toggle doesn't briefly flash for the old worktree while the user picks a new ref.
+		// `mergeBase` is intentionally NOT cleared here — keeping the prior value means a click
+		// during picker open still produces a coherent file context (against the OLD, unchanged
+		// comparison) instead of falling through to the 2-dot fallback and producing a diff that
+		// mismatches the visible file list. On picker confirm, `clearBranchCompareData()` below
+		// wipes mergeBase + everything.
 		if (side === 'right') {
 			this.state.branchCompareRightRefWorktreePath.set(undefined);
 		}
+
+		// Wait for a pending click focus grant to land before opening the quick pick — opening it
+		// mid-grant races the webview regaining focus after the picker shows, which dismisses it
+		// (see `waitForFocusSettled`).
+		await waitForFocusSettled();
 
 		const currentRef =
 			side === 'left' ? this.state.branchCompareLeftRef.get() : this.state.branchCompareRightRef.get();
 		const result = await this.services.graphInspect.chooseRef(
 			repoPath,
-			'Choose a Reference to Compare',
+			l10n.t('Choose a Reference to Compare'),
 			currentRef,
 		);
 		if (!result) {
@@ -2206,14 +2210,12 @@ export class DetailsActions {
 		this.state.branchCompareIncludeWorkingTree.set(false);
 		// Comparison identity changed — old commit selections no longer apply to the new range.
 		this.state.branchCompareSelectedCommitShaByTab.set(new Map());
-		this.state.branchCompareAheadLoaded.set(false);
-		this.state.branchCompareBehindLoaded.set(false);
-		this.state.branchCompareAheadHasMore.set(false);
-		this.state.branchCompareBehindHasMore.set(false);
-		this.state.branchCompareAheadLimit.set(100);
-		this.state.branchCompareBehindLimit.set(100);
-		this.state.branchCompareAheadLoadingMore.set(false);
-		this.state.branchCompareBehindLoadingMore.set(false);
+		for (const side of compareSides) {
+			this.state.branchCompareLoadedBySide[side].set(false);
+			this.state.branchCompareHasMoreBySide[side].set(false);
+			this.state.branchCompareLimitBySide[side].set(100);
+			this.state.branchCompareLoadingMoreBySide[side].set(false);
+		}
 		// Clear synchronously so the IWT toggle doesn't briefly flash for the prior rightRef's
 		// worktree while the new summary fetch is in flight. `fetchCompareSummary` re-populates
 		// this from the new identity's result.
@@ -2226,12 +2228,11 @@ export class DetailsActions {
 	toggleCompareWorkingTree(repoPath: string | undefined): void {
 		this.state.branchCompareIncludeWorkingTree.set(!this.state.branchCompareIncludeWorkingTree.get());
 		this.state.branchCompareStale.set(false);
-		this.state.branchCompareAheadLoaded.set(false);
-		this.state.branchCompareBehindLoaded.set(false);
-		this.state.branchCompareAheadHasMore.set(false);
-		this.state.branchCompareBehindHasMore.set(false);
-		this.state.branchCompareAheadLimit.set(100);
-		this.state.branchCompareBehindLimit.set(100);
+		for (const side of compareSides) {
+			this.state.branchCompareLoadedBySide[side].set(false);
+			this.state.branchCompareHasMoreBySide[side].set(false);
+			this.state.branchCompareLimitBySide[side].set(100);
+		}
 		this.state.branchCompareSelectedCommitShaByTab.set(new Map());
 		this.clearBranchCompareEnrichmentCaches();
 		void this.refreshCompare(repoPath);
@@ -2304,8 +2305,7 @@ export class DetailsActions {
 		tab: 'ahead' | 'behind',
 		sha: string,
 	): Promise<void> {
-		const listState =
-			tab === 'ahead' ? this.state.branchCompareAheadCommits : this.state.branchCompareBehindCommits;
+		const listState = this.state.branchCompareCommitsBySide[tab];
 		const commits = listState.get();
 		if (!commits) return;
 
@@ -2366,7 +2366,11 @@ export class DetailsActions {
 		} catch (ex) {
 			if (signal.aborted) return;
 
-			Logger.error(ex, `Failed to fetch files for commit ${sha}`);
+			if (isConnectionClosedError(ex)) {
+				Logger.debug(`Fetch files for commit ${sha} dropped by deliberate connection teardown`);
+			} else {
+				Logger.error(ex, `Failed to fetch files for commit ${sha}`);
+			}
 		} finally {
 			if (this._compareCommitFilesControllers.get(controllerKey) === controller) {
 				this._compareCommitFilesControllers.delete(controllerKey);
@@ -2440,8 +2444,8 @@ export class DetailsActions {
 	}
 
 	private getShasInScope(scope: BranchComparisonContributorsScope): string[] {
-		const ahead = this.state.branchCompareAheadCommits.get();
-		const behind = this.state.branchCompareBehindCommits.get();
+		const ahead = this.state.branchCompareCommitsBySide.ahead.get();
+		const behind = this.state.branchCompareCommitsBySide.behind.get();
 		if (scope === 'ahead') return ahead.map(c => c.sha);
 		if (scope === 'behind') return behind.map(c => c.sha);
 		return [...ahead.map(c => c.sha), ...behind.map(c => c.sha)];
@@ -2755,7 +2759,7 @@ export class DetailsActions {
 			const modified = unstaged.length - added - deleted;
 			items.push({
 				id: 'unstaged',
-				label: 'Unstaged changes',
+				label: l10n.t('Unstaged changes'),
 				additions: added || undefined,
 				deletions: deleted || undefined,
 				modified: modified || undefined,
@@ -2769,7 +2773,7 @@ export class DetailsActions {
 			const modified = staged.length - added - deleted;
 			items.push({
 				id: 'staged',
-				label: 'Staged changes',
+				label: l10n.t('Staged changes'),
 				additions: added || undefined,
 				deletions: deleted || undefined,
 				modified: modified || undefined,
@@ -2804,7 +2808,8 @@ export class DetailsActions {
 		if (this.state.branchCommitsHasMore.get()) {
 			items.push({
 				id: 'load-more',
-				label: this.state.branchCommitsLoadingMore.get() ? 'Loading…' : 'Load more commits',
+				label: this.state.branchCommitsLoadingMore.get() ? l10n.t('Loading…') : l10n.t('Load more commits'),
+				loading: this.state.branchCommitsLoadingMore.get(),
 				state: 'load-more',
 			});
 		}
@@ -2923,6 +2928,7 @@ export class DetailsActions {
 
 	async composeCommitAll(
 		repoPath: string | undefined,
+		sessionKey: ComposeSessionKey,
 		sha: string | undefined,
 		graphReachability?: GitCommitReachability,
 		includedCommitIds?: readonly string[],
@@ -2941,7 +2947,7 @@ export class DetailsActions {
 
 		this.state.composeApplying.set(true);
 		try {
-			const result = await this.services.graphInspect.commitCompose(repoPath, {
+			const result = await this.services.graphInspect.commitCompose(repoPath, sessionKey, {
 				commits: composeValue.result.commits,
 				base: composeValue.result.baseCommit,
 				includedCommitIds: includedCommitIds,
@@ -2973,12 +2979,11 @@ export class DetailsActions {
 			this.state.composePreErrorValue.set(undefined);
 			this.state.composeLastFailedAction.set(undefined);
 			this.state.composeLastCommitAllIncludedIds.set(undefined);
-			this.state.composeCurrentCacheKey.set(undefined);
 			void this.refreshScopedAiModel();
 			this.refreshWip();
 			void this.fetchDetails(sha, repoPath, graphReachability);
 		} catch {
-			this.resources.compose.mutate({ error: { message: 'Failed to commit plan.' } });
+			this.resources.compose.mutate({ error: { message: l10n.t('Failed to commit plan.') } });
 		} finally {
 			this.state.composeApplying.set(false);
 		}
@@ -3085,7 +3090,9 @@ export class DetailsActions {
 	}
 
 	copyWipPatchToClipboard(repoPath: string, scope: 'all' | 'staged' | 'unstaged', uris?: readonly string[]): void {
-		fireAndForget(this.services.drafts.copyWipPatchToClipboard(repoPath, scope, uris), 'copy WIP patch');
+		notifyService(this.services.drafts, 'copy WIP patch', svc =>
+			svc.copyWipPatchToClipboard(repoPath, scope, uris),
+		);
 	}
 
 	/**
@@ -3093,7 +3100,9 @@ export class DetailsActions {
 	 * `to` is the commit sha, `from` the parent (undefined for a root commit).
 	 */
 	copyCommitPatchToClipboard(repoPath: string, to: string, from?: string): void {
-		fireAndForget(this.services.drafts.copyCommitPatchToClipboard(repoPath, to, from), 'copy commit patch');
+		notifyService(this.services.drafts, 'copy commit patch', svc =>
+			svc.copyCommitPatchToClipboard(repoPath, to, from),
+		);
 	}
 
 	stageFile(detail: FileChangeListItemDetail): void {
@@ -3285,7 +3294,7 @@ export class DetailsActions {
 	/**
 	 * Awaits the stage/unstage RPC and logs failures so they don't become unhandled rejections.
 	 * No explicit refetch — the host's `git add` triggers its working-tree watcher, which
-	 * pushes the updated WIP via `DidChangeWorkingTreeNotification`. The panel applies that
+	 * pushes the updated WIP via the `workingTreeChanged` RPC event. The panel applies that
 	 * push directly. The optimistic update (already fired by the caller) covers the brief
 	 * window between RPC dispatch and the push arriving.
 	 */
@@ -3297,7 +3306,11 @@ export class DetailsActions {
 		try {
 			await op;
 		} catch (ex) {
-			Logger.error(ex, `Staging op failed (${context})`);
+			if (isConnectionClosedError(ex)) {
+				Logger.debug(`Staging op dropped by deliberate connection teardown (${context})`);
+			} else {
+				Logger.error(ex, `Staging op failed (${context})`);
+			}
 			if (telemetry != null) {
 				this.sendTelemetryEvent('graph/wip/staging/failed', telemetry);
 			}
@@ -3309,7 +3322,7 @@ export class DetailsActions {
 	 * etc.). Used by explicit user refresh (mode header refresh button) — anywhere we WANT a
 	 * fresh round-trip rather than waiting for the host's working-tree push. For host-driven
 	 * working-tree updates, prefer `applyPushedWip` which consumes the pre-fetched WIP that
-	 * `DidChangeWorkingTreeNotification` already carries.
+	 * the `workingTreeChanged` RPC event already carries.
 	 */
 	async refetchWipQuiet(repoPath: string, force?: boolean): Promise<void> {
 		// Bypass the fetch dedup so we always re-query.
@@ -3352,7 +3365,7 @@ export class DetailsActions {
 	}
 
 	/**
-	 * Adopt a WIP payload pushed by the host (via `DidChangeWorkingTreeNotification`). Same
+	 * Adopt a WIP payload pushed by the host (via the `workingTreeChanged` RPC event). Same
 	 * semantics as the tail of `refetchWipQuiet` — replace local WIP in-place, mark stale when
 	 * a mode is active, re-fire branch enrichment on branch identity changes — but without the
 	 * round-trip fetch. Saves one `git status` per working-tree tick.
@@ -3544,6 +3557,89 @@ export class DetailsActions {
 			// `commit` returns a discriminated result and never throws for git failures — the host
 			// classifies the error and presents the modal/full-output document itself.
 			const result = await this.services.repository.commit(repoPath, message, { amend: isAmend, all: all });
+			// Cancelled: the user backed out of a host confirmation — leave the box untouched.
+			if (result.status === 'cancelled') return;
+
+			if (result.status === 'committed') {
+				this.state.commitMessage.set('');
+				this.state.commitMessageDirty.set(false);
+				this.state.amend.set(false);
+				this.state.amendBaseSha.set(undefined);
+				// Must run before `fetchDetails`, which reads `graphState.getWipState()` synchronously.
+				this.optimisticallyClearCommittedFiles(all);
+				this.refreshWip();
+				void this.fetchDetails(sha, repoPath);
+				this.sendTelemetryEvent('graph/wip/commit/succeeded', composition);
+			} else {
+				// Message + amend are intentionally preserved so the user can fix and retry.
+				this.state.commitError.set(result.summary);
+				this.sendTelemetryEvent('graph/wip/commit/failed', {
+					...composition,
+					reason: result.reason,
+					hasOutput: result.hasOutput,
+				});
+			}
+		} finally {
+			this.state.committing.set(false);
+			this._committingRepoPath = undefined;
+		}
+	}
+
+	/** Fixup commit + squash: commits the current (`fixup! <subject>`) message, then immediately
+	 *  rebases it onto `targetSha` — the commit the message's subject resolved to (see
+	 *  `fixup.utils.ts#findFixupTargetRow`). Mirrors {@link commit} exactly (staging-op wait, gating,
+	 *  in-flight flags, `all` computation, post-success cleanup, failure handling); the only
+	 *  difference is the RPC call, which also does the follow-up squash host-side so the webview
+	 *  doesn't have to sequence two round-trips. */
+	async commitAndSquash(
+		repoPath: string | undefined,
+		sha: string | undefined,
+		targetSha: string | undefined,
+	): Promise<void> {
+		// Guard against double-submit while a commit RPC is already in flight.
+		if (!repoPath || !targetSha || !this.canCommit() || this.state.committing.get()) return;
+
+		const message = this.state.commitMessage.get();
+		const isAmend = this.state.amend.get();
+		const wip = this.state.wip.get();
+		const hasStagedFiles = wip?.changes?.files?.some(f => f.staged) ?? false;
+		const smartCommit = this.state.preferences.get()?.enableSmartCommit ?? false;
+
+		// Wait for any in-flight staging operations
+		if (this._pendingStagingOp != null) {
+			await this._pendingStagingOp;
+			this._pendingStagingOp = undefined;
+		}
+
+		const all = !hasStagedFiles && smartCommit;
+
+		// Shared commit composition — emitted on both success and failure so they form a
+		// comparable funnel. Privacy-safe: counts/booleans + message length only.
+		const files = wip?.changes?.files;
+		const composition = {
+			amend: isAmend,
+			all: all,
+			smartCommit: smartCommit,
+			hasStagedFiles: hasStagedFiles,
+			'files.staged.count': files?.filter(f => f.staged).length ?? 0,
+			'files.total.count': files?.length ?? 0,
+			'message.length': message?.length ?? 0,
+		};
+
+		// Clear any prior error and enter the in-flight state (spinner + input lock).
+		this.state.commitError.set(undefined);
+		this.state.committing.set(true);
+		// Suppress host WIP pushes for this repo until the commit settles (see `applyPushedWip`).
+		this._committingRepoPath = repoPath;
+		try {
+			// Same discriminated-result contract as `commit` — never throws for git failures.
+			const result = await this.services.repository.commitAndSquashFixup(repoPath, message, {
+				targetSha: targetSha,
+				all: all,
+			});
+			// Cancelled: the user backed out of the pushed-target confirmation — leave the box untouched.
+			if (result.status === 'cancelled') return;
+
 			if (result.status === 'committed') {
 				this.state.commitMessage.set('');
 				this.state.commitMessageDirty.set(false);
@@ -3571,6 +3667,11 @@ export class DetailsActions {
 
 	async addCoauthors(repoPath: string | undefined): Promise<void> {
 		if (!repoPath) return;
+
+		// Wait for a pending click focus grant to land before opening the quick pick — opening it
+		// mid-grant races the webview regaining focus after the picker shows, which dismisses it
+		// (see `waitForFocusSettled`).
+		await waitForFocusSettled();
 
 		// Host shows the same contributor picker as the SCM `Add Co-authors…` action, pre-picking
 		// anyone already in the message, and returns the selected `Name <email>` strings.
@@ -3607,46 +3708,63 @@ export class DetailsActions {
 		}
 	}
 
-	switchBranch(repoPath: string | undefined): void {
+	async switchBranch(repoPath: string | undefined): Promise<void> {
 		if (!repoPath) return;
 
-		void this.services.repository.switchBranch(repoPath);
+		await waitForFocusSettled();
+		notifyService(this.services.repository, 'repository/switchBranch', svc => svc.switchBranch(repoPath));
 	}
 
-	createBranch(repoPath: string | undefined): void {
+	async createBranch(repoPath: string | undefined): Promise<void> {
 		if (!repoPath) return;
 
-		void this.services.repository.createBranch(repoPath);
+		await waitForFocusSettled();
+		notifyService(this.services.repository, 'repository/createBranch', svc => svc.createBranch(repoPath));
 	}
 
-	stashSave(repoPath: string | undefined, onlyStaged?: boolean): void {
+	async stashSave(repoPath: string | undefined, onlyStaged?: boolean): Promise<void> {
 		if (!repoPath) return;
 
-		void this.services.commands.execute('gitlens.stashSave', { repoPath: repoPath, onlyStaged: onlyStaged });
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.stashSave', svc =>
+			svc.execute('gitlens.stashSave', { repoPath: repoPath, onlyStaged: onlyStaged }),
+		);
 	}
 
-	applyStash(repoPath: string | undefined): void {
+	async applyStash(repoPath: string | undefined): Promise<void> {
 		if (!repoPath) return;
 
-		void this.services.commands.execute('gitlens.stashesApply', { repoPath: repoPath });
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.stashesApply', svc =>
+			svc.execute('gitlens.stashesApply', { repoPath: repoPath }),
+		);
 	}
 
-	createWorktree(): void {
-		void this.services.commands.execute('gitlens.views.createWorktree');
+	async createWorktree(): Promise<void> {
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.views.createWorktree', svc =>
+			svc.execute('gitlens.views.createWorktree'),
+		);
 	}
 
-	startWork(showOpenInAgent?: 'ask' | 'manual' | 'agent'): void {
-		void this.services.commands.execute('gitlens.startWork', {
-			source: 'graph-details' as const,
-			...(showOpenInAgent != null ? { showOpenInAgent: showOpenInAgent } : {}),
-		});
+	async startWork(showOpenInAgent?: 'ask' | 'manual' | 'agent'): Promise<void> {
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.startWork', svc =>
+			svc.execute('gitlens.startWork', {
+				source: 'graph-details' as const,
+				...(showOpenInAgent != null ? { showOpenInAgent: showOpenInAgent } : {}),
+			}),
+		);
 	}
 
-	startPRReview(showOpenInAgent?: 'ask' | 'manual' | 'agent'): void {
-		void this.services.commands.execute('gitlens.startReview', {
-			source: { source: 'graph-details' },
-			...(showOpenInAgent != null ? { showOpenInAgent: showOpenInAgent } : {}),
-		});
+	async startPRReview(showOpenInAgent?: 'ask' | 'manual' | 'agent'): Promise<void> {
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.startReview', svc =>
+			svc.execute('gitlens.startReview', {
+				source: { source: 'graph-details' },
+				...(showOpenInAgent != null ? { showOpenInAgent: showOpenInAgent } : {}),
+			}),
+		);
 	}
 
 	createPullRequest(repoPath: string | undefined, options?: { describeWithAI?: boolean }): void {
@@ -3657,26 +3775,34 @@ export class DetailsActions {
 		const upstreamName = branch?.upstream?.name;
 		if (branch?.name == null || upstreamName == null) return;
 
-		void this.services.commands.execute('gitlens.createPullRequestOnRemote', {
-			repoPath: repoPath,
-			compare: branch.name,
-			remote: getRemoteNameFromBranchName(upstreamName),
-			describeWithAI: options?.describeWithAI,
-		});
+		notifyService(this.services.commands, 'command: gitlens.createPullRequestOnRemote', svc =>
+			svc.execute('gitlens.createPullRequestOnRemote', {
+				repoPath: repoPath,
+				compare: branch.name,
+				remote: getRemoteNameFromBranchName(upstreamName),
+				describeWithAI: options?.describeWithAI,
+			}),
+		);
 	}
 
-	rebaseOntoMergeTarget(): void {
+	async rebaseOntoMergeTarget(): Promise<void> {
 		const ref = this.buildMergeTargetBranchRef();
 		if (ref == null) return;
 
-		void this.services.commands.executeScoped('gitlens.rebaseCurrentOnto:graph', ref);
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.rebaseCurrentOnto:graph', svc =>
+			svc.executeScoped('gitlens.rebaseCurrentOnto:graph', ref),
+		);
 	}
 
-	mergeMergeTargetIntoCurrent(): void {
+	async mergeMergeTargetIntoCurrent(): Promise<void> {
 		const ref = this.buildMergeTargetBranchRef();
 		if (ref == null) return;
 
-		void this.services.commands.executeScoped('gitlens.mergeIntoCurrent:graph', ref);
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.mergeIntoCurrent:graph', svc =>
+			svc.executeScoped('gitlens.mergeIntoCurrent:graph', ref),
+		);
 	}
 
 	private buildMergeTargetBranchRef(): { repoPath: string; branchId: string; branchName: string } | undefined {
@@ -3688,13 +3814,16 @@ export class DetailsActions {
 		return { repoPath: repoPath, branchId: target.id, branchName: target.name };
 	}
 
-	openOnRemote(repoPath: string | undefined, sha: string): void {
+	async openOnRemote(repoPath: string | undefined, sha: string): Promise<void> {
 		if (!repoPath) return;
 
-		void this.services.commands.execute('gitlens.openOnRemote', {
-			repoPath: repoPath,
-			resource: { type: 'commit' satisfies `${RemoteResourceType.Commit}`, sha: sha },
-		});
+		await waitForFocusSettled();
+		notifyService(this.services.commands, 'command: gitlens.openOnRemote', svc =>
+			svc.execute('gitlens.openOnRemote', {
+				repoPath: repoPath,
+				resource: { type: 'commit' satisfies `${RemoteResourceType.Commit}`, sha: sha },
+			}),
+		);
 	}
 
 	changeFilesLayout(layout: ViewFilesLayout): void {

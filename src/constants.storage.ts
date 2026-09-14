@@ -1,6 +1,6 @@
-import type { ColumnMode } from '@gitkraken/commit-graph/view.js';
+import type { ColumnMode } from '@gitkraken/commit-graph/zones.js';
 import type { AIProviderAndModel, AIProviders } from '@gitlens/ai/constants.js';
-import type { GitHealthSlowness } from '@gitlens/git/gitHealth.js';
+import type { GitHealthSlowness, GitHealthSlownessSample } from '@gitlens/git/gitHealth.js';
 import type { GitRevisionRangeNotation } from '@gitlens/git/models/revision.js';
 import type {
 	IntegrationIds,
@@ -121,13 +121,20 @@ interface GlobalStorageCore {
 	'launchpad:indicator:hasLoaded': boolean;
 	'launchpad:indicator:hasInteracted': string;
 	'launchpadView:groups:expanded': StoredLaunchpadGroup[];
+	'graph:defaultLayout': StoredGraphDefaultLayout;
 	'graph:searchMode': StoredGraphSearchMode;
+	/** A/B (intro-video): the variant the most recently RENDERED sign-in gate actually showed */
+	'graph:signInGate:introVideoShown': boolean;
 	'graph:useNaturalLanguageSearch': boolean;
 	'views:pendingLegacyHide': boolean;
 	'integrations:configured': StoredIntegrationConfigurations;
 	/** Unified onboarding/dismissible UI state */
 	'onboarding:state': OnboardingStorage;
 	'featureFlags:flags': FeatureFlagMap;
+	/** Whether a feature-flag fetch has ever completed (even unsuccessfully) — see `hasEverFetched` */
+	'featureFlags:fetched': boolean;
+	/** A/B (welcome-in-editor): the arm latched on first run — true = Welcome opened as an editor tab */
+	'welcome:inEditorShown': boolean;
 }
 
 type GlobalStorageDynamic = Record<`plus:preview:${FeaturePreviews}:usages`, StoredFeaturePreviewUsagePeriod[]> &
@@ -139,7 +146,6 @@ type GlobalStorageDynamic = Record<`plus:preview:${FeaturePreviews}:usages`, Sto
 	Record<`provider:authentication:skip:${string}`, boolean> &
 	Record<`gk:promo:${string}:ai:allAccess:dismissed`, boolean> &
 	Record<`gk:promo:${string}:ai:allAccess:notified`, boolean> &
-	Record<`gk:${string}:checkin`, Stored<StoredGKCheckInResponse>> &
 	Record<`gk:${string}:organizations`, Stored<StoredOrganization[]>> &
 	Record<`jira:${string}:organizations`, Stored<StoredJiraOrganization[] | undefined>> &
 	Record<`jira:${string}:projects`, Stored<StoredJiraProject[] | undefined>> &
@@ -198,23 +204,41 @@ export type DeprecatedWorkspaceStorage = {
 	'graph:banners:dismissed': Record<string, boolean>;
 	/** @deprecated */
 	'views:searchAndCompare:keepResults': boolean;
+	/** @deprecated Superseded by v2; its data included remote/interactive command time. */
+	'gitHealth:slowness': Record<string, GitHealthSlownessSample>;
+	/** @deprecated Superseded by v3; aggregate data cannot be safely assigned to an operation family. */
+	'gitHealth:slowness:v2': Record<string, GitHealthSlownessSample>;
 } & {
 	/** @deprecated */
 	[key in `confirm:ai:tos:${AIProviders}`]: boolean;
 };
 
-/** Persisted passive-slowness summary for a repo (keyed by repo path in `gitHealth:slowness`). */
+/** Persisted passive-slowness summary for a repo. */
 export type StoredGitHealthSlowness = GitHealthSlowness;
+
+/** Per-repo Git Health banner suppression timestamps. */
+export type StoredGitHealthBannerSuppression = { dismissedAt?: number; visitedAt?: number };
 
 interface WorkspaceStorageCore {
 	assumeRepositoriesOnStartup?: boolean;
 	'branch:comparisons': StoredBranchComparisons;
 	'gitComandPalette:usage': StoredRecentUsage;
-	/** Passive git-slowness summary per repo path (feeds the Git Health banner). */
-	'gitHealth:slowness': Record<string, StoredGitHealthSlowness>;
+	/** Per-repo sticky state for switch's "In a New Worktree" toggle. Key is the repo id. */
+	'gitComandPalette:switch:viaWorktree': Record<string, boolean>;
+	'gitComandPalette:worktreeDelete:actions': StoredWorktreeDeleteActions;
+	/** Per-repo Git Health banner suppression — when the user dismissed the strip and last visited the health view. */
+	'gitHealth:banner:v1': Record<string, StoredGitHealthBannerSuppression>;
+	/** Operation-classified local git-slowness summary per repo path (feeds targeted Git Health guidance). */
+	'gitHealth:slowness:v3': Record<string, StoredGitHealthSlowness>;
 	gitPath: string;
 	'graph:columns': Record<string, StoredGraphColumn>;
 	'graph:filtersByRepo': Record<string, StoredGraphFilters>;
+	/** The worktree perspective the graph is scoped to, so a full window reload can re-establish it on boot
+	 *  (the rebind is otherwise session-only). Keyed `` `${host.id}|${homeRepoPath}` `` — home is the stable
+	 *  identity across a rebind (mirroring `graph:filtersByRepo`), and each surface (sidebar view vs editor
+	 *  panel) binds independently so it needs its own entry or the two clobber each other. Absent means
+	 *  "not scoped". */
+	'graph:perspectiveByRepo': Record<string, StoredGraphWorktreePerspective>;
 	'graph:state': StoredGraphState;
 	/** Per-worktree commit draft for the Graph's WIP details panel. Key is the worktree's
 	 *  fsPath — invariant whether the user opens the main repo or the worktree directly. */
@@ -228,6 +252,11 @@ interface WorkspaceStorageCore {
 	'views:repositories:autoRefresh': boolean;
 	'views:searchAndCompare:pinned': StoredSearchAndCompareItems;
 	'views:scm:grouped:selected': GroupableTreeViewTypes;
+	/** Workspace-wide MRU of "Run Task on Worktree" picks: task keys (`${task.source}:${task.name}`),
+	 *  newest first. */
+	'worktrees:runTaskHistory': string[];
+	/** Task key (`${task.source}:${task.name}`) run by the WIP row's Run Task button. */
+	'worktrees:runTaskDefault': string;
 }
 
 /**
@@ -262,59 +291,6 @@ export interface Stored<T, SchemaVersion extends number = 1> {
 	data: T;
 	timestamp?: number;
 }
-
-export type StoredGKLicenses = Partial<Record<StoredGKLicenseType, StoredGKLicense>>;
-
-export interface StoredGKCheckInResponse {
-	user: StoredGKUser;
-	licenses: {
-		paidLicenses: StoredGKLicenses;
-		effectiveLicenses: StoredGKLicenses;
-	};
-}
-
-export interface StoredGKUser {
-	id: string;
-	name: string;
-	email: string;
-	status: 'activated' | 'pending';
-	createdDate: string;
-	firstGitLensCheckIn?: string;
-}
-
-export interface StoredGKLicense {
-	latestStatus: 'active' | 'canceled' | 'cancelled' | 'expired' | 'in_trial' | 'non_renewing' | 'trial';
-	latestStartDate: string;
-	latestEndDate: string;
-	organizationId: string | undefined;
-	reactivationCount?: number;
-}
-
-export type StoredGKLicenseType =
-	| 'gitlens-pro'
-	| 'gitlens-advanced'
-	| 'gitlens-teams'
-	| 'gitlens-hosted-enterprise'
-	| 'gitlens-self-hosted-enterprise'
-	| 'gitlens-standalone-enterprise'
-	| 'bundle-pro'
-	| 'bundle-advanced'
-	| 'bundle-teams'
-	| 'bundle-hosted-enterprise'
-	| 'bundle-self-hosted-enterprise'
-	| 'bundle-standalone-enterprise'
-	| 'gitkraken_v1-pro'
-	| 'gitkraken_v1-advanced'
-	| 'gitkraken_v1-teams'
-	| 'gitkraken_v1-hosted-enterprise'
-	| 'gitkraken_v1-self-hosted-enterprise'
-	| 'gitkraken_v1-standalone-enterprise'
-	| 'gitkraken-v1-pro'
-	| 'gitkraken-v1-advanced'
-	| 'gitkraken-v1-teams'
-	| 'gitkraken-v1-hosted-enterprise'
-	| 'gitkraken-v1-self-hosted-enterprise'
-	| 'gitkraken-v1-standalone-enterprise';
 
 export interface StoredOrganization {
 	id: string;
@@ -429,6 +405,8 @@ export interface StoredGraphColumn {
 	isHidden?: boolean;
 	mode?: StoredGraphColumnMode;
 	width?: number;
+	/** Left-to-right position of the column. Persisted by the webview's full-config writes; absent for records written only by host-side single-field toggles. */
+	order?: number;
 	/** Column↔grouped placement for both columns: `undefined`/`true` = grouped with the default host zone (host Group commands write `true`; the webview echoes back the resolved zone id), a zone-id string = grouped with that zone, `false` = standalone column. */
 	grouped?: boolean | string;
 }
@@ -452,8 +430,8 @@ export interface StoredGraphState {
 			activePanel?: GraphSidebarPanel;
 			/** How the sidebar's filter input presents non-matches: `true` hides them (filter), `false` dims them (highlight). */
 			searchBoxFilter?: boolean;
-			/** Whether the agents panel shows completed sessions. Defaults to false (hidden). */
-			showCompletedAgentSessions?: boolean;
+			/** Whether the agents panel shows past (ended) sessions. Defaults to false (hidden). */
+			showPastAgentSessions?: boolean;
 		};
 		minimap?: {
 			visible?: boolean;
@@ -473,6 +451,15 @@ export interface StoredGraphState {
 	};
 }
 
+/** A user-saved snapshot of the Commit Graph layout, stored globally and used to seed workspaces
+ *  that have no layout of their own yet (see `GraphWebviewProvider.ensureDefaultLayoutSeeded`).
+ *  `columns` mirrors the workspace `graph:columns` record verbatim (possibly partial — built-in
+ *  defaults fill the gaps at read time); `panels` mirrors `StoredGraphState['panels']`. */
+export interface StoredGraphDefaultLayout {
+	columns?: Record<string, StoredGraphColumn>;
+	panels?: StoredGraphState['panels'];
+}
+
 export interface StoredGraphWipDraft {
 	/** The commit message currently in the WIP commit input. */
 	message: string;
@@ -487,6 +474,12 @@ export interface StoredGraphWipDraft {
 }
 
 export type StoredGraphExcludeTypes = 'remotes' | 'stashes' | 'tags';
+
+/** The persisted half of `graph:perspectiveByRepo` — just enough to re-resolve the worktree at boot; the
+ *  branch name and the rest of the chrome's state ride the fresh state the re-established rebind produces. */
+export interface StoredGraphWorktreePerspective {
+	path: string;
+}
 
 export interface StoredGraphFilters {
 	branchesVisibility?: GraphBranchesVisibility;
@@ -554,15 +547,6 @@ export interface StoredSearch {
 	type: 'search';
 	timestamp: number;
 	path: string;
-	labels: {
-		label: string;
-		queryLabel:
-			| string
-			| {
-					label: string;
-					resultsType?: { singular: string; plural: string };
-			  };
-	};
 	search: StoredSearchQuery;
 }
 
@@ -579,6 +563,7 @@ export type StoredSearchAndCompareItem = StoredComparison | StoredSearch;
 export type StoredSearchAndCompareItems = Record<string, StoredSearchAndCompareItem>;
 export type StoredStarred = Record<string, boolean>;
 export type StoredRecentUsage = Record<string, number>;
+export type StoredWorktreeDeleteActions = { branch: boolean; upstream: boolean };
 
 export type StoredLaunchpadGroup =
 	| 'current-branch'

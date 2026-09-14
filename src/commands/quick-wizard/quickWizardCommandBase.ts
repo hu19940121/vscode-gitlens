@@ -1,5 +1,5 @@
 import type { Disposable, InputBox, QuickInputButton, QuickPick, QuickPickItem } from 'vscode';
-import { InputBoxValidationSeverity, QuickInputButtons, window } from 'vscode';
+import { InputBoxValidationSeverity, l10n, QuickInputButtons, window } from 'vscode';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { isPromise } from '@gitlens/utils/promise.js';
 import type { GlCommands } from '../../constants.commands.js';
@@ -7,6 +7,7 @@ import { Container } from '../../container.js';
 import { Directive, isDirective, isDirectiveQuickPickItem } from '../../quickpicks/items/directive.js';
 import { configuration } from '../../system/-webview/configuration.js';
 import type { KeyMapping } from '../../system/-webview/keyboard.js';
+import { supportedInVSCodeVersion } from '../../system/-webview/vscode.js';
 import { GlCommandBase } from '../commandBase.js';
 import type { QuickWizardCommandArgsWithCompletion } from './models/quickWizard.js';
 import type { CustomStep } from './models/steps.custom.js';
@@ -20,9 +21,8 @@ import {
 	WillConfirmForcedQuickInputButton,
 	WillConfirmToggleQuickInputButton,
 } from './quickButtons.js';
-import type { QuickCommand } from './quickCommand.js';
-import { QuickWizardRootStep } from './quickWizardRootStep.js';
-import { isQuickCommand } from './utils/quickWizard.utils.js';
+import { QuickCommand } from './quickCommand.js';
+import type { QuickWizardRootStep } from './quickWizardRootStep.js';
 import { isCustomStep, isQuickInputStep, isQuickPickStep } from './utils/steps.utils.js';
 
 const sanitizeLabel = /\$\(.+?\)|\s/g;
@@ -40,6 +40,7 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 
 	@debug({ args: false, onlyExit: true, timing: false })
 	async execute(args?: QuickWizardCommandArgsWithCompletion, waitUntil?: Promise<unknown>): Promise<void> {
+		const { QuickWizardRootStep } = await import(/* webpackChunkName: "quick-wizard" */ './quickWizardRootStep.js');
 		const rootStep = new QuickWizardRootStep(this.container, args);
 
 		const command = args?.command != null ? rootStep.find(args.command) : undefined;
@@ -149,7 +150,7 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 					disposables.push(quickpick.onDidHide(() => resolve(step)));
 
 					quickpick.title = title;
-					quickpick.placeholder = 'Loading...';
+					quickpick.placeholder = l10n.t('Loading...');
 					quickpick.busy = true;
 					quickpick.enabled = false;
 
@@ -526,7 +527,7 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 							let activeCommand: QuickCommand | undefined;
 							if (rootStep.command == null && quickpick.activeItems.length !== 0) {
 								const active = quickpick.activeItems[0];
-								if (isQuickCommand(active)) {
+								if (active instanceof QuickCommand) {
 									activeCommand = active;
 								}
 							}
@@ -660,7 +661,7 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 						if (rootStep.command != null || quickpick.activeItems.length === 0) return;
 
 						const command = quickpick.activeItems[0];
-						if (!isQuickCommand(command)) return;
+						if (!(command instanceof QuickCommand)) return;
 
 						quickpick.buttons = this.getButtons(undefined, command);
 					}),
@@ -776,7 +777,7 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 
 						if (rootStep.command == null) {
 							const [command] = items;
-							if (!isQuickCommand(command)) return;
+							if (!(command instanceof QuickCommand)) return;
 
 							rootStep.setCommand(command, this.startedFrom);
 						}
@@ -798,6 +799,11 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 				);
 
 				quickpick.title = step.title;
+				// Only touch `prompt` when supported: on older editors the setter itself is proposal-gated and throws
+				if (supportedInVSCodeVersion('quickpick-prompt')) {
+					quickpick.prompt = step.prompt;
+				}
+
 				quickpick.matchOnDescription = Boolean(step.matchOnDescription);
 				quickpick.matchOnDetail = Boolean(step.matchOnDetail);
 
@@ -806,7 +812,7 @@ export abstract class QuickWizardCommandBase extends GlCommandBase {
 				let items;
 				let shown = false;
 				if (isPromise(step.items)) {
-					quickpick.placeholder = 'Loading...';
+					quickpick.placeholder = l10n.t('Loading...');
 
 					quickpick.busy = true;
 

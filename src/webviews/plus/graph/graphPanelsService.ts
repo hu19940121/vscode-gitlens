@@ -1,3 +1,4 @@
+import { createWipRowId } from '@gitkraken/commit-graph/wip/identity.js';
 import { Uri } from 'vscode';
 import type { Account } from '@gitlens/git/models/author.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
@@ -8,7 +9,6 @@ import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { RemoteProvider } from '@gitlens/git/models/remoteProvider.js';
 import type { GitStatus } from '@gitlens/git/models/status.js';
 import type { GitWorktree } from '@gitlens/git/models/worktree.js';
-import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/git/utils/branch.utils.js';
 import { getPullRequestNumberFromUrl } from '@gitlens/git/utils/pullRequest.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import { getDefaultRemoteOrOrigin } from '@gitlens/git/utils/remote.utils.js';
@@ -20,13 +20,14 @@ import { fromProviderPullRequest, toProviderPullRequestWithUniqueId } from '@git
 import { getIntegrationIdForRemote } from '@gitlens/integrations/utils/integration.utils.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
+import { getBranchNameWithoutRemote, getRemoteNameFromBranchName } from '@gitlens/utils/gitRefs.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { areEqual } from '@gitlens/utils/object.js';
 import { pauseOnCancelOrTimeout } from '@gitlens/utils/promise.js';
-import type { AgentSessionState } from '../../../agents/models/agentSessionState.js';
 import type { GlCommands } from '../../../constants.commands.js';
 import type { StoredGraphExcludedRef } from '../../../constants.storage.js';
 import type { Container } from '../../../container.js';
+import { getPresentableErrorMessage } from '../../../errors.js';
 import * as BranchActions from '../../../git/actions/branch.js';
 import * as RemoteActions from '../../../git/actions/remote.js';
 import * as RepoActions from '../../../git/actions/repository.js';
@@ -55,8 +56,8 @@ import {
 import { executeCommand } from '../../../system/-webview/command.js';
 import type { ConfigPath } from '../../../system/-webview/configuration.js';
 import { configuration } from '../../../system/-webview/configuration.js';
-import type { IpcParams } from '../../ipc/handlerRegistry.js';
-import type { IpcNotification } from '../../ipc/models/ipc.js';
+import type { EventVisibilityBuffer, SubscriptionTracker } from '../../rpc/eventVisibilityBuffer.js';
+import { createRpcEvent } from '../../rpc/eventVisibilityBuffer.js';
 import type {
 	GetOverviewEnrichmentResponse,
 	GetOverviewWipResponse,
@@ -65,18 +66,19 @@ import type {
 import { getBranchOverviewType, toOverviewBranch } from '../../shared/overviewBranches.js';
 import { getOverviewEnrichment, getOverviewWip } from '../../shared/overviewEnrichment.utils.js';
 import type { WebviewHost } from '../../webviewProvider.js';
+import type { GraphServices } from './graphService.js';
 import { markSidebarInlineInvocation } from './graphSidebarActionTelemetry.js';
+import { buildBranchContextSuffix, buildPullRequestContextSuffix, restampFilterRefId } from './graphWebview.utils.js';
 import type {
 	DidGetSidebarDataParams,
-	GetOverviewEnrichmentRequest,
-	GetOverviewRequest,
-	GetOverviewWipDetailedRequest,
-	GetOverviewWipRequest,
+	GetOverviewParams,
 	GraphBranchContextValue,
 	GraphItemRefContext,
 	GraphItemTypedContext,
+	GraphOverviewBranch,
 	GraphOverviewData,
 	GraphPullRequestContextValue,
+	GraphPullRequestSheetData,
 	GraphRemoteContextValue,
 	GraphSidebarItemOrigin,
 	GraphSidebarPanel,
@@ -85,28 +87,37 @@ import type {
 	GraphSidebarWorktree,
 	GraphStashContextValue,
 	GraphTagContextValue,
+	SidebarWorktreeChange,
 } from './protocol.js';
-import { createWipRowId, DidChangeOverviewNotification, sidebarItemOrigin } from './protocol.js';
+import { sidebarItemOrigin } from './protocol.js';
 
 /** Collaborators the panels cluster reaches for on the host provider, assembled by
  *  `GraphWebviewProvider.createGraphPanelsContext()`. `getRepository`/`getSession`/`getLoading` read
- *  live provider state; `getPinnedRefId`/`getExcludedRefsByRepo`/`fetchWipStatus`/`computeWorktreeChanges`
- *  forward into provider-owned filter storage and the WIP service's caches (kept there); `fireSidebarInvalidated`
- *  fires the provider's `sidebarInvalidated` RPC event (that transport stays wired in `getRpcServices`); the
- *  pending-notification callback routes through the provider's shared `_ipcNotificationMap`, which stays there. */
+ *  live provider state; `getPinnedRefId`/`getExcludedRefsByRepo` read the provider's stored filters through
+ *  its home-aware key — `getPinnedRefId` returns its id already re-stamped onto the LIVE path passed to it,
+ *  while `getExcludedRefsByRepo` returns raw ids every caller here re-stamps (see `restampFilterRefId`);
+ *  `fetchWipStatus`/
+ *  `computeWorktreeChanges` forward into the WIP service's caches (kept there); `fireSidebarInvalidated`
+ *  fires the provider's `sidebarInvalidated` RPC event (that transport stays wired in `getRpcServices`). */
 export type GraphPanelsServiceContext = {
 	container: Container;
 	host: WebviewHost<'gitlens.views.graph' | 'gitlens.graph'>;
 	getRepository: () => GlRepository | undefined;
 	getSession: () => GitGraphSession | undefined;
 	getLoading: () => Promise<GitGraph> | undefined;
-	getPinnedRefId: (repoPath: string | undefined) => string | undefined;
-	getExcludedRefsByRepo: (repoPath: string | undefined) => Record<string, StoredGraphExcludedRef> | undefined;
+	getPinnedRefId: (livePath: string) => string | undefined;
+	getExcludedRefsByRepo: () => Record<string, StoredGraphExcludedRef> | undefined;
 	fetchWipStatus: (path: string, signal?: AbortSignal) => Promise<GitStatus | undefined>;
 	computeWorktreeChanges: (worktrees: GitWorktree[]) => void;
+	getLastWorktreeChange: (path: string) => SidebarWorktreeChange | undefined;
 	fireSidebarInvalidated: () => void;
-	addPendingNotification: (notification: IpcNotification<any>) => void;
 };
+
+/** Page size for the Overview panel's "Load More" older-branches paging — how many additional
+ *  older branches one page reveals. Mirrored on the webview side (`graph-overview.ts`); the host
+ *  never sees a page size larger than what the webview asks for via `olderLimit`, but this bounds a
+ *  malformed/oversized request. */
+const overviewOlderBranchesMaxLimit = 500;
 
 /** Open-PR list TTL. Matches Launchpad's list-level cache, which fronts the same kind of query. */
 const pullRequestsCacheExpiration = 30 * 60 * 1000;
@@ -219,11 +230,18 @@ export class GraphPanelsService {
 	// Timeframe for the Overview panel's "Recent" section. Seeded from the `graph:state` memento
 	// in `getState`, updated in-place by `onGetOverview` when the webview changes it.
 	private _overviewRecentThreshold: OverviewRecentThreshold = 'OneWeek';
+	// How many older-than-threshold branches to include in `GraphOverviewData.older`. Updated in-place
+	// by `onGetOverview` when the webview changes it (paging via "Load More"). Not persisted — each
+	// panel mount/refresh starts back at 0, matching the webview's own `_olderLimit` reset.
+	private _overviewOlderLimit = 0;
 	// Last overview shipped to the webview. `setGraph` fires `notifyDidChangeOverview` on every graph
 	// reload (repo/visibility/filter change, refresh); most reloads reproduce the prior overview, so
 	// a deep-equal gate skips the redundant serialize + webview re-render. Cleared in `setGraph` on
 	// graph identity change.
 	private _lastSentOverview: GraphOverviewData | undefined;
+	// `save-last`: the payload is a complete overview snapshot, so a hidden webview only ever needs the
+	// newest one — the `EventVisibilityBuffer` replays it on show.
+	private readonly _overviewChangedEvent = createRpcEvent<GraphOverviewData>('overviewChanged', 'save-last');
 	// Open PRs (and their categorization) for the pull-requests panel, keyed by repo + integration +
 	// remote. Holds the promise (not the value) so concurrent opens share one request; dropped on
 	// rejection so a failure doesn't stick for the full TTL.
@@ -245,21 +263,34 @@ export class GraphPanelsService {
 		this._lastSentOverview = undefined;
 	}
 
-	onGetOverview(params: IpcParams<typeof GetOverviewRequest>): GraphOverviewData {
-		if (params.recentThreshold != null) {
+	async onGetOverview(params?: GetOverviewParams): Promise<GraphOverviewData> {
+		if (params?.recentThreshold != null) {
 			this._overviewRecentThreshold = params.recentThreshold;
 		}
+
+		if (params?.olderLimit != null) {
+			this._overviewOlderLimit = Math.max(0, Math.min(params.olderLimit, overviewOlderBranchesMaxLimit));
+		}
 		try {
-			return this.getOverviewData();
+			if (this._graphSession == null) {
+				await this.context.getLoading()?.catch(() => undefined);
+			}
+
+			return this.getOverviewData() ?? { active: [], recent: [] };
 		} catch (ex) {
 			Logger.error(ex, 'GraphWebviewProvider', 'onGetOverview');
 			// Ship a structurally-valid shape so the frontend's `.length`/`.map` reads don't crash.
-			return { active: [], recent: [], error: ex instanceof Error ? ex.message : String(ex) };
+			return { active: [], recent: [], error: getPresentableErrorMessage(ex) };
 		}
 	}
 
-	async onGetOverviewWip(params: IpcParams<typeof GetOverviewWipRequest>): Promise<GetOverviewWipResponse> {
-		if (params.branchIds.length === 0 || this._graphSession == null || this.repository == null) return {};
+	async onGetOverviewWip(
+		branchIds: string[],
+		cheap?: boolean,
+		signal?: AbortSignal,
+	): Promise<GetOverviewWipResponse> {
+		signal?.throwIfAborted();
+		if (branchIds.length === 0 || this._graphSession == null || this.repository == null) return {};
 
 		// Visibility-refresh path: webview asks for current overview WIP on panel mount / focus.
 		// Default mode routes through the shared `_wipStatusCache`, so when the per-event push has
@@ -271,22 +302,25 @@ export class GraphPanelsService {
 		// the status cache entirely; the breakdown arrives later via the hover-triggered detailed
 		// fetch which goes through the cache.
 		try {
-			return await this.computeOverviewWipFromCache(params.branchIds, params.cheap);
+			return await this.computeOverviewWipFromCache(branchIds, cheap);
 		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
 			Logger.error(ex, 'GraphWebviewProvider', 'onGetOverviewWip');
 			// Record-shaped response — empty map is safe; frontend reads `response[sha]` and gets `undefined`.
 			return {};
 		}
 	}
 
-	async onGetOverviewWipDetailed(
-		params: IpcParams<typeof GetOverviewWipDetailedRequest>,
-	): Promise<GetOverviewWipResponse> {
-		if (params.branchIds.length === 0 || this._graphSession == null || this.repository == null) return {};
+	async onGetOverviewWipDetailed(branchIds: string[], signal?: AbortSignal): Promise<GetOverviewWipResponse> {
+		signal?.throwIfAborted();
+		if (branchIds.length === 0 || this._graphSession == null || this.repository == null) return {};
 
 		try {
-			return await this.computeOverviewWipFromCache(params.branchIds);
+			return await this.computeOverviewWipFromCache(branchIds);
 		} catch (ex) {
+			if (isCancellationError(ex)) throw ex;
+
 			Logger.error(ex, 'GraphWebviewProvider', 'onGetOverviewWipDetailed');
 			return {};
 		}
@@ -311,19 +345,19 @@ export class GraphPanelsService {
 		);
 	}
 
-	async onGetOverviewEnrichment(
-		params: IpcParams<typeof GetOverviewEnrichmentRequest>,
-	): Promise<GetOverviewEnrichmentResponse> {
-		if (params.branchIds.length === 0 || this._graphSession == null || this.repository == null) return {};
+	async onGetOverviewEnrichment(branchIds: string[], signal?: AbortSignal): Promise<GetOverviewEnrichmentResponse> {
+		signal?.throwIfAborted();
+		if (branchIds.length === 0 || this._graphSession == null || this.repository == null) return {};
 
 		try {
 			const subscription = await this.container.subscription.getSubscription();
+			signal?.throwIfAborted();
 			const isPro = isSubscriptionTrialOrPaidFromState(subscription.state);
 
 			return await getOverviewEnrichment(
 				this.container,
 				this._graphSession.current.branches.values(),
-				params.branchIds,
+				branchIds,
 				{
 					isPro: isPro,
 					resolveLaunchpad: true,
@@ -343,20 +377,19 @@ export class GraphPanelsService {
 		}
 	}
 
-	onGetAgentSessions(): AgentSessionState[] {
-		return this.container.agentStatus?.getSerializedSessions() ?? [];
-	}
-
-	getOverviewData(): GraphOverviewData {
+	getOverviewData(): GraphOverviewData | undefined {
 		const active: GraphOverviewData['active'] = [];
 		const recent: GraphOverviewData['recent'] = [];
+		const older: GraphOverviewBranch[] = [];
 
 		if (this._graphSession == null || this.repository == null) {
-			return { active: active, recent: recent };
+			return undefined;
 		}
 
 		const data = this._graphSession.current;
 		const worktreesByBranch = data.worktreesByBranch ?? new Map();
+		const pinnedRefId = this.context.getPinnedRefId(data.repoPath);
+		const { hiddenIds } = this.getHiddenRefState(data.repoPath);
 
 		for (const branch of data.branches.values()) {
 			if (branch.remote) continue;
@@ -369,40 +402,73 @@ export class GraphPanelsService {
 			);
 			switch (branchType) {
 				case 'active':
-					active.push(toOverviewBranch(branch, worktreesByBranch, true));
+					active.push({
+						...toOverviewBranch(branch, worktreesByBranch, true),
+						// Same context vocabulary as the sidebar branches panel — see `buildBranchContext`.
+						// Overview never lists remote branches, so `hiddenByRemote` is always `false` here.
+						context: this.buildBranchContext(branch, data.repoPath, pinnedRefId, hiddenIds, false),
+					});
 					break;
 				case 'recent':
-					recent.push(toOverviewBranch(branch, worktreesByBranch, false));
+					recent.push({
+						...toOverviewBranch(branch, worktreesByBranch, false),
+						context: this.buildBranchContext(branch, data.repoPath, pinnedRefId, hiddenIds, false),
+					});
+					break;
+				// 'stale' and `undefined` both fall outside the Recent threshold — pageable via "Load More"
+				// rather than dropped.
+				default:
+					older.push({
+						...toOverviewBranch(branch, worktreesByBranch, false),
+						context: this.buildBranchContext(branch, data.repoPath, pinnedRefId, hiddenIds, false),
+					});
 					break;
 			}
 		}
 
 		recent.sort((a, b) => (b.timestamp ?? -1) - (a.timestamp ?? -1));
 
-		return { active: active, recent: recent };
+		const overview: GraphOverviewData = { active: active, recent: recent };
+		if (older.length > 0) {
+			older.sort((a, b) => (b.timestamp ?? -1) - (a.timestamp ?? -1));
+			overview.olderTotal = older.length;
+			if (this._overviewOlderLimit > 0) {
+				overview.older = older.slice(0, this._overviewOlderLimit);
+			}
+		}
+		return overview;
 	}
 
 	@trace()
-	async notifyDidChangeOverview(): Promise<boolean> {
-		if (!this.host.ready || !this.host.visible) {
-			this.context.addPendingNotification(DidChangeOverviewNotification);
-			return false;
-		}
-
-		// Skip identical pushes — most graph reloads reproduce the prior overview verbatim. Advance
-		// the last-sent snapshot only on confirmed delivery: a failed `notify` is requeued by type
-		// and REPLACED by a later one, so a speculative advance could let the gate suppress the
-		// replacement and leave the webview never receiving the overview.
+	notifyDidChangeOverview(): void {
 		const overview = this.getOverviewData();
+		// No graph/repo yet — the data isn't ready. Pushing this would clobber a real overview the
+		// webview already has (or is about to receive) with a not-ready snapshot.
+		if (overview == null) return;
+
+		// Skip identical pushes — most graph reloads reproduce the prior overview verbatim. The
+		// `EventVisibilityBuffer` (save-last) replays the latest emission to a hidden/not-yet-ready
+		// webview, so there's no requeue-by-type bookkeeping to do here anymore.
 		if (this._lastSentOverview != null && areEqual(overview, this._lastSentOverview)) {
-			return false;
+			return;
 		}
 
-		const success = await this.host.notify(DidChangeOverviewNotification, { overview: overview });
-		if (success) {
-			this._lastSentOverview = overview;
-		}
-		return success;
+		this._lastSentOverview = overview;
+		this._overviewChangedEvent.fire(overview);
+	}
+
+	/** Mirrors {@link GraphSearchService.createServices} — the Overview panel's RPC service surface,
+	 *  wired against the shared `EventVisibilityBuffer`/`SubscriptionTracker` from `getRpcServices`. */
+	createServices(buffer?: EventVisibilityBuffer, tracker?: SubscriptionTracker): Pick<GraphServices, 'overview'> {
+		return {
+			overview: {
+				getOverview: params => this.onGetOverview(params),
+				getWip: (branchIds, cheap, signal) => this.onGetOverviewWip(branchIds, cheap, signal),
+				getWipDetailed: (branchIds, signal) => this.onGetOverviewWipDetailed(branchIds, signal),
+				getEnrichment: (branchIds, signal) => this.onGetOverviewEnrichment(branchIds, signal),
+				onOverviewChanged: this._overviewChangedEvent.subscribe(buffer, tracker),
+			},
+		};
 	}
 
 	async onGetSidebarData(
@@ -436,9 +502,10 @@ export class GraphPanelsService {
 	 *  exempted from that hide — the wildcard's `except`, empty when none). Sidebar rows bake these into
 	 *  their `webviewItem` token as `+hidden`/`+hiddenbyremote` — see `getSidebarBranches`,
 	 *  `getSidebarRemotes`, `getSidebarTags`. `+hiddenbyremote` is baked in ONLY for a branch that isn't
-	 *  exempted; the remote header row itself keeps `+hidden` regardless of exceptions. */
-	private getHiddenRefState(repoPath: string): { hiddenIds: Set<string>; hiddenRemotes: Map<string, Set<string>> } {
-		const storedExcludeRefs = this.context.getExcludedRefsByRepo(repoPath);
+	 *  exempted; the remote header row itself keeps `+hidden` regardless of exceptions. Every returned id is
+	 *  re-stamped onto `livePath`, since the bucket read is home-keyed — see {@link restampFilterRefId}. */
+	private getHiddenRefState(livePath: string): { hiddenIds: Set<string>; hiddenRemotes: Map<string, Set<string>> } {
+		const storedExcludeRefs = this.context.getExcludedRefsByRepo();
 		const hiddenIds = new Set<string>();
 		const hiddenRemotes = new Map<string, Set<string>>();
 		if (storedExcludeRefs != null) {
@@ -446,10 +513,13 @@ export class GraphPanelsService {
 				const stored = storedExcludeRefs[id];
 				if (stored.type === 'remote' && stored.name === '*') {
 					if (stored.owner) {
-						hiddenRemotes.set(stored.owner, new Set(stored.except));
+						hiddenRemotes.set(
+							stored.owner,
+							new Set(stored.except?.map(exceptId => restampFilterRefId(exceptId, livePath))),
+						);
 					}
 				} else {
-					hiddenIds.add(stored.id);
+					hiddenIds.add(restampFilterRefId(stored.id, livePath));
 				}
 			}
 		}
@@ -464,6 +534,42 @@ export class GraphPanelsService {
 			}
 		}
 		return providerByRemote;
+	}
+
+	/**
+	 * Builds a local/remote branch's native right-click context (the `gitlens:branch...` webviewItem and
+	 * its `webviewItemValue`) — shared by the sidebar branches panel and the Overview panel's branch
+	 * cards so the two surfaces can't drift out of the same menu. `hiddenByRemote` only ever applies to a
+	 * remote branch under a wildcard-hidden remote (see `getHiddenRefState`); the Overview panel only
+	 * ever lists local branches, so its caller always passes `false`.
+	 */
+	private buildBranchContext(
+		b: GitBranch,
+		repoPath: string,
+		pinnedRefId: string | undefined,
+		hiddenIds: Set<string>,
+		hiddenByRemote: boolean,
+	): GraphItemRefContext<GraphBranchContextValue> & GraphSidebarItemOrigin {
+		return {
+			webview: this.host.id,
+			webviewItemOrigin: sidebarItemOrigin,
+			webviewItem: buildBranchContextSuffix(b, {
+				isCheckedOut: b.worktree != null && b.worktree !== false,
+				pinnedRefId: pinnedRefId,
+				hiddenIds: hiddenIds,
+				hiddenByRemote: hiddenByRemote,
+			}),
+			webviewItemValue: {
+				type: 'branch',
+				ref: createReference(b.name, repoPath, {
+					id: b.id,
+					refType: 'branch',
+					name: b.name,
+					remote: b.remote,
+					upstream: b.upstream,
+				}),
+			},
+		};
 	}
 
 	private getSidebarBranches(graph: GitGraph) {
@@ -523,27 +629,7 @@ export class GraphPanelsService {
 				providerIcon: provider?.icon,
 				starred: b.starred || undefined,
 				pinned: (pinnedRefId != null && b.id === pinnedRefId) || undefined,
-				context: {
-					webview: this.host.id,
-					webviewItemOrigin: sidebarItemOrigin,
-					webviewItem: `gitlens:branch${b.remote ? '+remote' : ''}${b.current ? '+current' : ''}${
-						b.upstream != null && !b.upstream.missing ? '+tracking' : ''
-					}${hasWorktree ? '+worktree' : ''}${
-						b.current || isCheckedOut ? '+checkedout' : ''
-					}${b.upstream?.state.ahead ? '+ahead' : ''}${b.upstream?.state.behind ? '+behind' : ''}${
-						pinnedRefId != null && b.id === pinnedRefId ? '+pinned' : ''
-					}${!b.current && hiddenIds.has(b.id) ? '+hidden' : ''}${hiddenByRemote ? '+hiddenbyremote' : ''}`,
-					webviewItemValue: {
-						type: 'branch',
-						ref: createReference(b.name, graph.repoPath, {
-							id: b.id,
-							refType: 'branch',
-							name: b.name,
-							remote: b.remote,
-							upstream: b.upstream,
-						}),
-					},
-				} satisfies GraphItemRefContext<GraphBranchContextValue> & GraphSidebarItemOrigin,
+				context: this.buildBranchContext(b, graph.repoPath, pinnedRefId, hiddenIds, hiddenByRemote),
 			};
 		});
 		return {
@@ -689,11 +775,11 @@ export class GraphPanelsService {
 
 		const result = await this.fetchPullRequests(graph.repoPath, integration, remote);
 		signal?.throwIfAborted();
-		// No list at all means nothing answered — a failed lookup (which resolves rather than throwing), an
-		// unresolvable session, or a host with no query to ask. None of those is an empty repository, so
-		// none may render a bare empty list: that would claim there are no open pull requests.
+		// No list at all means nothing answered — a failed lookup (which resolves rather than throwing) or an
+		// unresolvable session. Reject so the panel's Resource owns the failure: the tree stays mounted and a
+		// failed refresh keeps its last good rows rather than replacing them with a successful empty payload.
 		if (result.prs == null) {
-			return { ...empty, emptyState: { reason: 'unavailable' as const } };
+			throw new Error('Unable to load pull requests');
 		}
 		if (!result.prs.length) return empty;
 
@@ -741,9 +827,12 @@ export class GraphPanelsService {
 		// only resolves `isConnected()` for the default or the only remote, so any repo with two remotes and
 		// no default lands here on a cold session — meaning a connected integration can still reach this. It
 		// gets neither a Connect pitch (it's already connected) nor a bare empty list (we never got to ask,
-		// which is not the same as there being none). It settles on the next invalidation.
+		// which is not the same as there being none). Reject so the panel's Resource reports the retryable
+		// failure inside the tree; the remote selection can settle on the next invalidation.
 		const integration = await getRemoteIntegration(remote);
-		if (integration?.maybeConnected ?? (await integration?.isConnected())) return { reason: 'unavailable' };
+		if (integration?.maybeConnected ?? (await integration?.isConnected())) {
+			throw new Error('Unable to load pull requests');
+		}
 
 		return {
 			reason: 'integration-disconnected',
@@ -944,6 +1033,109 @@ export class GraphPanelsService {
 	}
 
 	/**
+	 * Everything the pull request sheet renders, in ONE round trip: the pull request itself and, when
+	 * it's one layer of a stack, every layer beside it. Also resolves a whole stack by number, for the
+	 * stack's own summary sheet.
+	 *
+	 * Deliberately independent of the pull requests panel. The sheet used to wait on that panel's list —
+	 * the whole repository's open pull requests, up to three paged fetches plus a viewer lookup and a
+	 * categorization pass — purely to find the handful of pull requests in one stack, and gave up on it
+	 * after 5s, dropping the user out to the browser. Here each layer is one by-number lookup, cached by
+	 * id, so a cold open costs one request per layer and a re-open costs none.
+	 *
+	 * Separate from {@link onFindPullRequest} rather than folded into it: that one answers the Focus
+	 * pane's search, which wants the single pull request and none of the stack work.
+	 */
+	async onResolvePullRequestSheet(
+		params: { number: string } | { stackNumber: number },
+	): Promise<GraphPullRequestSheetData | undefined> {
+		const graph = this._graphSession?.current ?? (await this.context.getLoading()?.catch(() => undefined));
+		if (graph == null) return undefined;
+
+		const remote = await getBestRemoteWithIntegration(graph.repoPath);
+		if (remote == null) return undefined;
+
+		const integration = await getRemoteIntegration(remote);
+		if (integration == null) return undefined;
+
+		// Best-effort, exactly as the panel treats it — a stacked pull request whose membership can't be
+		// resolved still opens, just without its layers. Cancellation is the only error it raises, and
+		// nothing here is cancellable, so swallowing it is the whole story.
+		const stacks = await this.getStacksByPullRequestNumber(remote, integration).catch(() => undefined);
+
+		const { localByUpstream, remoteNames } = buildLocalBranchesByUpstream(graph);
+		const currentBranchName = getCurrentBranchName(graph);
+		const toSidebar = (pr: PullRequest) =>
+			this.toSidebarPullRequest(
+				pr,
+				graph.repoPath,
+				remote.name,
+				localByUpstream,
+				remoteNames,
+				undefined,
+				currentBranchName,
+				stacks,
+			);
+
+		// Set only on the by-number path — it's the pull request the sheet was opened for, and it's
+		// already in hand, so it's never re-fetched below.
+		let requested: GraphSidebarPullRequest | undefined;
+		let stackNumber: number;
+
+		if ('stackNumber' in params) {
+			stackNumber = params.stackNumber;
+		} else {
+			// Cached by id in `src/cache.ts`, so re-opening the same sheet doesn't re-hit the API.
+			const pr = await integration.getPullRequest(remote.provider.repoDesc, params.number);
+			if (pr == null) return undefined;
+
+			requested = toSidebar(pr);
+			// Not stacked (or membership unavailable) — the sheet renders the one pull request.
+			if (requested.stack == null) return { pr: requested };
+
+			stackNumber = requested.stack.number;
+		}
+
+		const numbers: number[] = [];
+		if (stacks != null) {
+			for (const [number, stack] of stacks) {
+				if (stack.number !== stackNumber || String(number) === requested?.number) continue;
+
+				numbers.push(number);
+			}
+		}
+
+		// In parallel, and settled rather than all-or-nothing: one layer the provider won't answer for
+		// shouldn't cost the sheet the rest of the stack.
+		const results = await Promise.allSettled(
+			numbers.map(n => integration.getPullRequest(remote.provider.repoDesc, String(n))),
+		);
+
+		const members: GraphSidebarPullRequest[] = requested != null ? [requested] : [];
+		for (const result of results) {
+			if (result.status !== 'fulfilled' || result.value == null) continue;
+
+			members.push(toSidebar(result.value));
+		}
+
+		// Top layer first, matching how the panel's own stack rows are ordered — `position` is 1-based
+		// from the stack's base.
+		members.sort((a, b) => (b.stack?.position ?? 0) - (a.stack?.position ?? 0));
+
+		if (requested == null) {
+			const top = members[0];
+			if (top == null) return undefined;
+
+			// A partial roster can't be summarized honestly, so `stackRoot` stays false and the sheet
+			// falls back to the top loaded layer's own sheet — the same rule the panel-loaded path applies.
+			return { pr: top, layers: members, stackRoot: members.length === top.stack?.size };
+		}
+
+		// One member is just the requested pull request itself, which is a single-layer sheet.
+		return { pr: requested, layers: members.length >= 2 ? members : undefined };
+	}
+
+	/**
 	 * Resolves a pull request and its integration for the merge action — same resolution as
 	 * {@link onFindPullRequest}, but returns the raw model (with `refs`/`stack`) instead of the
 	 * sidebar-mapped shape, since the merge confirmation and the mutation itself need those fields.
@@ -1114,18 +1306,8 @@ export class GraphPanelsService {
 			context: {
 				webview: this.host.id,
 				webviewItemOrigin: sidebarItemOrigin,
-				// Every suffix names a precondition some handler actually checks, because a suffix that
-				// merely says "a refs object exists" gates nothing: the providers-api path always builds
-				// `refs`, filling a gone head with empty strings. So — `+head` for an actionable head
-				// (branch and url both non-empty, what switch/worktree need), `+shas` for a diffable pair
-				// (changes/comparison), `+focus` for a scope target that's really in this repo. `+head`
-				// isn't fork-gated: those commands work for a fork off its own url, since the deep link
-				// adds the remote. Kept in sync with the graph row's producer (`GraphProducersService`).
-				webviewItem: `gitlens:pullrequest${
-					headBranch != null && headUrl != null ? '+head' : ''
-				}${pr.refs?.base?.sha && pr.refs.head?.sha ? '+shas' : ''}${
-					pr.state !== 'opened' ? '+closed' : ''
-				}${pr.refs?.isCrossRepository === true ? '+fork' : ''}${isCurrent ? '+current' : ''}`,
+				// Suffix tokens and their preconditions are documented on `buildPullRequestContextSuffix`.
+				webviewItem: buildPullRequestContextSuffix(pr, isCurrent === true),
 				webviewItemValue: {
 					type: 'pullrequest',
 					id: pr.id,
@@ -1442,7 +1624,10 @@ export class GraphPanelsService {
 									remote: false,
 									upstream: w.branch.upstream,
 								}),
-								worktreePath: w.uri.fsPath,
+								// `w.path` (normalized), NOT `w.uri.fsPath` (raw, backslashed on Windows) — this
+								// round-trips as a `GraphScopeOrigin.path`/rebind `worktreePath` and must
+								// compare byte-for-byte equal against `RepositoryShape.path`, also normalized.
+								worktreePath: w.path,
 							},
 						}
 					: w.sha != null
@@ -1457,20 +1642,23 @@ export class GraphPanelsService {
 										name: w.sha,
 										message: '',
 									}),
-									worktreePath: w.uri.fsPath,
+									worktreePath: w.path,
 								},
 							}
 						: undefined;
 
 			return {
 				name: w.name,
-				uri: w.uri.fsPath,
+				// Normalized, for the same reason as `worktreePath` above.
+				uri: w.path,
 				branch: w.branch?.name,
 				sha: w.sha,
 				isDefault: w.isDefault,
 				locked: w.locked !== false,
 				opened: w.workspaceFolder != null,
 				wipSha: wipSha,
+				// Last known verdict; the probe fired below re-pushes and corrects it.
+				hasChanges: this.context.getLastWorktreeChange(w.path)?.hasChanges,
 				status: w.branch?.status,
 				upstream: w.branch?.upstream?.name,
 				tracking: w.branch?.upstream?.state,

@@ -8,7 +8,9 @@
  * - Per-repo change events (working tree FS changes, filtered repository changes)
  */
 
-import { Disposable, FileSystemError, Uri, window, workspace } from 'vscode';
+import { Disposable, FileSystemError, l10n, Uri, window, workspace } from 'vscode';
+import type { MessageItem } from 'vscode';
+import { getSquashSequenceEditor } from '@env/git/squashEditor.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitFileChange, GitFileChangeShape } from '@gitlens/git/models/fileChange.js';
@@ -26,17 +28,18 @@ import {
 	getConflictIncomingRef,
 	resolveConflictFilePaths,
 } from '@gitlens/git/utils/pausedOperationStatus.utils.js';
-import { createRevisionRange } from '@gitlens/git/utils/revision.utils.js';
+import { createRevisionRange, isSha } from '@gitlens/git/utils/revision.utils.js';
+import { getNumericFormat } from '@gitlens/utils/date.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { LruMap } from '@gitlens/utils/lruMap.js';
 import { normalizePath } from '@gitlens/utils/path.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
-import { pluralize } from '@gitlens/utils/string.js';
 import { getAvatarUri } from '../../../avatars.js';
 import type { DiffWithCommandArgs } from '../../../commands/diffWith.js';
 import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
-import { ProviderNotSupportedError } from '../../../errors.js';
+import { getPresentableErrorMessage, ProviderNotSupportedError } from '../../../errors.js';
 import type { FeatureAccess, PlusFeatures } from '../../../features.js';
 import * as BranchActions from '../../../git/actions/branch.js';
 import * as RepoActions from '../../../git/actions/repository.js';
@@ -46,6 +49,7 @@ import {
 	getCommitAuthorAvatarUri,
 	getCommitCommitterAvatarUri,
 	getCommitSignature,
+	isCommitPushed,
 } from '../../../git/utils/-webview/commit.utils.js';
 import {
 	resolveAllConflicts as resolveAllConflictsHelper,
@@ -56,11 +60,12 @@ import { getReferenceFromBranch } from '../../../git/utils/-webview/reference.ut
 import { getReachableWorktrees } from '../../../git/utils/-webview/worktree.utils.js';
 import { executeCommand, executeCoreCommand } from '../../../system/-webview/command.js';
 import { serialize } from '../../../system/serialize.js';
-import type { EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
-import { bufferEventHandler } from '../eventVisibilityBuffer.js';
+import type { EventRegistration, EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
+import { bufferEventHandler, toEventNotifier, trackRpcRegistration } from '../eventVisibilityBuffer.js';
 import type { ClassifiedCommitFailure, CommitResult } from './commitFailure.js';
 import { buildCommitOutputPreview, classifyCommitFailure } from './commitFailure.js';
 import { classifyFilesForDiscard, discardOneWith } from './discard.utils.js';
+import { createRepositoryChangeAggregator } from './repositoryChangeAggregator.js';
 import type {
 	CommitAvatarsShape,
 	CommitSignatureShape,
@@ -77,6 +82,10 @@ import type {
 } from './types.js';
 
 export class RepositoryService {
+	readonly #workingChangedRegistrations = new Set<EventRegistration>();
+	readonly #repositoryChangedRegistrations = new Set<EventRegistration>();
+	readonly #orWorktreeChangedRegistrations = new Set<EventRegistration>();
+
 	constructor(
 		private readonly container: Container,
 		private readonly buffer: EventVisibilityBuffer | undefined,
@@ -101,15 +110,16 @@ export class RepositoryService {
 
 		const pendingKey = Symbol(`repositoryWorking:${repoPath}`);
 		const buffered = bufferEventHandler<undefined>(this.buffer, pendingKey, callback, 'signal', undefined);
-		const disposable = Disposable.from(
-			repo.watchWorkingTree(1000),
-			repo.onDidChangeWorkingTree(() => buffered(undefined)),
-		);
-		const unsubscribe = () => {
-			this.buffer?.removePending(pendingKey);
-			disposable.dispose();
-		};
-		return this.tracker != null ? this.tracker.track(unsubscribe) : unsubscribe;
+		return trackRpcRegistration(this.#workingChangedRegistrations, this.tracker, () => {
+			const disposable = Disposable.from(
+				repo.watchWorkingTree(1000),
+				repo.onDidChangeWorkingTree(() => buffered(undefined)),
+			);
+			return () => {
+				this.buffer?.removePending(pendingKey);
+				disposable.dispose();
+			};
+		});
 	}
 
 	/**
@@ -123,37 +133,24 @@ export class RepositoryService {
 	 */
 	onRepositoryChanged(repoPath: string, callback: (data: RepositoryChangeEventData) => void): Unsubscribe {
 		const pendingKey = Symbol(`repositoryChanged:${repoPath}`);
-		const pendingChanges = new Set<RepositoryChange>();
-		let pendingUri: string | undefined;
+		const notifier = toEventNotifier(callback);
+		const aggregator = createRepositoryChangeAggregator(this.buffer, pendingKey, notifier);
 
-		const disposable = this.container.git.onDidChangeRepository(e => {
-			if (e.repository.path !== repoPath) return;
+		return trackRpcRegistration(this.#repositoryChangedRegistrations, this.tracker, () => {
+			const disposable = this.container.git.onDidChangeRepository(e => {
+				if (e.repository.path !== repoPath) return;
 
-			const data: RepositoryChangeEventData = {
-				repoPath: e.repository.path,
-				repoUri: e.repository.uri.toString(),
-				changes: extractRepositoryChanges(e),
-			};
-			if (!this.buffer || this.buffer.visible) {
-				callback(data);
-			} else {
-				pendingUri = data.repoUri;
-				for (const c of data.changes) {
-					pendingChanges.add(c);
-				}
-				this.buffer.addPending(pendingKey, () => {
-					callback({ repoPath: repoPath, repoUri: pendingUri!, changes: [...pendingChanges] });
-					pendingChanges.clear();
-					pendingUri = undefined;
+				aggregator.record({
+					repoPath: e.repository.path,
+					repoUri: e.repository.uri.toString(),
+					changes: extractRepositoryChanges(e),
 				});
-			}
+			});
+			return () => {
+				aggregator.dispose();
+				disposable.dispose();
+			};
 		});
-		const unsubscribe = () => {
-			this.buffer?.removePending(pendingKey);
-			pendingChanges.clear();
-			disposable.dispose();
-		};
-		return this.tracker != null ? this.tracker.track(unsubscribe) : unsubscribe;
 	}
 
 	/**
@@ -169,33 +166,56 @@ export class RepositoryService {
 	 */
 	async onRepositoryOrWorktreeChanged(repoPath: string, callback: () => void): Promise<Unsubscribe> {
 		const epoch = this.tracker?.epoch;
-		const watcher = await this.container.git.getRepositoryService(repoPath).watch();
-		if (watcher == null) return () => {};
+		// Read synchronously, before the await below — only reliable at the top of the dispatch.
+		// Carried through to `trackRpcRegistration` below, which re-checks it immediately before
+		// attaching (see that helper's doc comment) — this method must NOT re-read `callerSession`
+		// itself after the await, since by then it no longer reliably names this caller.
+		const session = this.tracker?.callerSession;
+		// Makes this acquisition visible to a validation landing before `trackRpcRegistration` below —
+		// without it, a validation superseding `session` while nothing is tracked yet for it would
+		// have no way to tombstone it. The one-shot handle is released in the `finally` so EVERY
+		// exit path — attach, abandon, or a `watch()` rejection — clears it, and only after
+		// `trackRpcRegistration` has run its released-session check.
+		const unreserve = this.tracker?.reserveSession(session);
+		try {
+			const watcher = await this.container.git.getRepositoryService(repoPath).watch();
+			if (watcher == null) return () => {};
 
-		// The tracker was reset (RPC reconnect) while the watch acquisition was in flight — this
-		// subscription belongs to the superseded generation. Tracking it now would leak the watcher until
-		// the NEXT reset and double-deliver alongside the new generation's re-subscription; dispose instead.
-		if (this.tracker != null && this.tracker.epoch !== epoch) {
-			watcher.dispose();
-			return () => {};
+			// The tracker was reset (RPC reconnect) while the watch acquisition was in flight — an
+			// epoch change. Tracking the watcher now would leak it until the NEXT reset and
+			// double-deliver alongside the current generation's re-subscription; dispose instead.
+			// Session invalidation (superseded at validation, or rejected as a straggler) while the
+			// watch was in flight is handled centrally by `trackRpcRegistration`, via `session` below.
+			if (this.tracker != null && this.tracker.epoch !== epoch) {
+				watcher.dispose();
+				return () => {};
+			}
+
+			const pendingKey = Symbol(`repositoryOrWorktreeChanged:${repoPath}`);
+			const buffered = bufferEventHandler<undefined>(this.buffer, pendingKey, callback, 'signal', undefined);
+			return await trackRpcRegistration(
+				this.#orWorktreeChangedRegistrations,
+				this.tracker,
+				() => {
+					const disposable = Disposable.from(
+						watcher,
+						watcher.onDidChange(e => {
+							if (e.changed('index', 'head', 'heads')) {
+								buffered(undefined);
+							}
+						}),
+						watcher.onDidChangeWorkingTree(() => buffered(undefined)),
+					);
+					return () => {
+						this.buffer?.removePending(pendingKey);
+						disposable.dispose();
+					};
+				},
+				session,
+			);
+		} finally {
+			unreserve?.();
 		}
-
-		const pendingKey = Symbol(`repositoryOrWorktreeChanged:${repoPath}`);
-		const buffered = bufferEventHandler<undefined>(this.buffer, pendingKey, callback, 'signal', undefined);
-		const disposable = Disposable.from(
-			watcher,
-			watcher.onDidChange(e => {
-				if (e.changed('index', 'head', 'heads')) {
-					buffered(undefined);
-				}
-			}),
-			watcher.onDidChangeWorkingTree(() => buffered(undefined)),
-		);
-		const unsubscribe = () => {
-			this.buffer?.removePending(pendingKey);
-			disposable.dispose();
-		};
-		return this.tracker != null ? this.tracker.track(unsubscribe) : unsubscribe;
 	}
 
 	// ============================================================
@@ -395,7 +415,7 @@ export class RepositoryService {
 		const pausedStatus = await svc.pausedOps?.getPausedOperationStatus?.();
 		if (pausedStatus?.mergeBase == null) {
 			Logger.warn('openConflictChanges: paused-operation status or merge-base unavailable');
-			void window.showWarningMessage('Unable to open conflict changes — operation status unavailable');
+			void window.showWarningMessage(l10n.t('Unable to open conflict changes — operation status unavailable'));
 			return;
 		}
 
@@ -425,12 +445,12 @@ export class RepositoryService {
 			lhs: {
 				sha: mergeBase,
 				uri: GitUri.fromFile(lhsPath, file.repoPath, mergeBase),
-				title: `${lhsPath} (merge-base)`,
+				title: l10n.t('{0} (merge-base)', lhsPath),
 			},
 			rhs: {
 				sha: ref,
 				uri: GitUri.fromFile(rhsPath, file.repoPath, ref),
-				title: `${rhsPath} (${side === 'current' ? 'current' : 'incoming'})`,
+				title: side === 'current' ? l10n.t('{0} (current)', rhsPath) : l10n.t('{0} (incoming)', rhsPath),
 			},
 			repoPath: file.repoPath,
 			showOptions: { preserveFocus: false, preview: true },
@@ -554,10 +574,15 @@ export class RepositoryService {
 	}
 
 	private async confirmStageWithConflictMarkers(uri: Uri, path: string, markers: number): Promise<boolean> {
-		const stage = 'Stage Anyway';
-		const open = 'Open File';
+		const stage = l10n.t('Stage Anyway');
+		const open = l10n.t('Open File');
 		const choice = await window.showWarningMessage(
-			`"${path}" still contains ${pluralize('unresolved conflict marker', markers)}. Staging will commit them as-is.`,
+			formatPlural(
+				l10n.t(
+					'{1, plural, one{"{0}" still contains {1} unresolved conflict marker. Staging will commit them as-is.} other{"{0}" still contains {1} unresolved conflict markers. Staging will commit them as-is.}}',
+				),
+				[path, markers],
+			),
 			{ modal: true },
 			stage,
 			open,
@@ -570,9 +595,14 @@ export class RepositoryService {
 	}
 
 	private async confirmStageAllWithConflictMarkers(fileCount: number): Promise<boolean> {
-		const stage = 'Stage All Anyway';
+		const stage = l10n.t('Stage All Anyway');
 		const choice = await window.showWarningMessage(
-			`${pluralize('file', fileCount)} still ${fileCount === 1 ? 'contains' : 'contain'} unresolved conflict markers. Staging will commit them as-is.`,
+			formatPlural(
+				l10n.t(
+					'{0, plural, one{{0} file still contains unresolved conflict markers. Staging will commit them as-is.} other{{0} files still contain unresolved conflict markers. Staging will commit them as-is.}}',
+				),
+				[fileCount],
+			),
 			{ modal: true },
 			stage,
 		);
@@ -625,7 +655,7 @@ export class RepositoryService {
 			// no longer maps onto a current state we can reason about.
 			if (fresh == null) {
 				Logger.warn(`Discard skipped for "${file.path}": file is no longer in working-tree status.`);
-				void window.showWarningMessage(`"${file.path}" no longer has changes to discard.`);
+				void window.showWarningMessage(l10n.t('"{0}" no longer has changes to discard.', file.path));
 				return;
 			}
 
@@ -636,7 +666,7 @@ export class RepositoryService {
 		} catch (ex) {
 			Logger.error(ex, 'Failed to discard changes');
 			void window.showErrorMessage(
-				`Failed to discard changes in "${file.path}": ${ex instanceof Error ? ex.message : String(ex)}`,
+				l10n.t('Failed to discard changes in "{0}": {1}', file.path, getPresentableErrorMessage(ex)),
 			);
 			throw ex;
 		}
@@ -767,7 +797,7 @@ export class RepositoryService {
 		} catch (ex) {
 			Logger.error(ex, 'Failed to discard unstaged changes');
 			void window.showErrorMessage(
-				`Failed to discard unstaged changes: ${ex instanceof Error ? ex.message : String(ex)}`,
+				l10n.t('Failed to discard unstaged changes: {0}', getPresentableErrorMessage(ex)),
 			);
 			throw ex;
 		}
@@ -798,7 +828,7 @@ export class RepositoryService {
 			const status = await svc.status.getStatus();
 			if (status == null) {
 				Logger.warn(`discardFiles: status unavailable for "${files[0].repoPath}"`);
-				void window.showWarningMessage('Unable to discard changes — repository status unavailable.');
+				void window.showWarningMessage(l10n.t('Unable to discard changes — repository status unavailable.'));
 				return;
 			}
 
@@ -817,11 +847,16 @@ export class RepositoryService {
 						`discardFiles: nothing to discard — ${skippedMissingCount} of ${requested.size} selected file(s) no longer have changes`,
 					);
 					void window.showWarningMessage(
-						`${pluralize('file', skippedMissingCount)} selected no longer ${skippedMissingCount === 1 ? 'has' : 'have'} changes — nothing to discard.`,
+						formatPlural(
+							l10n.t(
+								'{0, plural, one{{0} file selected no longer has changes — nothing to discard.} other{{0} files selected no longer have changes — nothing to discard.}}',
+							),
+							[skippedMissingCount],
+						),
 					);
 				} else {
 					Logger.warn('discardFiles: none of the selected files have changes to discard');
-					void window.showWarningMessage('None of the selected files have changes to discard.');
+					void window.showWarningMessage(l10n.t('None of the selected files have changes to discard.'));
 				}
 				return;
 			}
@@ -869,7 +904,7 @@ export class RepositoryService {
 			this.warnDiscardFailures(failed);
 		} catch (ex) {
 			Logger.error(ex, 'Failed to discard changes');
-			void window.showErrorMessage(`Failed to discard changes: ${ex instanceof Error ? ex.message : String(ex)}`);
+			void window.showErrorMessage(l10n.t('Failed to discard changes: {0}', getPresentableErrorMessage(ex)));
 			throw ex;
 		}
 	}
@@ -921,20 +956,21 @@ export class RepositoryService {
 		} catch (ex) {
 			Logger.error(ex, 'Failed to discard staged changes');
 			void window.showErrorMessage(
-				`Failed to discard staged changes: ${ex instanceof Error ? ex.message : String(ex)}`,
+				l10n.t('Failed to discard staged changes: {0}', getPresentableErrorMessage(ex)),
 			);
 			throw ex;
 		}
 	}
 
 	/**
-	 * Build the "<preview>, and N more" tail shared by the two discard failure warnings below, so the
-	 * truncation style can't drift between them.
+	 * Build the path data shared by the two discard failure warnings below. The localized warning
+	 * owns the complete sentence, including the optional additional-path count.
 	 */
-	private previewFailedFiles(failed: string[]): string {
-		const preview = failed.slice(0, 3).join(', ');
-		const more = failed.length > 3 ? `, and ${failed.length - 3} more` : '';
-		return `${preview}${more}`;
+	private getFailedFilesPreview(failed: string[]): { paths: string; additionalCount: number } {
+		return {
+			paths: failed.slice(0, 3).join(', '),
+			additionalCount: Math.max(0, failed.length - 3),
+		};
 	}
 
 	/**
@@ -949,11 +985,21 @@ export class RepositoryService {
 	private warnDiscardRestoreFailures(failed: string[]): void {
 		if (failed.length === 0) return;
 
-		const preview = this.previewFailedFiles(failed);
-		const they = failed.length === 1 ? "it's" : "they're";
-		const their = failed.length === 1 ? 'its' : 'their';
+		const preview = this.getFailedFilesPreview(failed);
 		void window.showWarningMessage(
-			`Couldn't restore ${pluralize('file', failed.length)} after discard: ${preview} — ${they} missing from the working tree, but ${their} content is recoverable from Git.`,
+			preview.additionalCount === 0
+				? formatPlural(
+						l10n.t(
+							"{0, plural, one{Couldn't restore {0} file after discard: {1} — it's missing from the working tree, but its content is recoverable from Git.} other{Couldn't restore {0} files after discard: {1} — they're missing from the working tree, but their content is recoverable from Git.}}",
+						),
+						[failed.length, preview.paths],
+					)
+				: l10n.t(
+						"Couldn't restore {0} files after discard: {1}, and {2} more — they're missing from the working tree, but their content is recoverable from Git.",
+						getNumericFormat()(failed.length),
+						preview.paths,
+						getNumericFormat()(preview.additionalCount),
+					),
 		);
 	}
 
@@ -967,9 +1013,21 @@ export class RepositoryService {
 	private warnDiscardFailures(failed: string[]): void {
 		if (failed.length === 0) return;
 
-		const preview = this.previewFailedFiles(failed);
+		const preview = this.getFailedFilesPreview(failed);
 		void window.showWarningMessage(
-			`Failed to discard changes in ${pluralize('file', failed.length)}: ${preview} — check ${failed.length === 1 ? 'its' : 'their'} state before continuing.`,
+			preview.additionalCount === 0
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Failed to discard changes in {0} file: {1} — check its state before continuing.} other{Failed to discard changes in {0} files: {1} — check their state before continuing.}}',
+						),
+						[failed.length, preview.paths],
+					)
+				: l10n.t(
+						'Failed to discard changes in {0} files: {1}, and {2} more — check their state before continuing.',
+						getNumericFormat()(failed.length),
+						preview.paths,
+						getNumericFormat()(preview.additionalCount),
+					),
 		);
 	}
 
@@ -1012,18 +1070,24 @@ export class RepositoryService {
 		// expectation explicit so users aren't surprised when staged changes remain — and so they
 		// understand a second discard is needed to fully revert.
 		if (isMixed) {
-			const discard = 'Discard Unstaged Changes';
+			const discard = l10n.t('Discard Unstaged Changes');
 			const choice = await window.showWarningMessage(
-				`Are you sure you want to discard the unstaged changes in "${path}"?\n\nThe staged changes will be preserved — discard again to remove them.\nThis is IRREVERSIBLE!\nYour unstaged changes will be FOREVER LOST if you proceed.`,
+				l10n.t(
+					'Are you sure you want to discard the unstaged changes in "{0}"?\n\nThe staged changes will be preserved — discard again to remove them.\nThis is IRREVERSIBLE!\nYour unstaged changes will be FOREVER LOST if you proceed.',
+					path,
+				),
 				{ modal: true },
 				discard,
 			);
 			return choice === discard;
 		}
 
-		const discard = 'Discard Changes';
+		const discard = l10n.t('Discard Changes');
 		const choice = await window.showWarningMessage(
-			`Are you sure you want to discard changes in "${path}"?\n\nThis is IRREVERSIBLE!\nYour current changes will be FOREVER LOST if you proceed.`,
+			l10n.t(
+				'Are you sure you want to discard changes in "{0}"?\n\nThis is IRREVERSIBLE!\nYour current changes will be FOREVER LOST if you proceed.',
+				path,
+			),
 			{ modal: true },
 			discard,
 		);
@@ -1031,9 +1095,14 @@ export class RepositoryService {
 	}
 
 	private async confirmDiscardStaged(fileCount: number): Promise<boolean> {
-		const discard = 'Discard Staged Changes';
+		const discard = l10n.t('Discard Staged Changes');
 		const choice = await window.showWarningMessage(
-			`Are you sure you want to discard staged changes in ${pluralize('file', fileCount)}?\n\nThis is IRREVERSIBLE!\nYour staged changes will be FOREVER LOST if you proceed.`,
+			formatPlural(
+				l10n.t(
+					'{0, plural, one{Are you sure you want to discard staged changes in {0} file?\n\nThis is IRREVERSIBLE!\nYour staged changes will be FOREVER LOST if you proceed.} other{Are you sure you want to discard staged changes in {0} files?\n\nThis is IRREVERSIBLE!\nYour staged changes will be FOREVER LOST if you proceed.}}',
+				),
+				[fileCount],
+			),
 			{ modal: true },
 			discard,
 		);
@@ -1074,14 +1143,31 @@ export class RepositoryService {
 		const beyondUnstaged = staged > 0 || conflicted > 0;
 		const sections: string[] = [
 			beyondUnstaged
-				? `Are you sure you want to discard changes in ${pluralize('file', total)}?`
-				: `Are you sure you want to discard unstaged changes in ${pluralize('file', total)}?`,
+				? formatPlural(
+						l10n.t(
+							'{0, plural, one{Are you sure you want to discard changes in {0} file?} other{Are you sure you want to discard changes in {0} files?}}',
+						),
+						[total],
+					)
+				: formatPlural(
+						l10n.t(
+							'{0, plural, one{Are you sure you want to discard unstaged changes in {0} file?} other{Are you sure you want to discard unstaged changes in {0} files?}}',
+						),
+						[total],
+					),
 		];
 		if (untracked > 0) {
 			// Don't promise the Trash — `moveToTrash` hard-deletes on trash-unavailable providers,
 			// and untracked files aren't in Git, so there's no other recovery path. The IRREVERSIBLE
 			// line below is the honest worst case.
-			sections.push(`This will DELETE ${pluralize('untracked file', untracked)}.`);
+			sections.push(
+				formatPlural(
+					l10n.t(
+						'{0, plural, one{This will DELETE {0} untracked file.} other{This will DELETE {0} untracked files.}}',
+					),
+					[untracked],
+				),
+			);
 		}
 		if (stagedAdded > 0) {
 			// Staged-added files aren't in HEAD, so discard is trash-then-unstage with no restore —
@@ -1089,7 +1175,12 @@ export class RepositoryService {
 			// so this is the one genuinely unrecoverable case in the feature. Don't promise the Trash
 			// here either, matching the untracked section above.
 			sections.push(
-				`This will DELETE ${pluralize('staged file', stagedAdded)} added to the index — Git cannot restore ${stagedAdded === 1 ? 'it' : 'them'} because ${stagedAdded === 1 ? "it isn't" : "they aren't"} in HEAD.`,
+				formatPlural(
+					l10n.t(
+						"{0, plural, one{This will DELETE {0} staged file added to the index — Git cannot restore it because it isn't in HEAD.} other{This will DELETE {0} staged files added to the index — Git cannot restore them because they aren't in HEAD.}}",
+					),
+					[stagedAdded],
+				),
 			);
 		}
 		if (mixed > 0) {
@@ -1098,7 +1189,12 @@ export class RepositoryService {
 			// once it's purely staged, the repo-wide path skips it — so any "do X next" is wrong for one
 			// of them. `confirmDiscardChanges` can still say "discard again" because it has one caller.
 			sections.push(
-				`${pluralize('file', mixed)} also ${mixed === 1 ? 'has' : 'have'} staged changes — only ${mixed === 1 ? 'its' : 'their'} unstaged portion will be discarded; the staged changes remain.`,
+				formatPlural(
+					l10n.t(
+						'{0, plural, one{{0} file also has staged changes — only its unstaged portion will be discarded; the staged changes remain.} other{{0} files also have staged changes — only their unstaged portions will be discarded; the staged changes remain.}}',
+					),
+					[mixed],
+				),
 			);
 		}
 		if (staged > 0) {
@@ -1108,7 +1204,12 @@ export class RepositoryService {
 			// the two describe disjoint file sets, and a destructive confirm can't leave the reader
 			// guessing which one a sentence is about.
 			sections.push(
-				`${pluralize('file', staged)} ${staged === 1 ? 'has' : 'have'} ONLY staged changes — ${staged === 1 ? 'it' : 'these'} will be discarded in full, not preserved.`,
+				formatPlural(
+					l10n.t(
+						'{0, plural, one{{0} file has ONLY staged changes — it will be discarded in full, not preserved.} other{{0} files have ONLY staged changes — they will be discarded in full, not preserved.}}',
+					),
+					[staged],
+				),
 			);
 		}
 		if (conflicted > 0) {
@@ -1118,15 +1219,25 @@ export class RepositoryService {
 			// matches the conflict vocabulary used by "Open Current/Incoming Changes" and
 			// `canStageCurrent`; "paused operation" covers rebase, merge, cherry-pick and revert.
 			sections.push(
-				`${pluralize('conflicted file', conflicted)} will be reset to Current and marked resolved — any conflict resolution will be lost, and the paused operation will continue as if ${conflicted === 1 ? 'it was' : 'they were'} resolved.`,
+				formatPlural(
+					l10n.t(
+						'{0, plural, one{{0} conflicted file will be reset to Current and marked resolved — any conflict resolution will be lost, and the paused operation will continue as if it was resolved.} other{{0} conflicted files will be reset to Current and marked resolved — any conflict resolution will be lost, and the paused operation will continue as if they were resolved.}}',
+					),
+					[conflicted],
+				),
 			);
 		}
 		if (skippedMissing > 0) {
 			sections.push(
-				`${pluralize('file', skippedMissing)} selected no longer ${skippedMissing === 1 ? 'has' : 'have'} changes and will be skipped.`,
+				formatPlural(
+					l10n.t(
+						'{0, plural, one{{0} file selected no longer has changes and will be skipped.} other{{0} files selected no longer have changes and will be skipped.}}',
+					),
+					[skippedMissing],
+				),
 			);
 		}
-		sections.push('This is IRREVERSIBLE!\nYour current working set will be FOREVER LOST if you proceed.');
+		sections.push(l10n.t('This is IRREVERSIBLE!\nYour current working set will be FOREVER LOST if you proceed.'));
 
 		// Label switches to the verb form (no count) whenever ANY mixed file is in the batch —
 		// the count form would mis-describe mixed entries as "Unstaged Files" since those get
@@ -1134,10 +1245,13 @@ export class RepositoryService {
 		// composition that includes mixed files. Staged or conflicted files win over both: once the
 		// index is in scope, "Unstaged" no longer describes the operation at all.
 		const discard = beyondUnstaged
-			? 'Discard Changes'
+			? l10n.t('Discard Changes')
 			: mixed > 0
-				? 'Discard Unstaged Changes'
-				: `Discard ${pluralize('Unstaged File', total)}`;
+				? l10n.t('Discard Unstaged Changes')
+				: formatPlural(
+						l10n.t('{0, plural, one{Discard {0} Unstaged File} other{Discard {0} Unstaged Files}}'),
+						[total],
+					);
 		const choice = await window.showWarningMessage(sections.join('\n\n'), { modal: true }, discard);
 		return choice === discard;
 	}
@@ -1153,8 +1267,7 @@ export class RepositoryService {
 			// Some filesystem providers (SSH-remote, dev containers, virtual FS) don't implement
 			// trash. Fall back to a direct delete — the user already accepted the IRREVERSIBLE
 			// warning in confirmDiscardChanges, so losing the recovery path is in policy.
-			const msg = ex instanceof Error ? ex.message : String(ex);
-			if (!msg.includes('via trash because provider does not support')) throw ex;
+			if (!(ex instanceof Error && ex.message.includes('via trash because provider does not support'))) throw ex;
 
 			Logger.warn(`Trash unsupported for ${uri.toString()}; deleting without trash`);
 			await workspace.fs.delete(uri, { useTrash: false });
@@ -1191,6 +1304,121 @@ export class RepositoryService {
 				hasOutput: failure.output != null && failure.output.length > 0,
 			};
 		}
+	}
+
+	/**
+	 * Commits staged changes as a `fixup!`-prefixed message, then immediately relocates that fixup
+	 * commit directly under its target via a headless interactive rebase — folding it in right away
+	 * rather than waiting for a later `--autosquash` pass. Never throws; the rebase step degrades to
+	 * a toast on conflict or failure while still reporting the commit itself as succeeded.
+	 */
+	async commitAndSquashFixup(
+		repoPath: string,
+		message: string,
+		options: { targetSha: string; all?: boolean },
+	): Promise<CommitResult> {
+		const svc = this.container.git.getRepositoryService(repoPath);
+		if (svc.ops?.rebase == null) {
+			return {
+				status: 'failed',
+				reason: 'unknown',
+				summary: l10n.t("Squashing fixups isn't supported in this environment"),
+				hasOutput: false,
+			};
+		}
+
+		let published = false;
+		try {
+			published = await isCommitPushed(repoPath, options.targetSha);
+		} catch {
+			// Ignore — fall back to committing without the published warning.
+		}
+		if (published) {
+			const confirm: MessageItem = { title: l10n.t('Commit & Squash') };
+			const cancel: MessageItem = { title: l10n.t('Cancel'), isCloseAffordance: true };
+			let choice: MessageItem | undefined;
+			try {
+				choice = await window.showWarningMessage(
+					l10n.t('Commit and squash this fixup?'),
+					{
+						modal: true,
+						detail: l10n.t(
+							'The target commit has already been pushed. Squashing the fixup rewrites history and will require a force push.',
+						),
+					},
+					confirm,
+					cancel,
+				);
+			} catch {
+				// An unpresentable confirmation counts as a decline — never rewrite unconfirmed.
+			}
+			if (choice !== confirm) return { status: 'cancelled' };
+		}
+
+		try {
+			await svc.ops.commit(message, { all: options.all, source: { source: 'graph' } satisfies Source });
+		} catch (ex) {
+			const failure = classifyCommitFailure(ex);
+			void presentCommitFailure(failure);
+
+			return {
+				status: 'failed',
+				reason: failure.reason,
+				summary: failure.summary,
+				hasOutput: failure.output != null && failure.output.length > 0,
+			};
+		}
+
+		let resolved;
+		try {
+			resolved = await svc.revision.resolveRevision('HEAD');
+		} catch {
+			// Fall through to the committed-without-squash path below.
+		}
+		if (resolved == null || !isSha(resolved.sha)) {
+			void window.showWarningMessage(
+				l10n.t('The fixup was committed, but GitLens could not locate it to squash automatically.'),
+			);
+
+			return { status: 'committed' };
+		}
+
+		try {
+			const sequenceEditor = getSquashSequenceEditor(this.container);
+			const result = await svc.ops.rebase(
+				`${options.targetSha}^`,
+				{
+					interactive: true,
+					// The editor is a script that rewrites the todo by SHA, so force git to emit a plain,
+					// natural-order todo (no autosquash reordering, no abbreviated `p` commands).
+					programmaticEditor: true,
+					editor: sequenceEditor.editor,
+					autoStash: true,
+					updateRefs: true,
+					source: { source: 'graph' } satisfies Source,
+				},
+				{
+					env: {
+						...sequenceEditor.env,
+						GL_FIXUP_SHA: resolved.sha,
+						GL_FIXUP_TARGET: options.targetSha,
+					},
+				},
+			);
+			if (result?.conflicted) {
+				void window.showWarningMessage(
+					l10n.t(
+						'Fixup stopped because of conflicts. Resolve them to continue, or abort the rebase to cancel.',
+					),
+				);
+			}
+		} catch (ex) {
+			void window.showErrorMessage(
+				l10n.t('Committed the fixup, but squashing it failed: {0}', getPresentableErrorMessage(ex)),
+			);
+		}
+
+		return { status: 'committed' };
 	}
 
 	/**
@@ -1398,7 +1626,7 @@ async function presentCommitFailure(failure: ClassifiedCommitFailure): Promise<v
 	// Self-contained: this runs as a fire-and-forget effect off the commit RPC, so it must never
 	// escape as an unhandled rejection if a dialog/editor API rejects (e.g. the host refuses dialogs).
 	try {
-		const viewOutput = 'View Full Output';
+		const viewOutput = l10n.t('View Full Output');
 		const choice = await window.showErrorMessage(
 			summary,
 			{ modal: true, detail: hasOutput ? buildCommitOutputPreview(output) : undefined },

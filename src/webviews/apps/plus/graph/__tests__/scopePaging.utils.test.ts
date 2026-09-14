@@ -1,5 +1,6 @@
 import * as assert from 'assert';
-import { pickScopePageTarget } from '../utils/scopePaging.utils.js';
+import { emptySetMarker } from '@gitkraken/commit-graph-ui/scope/filtering.js';
+import { countLoadedIncludedRefs, pickScopePageTarget } from '@gitkraken/commit-graph-ui/scope/paging.js';
 
 suite('pickScopePageTarget', () => {
 	test('returns an unloaded, unrequested anchor sha when one exists', () => {
@@ -27,7 +28,7 @@ suite('pickScopePageTarget', () => {
 	});
 
 	test('returns undefined when mergeBase is already in flight', () => {
-		// Dedupe guard — a previous unreachable event already issued GetMoreRowsCommand for the
+		// Dedupe guard — a previous unreachable event already issued a page request for the
 		// mergeBase. Don't re-fire while the response is still in flight.
 		const anchors = new Set(['branchTip']);
 		const loaded = new Set(['branchTip']);
@@ -36,7 +37,7 @@ suite('pickScopePageTarget', () => {
 	});
 
 	test('returns undefined when no anchors are missing and mergeBase is undefined', () => {
-		// Pre-mergeBase-resolution state: scope just got set, ResolveGraphScopeRequest hasn't
+		// Pre-mergeBase-resolution state: scope just got set, GraphScopeService.resolveScope hasn't
 		// returned yet. Library can't have flagged anchors unreachable for the mergeBase path
 		// since u is undefined; nothing useful for us to page.
 		const anchors = new Set(['branchTip']);
@@ -57,5 +58,38 @@ suite('pickScopePageTarget', () => {
 		const loaded = new Set(['a']);
 		const requested = new Set(['b']);
 		assert.strictEqual(pickScopePageTarget(anchors, loaded, requested, undefined), undefined);
+	});
+});
+
+suite('countLoadedIncludedRefs', () => {
+	test('counts a ref as loaded only when its id decorated a row', () => {
+		const refs = { 'refs/heads/main': {}, 'refs/heads/old': {} };
+		const result = countLoadedIncludedRefs(refs, new Set(['refs/heads/main']));
+		assert.deepStrictEqual(result, { loaded: 1, total: 2 });
+	});
+
+	test('ignores the empty-set sentinel so a narrowed-to-nothing filter reports nothing to disclose', () => {
+		// `favorited`/`agents` with no matching branches ship `{ [emptySetMarker]: … }` to mean "include
+		// nothing". Counting it would render a permanent "0 of 1 branches" footer with no way to resolve it.
+		const result = countLoadedIncludedRefs({ [emptySetMarker]: {} }, new Set<string>());
+		assert.deepStrictEqual(result, { loaded: 0, total: 0 });
+	});
+
+	test('counts real refs alongside the sentinel without counting the sentinel itself', () => {
+		const refs = { [emptySetMarker]: {}, 'refs/heads/main': {} };
+		const result = countLoadedIncludedRefs(refs, new Set(['refs/heads/main']));
+		assert.deepStrictEqual(result, { loaded: 1, total: 1 });
+	});
+
+	test('reports zero totals for an undefined or empty ref set', () => {
+		assert.deepStrictEqual(countLoadedIncludedRefs(undefined, new Set(['a'])), { loaded: 0, total: 0 });
+		assert.deepStrictEqual(countLoadedIncludedRefs({}, new Set(['a'])), { loaded: 0, total: 0 });
+	});
+
+	test('reports every ref loaded once all ids are present', () => {
+		// The footer's suppression condition — `loaded >= total` must be reachable, or it never goes away.
+		const refs = { 'refs/heads/main': {}, 'refs/remotes/origin/main': {} };
+		const loadedIds = new Set(['refs/heads/main', 'refs/remotes/origin/main', 'refs/heads/unrelated']);
+		assert.deepStrictEqual(countLoadedIncludedRefs(refs, loadedIds), { loaded: 2, total: 2 });
 	});
 });

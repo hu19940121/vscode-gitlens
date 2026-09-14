@@ -1,4 +1,4 @@
-import { Uri } from 'vscode';
+import { l10n, Uri } from 'vscode';
 import type { GitCommitStats } from '@gitlens/git/models/commit.js';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import type { GitFile } from '@gitlens/git/models/file.js';
@@ -15,7 +15,8 @@ import {
 	getChangedFilesCount,
 } from '@gitlens/git/utils/commit.utils.js';
 import { isUncommitted } from '@gitlens/git/utils/revision.utils.js';
-import { pluralize } from '@gitlens/utils/string.js';
+import { formatPlural } from '@gitlens/utils/plural.js';
+import { encodeHtmlWeak } from '@gitlens/utils/string.js';
 import type { EnrichedAutolink } from '../../../autolinks/models/autolinks.js';
 import { getAvatarUri, getCachedAvatarUri } from '../../../avatars.js';
 import type { CurrentUserNameStyle, GravatarDefaultStyle } from '../../../config.js';
@@ -191,7 +192,19 @@ export function formatCommitStats(
 
 	function formatStat(type: 'added' | 'changed' | 'deleted', value: number) {
 		if (style === 'expanded') {
-			return `${pluralize('file', value)} ${type}`;
+			let text: string;
+			switch (type) {
+				case 'added':
+					text = formatPlural(l10n.t('{0, plural, one{{0} file added} other{{0} files added}}'), [value]);
+					break;
+				case 'changed':
+					text = formatPlural(l10n.t('{0, plural, one{{0} file changed} other{{0} files changed}}'), [value]);
+					break;
+				case 'deleted':
+					text = formatPlural(l10n.t('{0, plural, one{{0} file deleted} other{{0} files deleted}}'), [value]);
+					break;
+			}
+			return options?.color ? encodeHtmlWeak(text) : text;
 		}
 
 		const label = `${type === 'added' ? '+' : type === 'deleted' ? '-' : '~'}${value}`;
@@ -245,10 +258,12 @@ export function formatCommitStats(
 		const lineStats = [];
 
 		if (additions) {
-			const additionsText = pluralize('addition', additions);
+			const additionsText = formatPlural(l10n.t('{0, plural, one{{0} addition} other{{0} additions}}'), [
+				additions,
+			]);
 			if (options?.color) {
 				lineStats.push(
-					/*html*/ `<span style="color:var(--vscode-gitDecoration-addedResourceForeground);">${additionsText}</span>`,
+					/*html*/ `<span style="color:var(--vscode-gitDecoration-addedResourceForeground);">${encodeHtmlWeak(additionsText)}</span>`,
 				);
 			} else {
 				lineStats.push(additionsText);
@@ -256,10 +271,12 @@ export function formatCommitStats(
 		}
 
 		if (deletions) {
-			const deletionsText = pluralize('deletion', deletions);
+			const deletionsText = formatPlural(l10n.t('{0, plural, one{{0} deletion} other{{0} deletions}}'), [
+				deletions,
+			]);
 			if (options?.color) {
 				lineStats.push(
-					/*html*/ `<span style="color:var(--vscode-gitDecoration-deletedResourceForeground);">${deletionsText}</span>`,
+					/*html*/ `<span style="color:var(--vscode-gitDecoration-deletedResourceForeground);">${encodeHtmlWeak(deletionsText)}</span>`,
 				);
 			} else {
 				lineStats.push(deletionsText);

@@ -40,6 +40,7 @@ export type ContextKeys = {
 	'gitlens:gk:organization:ai:providers': OrgAIProviders;
 	'gitlens:gk:organization:drafts:byob': boolean;
 	'gitlens:gk:organization:drafts:enabled': boolean;
+	'gitlens:graph:hasSavedDefaultLayout': boolean;
 	'gitlens:hasVirtualFolders': boolean;
 	'gitlens:launchpad:connected': boolean;
 	/** Indicates that this is the first run of a new install of GitLens */
@@ -87,6 +88,7 @@ export type ContextKeys = {
 	'gitlens:views:scm:grouped:view': GroupableTreeViewTypes;
 	'gitlens:views:scm:grouped:welcome': boolean;
 	'gitlens:vsls': boolean | 'host' | 'guest';
+	'gitlens:welcome:inEditor': boolean;
 	'gitlens:window:annotated': AnnotationStatus | `${AnnotationStatus}:${FileAnnotationType}`;
 	'gitlens:walkthroughSupported': boolean;
 } & Record<`gitlens:action:${string}`, number> &

@@ -7,6 +7,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	renameSync,
 	rmSync,
 	statSync,
 	writeFileSync,
@@ -17,14 +18,70 @@ import type { GitOptimizationId } from '@gitlens/git/providers/maintenance.js';
 import { Git } from '../../../exec/git.js';
 import { findGitPath } from '../../../exec/locator.js';
 import type { TestRepo } from './helpers.js';
-import { addCommit, commitGraphChainDir, createTestRepo, gkConfig, maintenanceOf, setConfig } from './helpers.js';
+import {
+	addCommit,
+	addWorktree,
+	commitGraphChainDir,
+	createTestRepo,
+	gkConfig,
+	maintenanceOf,
+	setConfig,
+} from './helpers.js';
 
 const optimizationIds: readonly GitOptimizationId[] = [
 	'untrackedCache',
 	'fsmonitor',
 	'backgroundMaintenance',
 	'manyFiles',
+	'sparseIndex',
 ];
+
+type TestableMaintenance = {
+	applyOptimization(repoPath: string, optimization: GitOptimizationId, cancellation?: AbortSignal): Promise<boolean>;
+	probeLooseRefs(
+		refsDir: string,
+		readDirectory?: (dir: string) => Promise<{ name: string; isDirectory(): boolean }[]>,
+	): Promise<{ count: number; exact: boolean }>;
+	runSparseCheckoutReapply(repoPath: string, enabled: boolean, cancellation?: AbortSignal): Promise<void>;
+	testUntrackedCacheSupport(repoPath: string, cancellation?: AbortSignal): Promise<boolean>;
+};
+
+function testableMaintenance(repo: TestRepo): TestableMaintenance {
+	// oxlint-disable-next-line no-explicit-any -- deliberate reach into private test seams
+	return maintenanceOf(repo) as any as TestableMaintenance;
+}
+
+function blockNextSparseCheckoutReapply(repo: TestRepo): { started: Promise<void>; release(): void } {
+	const maintenance = testableMaintenance(repo);
+	const original = maintenance.runSparseCheckoutReapply.bind(maintenance);
+	let markStarted!: () => void;
+	let release!: () => void;
+	const started = new Promise<void>(resolve => (markStarted = resolve));
+	const blocked = new Promise<void>(resolve => (release = resolve));
+	maintenance.runSparseCheckoutReapply = async (repoPath, enabled, cancellation) => {
+		maintenance.runSparseCheckoutReapply = original;
+		markStarted();
+		await blocked;
+		await original(repoPath, enabled, cancellation);
+	};
+	return { started: started, release: release };
+}
+
+async function settlesWithin<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
+	let timeout: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timeout = setTimeout(() => reject(new Error(message)), milliseconds);
+			}),
+		]);
+	} finally {
+		if (timeout != null) {
+			clearTimeout(timeout);
+		}
+	}
+}
 
 /** Reads a repo's LOCAL-scope config value (independent of the developer's global/system config). */
 function localConfig(cwd: string, key: string): string | undefined {
@@ -69,7 +126,23 @@ function localConfigAll(cwd: string, key: string): string[] {
 	}
 }
 
-/** Reach into the private ownership-marker lock — the diagnosis, ownership, and release tests need to run
+function rawIndexEntryCount(repoPath: string): number {
+	const header = readFileSync(join(repoPath, '.git', 'index')).subarray(0, 12);
+	assert.strictEqual(header.toString('ascii', 0, 4), 'DIRC');
+	return header.readUInt32BE(8);
+}
+
+/** Packs every currently-unpacked reachable object into a new pack, then removes the redundant loose copies. */
+function packLooseObjects(repoPath: string): void {
+	execFileSync('git', ['pack-objects', '--all', '--unpacked', '.git/objects/pack/pack'], {
+		cwd: repoPath,
+		input: '',
+		stdio: ['pipe', 'pipe', 'pipe'],
+	});
+	execFileSync('git', ['prune-packed'], { cwd: repoPath, stdio: 'pipe' });
+}
+
+/** Reach into the private lock helper — the diagnosis, ownership, and release tests need to run
  *  code INSIDE the critical section (or with shortened timings), which no public entry point exposes. */
 function withMarkerLock<T>(
 	repo: TestRepo,
@@ -82,9 +155,10 @@ function withMarkerLock<T>(
 		writeRecord?: (handle: unknown) => Promise<void>;
 		openLock?: (lockPath: string) => Promise<unknown>;
 	},
+	lockLocation?: { readonly dir: string; readonly contention?: 'sparseIndex'; readonly lock: string },
 ): Promise<T> {
 	// oxlint-disable-next-line no-explicit-any -- deliberate reach into the private test seam
-	return (maintenanceOf(repo) as any).withMarkerLock(repoPath, fn, timings) as Promise<T>;
+	return (maintenanceOf(repo) as any).withMarkerLock(repoPath, fn, timings, lockLocation) as Promise<T>;
 }
 
 suite('MaintenanceSubProvider', () => {
@@ -105,8 +179,24 @@ suite('MaintenanceSubProvider', () => {
 		assert.strictEqual(snapshot.packCount, 0, 'no packs yet');
 		assert.strictEqual(snapshot.packBytes, 0, 'no pack bytes yet');
 		assert.strictEqual(snapshot.multiPackIndex, false, 'no multi-pack-index yet');
+		assert.strictEqual(typeof snapshot.multiPackIndexEnabled, 'boolean');
+		assert.strictEqual(typeof snapshot.incrementalRepackAutoThreshold, 'number');
+		assert.ok(
+			snapshot.packsOutsideMultiPackIndex === 0 || snapshot.packsOutsideMultiPackIndex === undefined,
+			'an enabled MIDX reports zero uncovered packs; an inherited opt-out reports unknown',
+		);
 		assert.strictEqual(snapshot.looseObjects.dirsSampled, 16, 'samples 16 fanout dirs');
 		assert.ok(snapshot.indexBytes > 0, 'index exists after the initial commit');
+		assert.deepStrictEqual(snapshot.repository, {
+			shallow: false,
+			partial: false,
+			sparseCheckout: false,
+			sparseCheckoutCone: false,
+			sparseIndex: false,
+			splitIndex: false,
+			refFormat: 'files',
+		});
+		assert.deepStrictEqual(snapshot.looseRefs, { count: 1, exact: true }, 'the main branch starts loose');
 
 		// The config levers read MERGED config (they can be inherited from the developer's global/system
 		// config), so only assert they resolve to booleans — not a specific value.
@@ -122,8 +212,10 @@ suite('MaintenanceSubProvider', () => {
 			fsmonitor: false,
 			manyFiles: false,
 			backgroundMaintenance: false,
+			sparseIndex: false,
 		});
 		assert.strictEqual(typeof snapshot.supportsMaintenanceRun, 'boolean');
+		assert.strictEqual(typeof snapshot.supportsPackRefsMaintenance, 'boolean');
 	});
 
 	test('getHealthSnapshot reads a BAREWORD (valueless) boolean entry as configured and enabled', async () => {
@@ -220,6 +312,133 @@ suite('MaintenanceSubProvider', () => {
 			assert.strictEqual(snapshot.indexEntryCount, trackedFiles, 'exact count matches `git ls-files`');
 		} finally {
 			countRepo.cleanup();
+		}
+	});
+
+	test('getHealthSnapshot labels a sparse-index header as a working-set count', async function () {
+		const sparseRepo = createTestRepo();
+		try {
+			for (let area = 0; area < 4; area++) {
+				for (let file = 0; file < 4; file++) {
+					addCommit(
+						sparseRepo.path,
+						`area-${area}/file-${file}.txt`,
+						`area ${area} file ${file}`,
+						`add area ${area} file ${file}`,
+					);
+				}
+			}
+			try {
+				execFileSync('git', ['sparse-checkout', 'init', '--cone', '--sparse-index'], {
+					cwd: sparseRepo.path,
+					stdio: 'pipe',
+				});
+			} catch {
+				this.skip();
+			}
+			execFileSync('git', ['sparse-checkout', 'set', 'area-0'], { cwd: sparseRepo.path, stdio: 'pipe' });
+
+			const total = execFileSync('git', ['ls-tree', '-r', '--name-only', 'HEAD'], {
+				cwd: sparseRepo.path,
+				encoding: 'utf8',
+			})
+				.split('\n')
+				.filter(Boolean).length;
+			const snapshot = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+
+			assert.strictEqual(snapshot.indexEntryCountType, 'sparse');
+			assert.ok(snapshot.indexEntryCount != null && snapshot.indexEntryCount < total);
+			assert.strictEqual(snapshot.repository.sparseCheckout, true);
+			assert.strictEqual(snapshot.repository.sparseCheckoutCone, true);
+			assert.strictEqual(snapshot.repository.sparseIndex, true);
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('getHealthSnapshot finds a linked worktree split index in its per-worktree git dir', async () => {
+		const splitRepo = createTestRepo();
+		const worktreePath = mkdtempSync(join(tmpdir(), 'gitlens-split-worktree-'));
+		try {
+			execFileSync('git', ['branch', 'linked-split'], { cwd: splitRepo.path, stdio: 'pipe' });
+			addWorktree(splitRepo.path, worktreePath, 'linked-split');
+			execFileSync('git', ['update-index', '--split-index'], { cwd: worktreePath, stdio: 'pipe' });
+
+			const snapshot = await maintenanceOf(splitRepo).getHealthSnapshot(worktreePath);
+			assert.strictEqual(snapshot.indexEntryCountType, 'split');
+			assert.strictEqual(snapshot.indexEntryCount, undefined);
+			assert.strictEqual(snapshot.repository.splitIndex, true);
+		} finally {
+			execFileSync('git', ['worktree', 'remove', '--force', worktreePath], {
+				cwd: splitRepo.path,
+				stdio: 'pipe',
+			});
+			rmSync(worktreePath, { recursive: true, force: true });
+			splitRepo.cleanup();
+		}
+	});
+
+	test('getHealthSnapshot marks a depth-limited clone as shallow', async () => {
+		const source = createTestRepo();
+		const cloneRoot = mkdtempSync(join(tmpdir(), 'gitlens-shallow-clone-'));
+		const shallowPath = join(cloneRoot, 'shallow');
+		try {
+			addCommit(source.path, 'second.txt', 'second', 'second');
+			execFileSync('git', ['clone', '--depth=1', `file://${source.path}`, shallowPath], { stdio: 'pipe' });
+
+			const snapshot = await maintenanceOf(repo).getHealthSnapshot(shallowPath);
+			assert.strictEqual(snapshot.repository.shallow, true);
+		} finally {
+			source.cleanup();
+			rmSync(cloneRoot, { recursive: true, force: true });
+		}
+	});
+
+	test('getHealthSnapshot ignores the mutable-layer header of an actual split index', async () => {
+		const splitRepo = createTestRepo();
+		try {
+			addCommit(splitRepo.path, 'a.txt', 'a', 'add a');
+			addCommit(splitRepo.path, 'b.txt', 'b', 'add b');
+			execFileSync('git', ['update-index', '--split-index'], { cwd: splitRepo.path, stdio: 'pipe' });
+			writeFileSync(join(splitRepo.path, 'c.txt'), 'c');
+			execFileSync('git', ['add', 'c.txt'], { cwd: splitRepo.path, stdio: 'pipe' });
+
+			assert.strictEqual(localConfig(splitRepo.path, 'core.splitIndex'), undefined, 'config hint is unset');
+			assert.ok(rawIndexEntryCount(splitRepo.path) > 0, 'raw mutable-layer header has an entry count');
+			const mutableIndexBytes = readFileSync(join(splitRepo.path, '.git', 'index')).byteLength;
+			const snapshot = await maintenanceOf(splitRepo).getHealthSnapshot(splitRepo.path);
+			assert.strictEqual(snapshot.indexEntryCountType, 'split');
+			assert.strictEqual(snapshot.indexEntryCount, undefined, 'raw split header is never trusted');
+			assert.ok(snapshot.indexBytes > mutableIndexBytes, 'the fallback proxy includes the shared base index');
+		} finally {
+			splitRepo.cleanup();
+		}
+	});
+
+	test('getHealthSnapshot does not claim an exact path count during a conflicted merge', async () => {
+		const conflictRepo = createTestRepo();
+		try {
+			addCommit(conflictRepo.path, 'conflict.txt', 'base', 'add conflict');
+			execFileSync('git', ['checkout', '-b', 'side'], { cwd: conflictRepo.path, stdio: 'pipe' });
+			addCommit(conflictRepo.path, 'conflict.txt', 'side', 'side change');
+			execFileSync('git', ['checkout', 'main'], { cwd: conflictRepo.path, stdio: 'pipe' });
+			addCommit(conflictRepo.path, 'conflict.txt', 'main', 'main change');
+			assert.throws(() =>
+				execFileSync('git', ['merge', '--no-ff', '--no-edit', 'side'], {
+					cwd: conflictRepo.path,
+					stdio: 'pipe',
+				}),
+			);
+
+			assert.ok(
+				execFileSync('git', ['ls-files', '--unmerged'], { cwd: conflictRepo.path, encoding: 'utf8' }).trim(),
+				'fixture contains unmerged index stages',
+			);
+			const snapshot = await maintenanceOf(conflictRepo).getHealthSnapshot(conflictRepo.path);
+			assert.strictEqual(snapshot.indexEntryCountType, 'conflicted');
+			assert.strictEqual(snapshot.indexEntryCount, undefined);
+		} finally {
+			conflictRepo.cleanup();
 		}
 	});
 
@@ -328,6 +547,458 @@ suite('MaintenanceSubProvider', () => {
 		await maintenanceOf(repo).revertOptimization(repo.path, 'untrackedCache');
 		assert.strictEqual(localConfig(repo.path, 'core.untrackedCache'), undefined, 'local config unset after revert');
 		assert.strictEqual(gkConfig(repo.path, 'gk.applied.untrackedCache'), undefined, 'marker cleared after revert');
+	});
+
+	test('sparseIndex converts and restores one cone-mode sparse worktree', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			addCommit(sparseRepo.path, 'area-b/b.txt', 'b', 'add area b');
+			execFileSync('git', ['sparse-checkout', 'init', '--cone', '--no-sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', 'area-a'], { cwd: sparseRepo.path, stdio: 'pipe' });
+
+			const before = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(before.repository.sparseIndex, false);
+			assert.strictEqual(before.applied.sparseIndex, false);
+
+			const applied = await maintenanceOf(sparseRepo).applyOptimization(sparseRepo.path, 'sparseIndex');
+			assert.strictEqual(applied, true);
+			const enabled = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(enabled.repository.sparseIndex, true);
+			assert.strictEqual(enabled.indexEntryCountType, 'sparse');
+			assert.strictEqual(enabled.applied.sparseIndex, true);
+
+			await maintenanceOf(sparseRepo).revertOptimization(sparseRepo.path, 'sparseIndex');
+			const restored = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(restored.repository.sparseIndex, false);
+			assert.strictEqual(restored.indexEntryCountType, 'full');
+			assert.strictEqual(restored.applied.sparseIndex, false);
+			assert.strictEqual(
+				execFileSync('git', ['sparse-checkout', 'list'], { cwd: sparseRepo.path, encoding: 'utf8' }).trim(),
+				'area-a',
+				'undo preserves the sparse-checkout definition',
+			);
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('sparseIndex does not hold the shared marker lock while rewriting the index', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			execFileSync('git', ['sparse-checkout', 'init', '--cone', '--no-sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', 'area-a'], { cwd: sparseRepo.path, stdio: 'pipe' });
+
+			const blocker = blockNextSparseCheckoutReapply(sparseRepo);
+			const applying = maintenanceOf(sparseRepo).applyOptimization(sparseRepo.path, 'sparseIndex');
+			await blocker.started;
+			try {
+				await withMarkerLock(sparseRepo, sparseRepo.path, async () => {}, { retryMs: 0, maxAttempts: 0 });
+				await assert.rejects(
+					maintenanceOf(sparseRepo).applyOptimization(sparseRepo.path, 'sparseIndex'),
+					(ex: unknown) => {
+						assert.ok(ex instanceof Error);
+						assert.match(ex.message, /sparse-index update is still in progress/i);
+						assert.doesNotMatch(
+							ex.message,
+							/delete/i,
+							'a live sparse operation never invites lock deletion',
+						);
+						return true;
+					},
+				);
+			} finally {
+				blocker.release();
+				await applying;
+			}
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('sparseIndex snapshots stay responsive and report config changes made by in-flight operations', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			execFileSync('git', ['sparse-checkout', 'init', '--cone', '--no-sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', 'area-a'], { cwd: sparseRepo.path, stdio: 'pipe' });
+
+			const applyBlocker = blockNextSparseCheckoutReapply(sparseRepo);
+			const applying = maintenanceOf(sparseRepo).applyOptimization(sparseRepo.path, 'sparseIndex');
+			await applyBlocker.started;
+			execFileSync('git', ['config', '--worktree', 'index.sparse', 'true'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			const applyingSnapshotPromise = maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			try {
+				const applyingSnapshot = await settlesWithin(
+					applyingSnapshotPromise,
+					750,
+					'health snapshot waited for the sparse-index apply',
+				);
+				assert.strictEqual(applyingSnapshot.repository.sparseIndex, true, 'reports the current config value');
+				assert.strictEqual(applyingSnapshot.applied.sparseIndex, false, 'does not claim an in-flight apply');
+			} finally {
+				applyBlocker.release();
+				await applying;
+				await applyingSnapshotPromise;
+			}
+
+			const revertBlocker = blockNextSparseCheckoutReapply(sparseRepo);
+			const reverting = maintenanceOf(sparseRepo).revertOptimization(sparseRepo.path, 'sparseIndex');
+			await revertBlocker.started;
+			execFileSync('git', ['config', '--worktree', 'index.sparse', 'false'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			const revertingSnapshotPromise = maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			try {
+				const revertingSnapshot = await settlesWithin(
+					revertingSnapshotPromise,
+					750,
+					'health snapshot waited for the sparse-index undo',
+				);
+				assert.strictEqual(revertingSnapshot.repository.sparseIndex, false, 'reports the current config value');
+				assert.strictEqual(revertingSnapshot.applied.sparseIndex, false, 'does not claim an in-flight undo');
+			} finally {
+				revertBlocker.release();
+				await reverting;
+				await revertingSnapshotPromise;
+			}
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('sparseIndex never claims or reverts a sparse index enabled outside GitLens', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			execFileSync('git', ['sparse-checkout', 'init', '--cone', '--sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', 'area-a'], { cwd: sparseRepo.path, stdio: 'pipe' });
+
+			assert.strictEqual(
+				await maintenanceOf(sparseRepo).applyOptimization(sparseRepo.path, 'sparseIndex'),
+				false,
+			);
+			await maintenanceOf(sparseRepo).revertOptimization(sparseRepo.path, 'sparseIndex');
+			const snapshot = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(snapshot.repository.sparseIndex, true);
+			assert.strictEqual(snapshot.applied.sparseIndex, false);
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('sparseIndex refuses a non-cone sparse checkout', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			execFileSync('git', ['sparse-checkout', 'init', '--no-cone', '--no-sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', '--no-cone', 'area-a/'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+
+			assert.strictEqual(
+				await maintenanceOf(sparseRepo).applyOptimization(sparseRepo.path, 'sparseIndex'),
+				false,
+			);
+			const snapshot = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(snapshot.repository.sparseIndex, false);
+			assert.strictEqual(snapshot.applied.sparseIndex, false);
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('sparseIndex reconciles an interrupted apply into worktree ownership', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			execFileSync('git', ['sparse-checkout', 'init', '--cone', '--no-sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', 'area-a'], { cwd: sparseRepo.path, stdio: 'pipe' });
+
+			const markerDir = join(sparseRepo.path, '.git', 'gk');
+			mkdirSync(markerDir, { recursive: true });
+			writeFileSync(join(markerDir, 'sparse-index.pending'), '');
+			execFileSync('git', ['sparse-checkout', 'reapply', '--sparse-index'], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+
+			const snapshot = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(snapshot.repository.sparseIndex, true);
+			assert.strictEqual(snapshot.applied.sparseIndex, true);
+			assert.strictEqual(existsSync(join(markerDir, 'sparse-index.pending')), false);
+			assert.strictEqual(existsSync(join(markerDir, 'sparse-index.applied')), true);
+
+			await maintenanceOf(sparseRepo).revertOptimization(sparseRepo.path, 'sparseIndex');
+		} finally {
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('sparseIndex ownership is scoped to one linked worktree', async function () {
+		if (!(await Promise.resolve(repo.provider.supports('git:sparse-index')))) {
+			this.skip();
+		}
+
+		const sparseRepo = createTestRepo();
+		const worktreePath = mkdtempSync(join(tmpdir(), 'gitlens-sparse-worktree-'));
+		try {
+			addCommit(sparseRepo.path, 'area-a/a.txt', 'a', 'add area a');
+			addCommit(sparseRepo.path, 'area-b/b.txt', 'b', 'add area b');
+			execFileSync('git', ['branch', 'linked-sparse'], { cwd: sparseRepo.path, stdio: 'pipe' });
+			addWorktree(sparseRepo.path, worktreePath, 'linked-sparse');
+			execFileSync('git', ['sparse-checkout', 'init', '--cone', '--no-sparse-index'], {
+				cwd: worktreePath,
+				stdio: 'pipe',
+			});
+			execFileSync('git', ['sparse-checkout', 'set', 'area-a'], { cwd: worktreePath, stdio: 'pipe' });
+
+			assert.strictEqual(await maintenanceOf(sparseRepo).applyOptimization(worktreePath, 'sparseIndex'), true);
+			const linked = await maintenanceOf(sparseRepo).getHealthSnapshot(worktreePath);
+			const main = await maintenanceOf(sparseRepo).getHealthSnapshot(sparseRepo.path);
+			assert.strictEqual(linked.repository.sparseIndex, true);
+			assert.strictEqual(linked.applied.sparseIndex, true);
+			assert.strictEqual(main.repository.sparseIndex, false);
+			assert.strictEqual(main.applied.sparseIndex, false);
+
+			await maintenanceOf(sparseRepo).revertOptimization(worktreePath, 'sparseIndex');
+		} finally {
+			execFileSync('git', ['worktree', 'remove', '--force', worktreePath], {
+				cwd: sparseRepo.path,
+				stdio: 'pipe',
+			});
+			rmSync(worktreePath, { recursive: true, force: true });
+			sparseRepo.cleanup();
+		}
+	});
+
+	test('a failed config write does not leave an ownership marker', async function () {
+		const supported = await Promise.resolve(repo.provider.supports('git:untrackedCache'));
+		if (!supported) {
+			this.skip();
+		}
+
+		const lockRepo = createTestRepo();
+		const configLock = join(lockRepo.path, '.git', 'config.lock');
+		try {
+			writeFileSync(configLock, 'held');
+			await assert.rejects(maintenanceOf(lockRepo).applyOptimization(lockRepo.path, 'untrackedCache'));
+
+			assert.strictEqual(localConfig(lockRepo.path, 'core.untrackedCache'), undefined, 'config was not changed');
+			assert.strictEqual(
+				gkConfig(lockRepo.path, 'gk.applied.untrackedCache'),
+				undefined,
+				'a failed config write cannot claim ownership',
+			);
+			assert.strictEqual(
+				gkConfig(lockRepo.path, 'gk.pending.untrackedCache'),
+				undefined,
+				'a failed config write cleans up its write-ahead record',
+			);
+		} finally {
+			rmSync(configLock, { force: true });
+			lockRepo.cleanup();
+		}
+	});
+
+	test('a probe reconciles an interrupted config write into recoverable ownership', async () => {
+		const interruptedRepo = createTestRepo();
+		try {
+			await interruptedRepo.provider.config.setGkConfig(
+				interruptedRepo.path,
+				'gk.pending.untrackedCache',
+				JSON.stringify({ prior: 'unset', value: 'true' }),
+			);
+			setConfig(interruptedRepo.path, 'core.untrackedCache', 'true');
+
+			const snapshot = await maintenanceOf(interruptedRepo).getHealthSnapshot(interruptedRepo.path);
+			assert.strictEqual(snapshot.applied.untrackedCache, true);
+			assert.strictEqual(gkConfig(interruptedRepo.path, 'gk.applied.untrackedCache'), 'unset');
+			assert.strictEqual(gkConfig(interruptedRepo.path, 'gk.pending.untrackedCache'), undefined);
+
+			await maintenanceOf(interruptedRepo).revertOptimization(interruptedRepo.path, 'untrackedCache');
+			assert.strictEqual(localConfig(interruptedRepo.path, 'core.untrackedCache'), undefined);
+		} finally {
+			interruptedRepo.cleanup();
+		}
+	});
+
+	test('a probe drops an interrupted record when its config write never landed', async () => {
+		const interruptedRepo = createTestRepo();
+		try {
+			await interruptedRepo.provider.config.setGkConfig(
+				interruptedRepo.path,
+				'gk.pending.untrackedCache',
+				JSON.stringify({ prior: 'unset', value: 'true' }),
+			);
+
+			const snapshot = await maintenanceOf(interruptedRepo).getHealthSnapshot(interruptedRepo.path);
+			assert.strictEqual(snapshot.applied.untrackedCache, false);
+			assert.strictEqual(localConfig(interruptedRepo.path, 'core.untrackedCache'), undefined);
+			assert.strictEqual(gkConfig(interruptedRepo.path, 'gk.applied.untrackedCache'), undefined);
+			assert.strictEqual(gkConfig(interruptedRepo.path, 'gk.pending.untrackedCache'), undefined);
+		} finally {
+			interruptedRepo.cleanup();
+		}
+	});
+
+	test('a probe drops a malformed pending record rather than wedging the repo forever', async () => {
+		const malformedRepo = createTestRepo();
+		try {
+			await malformedRepo.provider.config.setGkConfig(
+				malformedRepo.path,
+				'gk.pending.untrackedCache',
+				'not-json',
+			);
+			setConfig(malformedRepo.path, 'core.untrackedCache', 'true');
+
+			const snapshot = await maintenanceOf(malformedRepo).getHealthSnapshot(malformedRepo.path);
+			assert.strictEqual(snapshot.applied.untrackedCache, false);
+			assert.strictEqual(gkConfig(malformedRepo.path, 'gk.applied.untrackedCache'), undefined);
+			assert.strictEqual(gkConfig(malformedRepo.path, 'gk.pending.untrackedCache'), undefined);
+		} finally {
+			malformedRepo.cleanup();
+		}
+	});
+
+	test('a probe drops a pending record whose target does not match the lever', async () => {
+		const malformedRepo = createTestRepo();
+		try {
+			await malformedRepo.provider.config.setGkConfig(
+				malformedRepo.path,
+				'gk.pending.untrackedCache',
+				JSON.stringify({ prior: 'unset', value: 'false' }),
+			);
+			setConfig(malformedRepo.path, 'core.untrackedCache', 'false');
+
+			const snapshot = await maintenanceOf(malformedRepo).getHealthSnapshot(malformedRepo.path);
+			assert.strictEqual(snapshot.applied.untrackedCache, false);
+			assert.strictEqual(localConfig(malformedRepo.path, 'core.untrackedCache'), 'false');
+			assert.strictEqual(gkConfig(malformedRepo.path, 'gk.applied.untrackedCache'), undefined);
+			assert.strictEqual(gkConfig(malformedRepo.path, 'gk.pending.untrackedCache'), undefined);
+		} finally {
+			malformedRepo.cleanup();
+		}
+	});
+
+	test('manyFiles refuses an unsafe untracked cache before changing config', async function () {
+		const supported = await Promise.resolve(repo.provider.supports('git:manyFiles'));
+		if (!supported) {
+			this.skip();
+		}
+
+		const unsafeRepo = createTestRepo();
+		try {
+			const maintenance = maintenanceOf(unsafeRepo) as unknown as TestableMaintenance;
+			maintenance.testUntrackedCacheSupport = () => Promise.resolve(false);
+
+			const applied = await maintenance.applyOptimization(unsafeRepo.path, 'manyFiles');
+			assert.strictEqual(applied, false);
+			assert.strictEqual(localConfig(unsafeRepo.path, 'feature.manyFiles'), undefined);
+			assert.strictEqual(localConfig(unsafeRepo.path, 'index.skipHash'), undefined);
+			assert.strictEqual(gkConfig(unsafeRepo.path, 'gk.applied.manyFiles'), undefined);
+			assert.strictEqual(gkConfig(unsafeRepo.path, 'gk.applied.skipHash'), undefined);
+			assert.strictEqual(gkConfig(unsafeRepo.path, 'gk.untrackedCacheNotApplicable'), 'true');
+
+			// The marker recorded above must short-circuit BEFORE the probe on the next attempt — a rejecting
+			// stub proves the probe never runs again.
+			maintenance.testUntrackedCacheSupport = () => Promise.reject(new Error('probe must not run again'));
+			const reapplied = await maintenance.applyOptimization(unsafeRepo.path, 'manyFiles');
+			assert.strictEqual(reapplied, false);
+		} finally {
+			unsafeRepo.cleanup();
+		}
+	});
+
+	test('manyFiles preserves an explicit untracked-cache choice without probing the filesystem', async function () {
+		const supported = await Promise.resolve(repo.provider.supports('git:manyFiles'));
+		if (!supported) {
+			this.skip();
+		}
+
+		const configuredRepo = createTestRepo();
+		try {
+			setConfig(configuredRepo.path, 'core.untrackedCache', 'false');
+			const maintenance = maintenanceOf(configuredRepo) as unknown as TestableMaintenance;
+			maintenance.testUntrackedCacheSupport = () => Promise.reject(new Error('probe must not run'));
+
+			const applied = await maintenance.applyOptimization(configuredRepo.path, 'manyFiles');
+			assert.strictEqual(applied, true);
+			assert.strictEqual(localConfig(configuredRepo.path, 'core.untrackedCache'), 'false');
+			assert.strictEqual(localConfig(configuredRepo.path, 'feature.manyFiles'), 'true');
+		} finally {
+			configuredRepo.cleanup();
+		}
+	});
+
+	test('manyFiles does not claim a user-enabled local setting or strand its skipHash sub-lever', async function () {
+		const supported = await Promise.resolve(repo.provider.supports('git:manyFiles'));
+		if (!supported) {
+			this.skip();
+		}
+
+		const configuredRepo = createTestRepo();
+		try {
+			setConfig(configuredRepo.path, 'feature.manyFiles', 'true');
+			setConfig(configuredRepo.path, 'core.untrackedCache', 'false');
+
+			const applied = await maintenanceOf(configuredRepo).applyOptimization(configuredRepo.path, 'manyFiles');
+			assert.strictEqual(applied, false);
+			assert.strictEqual(localConfig(configuredRepo.path, 'feature.manyFiles'), 'true');
+			assert.strictEqual(localConfig(configuredRepo.path, 'index.skipHash'), undefined);
+			assert.strictEqual(gkConfig(configuredRepo.path, 'gk.applied.manyFiles'), undefined);
+			assert.strictEqual(gkConfig(configuredRepo.path, 'gk.applied.skipHash'), undefined);
+		} finally {
+			configuredRepo.cleanup();
+		}
 	});
 
 	test('revert restores a PRE-EXISTING local value instead of unsetting it (never inverts)', async function () {
@@ -875,6 +1546,58 @@ suite('MaintenanceSubProvider', () => {
 		}
 	});
 
+	test('sparse lock contention gives wait-only guidance only for a confirmed live owner', async () => {
+		const lockRepo = createTestRepo();
+		try {
+			const gkDir = join(lockRepo.path, '.git', 'gk');
+			mkdirSync(gkDir, { recursive: true });
+			const lockPath = join(gkDir, 'sparse-index.lock');
+			const contents = JSON.stringify({ host: hostname(), pid: 424242, ownerId: 'sparse-owner' });
+			writeFileSync(lockPath, contents);
+			const lockLocation = { dir: gkDir, contention: 'sparseIndex' as const, lock: lockPath };
+
+			for (const verdict of ['alive', 'dead', 'unverifiable'] as const) {
+				let ran = false;
+				await assert.rejects(
+					() =>
+						withMarkerLock(
+							lockRepo,
+							lockRepo.path,
+							async () => {
+								ran = true;
+							},
+							{ retryMs: 0, maxAttempts: 0, probeOwner: () => verdict },
+							lockLocation,
+						),
+					(ex: unknown) => {
+						const message = (ex as Error).message;
+						if (verdict === 'alive') {
+							assert.match(message, /sparse-index update is still in progress/i);
+							assert.doesNotMatch(message, /delete/i);
+						} else {
+							assert.match(
+								message,
+								verdict === 'dead'
+									? /previous VS Code window appears to have crashed/i
+									: /could not verify whether another window is still updating the sparse index/i,
+							);
+							assert.match(message, /delete/i);
+							assert.ok(message.includes(lockPath), `${verdict} error names the lock path`);
+						}
+
+						return true;
+					},
+				);
+
+				assert.strictEqual(ran, false, `${verdict} contention never enters the critical section`);
+				assert.strictEqual(existsSync(lockPath), true, `${verdict} contention never removes the lock`);
+				assert.strictEqual(readFileSync(lockPath, 'utf8'), contents, `${verdict} lock remains untouched`);
+			}
+		} finally {
+			lockRepo.cleanup();
+		}
+	});
+
 	test('a lock whose owner probes neither DEAD nor confirmed alive (e.g. a real EPERM) is never stolen — it fails loudly instead', async () => {
 		const lockRepo = createTestRepo();
 		try {
@@ -1118,8 +1841,186 @@ suite('MaintenanceSubProvider', () => {
 		}
 	});
 
+	test('snapshot counts only packs outside the MIDX and automatic repack honors Git config', async () => {
+		const midxRepo = createTestRepo();
+		try {
+			setConfig(midxRepo.path, 'core.multiPackIndex', 'true');
+			packLooseObjects(midxRepo.path);
+			addCommit(midxRepo.path, 'second.txt', 'second', 'second');
+			packLooseObjects(midxRepo.path);
+			execFileSync('git', ['multi-pack-index', 'write'], { cwd: midxRepo.path, stdio: 'pipe' });
+
+			const covered = await maintenanceOf(midxRepo).getHealthSnapshot(midxRepo.path);
+			assert.strictEqual(covered.multiPackIndex, true);
+			assert.ok(covered.packCount >= 2, 'fixture starts with multiple packs');
+			assert.strictEqual(covered.packsOutsideMultiPackIndex, 0, 'every current pack is represented');
+
+			addCommit(midxRepo.path, 'third.txt', 'third', 'third');
+			packLooseObjects(midxRepo.path);
+			const uncovered = await maintenanceOf(midxRepo).getHealthSnapshot(midxRepo.path);
+			assert.strictEqual(uncovered.packsOutsideMultiPackIndex, 1, 'the newly-created pack is not in the MIDX');
+
+			setConfig(midxRepo.path, 'maintenance.incremental-repack.auto', '2');
+			const skipped = await maintenanceOf(midxRepo).runMaintenanceTask(midxRepo.path, 'incremental-repack', {
+				auto: true,
+			});
+			assert.strictEqual(skipped, true, 'the supported auto task was invoked');
+			assert.strictEqual(
+				(await maintenanceOf(midxRepo).getHealthSnapshot(midxRepo.path)).packsOutsideMultiPackIndex,
+				1,
+				'Git leaves the MIDX unchanged below its configured auto threshold',
+			);
+
+			setConfig(midxRepo.path, 'maintenance.incremental-repack.auto', '1');
+			await maintenanceOf(midxRepo).runMaintenanceTask(midxRepo.path, 'incremental-repack', { auto: true });
+			assert.strictEqual(
+				(await maintenanceOf(midxRepo).getHealthSnapshot(midxRepo.path)).packsOutsideMultiPackIndex,
+				0,
+				'Git updates the MIDX once its auto condition is met',
+			);
+		} finally {
+			midxRepo.cleanup();
+		}
+	});
+
+	test('snapshot reads packs represented by an incremental MIDX chain', async () => {
+		const midxRepo = createTestRepo();
+		try {
+			setConfig(midxRepo.path, 'core.multiPackIndex', 'true');
+			packLooseObjects(midxRepo.path);
+			addCommit(midxRepo.path, 'second.txt', 'second', 'second');
+			packLooseObjects(midxRepo.path);
+			execFileSync('git', ['multi-pack-index', 'write'], { cwd: midxRepo.path, stdio: 'pipe' });
+
+			const packDir = join(midxRepo.path, '.git', 'objects', 'pack');
+			const classicPath = join(packDir, 'multi-pack-index');
+			const classic = readFileSync(classicPath);
+			const objectFormat = execFileSync('git', ['rev-parse', '--show-object-format'], {
+				cwd: midxRepo.path,
+				encoding: 'utf8',
+			}).trim();
+			const hashBytes = objectFormat === 'sha256' ? 32 : 20;
+			const hash = classic.subarray(classic.length - hashBytes).toString('hex');
+			const chainDir = join(packDir, 'multi-pack-index.d');
+			mkdirSync(chainDir);
+			renameSync(classicPath, join(chainDir, `multi-pack-index-${hash}.midx`));
+			writeFileSync(join(chainDir, 'multi-pack-index-chain'), `${hash}\n`);
+
+			const snapshot = await maintenanceOf(midxRepo).getHealthSnapshot(midxRepo.path);
+			assert.strictEqual(snapshot.multiPackIndex, true);
+			assert.strictEqual(snapshot.packsOutsideMultiPackIndex, 0);
+		} finally {
+			midxRepo.cleanup();
+		}
+	});
+
+	test('incremental repack honors an explicit core.multiPackIndex opt-out', async () => {
+		const midxRepo = createTestRepo();
+		try {
+			setConfig(midxRepo.path, 'core.multiPackIndex', 'false');
+			packLooseObjects(midxRepo.path);
+
+			const snapshot = await maintenanceOf(midxRepo).getHealthSnapshot(midxRepo.path);
+			assert.strictEqual(snapshot.multiPackIndexEnabled, false);
+			assert.strictEqual(snapshot.packsOutsideMultiPackIndex, undefined);
+			assert.strictEqual(
+				await maintenanceOf(midxRepo).runMaintenanceTask(midxRepo.path, 'incremental-repack'),
+				false,
+				'an explicit task does not claim to run against the opt-out',
+			);
+			assert.strictEqual(
+				await maintenanceOf(midxRepo).runMaintenanceTask(midxRepo.path, 'incremental-repack', { auto: true }),
+				false,
+				'an automatic task also honors the opt-out',
+			);
+		} finally {
+			midxRepo.cleanup();
+		}
+	});
+
+	test('runMaintenanceTask(pack-refs) packs a ref-heavy files backend', async function () {
+		const supported = await Promise.resolve(repo.provider.supports('git:maintenance:pack-refs'));
+		if (!supported) {
+			this.skip();
+		}
+
+		const refsRepo = createTestRepo();
+		try {
+			const looseRefCount = 256;
+			const oid = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: refsRepo.path, encoding: 'utf8' }).trim();
+			for (let i = 0; i < looseRefCount; i++) {
+				writeFileSync(join(refsRepo.path, '.git', 'refs', 'heads', `health-${String(i)}`), `${oid}\n`);
+			}
+			assert.strictEqual(
+				readdirSync(join(refsRepo.path, '.git', 'refs', 'heads')).length,
+				looseRefCount + 1,
+				'fixture created all loose refs',
+			);
+
+			const before = await maintenanceOf(refsRepo).getHealthSnapshot(refsRepo.path);
+			assert.ok(
+				before.looseRefs.count >= looseRefCount,
+				`fixture crosses the bounded ref threshold (reported ${String(before.looseRefs.count)})`,
+			);
+
+			const ran = await maintenanceOf(refsRepo).runMaintenanceTask(refsRepo.path, 'pack-refs');
+			assert.strictEqual(ran, true);
+
+			const after = await maintenanceOf(refsRepo).getHealthSnapshot(refsRepo.path);
+			assert.deepStrictEqual(after.looseRefs, { count: 0, exact: true });
+			assert.strictEqual(existsSync(join(refsRepo.path, '.git', 'packed-refs')), true);
+		} finally {
+			refsRepo.cleanup();
+		}
+	});
+
+	test('loose-ref probing tolerates a child directory removed or replaced during the walk', async () => {
+		const maintenance = testableMaintenance(repo);
+		const probeChildRace = async (code: 'ENOENT' | 'ENOTDIR') => {
+			let reads = 0;
+			const result = await maintenance.probeLooseRefs('/refs', async () => {
+				reads++;
+				if (reads === 1) {
+					return [
+						{ name: 'heads', isDirectory: () => true },
+						{ name: 'root-ref', isDirectory: () => false },
+					];
+				}
+
+				throw Object.assign(new Error('child layout changed'), { code: code });
+			});
+			return { reads: reads, result: result };
+		};
+
+		for (const code of ['ENOENT', 'ENOTDIR'] as const) {
+			const { reads, result } = await probeChildRace(code);
+
+			assert.deepStrictEqual(result, { count: 1, exact: true }, code);
+			assert.strictEqual(reads, 2, code);
+		}
+
+		let reads = 0;
+		await assert.rejects(
+			maintenance.probeLooseRefs('/refs', async () => {
+				reads++;
+				if (reads === 1) return [{ name: 'heads', isDirectory: () => true }];
+
+				throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+			}),
+			/permission denied/,
+			'non-race filesystem failures remain observable',
+		);
+		await assert.rejects(
+			maintenance.probeLooseRefs('/refs', async () => {
+				throw Object.assign(new Error('top-level refs is not a directory'), { code: 'ENOTDIR' });
+			}),
+			/top-level refs is not a directory/,
+			'ENOTDIR is routine only for a child that was already observed as a directory',
+		);
+	});
+
 	test('runMaintenanceTask(commit-graph) writes the graph directly, gated on git:commit-graph (not git:maintenance)', async () => {
-		// The commit-graph task uses a DIRECT `git commit-graph write --reachable --split` (2.24+), NOT
+		// The commit-graph task uses a DIRECT `git commit-graph write --reachable --split=replace` (2.24+), NOT
 		// `git maintenance run --task=commit-graph` (2.30+) — so it runs whenever git:commit-graph is supported.
 		const cgRepo = createTestRepo();
 		try {

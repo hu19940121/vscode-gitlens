@@ -2,7 +2,7 @@ import type { Signal } from '@lit-labs/signals';
 import { createContext } from '@lit/context';
 import { signalObject } from 'signal-utils/object';
 import type { GraphWalkthroughProgress, WalkthroughProgress } from '../../../../constants.walkthroughs.js';
-import { createSignalGroup } from '../state.js';
+import { createSignalGroup } from '../state/signals.js';
 
 export type OnboardingKey = 'integrationBanner';
 
@@ -13,6 +13,10 @@ export interface OnboardingState {
 	};
 	readonly walkthroughProgress: Signal.State<WalkthroughProgress | undefined>;
 	readonly graphWalkthroughProgress: Signal.State<GraphWalkthroughProgress | undefined>;
+	/** Mirrors `gitlens.advanced.skipOnboarding` (see `WalkthroughProgressPayload.onboardingOptedOut`) —
+	 *  the service-wide onboarding opt-out that non-dismissible surfaces like the "Try Kepler" banner
+	 *  consult since they have no dismiss button of their own. */
+	readonly onboardingOptedOut: Signal.State<boolean>;
 	/** Dismiss a banner by key. No-op before RPC connects; wired by root component. */
 	dismiss(key: OnboardingKey): void;
 	/** Dismiss the walkthrough. No-op before RPC connects; wired by root component. */
@@ -50,6 +54,7 @@ export function createOnboardingState(): OnboardingState {
 		}),
 		walkthroughProgress: signal<WalkthroughProgress | undefined>(undefined),
 		graphWalkthroughProgress: signal<GraphWalkthroughProgress | undefined>(undefined),
+		onboardingOptedOut: signal<boolean>(false),
 		dismiss: noop,
 		dismissWalkthrough: noop,
 		resetAll: resetAll,

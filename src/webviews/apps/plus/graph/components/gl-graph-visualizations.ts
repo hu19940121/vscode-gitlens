@@ -48,19 +48,11 @@ export class GlGraphVisualizations extends SignalWatcher(LitElement) {
 	@property({ type: Boolean, attribute: 'graph-ready' })
 	graphReady = false;
 
-	@consume({ context: graphStateContext, subscribe: true })
+	@consume({ context: graphStateContext, subscribe: false })
 	private graphState!: typeof graphStateContext.__context__;
 
 	private get mode(): VisualizationMode {
-		// Route through the shared resolver so this render decision, the switcher's active tab, and
-		// the `graph/visualizations/closed` telemetry all gate identically: when the experimental
-		// flag is off it force-routes to the timeline regardless of persisted `visualizationMode`
-		// (the stored value is left untouched so re-enabling restores the user's prior choice).
-		const key = getEffectiveVisualizationKey(
-			this.graphState.visualizationMode,
-			this.graphState.treemapMode,
-			this.graphState.config?.experimentalVisualizationsEnabled === true,
-		);
+		const key = getEffectiveVisualizationKey(this.graphState.visualizationMode, this.graphState.treemapMode);
 		if (key === 'timeline') return 'timeline';
 		// Gated identically to the switcher tab: without the maintenance sub-provider there is nothing to
 		// report, so a persisted `health` choice carried onto a virtual/web/Live Share repo must fall back
@@ -75,7 +67,7 @@ export class GlGraphVisualizations extends SignalWatcher(LitElement) {
 	override render(): unknown {
 		switch (this.mode) {
 			case 'health':
-				return html`<gl-graph-git-health></gl-graph-git-health>`;
+				return html`<gl-graph-git-health ?graph-ready=${this.graphReady}></gl-graph-git-health>`;
 			case 'treemap':
 				return html`<gl-graph-treemap ?graph-ready=${this.graphReady}></gl-graph-treemap>`;
 			default:
