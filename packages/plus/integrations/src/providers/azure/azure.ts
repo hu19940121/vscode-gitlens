@@ -8,11 +8,14 @@ import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import { base64 } from '@gitlens/utils/base64.js';
 import { CancellationError, isCancellationError } from '@gitlens/utils/cancellation.js';
+import { sha256 } from '@gitlens/utils/crypto.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
 import type { Disposable } from '@gitlens/utils/disposable.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
+import type { CacheController } from '@gitlens/utils/promiseCache.js';
+import { PromiseCache } from '@gitlens/utils/promiseCache.js';
 import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
 import type { TokenWithInfo } from '../../authentication/models.js';
 import type { IntegrationServiceContext } from '../../context.js';
@@ -28,10 +31,13 @@ import {
 import type { ProviderApiConfig } from '../apiConfig.js';
 import { baseProviderApiConfig } from '../apiConfig.js';
 import type {
+	AzureForkRepositoryUrls,
 	AzureGitCommit,
 	AzureProjectDescriptor,
 	AzurePullRequest,
 	AzurePullRequestWithLinks,
+	AzureRepositoryReference,
+	AzureRepositoryUrls,
 	AzureRepositoryWithMetadata,
 	AzureWorkItemState,
 	AzureWorkItemStateCategory,
@@ -46,7 +52,20 @@ import {
 	isClosedAzurePullRequestStatus,
 	isClosedAzureWorkItemStateCategory,
 	normalizeAzureBranchName,
+	sanitizeAzureRepositoryUrl,
 } from './models.js';
+
+const forkRepositoryUrlCacheTtl = 5 * 60 * 1000;
+
+function parseAzureRepositoryDescriptor(repo: string): { projectName: string; repoName: string } {
+	const parts = repo.split('/');
+	const [projectName, segment, repoName] = parts;
+	if (parts.length !== 3 || segment !== '_git' || !projectName || !repoName) {
+		throw new Error(`Invalid Azure repository descriptor '${repo}'; expected '{project}/_git/{repoName}'.`);
+	}
+
+	return { projectName: projectName, repoName: repoName };
+}
 
 class WorkItemStates {
 	private readonly _categories = new Map<string, AzureWorkItemStateCategory>();
@@ -100,6 +119,10 @@ class WorkItemStates {
 export class AzureDevOpsApi implements Disposable {
 	private readonly _disposable: Disposable | undefined;
 	private _workItemStates: WorkItemStates = new WorkItemStates();
+	private readonly _forkRepositoryUrls = new PromiseCache<string, AzureForkRepositoryUrls | undefined>({
+		capacity: 100,
+		createTTL: forkRepositoryUrlCacheTtl,
+	});
 
 	constructor(private readonly config: ProviderApiConfig) {
 		this._disposable = config.onConfigChanged?.(() => this.resetCaches());
@@ -111,6 +134,7 @@ export class AzureDevOpsApi implements Disposable {
 
 	private resetCaches(): void {
 		this._workItemStates.clear();
+		this._forkRepositoryUrls.clear();
 	}
 
 	@trace({
@@ -133,7 +157,7 @@ export class AzureDevOpsApi implements Disposable {
 		},
 	): Promise<PullRequest | undefined> {
 		const scope = getScopedLogger();
-		const [projectName, _, repoName] = repo.split('/');
+		const { projectName, repoName } = parseAzureRepositoryDescriptor(repo);
 
 		try {
 			const prResult = await this.request<{ value: AzurePullRequest[] }>(
@@ -168,8 +192,12 @@ export class AzureDevOpsApi implements Disposable {
 			const pr = sortedPRs?.[0];
 			if (pr == null) return undefined;
 
-			return fromAzurePullRequest(pr, provider, owner);
+			return await this.toPullRequest(pr, provider, token, owner, options.baseUrl, scope);
 		} catch (ex) {
+			// A rejected credential is actionable and must not be reported as an absent result; every other
+			// failure keeps the existing degrade-to-undefined behavior.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			scope?.error(ex);
 			return undefined;
 		}
@@ -198,7 +226,7 @@ export class AzureDevOpsApi implements Disposable {
 		cancellation?: AbortSignal,
 	): Promise<PullRequest | undefined> {
 		const scope = getScopedLogger();
-		const [projectName, _, repoName] = repo.split('/');
+		const { projectName, repoName } = parseAzureRepositoryDescriptor(repo);
 		try {
 			const prResult = await this.request<{ results: Record<string, AzurePullRequest[]>[] }>(
 				provider,
@@ -226,16 +254,20 @@ export class AzureDevOpsApi implements Disposable {
 			const pullRequest = await this.request<AzurePullRequestWithLinks>(
 				provider,
 				token,
-				undefined,
-				pr.url,
+				baseUrl,
+				`${owner}/${encodeURIComponent(pr.repository.project.id)}/_apis/git/repositories/${encodeURIComponent(pr.repository.id)}/pullRequests/${encodeURIComponent(pr.pullRequestId.toString())}`,
 				{ method: 'GET' },
 				scope,
 				cancellation,
 			);
 			if (pullRequest == null) return undefined;
 
-			return fromAzurePullRequest(pullRequest, provider, owner);
+			return await this.toPullRequest(pullRequest, provider, token, owner, baseUrl, scope, cancellation);
 		} catch (ex) {
+			// A rejected credential is actionable and must not be reported as an absent result; every other
+			// failure keeps the existing degrade-to-undefined behavior.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			scope?.error(ex);
 			return undefined;
 		}
@@ -262,7 +294,7 @@ export class AzureDevOpsApi implements Disposable {
 		},
 	): Promise<IssueOrPullRequest | undefined> {
 		const scope = getScopedLogger();
-		const [projectName, _, repoName] = repo.split('/');
+		const { projectName, repoName } = parseAzureRepositoryDescriptor(repo);
 
 		if (options?.type === undefined || options?.type === 'issue') {
 			try {
@@ -305,6 +337,10 @@ export class AzureDevOpsApi implements Disposable {
 					};
 				}
 			} catch (ex) {
+				// A rejected credential is actionable and must not be reported as an absent issue; every other
+				// non-404 keeps the existing degrade-to-undefined behavior.
+				if (ex instanceof AuthenticationError) throw ex;
+
 				if (ex.original?.status !== 404) {
 					scope?.error(ex);
 					return undefined;
@@ -336,12 +372,16 @@ export class AzureDevOpsApi implements Disposable {
 						state: azurePullRequestStatusToState(prResult.status),
 						closed: isClosedAzurePullRequestStatus(prResult.status),
 						title: prResult.title,
-						url: getAzurePullRequestWebUrl(prResult),
+						url: getAzurePullRequestWebUrl(prResult, options.baseUrl, owner),
 					};
 				}
 
 				return undefined;
 			} catch (ex) {
+				// A rejected credential is actionable and must not be reported as an absent issue; every other
+				// non-404 keeps the existing degrade-to-undefined behavior.
+				if (ex instanceof AuthenticationError) throw ex;
+
 				if (ex.original?.status !== 404) {
 					scope?.error(ex);
 					return undefined;
@@ -398,6 +438,10 @@ export class AzureDevOpsApi implements Disposable {
 				return fromAzureWorkItem(issueResult, provider, project, stateCategory);
 			}
 		} catch (ex) {
+			// A rejected credential is actionable and must not be reported as an absent work item; every other
+			// non-404 keeps the existing degrade-to-undefined behavior.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			if (ex.original?.status !== 404) {
 				scope?.error(ex);
 				return undefined;
@@ -429,7 +473,7 @@ export class AzureDevOpsApi implements Disposable {
 		},
 	): Promise<UnidentifiedAuthor | undefined> {
 		const scope = getScopedLogger();
-		const [projectName, _, repoName] = repo.split('/');
+		const { projectName, repoName } = parseAzureRepositoryDescriptor(repo);
 
 		try {
 			// Try to get the Work item (wit) first with specific fields
@@ -457,6 +501,10 @@ export class AzureDevOpsApi implements Disposable {
 				avatarUrl: undefined,
 			} satisfies UnidentifiedAuthor;
 		} catch (ex) {
+			// A rejected credential is actionable and must not be reported as an absent work item; every other
+			// non-404 keeps the existing degrade-to-undefined behavior.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			if (ex.original?.status !== 404) {
 				scope?.error(ex);
 				return undefined;
@@ -522,6 +570,9 @@ export class AzureDevOpsApi implements Disposable {
 				username: username,
 			};
 		} catch (ex) {
+			// A rejected credential is the whole point of this read failing; reporting "no user" instead hides it.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			scope?.error(ex, `Failed to get current user from ${baseUrl}`);
 			return undefined;
 		}
@@ -574,6 +625,11 @@ export class AzureDevOpsApi implements Disposable {
 
 			return issueResult?.value ?? [];
 		} catch (ex) {
+			// A rejected credential must not be degraded to an empty state list: the caller caches whatever this
+			// returns, so an empty list would pin every work item of this type to an unknown state until the
+			// cache is dropped — long after the session recovery this error is supposed to trigger.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			scope?.error(ex);
 			return [];
 		}
@@ -626,6 +682,10 @@ export class AzureDevOpsApi implements Disposable {
 						: undefined,
 			} satisfies RepositoryMetadata;
 		} catch (ex) {
+			// A rejected credential is not a probe outcome: it is actionable, and the caller routes it into the
+			// session recovery. A cancellation or a 404 still degrades quietly.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			// Cancellations and 404s are expected outcomes for a probe; don't log them as errors.
 			if (!isCancellationError(ex) && !(ex instanceof RequestNotFoundError)) {
 				scope?.error(ex);
@@ -671,6 +731,10 @@ export class AzureDevOpsApi implements Disposable {
 				name: normalizeAzureBranchName(response.defaultBranch),
 			} satisfies DefaultBranch;
 		} catch (ex) {
+			// A rejected credential is not a probe outcome: it is actionable, and the caller routes it into the
+			// session recovery. A cancellation or a 404 still degrades quietly.
+			if (ex instanceof AuthenticationError) throw ex;
+
 			// Cancellations and 404s are expected outcomes for a probe; don't log them as errors.
 			if (!isCancellationError(ex) && !(ex instanceof RequestNotFoundError)) {
 				scope?.error(ex);
@@ -688,12 +752,7 @@ export class AzureDevOpsApi implements Disposable {
 		scope: ScopedLogger | undefined,
 		cancellation?: AbortSignal,
 	): Promise<AzureRepositoryWithMetadata | undefined> {
-		const parts = repo.split('/');
-		const [projectName, segment, repoName] = parts;
-		// The descriptor must be exactly `"{project}/_git/{repoName}"`; bail before issuing a bogus request.
-		if (parts.length !== 3 || segment !== '_git' || !projectName || !repoName) {
-			throw new Error(`Invalid Azure repository descriptor '${repo}'; expected '{project}/_git/{repoName}'.`);
-		}
+		const { projectName, repoName } = parseAzureRepositoryDescriptor(repo);
 		return this.request<AzureRepositoryWithMetadata>(
 			provider,
 			token,
@@ -703,6 +762,118 @@ export class AzureDevOpsApi implements Disposable {
 			scope,
 			cancellation,
 		);
+	}
+
+	private async toPullRequest(
+		pr: AzurePullRequest,
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		baseUrl: string,
+		scope: ScopedLogger | undefined,
+		cancellation?: AbortSignal,
+	): Promise<PullRequest> {
+		const forkRepositoryUrls = await this.getForkRepositoryUrls(
+			provider,
+			token,
+			owner,
+			baseUrl,
+			pr.forkSource?.repository,
+			scope,
+			cancellation,
+		);
+		return fromAzurePullRequest(pr, provider, owner, baseUrl, forkRepositoryUrls);
+	}
+
+	/**
+	 * Resolves the web and HTTPS clone URLs of the fork a cross-repository pull request comes from. Every other
+	 * repository URL the model reports is rebuilt from the pull request payload; only a fork reference lacks the
+	 * project to do that, so only a fork costs a request.
+	 *
+	 * Best-effort by contract: a fork in a project the token cannot read, a deleted fork, or a throttled request
+	 * leaves the head ref without a URL. It must never cost the pull request itself, which is what makes swallowing
+	 * the failure here the right call rather than a shortcut.
+	 */
+	private async getForkRepositoryUrls(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		baseUrl: string,
+		repository: AzureRepositoryReference | undefined,
+		scope: ScopedLogger | undefined,
+		cancellation?: AbortSignal,
+	): Promise<AzureForkRepositoryUrls | undefined> {
+		if (repository == null) return undefined;
+
+		let tokenHash: string;
+		try {
+			tokenHash = await sha256(token.accessToken);
+		} catch {
+			return undefined;
+		}
+
+		const cacheKey = JSON.stringify([tokenHash, baseUrl, owner, repository.id]);
+		// The request is shared, so the factory is handed the cache's aggregate signal rather than this caller's: it
+		// aborts only once every caller waiting on the entry has cancelled.
+		return this._forkRepositoryUrls.getOrCreate(
+			cacheKey,
+			(cacheable, aggregate) =>
+				this.fetchForkRepositoryUrls(
+					provider,
+					token,
+					owner,
+					baseUrl,
+					repository.id,
+					cacheable,
+					scope,
+					aggregate,
+				),
+			{ cancellation: cancellation },
+		);
+	}
+
+	private async fetchForkRepositoryUrls(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		baseUrl: string,
+		repositoryId: string,
+		cacheable: CacheController,
+		scope: ScopedLogger | undefined,
+		cancellation?: AbortSignal,
+	): Promise<AzureForkRepositoryUrls | undefined> {
+		try {
+			const response = await this.request<AzureRepositoryUrls>(
+				provider,
+				token,
+				baseUrl,
+				`${owner}/_apis/git/repositories/${encodeURIComponent(repositoryId)}?api-version=4.1`,
+				{ method: 'GET' },
+				scope,
+				cancellation,
+			);
+			const webUrl = sanitizeAzureRepositoryUrl(response?.webUrl, baseUrl, owner);
+			const cloneHttps = sanitizeAzureRepositoryUrl(response?.remoteUrl, baseUrl, owner);
+
+			// The clone URL stands in for the web URL when the response omits it — an older `api-version` promises
+			// neither field, and naming the fork by the URL git would use beats naming it not at all.
+			const url = webUrl ?? cloneHttps;
+			if (url == null) {
+				cacheable.invalidate();
+				return undefined;
+			}
+
+			return { url: url, cloneHttps: cloneHttps };
+		} catch (ex) {
+			// Missing or inaccessible forks are cached briefly; transient failures retry on the next read.
+			if (!(ex instanceof RequestNotFoundError) && !(ex instanceof AuthenticationError)) {
+				cacheable.invalidate();
+			}
+
+			const status = ex instanceof ProviderFetchError ? ` (${ex.status})` : '';
+			scope?.warn(`Unable to resolve the fork repository URLs${status}`);
+			return undefined;
+		}
 	}
 
 	private async request<T>(
@@ -719,7 +890,7 @@ export class AzureDevOpsApi implements Disposable {
 
 		let rsp: Response;
 		try {
-			const sw = maybeStopWatch(`[AZURE] ${options?.method ?? 'GET'} ${url}`, { log: { onlyExit: true } });
+			const sw = maybeStopWatch(`[AZURE] ${options?.method ?? 'GET'} request`, { log: { onlyExit: true } });
 
 			try {
 				if (cancellation?.aborted) throw new CancellationError();
@@ -736,6 +907,20 @@ export class AzureDevOpsApi implements Disposable {
 				);
 
 				if (rsp.ok) {
+					// Azure answers a rejected credential by redirecting to its sign-in page, which returns `203
+					// text/html` rather than `401`. `rsp.ok` spans 200-299, so that page used to reach `json()` and
+					// die as a bare `SyntaxError` — which `getIssue` and friends catch and report as "not found",
+					// making an invalid credential indistinguishable from a missing work item (GKDEV-3617).
+					const contentType = rsp.headers.get('content-type')?.toLowerCase() ?? '';
+					if (contentType.startsWith('text/html')) {
+						const { accessToken: _accessToken, ...tokenInfo } = token;
+						throw new AuthenticationError(
+							tokenInfo,
+							AuthenticationErrorReason.Unauthorized,
+							new Error(`(${rsp.status}) Azure DevOps returned a sign-in page instead of data`),
+						);
+					}
+
 					return (await rsp.json()) as T;
 				}
 

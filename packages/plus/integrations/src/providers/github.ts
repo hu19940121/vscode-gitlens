@@ -26,7 +26,7 @@ import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../c
 import type { IntegrationServiceContext } from '../context.js';
 import { IntegrationReadUnavailableError } from '../errors.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
-import type { SearchMyPullRequestsOptions } from '../models/gitHostIntegration.js';
+import type { SearchMyPullRequestsOptions, SearchPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type {
 	ProviderIssueSearchPage,
@@ -397,9 +397,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		session: ProviderAuthenticationSession,
 		repos?: GitHubRepositoryDescriptor[],
 		cancellation?: AbortSignal,
-		silent?: boolean,
-		state?: PullRequestStateFilter,
-		_options?: SearchMyPullRequestsOptions,
+		options?: SearchMyPullRequestsOptions,
 	): Promise<PullRequest[] | undefined> {
 		return (await this.authenticationService.apis.github)?.searchMyPullRequests(
 			this,
@@ -407,8 +405,8 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			{
 				repos: repos?.map(r => `${r.owner}/${r.name}`),
 				baseUrl: this.apiBaseUrl,
-				silent: silent,
-				state: state,
+				silent: options?.silent,
+				state: options?.state,
 			},
 			cancellation,
 		);
@@ -586,6 +584,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				includeBody: true,
 				includeAllAssignees: options?.includeAllAssignees,
 				cursor: options?.cursor,
+				pageSize: options?.pageSize,
 				sort: options?.sort,
 				categories: options?.filters?.length
 					? {
@@ -690,6 +689,24 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 	}
 
 	/**
+	 * Resolves several issues by `(owner, repo, number)` in ONE request, by aliasing the point read rather than a
+	 * search — see {@link GitHubApi.getIssuesBatch} for why that distinction is the whole design.
+	 */
+	protected override async getProviderIssuesBatch(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number }[],
+		cancellation?: AbortSignal,
+	): Promise<(IssueShape | undefined)[] | undefined> {
+		return (await this.authenticationService.apis.github)?.getIssuesBatch(
+			this,
+			toTokenWithInfo(this.id, session),
+			coordinates,
+			{ baseUrl: this.apiBaseUrl, includeBody: true },
+			cancellation,
+		);
+	}
+
+	/**
 	 * Counts several pull-request scopes in ONE request. Like {@link countProviderIssues}, GitHub's `search`
 	 * reports `issueCount` on a zero-node selection, so a count preview costs no pull-request transfer.
 	 */
@@ -716,7 +733,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		searchQuery: string,
 		repos?: GitHubRepositoryDescriptor[],
 		cancellation?: AbortSignal,
-		options?: { include?: PullRequestState[] },
+		options?: SearchPullRequestsOptions,
 	): Promise<PullRequest[] | undefined> {
 		return (await this.authenticationService.apis.github)?.searchPullRequests(
 			this,

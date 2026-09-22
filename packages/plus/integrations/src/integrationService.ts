@@ -87,6 +87,8 @@ import { countIssues, countPullRequests } from './reads/counts.js';
 import type { SupportedFilters } from './reads/filters.js';
 import { getSupportedFilters } from './reads/filters.js';
 import { listOrgs, listProjects, listRepos } from './reads/hierarchy.js';
+import type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
+import { getIssuesBatch } from './reads/issueBatch.js';
 import { listIssuesPage } from './reads/issues.js';
 import { listIssueTrackerIssuesPage } from './reads/issueTracker.js';
 import { listPullRequestsPage } from './reads/pullRequests.js';
@@ -94,6 +96,8 @@ import { resolveRepository } from './reads/resolveRepository.js';
 import { searchIssuesPage } from './reads/searchIssues.js';
 import { searchPullRequestsPage } from './reads/searchPullRequests.js';
 import { sweepClosedPullRequests, sweepPullRequests } from './reads/sweeps.js';
+import type { TrackerIssueResult } from './reads/trackerIssue.js';
+import { getTrackerIssue } from './reads/trackerIssue.js';
 import { noConnectionWarning } from './reads/warnings.js';
 import type {
 	ConnectionStateChangeEvent,
@@ -745,7 +749,6 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	async getMyPullRequests(
 		integrationIds?: (GitCloudHostIntegrationId | CloudGitSelfManagedHostIntegrationIds)[],
 		cancellation?: AbortSignal,
-		silent?: boolean,
 		options?: SearchMyPullRequestsOptions,
 	): Promise<IntegrationResult<PullRequest[] | undefined>> {
 		const integrations: Map<GitHostIntegration, ResourceDescriptor[] | undefined> = new Map();
@@ -762,13 +765,12 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		}
 		if (integrations.size === 0) return undefined;
 
-		return this.getMyPullRequestsCore(integrations, cancellation, silent, options);
+		return this.getMyPullRequestsCore(integrations, cancellation, options);
 	}
 
 	private async getMyPullRequestsCore(
 		integrations: Map<GitHostIntegration, ResourceDescriptor[] | undefined>,
 		cancellation?: AbortSignal,
-		silent?: boolean,
 		options?: SearchMyPullRequestsOptions,
 	): Promise<IntegrationResult<PullRequest[] | undefined>> {
 		const start = performance.now();
@@ -777,7 +779,7 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		for (const [integration, repos] of integrations) {
 			if (integration == null) continue;
 
-			promises.push(integration.searchMyPullRequests(repos, cancellation, silent, undefined, undefined, options));
+			promises.push(integration.searchMyPullRequests(repos, cancellation, options));
 		}
 
 		const results = await Promise.allSettled(promises);
@@ -1154,6 +1156,29 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		domain?: string;
 	}): Promise<ProviderResult<IssueCountResult>> {
 		return countIssues(this, options);
+	}
+
+	async getIssuesBatch(options: {
+		providerId: IntegrationIds;
+		targets: readonly IssueBatchTarget[];
+		connectionId?: string;
+		/**
+		 * Explicit self-managed host domain. Used only when the requested connection has no configured domain;
+		 * it must come from the trusted authentication configuration, not repository or remote data.
+		 */
+		domain?: string;
+	}): Promise<ProviderResult<IssueBatchResult>> {
+		return getIssuesBatch(this, options);
+	}
+
+	async getTrackerIssue(options: {
+		providerId: IntegrationIds;
+		resourceId: string;
+		resourceUrl?: string;
+		key: string;
+		connectionId?: string;
+	}): Promise<ProviderResult<TrackerIssueResult>> {
+		return getTrackerIssue(this, options);
 	}
 
 	/**

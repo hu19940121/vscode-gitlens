@@ -54,6 +54,20 @@ export type ProviderIssueSearchPage = {
 export type IssuesForProjectOptions = {
 	/** The account handle to scope to, resolved per resource by the caller. Omitted reads every assignee. */
 	user?: string;
+	/**
+	 * The account's stable provider id for the same resource, when the caller could resolve one.
+	 *
+	 * Separate from {@link user} because a tracker scopes by identity in two different kinds of query, and only
+	 * one of them resolves an account. A user FIELD (Jira's `assignee`/`creator`) resolves this id, and resolves
+	 * it reliably — a handle only works while the directory can still match the display name, which it cannot for
+	 * a deactivated account or a profile whose visibility is restricted. A free-TEXT query (Jira's `comment ~`,
+	 * which is how mentions are expressed) resolves nothing: it matches the literal string against comment
+	 * bodies, so an opaque id matches nothing at all and the handle is the only value that can work.
+	 *
+	 * So this is not a better spelling of `user` and must not replace it — each is correct for a different query,
+	 * and a provider that cannot tell its queries apart should keep using `user` alone.
+	 */
+	userId?: string;
 	/** Validated by the caller against `ProviderMetadata.supportedIssueFilters`; unsupported refuses the read. */
 	filters?: IssueFilter[];
 	/**
@@ -65,6 +79,21 @@ export type IssuesForProjectOptions = {
 	 */
 	sort?: IssueSorting;
 };
+
+export type ProjectIssuesDrain = {
+	values: IssueShape[];
+	metadata?: CollectionMetadata;
+} & (
+	| { truncated: false }
+	| {
+			truncated: true;
+			/**
+			 * `narrow-scope` means a smaller server-side scope avoids this truncation. `none` covers incomplete
+			 * results without that guarantee, including Linear's client-side assignee filtering.
+			 */
+			recovery: 'narrow-scope' | 'none';
+	  }
+);
 
 /**
  * Options for the REPO-scoped issue read (`GitHostIntegration.getMyIssuesForRepos*`), the git-host counterpart of
@@ -114,6 +143,13 @@ export type SearchMyIssuesOptions = {
 	 */
 	filters?: IssueFilter[];
 	cursor?: string;
+	/**
+	 * Page size PER CATEGORY, not per page: GitHub runs one search per category (authored/assigned/mentioned), so
+	 * a page can hold up to `3 × pageSize` items before deduplication. Only honored by GitHub/GHE — GitLab, Azure
+	 * and Linear drain their account-wide reads with their own bounds and ignore it. Omitted keeps the provider's
+	 * default.
+	 */
+	pageSize?: number;
 	/**
 	 * Narrows the account-wide read to one org/account (Azure: the organization) and/or one project within it.
 	 * Only honored by a host with a project layer (Azure), whose account-wide read otherwise fans out over every

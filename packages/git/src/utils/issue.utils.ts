@@ -128,6 +128,15 @@ export function serializeIssue(value: IssueShape): IssueShape {
 		closedDate: value.closedDate,
 		closed: value.closed,
 		state: value.state,
+		providerState:
+			value.providerState == null
+				? undefined
+				: {
+						id: value.providerState.id,
+						name: value.providerState.name,
+						color: value.providerState.color,
+						category: value.providerState.category,
+					},
 		author:
 			value.author == null
 				? undefined
@@ -172,6 +181,17 @@ export function serializeIssue(value: IssueShape): IssueShape {
 		commentsCount: value.commentsCount,
 		thumbsUpCount: value.thumbsUpCount,
 		body: value.body,
+		bodyFormat: value.bodyFormat,
+		iterations:
+			value.iterations == null
+				? undefined
+				: value.iterations.map(iteration => ({
+						id: iteration.id,
+						name: iteration.name,
+						isActive: iteration.isActive,
+						startDate: iteration.startDate,
+						endDate: iteration.endDate,
+					})),
 	};
 	return serialized;
 }

@@ -11,9 +11,9 @@ import type {
 } from '@gitlens/git/models/pullRequest.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
-import { base64 } from '@gitlens/utils/base64.js';
 import { CancellationError } from '@gitlens/utils/cancellation.js';
 import type { Emitter } from '@gitlens/utils/event.js';
+import { mapSettledBounded } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type {
@@ -23,10 +23,10 @@ import type {
 } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
-import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
+import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
-import type { SearchMyPullRequestsOptions } from '../models/gitHostIntegration.js';
+import type { SearchMyPullRequestsOptions, SearchPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type { AccountWideIssuesResult, IntegrationKey, SearchMyIssuesOptions } from '../models/integration.js';
 import type {
@@ -56,7 +56,11 @@ import {
 	toProviderPullRequestStates,
 } from './models.js';
 import type { ProvidersApi } from './providersApi.js';
-import { collectProviderPagedResult, flatSettledOrThrow, mergeCollectionMetadata } from './utils/providerPaging.js';
+import {
+	collectProviderPagedResult,
+	flatSettledResultsOrThrow,
+	mergeCollectionMetadata,
+} from './utils/providerPaging.js';
 
 function getAzureRepositoryIdentity(repo: Pick<AzureRepositoryDescriptor, 'owner' | 'name' | 'project'>): {
 	resourceName: string;
@@ -69,6 +73,17 @@ function getAzureRepositoryIdentity(repo: Pick<AzureRepositoryDescriptor, 'owner
 		projectName: repo.project ?? match?.[1],
 		repositoryName: match?.[2] ?? repo.name,
 	};
+}
+
+function getAzureRepositoryApiBaseUrl(baseUrl: string, repo: Pick<AzureRepositoryDescriptor, 'virtualDirectory'>) {
+	if (repo.virtualDirectory == null) return baseUrl;
+
+	const segments = repo.virtualDirectory.split('/');
+	if (segments.some(segment => !segment || segment === '.' || segment === '..')) {
+		throw new Error(`Invalid Azure virtual directory '${repo.virtualDirectory}'.`);
+	}
+
+	return `${baseUrl.replace(/\/+$/, '')}/${segments.map(encodeURIComponent).join('/')}`;
 }
 
 /**
@@ -92,9 +107,12 @@ export abstract class AzureDevOpsIntegrationBase<
 		tokenWithInfo: TokenWithInfo<TIntegrationId>;
 		options: { isPAT: boolean; baseUrl?: string };
 	} {
+		// The secret is handed over raw: `isPAT` tells provider-apis to send it as an HTTP Basic credential, which
+		// it encodes itself as `base64(':' + token)`. Pre-encoding here would be encoded a second time and refused
+		// by Azure DevOps. `getCurrentUser` is the one read that needs a bearer token, and passes
+		// `doNotConvertToPat` to get one.
 		const usePat = !doNotConvertToPat;
-		const accessToken = usePat ? convertTokentoPAT(session.accessToken) : session.accessToken;
-		const tokenWithInfo = toTokenWithInfo<TIntegrationId>(this.id, session, accessToken);
+		const tokenWithInfo = toTokenWithInfo<TIntegrationId>(this.id, session);
 		return {
 			tokenWithInfo: tokenWithInfo,
 			options: { isPAT: usePat },
@@ -497,7 +515,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			repo.owner,
 			repo.name,
 			rev,
-			this.apiBaseUrl,
+			getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo),
 			options,
 		);
 	}
@@ -523,7 +541,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			toTokenWithInfo(this.id, session),
 			repo.owner,
 			repo.name,
-			{ baseUrl: this.apiBaseUrl },
+			{ baseUrl: getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo) },
 			cancellation,
 		);
 	}
@@ -541,7 +559,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			repo.name,
 			id,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo),
 				type: type,
 			},
 		);
@@ -591,7 +609,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			repo.name,
 			branch,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo),
 			},
 		);
 	}
@@ -607,7 +625,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			repo.owner,
 			repo.name,
 			rev,
-			this.apiBaseUrl,
+			getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo),
 		);
 	}
 
@@ -615,6 +633,7 @@ export abstract class AzureDevOpsIntegrationBase<
 		owner: string;
 		name: string;
 		project?: string;
+		virtualDirectory?: string;
 		connectionId?: string;
 	}): Promise<ProviderRepository | undefined> {
 		const identity = getAzureRepositoryIdentity(repo);
@@ -626,13 +645,10 @@ export abstract class AzureDevOpsIntegrationBase<
 		if (session == null) return undefined;
 
 		const { tokenWithInfo, options } = this.getApiOptions(session);
-		return api.getRepo(
-			tokenWithInfo,
-			identity.resourceName,
-			identity.repositoryName,
-			identity.projectName,
-			options,
-		);
+		return api.getRepo(tokenWithInfo, identity.resourceName, identity.repositoryName, identity.projectName, {
+			...options,
+			baseUrl: getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo),
+		});
 	}
 
 	protected override async getProviderRepositoryMetadata(
@@ -645,7 +661,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			toTokenWithInfo(this.id, session),
 			repo.owner,
 			repo.name,
-			{ baseUrl: this.apiBaseUrl },
+			{ baseUrl: getAzureRepositoryApiBaseUrl(this.apiBaseUrl, repo) },
 			cancellation,
 		);
 	}
@@ -654,9 +670,7 @@ export abstract class AzureDevOpsIntegrationBase<
 		session: ProviderAuthenticationSession,
 		repos?: AzureRepositoryDescriptor[],
 		_cancellation?: AbortSignal,
-		_silent?: boolean,
-		state?: PullRequestStateFilter,
-		_options?: SearchMyPullRequestsOptions,
+		options?: SearchMyPullRequestsOptions,
 	): Promise<PullRequest[] | undefined> {
 		const api = await this.getProvidersApi();
 		if (repos != null) {
@@ -664,7 +678,7 @@ export abstract class AzureDevOpsIntegrationBase<
 			return undefined;
 		}
 
-		const states = toProviderPullRequestStates(state);
+		const states = toProviderPullRequestStates(options?.state);
 
 		const user = await this.getProviderCurrentAccount(session);
 		// Azure filters key on the identity GUID (account id), not the display name — see
@@ -683,21 +697,21 @@ export abstract class AzureDevOpsIntegrationBase<
 			.filter(r => r != null)
 			.flat();
 
-		const { tokenWithInfo, options } = this.getApiOptions(session);
+		const { tokenWithInfo, options: apiOptions } = this.getApiOptions(session);
 		const projectInputs = projects.values.map(p => ({ namespace: p.resourceName, project: p.name }));
 		// Legacy array-returning path (Launchpad/focus view): unwrap `.values` from the SDK collection result.
 		// The metadata (partial/failures) isn't surfaced here because this path's return type has no warning
 		// channel; the metadata-aware ProviderBackend surface is getProviderMyPullRequestsForUser above.
 		const assignedPrs = (
 			await api.getPullRequestsForAzureProjects(tokenWithInfo, projectInputs, {
-				...options,
+				...apiOptions,
 				assigneeLogins: [user.id],
 				states: states,
 			})
 		).values.map(pr => this.fromAzureProviderPullRequest(pr, repoDescriptors, projects.values));
 		const authoredPrs = (
 			await api.getPullRequestsForAzureProjects(tokenWithInfo, projectInputs, {
-				...options,
+				...apiOptions,
 				authorLogin: user.id,
 				states: states,
 			})
@@ -883,7 +897,7 @@ export abstract class AzureDevOpsIntegrationBase<
 		searchQuery: string,
 		repos?: AzureRepositoryDescriptor[],
 		cancellation?: AbortSignal,
-		options?: { include?: PullRequestState[] },
+		options?: SearchPullRequestsOptions,
 	): Promise<PullRequest[] | undefined> {
 		if (cancellation?.aborted) throw new CancellationError();
 
@@ -939,8 +953,8 @@ export abstract class AzureDevOpsIntegrationBase<
 						project: { namespace: project.resourceName, project: project.name },
 					}));
 
-		const providerPullRequests = await flatSettledOrThrow(
-			searchScopes.map(async scope => {
+		const providerPullRequests = flatSettledResultsOrThrow(
+			await mapSettledBounded(searchScopes, providerFanOutConcurrency, async scope => {
 				const values: ProviderPullRequest[] = [];
 				let page: number | undefined;
 				for (let i = 0; i < 20; i++) {
@@ -1336,8 +1350,4 @@ export class AzureDevOpsServerIntegration extends AzureDevOpsIntegrationBase<Git
 				}
 			: undefined;
 	}
-}
-
-export function convertTokentoPAT(accessToken: string): string {
-	return base64(`PAT:${accessToken}`);
 }

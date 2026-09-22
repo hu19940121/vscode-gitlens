@@ -129,14 +129,19 @@ export function resolvePullRequestSearchCriteria(
 
 /** Why a filtered pull-request search's repository/organization boundary was refused. */
 export type PullRequestSearchScopeRejection =
-	| 'unscoped'
-	| 'repo-ids'
-	| 'unsupported-repository-scope'
-	| 'unsupported-organization-scope';
+	| { reason: 'unscoped' }
+	| { reason: 'repo-ids' }
+	| { reason: 'unsupported-repository-scope' }
+	| { reason: 'unsupported-organization-scope' }
+	/** Scope names a query cannot carry AS GIVEN; see {@link unusableSearchScopeNames}. */
+	| { reason: 'unusable-scope'; scopes: string[] };
 
 /**
  * Validates the search boundary independently from its criteria. A current-user relationship is itself a safe
  * account-wide boundary; without one, a repository or organization scope is mandatory.
+ *
+ * Scope names go through the same {@link unusableSearchScopeNames} rule the issue search uses — shared rather
+ * than re-derived, because the defect is identical on both reads.
  */
 export function resolvePullRequestSearchScope(
 	id: IntegrationIds,
@@ -148,22 +153,32 @@ export function resolvePullRequestSearchScope(
 	let resolvedRepos: ProviderRepoInput[] | undefined;
 
 	if (repos?.length) {
-		if (repos.some(r => typeof r === 'string' || typeof r === 'number')) return { rejection: 'repo-ids' };
-		if (supported?.repositoryScope !== true) return { rejection: 'unsupported-repository-scope' };
+		if (repos.some(r => typeof r === 'string' || typeof r === 'number')) {
+			return { rejection: { reason: 'repo-ids' } };
+		}
+		if (supported?.repositoryScope !== true) return { rejection: { reason: 'unsupported-repository-scope' } };
 
 		resolvedRepos = repos as ProviderRepoInput[];
 	}
 
 	const hasOrganizationScope = org != null && org.length > 0;
 	if (hasOrganizationScope && supported?.organizationScope !== true) {
-		return { rejection: 'unsupported-organization-scope' };
+		return { rejection: { reason: 'unsupported-organization-scope' } };
 	}
+
+	// After the capability checks and before the "is it scoped at all" rule: a scope the provider cannot express
+	// at all is the more fundamental refusal, and an unusable value that WAS supplied must not be reported as a
+	// missing one. `org` is passed bare, matching the issue twin — the helper applies its own empty-means-
+	// unsupplied guard, so re-testing `hasOrganizationScope` here would only make the two resolvers look like
+	// they differ.
+	const unusable = unusableSearchScopeNames(org, resolvedRepos);
+	if (unusable.length > 0) return { rejection: { reason: 'unusable-scope', scopes: unusable } };
 
 	if (resolvedRepos != null || hasOrganizationScope || (criteria?.relationships?.length ?? 0) > 0) {
 		return { repos: resolvedRepos };
 	}
 
-	return { rejection: 'unscoped' };
+	return { rejection: { reason: 'unscoped' } };
 }
 
 /**
@@ -195,6 +210,20 @@ export type IssueSearchCriteriaRejection =
 	| { reason: 'unsupported-criteria'; criteria: string[] }
 	/** `any-assignee` and `unassigned` partition the scope between them; asking for both asks for nothing. */
 	| { reason: 'contradictory-relationships' };
+
+/**
+ * Whether a provider exposes the FILTERED issue search at all — the one predicate a caller can check BEFORE
+ * building criteria, so a read that would only be refused is never issued.
+ *
+ * The same test {@link resolveIssueSearchCriteria} makes for its `unsupported-search` rejection, named rather
+ * than re-derived at each call site: a caller writing `supportedIssueSearch != null` itself is a copy free to
+ * disagree with the validator about what "has a search" means. `broadenIssues` reads it to pick its engine —
+ * the org-scoped search where there is one, the repository drain where there isn't — which is a CHOICE rather
+ * than a refusal, so it needs the predicate without the rejection.
+ */
+export function supportsFilteredIssueSearch(id: IntegrationIds): boolean {
+	return providersMetadata[id]?.supportedIssueSearch != null;
+}
 
 /**
  * Validates a filtered issue search's criteria against {@link ProviderMetadata.supportedIssueSearch}.
@@ -307,9 +336,106 @@ const unsupportedPullRequestSearchCapabilities: PullRequestSearchCapabilities = 
 /** Why a filtered issue search's scope was refused, or `undefined` when it is usable. */
 export type IssueSearchScopeRejection =
 	/** No repositories, no org, and no user-relative relationship: a search of the whole host. */
-	| 'unscoped'
+	| { reason: 'unscoped' }
 	/** Repositories given as ids. A search names repositories by PATH, so ids can't express a scope. */
-	| 'repo-ids';
+	| { reason: 'repo-ids' }
+	/** Scope names a query cannot carry AS GIVEN; see {@link unusableSearchScopeNames}. */
+	| { reason: 'unusable-scope'; scopes: string[] };
+
+/**
+ * Whether a scope name reaches the provider NAMING THE SAME SCOPE — the one rule behind every `unusable-scope`
+ * refusal, and the canonical home for its reasoning: the call sites point here rather than restating it.
+ *
+ * The defect it exists to prevent: the boundary is checked against the value AS SUPPLIED while the request is
+ * built from the value AFTER the provider sanitizes it, so a name a query cannot spell produces a read that is no
+ * longer the read that was authorized. Three outcomes, all of which LOOK LIKE SUCCESS, so there is nothing for a
+ * consumer to branch on:
+ * - **emptied** — a value of only quotes/whitespace/control characters emits no scope qualifier at all. A scope is
+ *   also what makes a relationship-less read legal, so the request carries neither and every item on the host
+ *   matches: measured at 52 million issues across unrelated accounts.
+ * - **altered** — a quote inside a real name sanitizes to a real but DIFFERENT scope (`git"kraken` -> `gitkraken`),
+ *   whose answer looks entirely normal.
+ * - **split** — whitespace delimits qualifiers, so `my org` emits `org:my org`: a search of `my` additionally
+ *   filtered by the free text `org`. Measured against the live API this is a wrong NARROWING rather than a
+ *   widening — `org:gitkraken bar` returns 12 where `org:gitkraken` returns 379.
+ *
+ * Refusing beats sanitizing, and the count probes are why it matters most: they deliberately apply exactly the
+ * qualifiers their search would, so a sanitized scope makes the count AGREE with the wrong search rather than
+ * disagree with it, and a consumer cross-checking "N matched" cannot detect it by construction. Nor can it
+ * pre-empt the rule — the free-text sanitizing rules are published precisely so a caller can mirror them, the
+ * scope rules are not — so only the caller knows which scope it meant, and the refusal goes back to it NAMING the
+ * offending value.
+ *
+ * Provider-NEUTRAL by design, and deliberately not an import of GitHub's `sanitizeGitHubQualifierValue`: this
+ * module validates for every provider, and a GitHub-specific rule reaching in here would be wrong for the next
+ * one that declares a search. Only GitHub and GHE declare one today, so the character class below is GitHub's in
+ * practice; it is stated as the common part of any query language because each class breaks a query on its own
+ * terms — a quote closes its own qualifier, a control character cannot appear at all, whitespace delimits the
+ * next qualifier — but a provider whose names legitimately carry one (Azure DevOps project names can contain
+ * spaces) needs its own rule alongside its `supported*Search` capability rather than an exception here.
+ *
+ * EDGES ARE STRIPPED before the test, which is what keeps the predicate no stricter than the provider's own
+ * sanitizing — the invariant that makes refusing safe to add, since it means this can only reject a name the
+ * provider would have altered, never one it would have resolved correctly. Leading and trailing whitespace AND
+ * control characters both qualify: a sanitizer maps a control character to a space, then collapses and trims, so
+ * `'gitkraken\n'` and `'gitkraken\u0000'` alike emit `org:gitkraken` — the scope that was asked for. Note this
+ * is wider than `String.trim()`, which leaves control characters in place.
+ *
+ * None of the three outcomes above survives the stripping, so the rule loses nothing: an all-edge value still
+ * empties, an INNER space or control character still splits (`'git\u0000kraken'` emits `git kraken`, two
+ * tokens), and a quote still alters wherever it sits.
+ */
+function isUsableSearchScopeName(name: string): boolean {
+	const stripped = stripSearchScopeEdges(name);
+	// eslint-disable-next-line no-control-regex
+	return stripped.length > 0 && !/["\u0000-\u001f\u007f\s]/.test(stripped);
+}
+
+/** The leading/trailing run a provider's sanitizing removes — see {@link isUsableSearchScopeName}. */
+function stripSearchScopeEdges(value: string): string {
+	// eslint-disable-next-line no-control-regex
+	return value.replace(/^[\s\u0000-\u001f\u007f]+|[\s\u0000-\u001f\u007f]+$/g, '');
+}
+
+/**
+ * The scope names a search cannot carry as given, as the strings to name in the refusal — empty when every one is
+ * usable. See {@link isUsableSearchScopeName} for the rule and why it refuses rather than sanitizes.
+ */
+function unusableSearchScopeNames(org: string | undefined, repos: readonly ProviderRepoInput[] | undefined): string[] {
+	const unusable: string[] = [];
+
+	// An EMPTY org is "no org supplied" and falls through to the remaining scopes; any other unusable value WAS
+	// supplied, so it is refused rather than dropped.
+	if (org != null && org.length > 0 && !isUsableSearchScopeName(org)) {
+		unusable.push(org);
+	}
+
+	// A `repo:` qualifier names a repository by its JOINED `namespace/name` path, which is the value the rule
+	// below is applied to. Both halves are read defensively, through the SAME locals the label is built from: the
+	// descriptor form is only narrowed from a union by an element-type check, so a half-built descriptor reaches
+	// here as `undefined` and must refuse rather than throw out of a facade that reports refusals as warnings —
+	// and reporting it as `undefined/a` would name a value the caller never passed.
+	for (const repo of repos ?? []) {
+		const namespace = repo.namespace ?? '';
+		const name = repo.name ?? '';
+		const path = `${namespace}/${name}`;
+		// BOTH the composite and each half, because neither sees what the other does:
+		// - the composite catches an offender the halves cannot, since an edge of a half is an INTERIOR character
+		//   of the path — `{ 'git ', 'kraken' }` has two usable-looking halves and emits `repo:git /kraken`.
+		// - the halves catch a BLANK one the composite cannot, since that offender sits at a composite EDGE where
+		//   stripping removes it — `' /a'` strips to `'/a'`, a perfectly spellable qualifier naming no repository.
+		// Each half is measured after the same stripping, so `' '` and `''` are one case rather than two.
+		if (
+			!isUsableSearchScopeName(path) ||
+			stripSearchScopeEdges(namespace).length === 0 ||
+			stripSearchScopeEdges(name).length === 0
+		) {
+			unusable.push(path);
+		}
+	}
+
+	return unusable;
+}
 
 /**
  * Validates that a filtered issue search is scoped at all, and narrows `repos` to the descriptor form the
@@ -320,25 +446,39 @@ export type IssueSearchScopeRejection =
  * warning: the two callers word it differently (whole-read vs naming the offending scope's key), and wording is
  * the warning layer's business.
  *
- * The two rejections are mutually exclusive — `repo-ids` requires repositories and `unscoped` requires none — so
- * the order they're checked in cannot change the outcome.
+ * `repo-ids` and `unscoped` are mutually exclusive — one requires repositories and the other requires none — so
+ * their relative order is free. `unusable-scope` is NOT: it must precede `unscoped`, so a value that was supplied
+ * but cannot be used is never reported as a missing one.
+ *
+ * Every scope name is checked for naming the same scope after the provider sanitizes it, not merely for being
+ * non-empty, and that distinction is a SECURITY one rather than a nicety — see {@link isUsableSearchScopeName}.
  */
 export function resolveIssueSearchScope(
 	repos: ProviderReposInput | undefined,
 	org: string | undefined,
 	criteria: IssueSearchCriteria | undefined,
 ): { rejection?: IssueSearchScopeRejection; repos?: ProviderRepoInput[] } {
+	let resolvedRepos: ProviderRepoInput[] | undefined;
+
 	if (repos?.length) {
 		// `ProviderReposInput` is a union of descriptor and id arrays; only the descriptor form is usable here.
-		if (repos.some(r => typeof r === 'string' || typeof r === 'number')) return { rejection: 'repo-ids' };
+		if (repos.some(r => typeof r === 'string' || typeof r === 'number')) {
+			return { rejection: { reason: 'repo-ids' } };
+		}
 
-		return { repos: repos as ProviderRepoInput[] };
+		resolvedRepos = repos as ProviderRepoInput[];
 	}
 
+	// Checked BEFORE the "is it scoped at all" rule below, so an unusable value is never reported as a missing
+	// one: it was supplied, and telling the caller to pass a scope it already passed names the wrong defect.
+	const unusable = unusableSearchScopeNames(org, resolvedRepos);
+	if (unusable.length > 0) return { rejection: { reason: 'unusable-scope', scopes: unusable } };
+
+	if (resolvedRepos != null) return { repos: resolvedRepos };
 	if (org != null && org.length > 0) return {};
 	if (criteria?.relationships?.some(r => userScopingIssueSearchRelationships.includes(r)) === true) return {};
 
-	return { rejection: 'unscoped' };
+	return { rejection: { reason: 'unscoped' } };
 }
 
 /**

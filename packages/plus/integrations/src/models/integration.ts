@@ -11,6 +11,7 @@ import type { Disposable } from '@gitlens/utils/disposable.js';
 import type { Event } from '@gitlens/utils/event.js';
 import { Emitter } from '@gitlens/utils/event.js';
 import { fnv1aHash64 } from '@gitlens/utils/hash.js';
+import { Logger } from '@gitlens/utils/logger.js';
 import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import type {
@@ -30,6 +31,7 @@ import type { Sources } from '../telemetry.js';
 import { areDomainsOnSameHost } from '../utils/domain.utils.js';
 import { isGitSelfManagedHostIntegrationId } from '../utils/integration.utils.js';
 import type { GitHostIntegration } from './gitHostIntegration.js';
+import { getCachedIssue } from './issueCache.js';
 import type { AccountWideIssuesResult, SearchMyIssuesOptions } from './issueReads.js';
 import type { IssuesIntegration } from './issuesIntegration.js';
 
@@ -65,6 +67,7 @@ type SyncReqUsecase = Exclude<
 	| 'getDefaultBranch'
 	| 'getIssue'
 	| 'getIssueOrPullRequest'
+	| 'getIssuesBatch'
 	| 'getIssuesForProject'
 	| 'getIssuesForRepos'
 	| 'getMyPullRequestsForUser'
@@ -491,7 +494,11 @@ export abstract class IntegrationBase<
 	): void {
 		if (isCancellationError(ex)) return;
 
-		options?.scope?.error(ex);
+		if (options?.scope != null) {
+			options.scope.error(ex);
+		} else {
+			Logger.error(ex);
+		}
 
 		// A per-connection (multi-account) read resolved its session through `resolveReadSession`'s
 		// `connectionId` branch, which deliberately never touches the cached primary `_session`. So the
@@ -821,38 +828,66 @@ export abstract class IntegrationBase<
 		type: undefined | IssueOrPullRequestType,
 	): Promise<IssueOrPullRequest | undefined>;
 
-	@trace()
 	async getIssue(
 		resource: T,
 		id: string,
-		options?: { expiryOverride?: boolean | number },
+		options?: { connectionId?: string; expiryOverride?: boolean | number },
 	): Promise<Issue | undefined> {
+		return (await this.getIssueResult(resource, id, options))?.value;
+	}
+
+	getIssueResult(
+		resource: T,
+		id: string,
+		options?: { connectionId?: string; expiryOverride?: boolean | number },
+	): Promise<IntegrationResult<Issue | undefined>> {
+		return this.getIssueResultCore(resource, id, options, session => this.getProviderIssue(session, resource, id));
+	}
+
+	@trace()
+	protected async getIssueResultCore(
+		resource: ResourceDescriptor,
+		id: string,
+		options: { connectionId?: string; expiryOverride?: boolean | number } | undefined,
+		getProviderIssue: (session: ProviderAuthenticationSession) => Promise<Issue | undefined>,
+	): Promise<IntegrationResult<Issue | undefined>> {
 		const scope = getScopedLogger();
+		const { connectionId: requestedConnectionId, expiryOverride } = options ?? {};
+		const connectionId = requestedConnectionId || undefined;
+		const session = await this.resolveReadSession(connectionId, scope);
+		if (session == null) return undefined;
 
-		const connected = this.maybeConnected ?? (await this.isConnected());
-		if (!connected) return undefined;
-
-		await this.refreshSessionIfExpired(scope);
-
-		const issue = this.ctx.cache.getIssue(
-			id,
-			resource,
-			this,
-			() => ({
-				value: (async () => {
+		try {
+			const issue = await getCachedIssue({
+				cache: this.ctx.cache,
+				id: id,
+				resource: resource,
+				integration: this,
+				load: async () => {
 					try {
-						const result = await this.getProviderIssue(this._session!, resource, id);
+						const issue = await getProviderIssue(session);
 						this.resetRequestExceptionCount('getIssue');
-						return result;
+						return issue;
 					} catch (ex) {
-						this.handleProviderException('getIssue', ex, { scope: scope });
-						return undefined;
+						if (!isCancellationError(ex)) {
+							this.handleProviderException('getIssue', toError(ex), {
+								scope: scope,
+								connectionId: connectionId,
+							});
+						}
+						throw ex;
 					}
-				})(),
-			}),
-			options,
-		);
-		return issue;
+				},
+				cacheOptions: {
+					connectionId: connectionId,
+					expiryOverride: expiryOverride,
+					etag: `${this.id}:${this.maybeConnected ?? false}:${this.getSessionFingerprint(session)}`,
+				},
+			});
+			return { value: issue };
+		} catch (ex) {
+			return { error: toError(ex) };
+		}
 	}
 
 	protected abstract getProviderIssue(

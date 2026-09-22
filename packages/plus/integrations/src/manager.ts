@@ -16,6 +16,8 @@ import type {
 	PullRequestCountScope,
 } from './reads/counts.js';
 import type { SupportedFilters } from './reads/filters.js';
+import type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
+import type { TrackerIssueResult } from './reads/trackerIssue.js';
 import type {
 	ConnectionStateChangeEvent,
 	ProviderBroadenResult,
@@ -402,15 +404,36 @@ export interface IntegrationManager {
 	 */
 	searchPullRequestsPage(options: {
 		providerId: IntegrationIds;
-		/** Repository descriptors that bound the search; ids cannot name provider search qualifiers. */
+		/**
+		 * Repository descriptors that bound the search; ids cannot name provider search qualifiers.
+		 *
+		 * Both halves of a descriptor must reach the provider unchanged — see `org` — since a search names a
+		 * repository by its `namespace/name` path.
+		 */
 		repos?: ProviderRepositoriesInput;
-		/** Organization/account that bounds the search. */
+		/**
+		 * Organization/account that bounds the search.
+		 *
+		 * Held to a STRICTER rule than the free-form `criteria.text`, which is sanitized: a scope name carrying a
+		 * quote, or an inner space or control character, is REFUSED (warning + `fetchFailed`), and the refusal
+		 * names the value. Leading and trailing whitespace and control characters are stripped and accepted,
+		 * since removing them cannot change which scope the query names. Sanitizing a scope would answer the wrong question — the sanitized value may name a real but
+		 * DIFFERENT organization, whose result looks entirely normal. Pass the name exactly as the provider spells
+		 * it; `''` means "no org supplied" and falls through to the other scopes.
+		 */
 		org?: string;
 		criteria?: PullRequestSearchCriteria;
 		/** Cursor-only: without a cursor, reaching page N costs O(N) upstream requests. */
 		page?: number;
 		cursor?: string;
-		/** Page size per relationship × state facet; the deduped union can contain more rows. */
+		/**
+		 * Page size PER RELATIONSHIP × STATE facet, not per page. Each facet is its own aliased provider query —
+		 * one axis more than {@link searchIssuesPage}'s per-relationship fan-out — so a page of a 3-relationship,
+		 * 2-state search returns up to `6 × itemsPerPage` items before deduplication, and fewer than that where
+		 * the facets overlap. Deduplication does NOT bring the page back to this size: it removes only the rows the
+		 * facets share. `page.itemsPerPage` reports what actually came back, so size the UI off that rather than
+		 * off this. A provider may also cap it below what is asked for.
+		 */
 		itemsPerPage?: number;
 		forceSync?: boolean;
 		connectionId?: string;
@@ -418,7 +441,9 @@ export interface IntegrationManager {
 		domain?: string;
 		/**
 		 * Requests the lightweight row shape: identity, body, author, repository, branch refs and stack info,
-		 * without review, check or diff statistics. It also raises the default page size.
+		 * without review, check or diff statistics. It also replaces the flat per-facet default page size with a
+		 * fixed budget shared across the search's ACTIVE facets, so with up to three of them it raises the page
+		 * and from four on it LOWERS it — measured against GitHub, a 100-row budget versus a flat 30 each.
 		 *
 		 * A provider without a lightweight projection ignores it and returns its usual shape, so this is a hint
 		 * rather than a contract about which fields are present.
@@ -473,6 +498,13 @@ export interface IntegrationManager {
 		page?: number;
 		/** Continuation from a prior page's `cursor`; supplying it costs exactly one upstream request per scope. */
 		cursor?: string;
+		/**
+		 * Page size PER QUERY, not per page. A page is a merge of one query per scope (repo-scoped) or per
+		 * relationship category (account-wide GitHub: authored/assigned/mentioned), so it can return up to
+		 * `N × itemsPerPage` items before deduplication. `page.itemsPerPage` reports what actually came back, so
+		 * size the UI off that rather than off this. Account-wide GitLab, Azure and Linear reads ignore it and
+		 * drain with their own bounds.
+		 */
 		itemsPerPage?: number;
 		forceSync?: boolean;
 		connectionId?: string;
@@ -511,9 +543,23 @@ export interface IntegrationManager {
 	 */
 	searchIssuesPage(options: {
 		providerId: IntegrationIds;
-		/** Repositories to search. Combines with `org`; both constrain the same query. */
+		/**
+		 * Repositories to search. Combines with `org`; both constrain the same query.
+		 *
+		 * Both halves of a descriptor must reach the provider unchanged — see `org` — since a search names a
+		 * repository by its `namespace/name` path.
+		 */
 		repos?: ProviderRepositoriesInput;
-		/** Organization/account to search. Combines with `repos`. */
+		/**
+		 * Organization/account to search. Combines with `repos`.
+		 *
+		 * Held to a STRICTER rule than the free-form criteria, which are sanitized: a scope name carrying a quote,
+		 * or an inner space or control character, is REFUSED (warning + `fetchFailed`), and the refusal names the
+		 * value. Leading and trailing whitespace and control characters are stripped and accepted, since removing
+		 * them cannot change which scope the query names.
+		 * The sanitized value may name a real but DIFFERENT org, whose result looks entirely normal. `''` means
+		 * "no org supplied" and falls through to the other scopes.
+		 */
 		org?: string;
 		criteria?: IssueSearchCriteria;
 		/**
@@ -563,6 +609,52 @@ export interface IntegrationManager {
 		/** Self-managed host domain fallback; see {@link ProviderSweepTarget.domain}. */
 		domain?: string;
 	}): Promise<ProviderResult<IssueCountResult>>;
+	/**
+	 * Resolves several issues BY COORDINATE — `(owner, repo, number)` — in one request.
+	 *
+	 * The read for "which issue does this branch name reference", which is an IDENTITY question rather than a
+	 * search. Emulating it by paging a scoped list and matching the identifier cannot prove absence without
+	 * walking the whole scope, so a miss stays unproven, uncacheable, and repeats its whole budget on every pass.
+	 * This answers it in one request per chunk, and a miss is final.
+	 *
+	 * Results are echoed under the caller's own `key`, so no positional matching is needed. Per-target isolation
+	 * is the rule: a chunk that fails upstream warns and drops only its own targets (with `fetchFailed` set) while
+	 * every other target still answers.
+	 *
+	 * `issue: undefined` means PROVEN ABSENT — the issue does not exist, or is not visible to this connection —
+	 * and is safe to cache. A target whose chunk failed is NOT returned at all, so the two are distinguishable;
+	 * caching a failure as an absence is exactly the bug this distinction prevents. GitHub/GHE only: a provider
+	 * that cannot batch refuses outright rather than degrading into N requests behind the caller's back.
+	 */
+	getIssuesBatch(options: {
+		providerId: IntegrationIds;
+		/** Each `key` must be unique — a duplicate refuses the whole call, since keys identify results. */
+		targets: readonly IssueBatchTarget[];
+		connectionId?: string;
+		/** Self-managed host domain fallback; see {@link ProviderSweepTarget.domain}. */
+		domain?: string;
+	}): Promise<ProviderResult<IssueBatchResult>>;
+	/**
+	 * Resolves one issue-tracker issue by key within a resource — the tracker counterpart of
+	 * {@link getIssuesBatch}, which cannot serve one.
+	 *
+	 * `issue: undefined` is a proven absence and may be cached. A failed read returns no item and sets
+	 * `fetchFailed`. `resourceId` is required and trusted; Jira also requires the resource's site URL so the result
+	 * retains its browser link. The read performs no resource discovery.
+	 *
+	 * Jira and Linear only. Trello refuses: its single-issue read falls back to a capped board scan for a numeric
+	 * identifier, so it cannot prove absence.
+	 */
+	getTrackerIssue(options: {
+		providerId: IntegrationIds;
+		/** Provider resource ID for the Atlassian site or Linear workspace. */
+		resourceId: string;
+		/** Jira site URL from resource discovery. Required for Jira so the result retains a browser link. */
+		resourceUrl?: string;
+		/** The provider's own key, e.g. `ABC-123`. Not a number. */
+		key: string;
+		connectionId?: string;
+	}): Promise<ProviderResult<TrackerIssueResult>>;
 	/**
 	 * How many pull requests match each scope, fetching none of them — the PR twin of {@link countIssues}, behind a
 	 * "this will fetch ~N pull requests" preview and a live count next to an unapplied filter. Same cost model,

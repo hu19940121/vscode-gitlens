@@ -2,7 +2,7 @@ import type { CollectionMetadata } from '@gitkraken/provider-apis';
 import type { IssueShape, IssueSorting } from '@gitlens/git/models/issue.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import { mapBounded } from '@gitlens/utils/promise.js';
-import { mergeAssessmentInto } from '../collectionMetadata.js';
+import { assessCollectionMetadata, mergeAssessmentInto } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import { providerFanOutConcurrency } from '../constants.js';
 import { isIssuesIntegration } from '../models/issuesIntegration.js';
@@ -262,9 +262,15 @@ export async function listIssueTrackerIssuesPage(
 	// handle from each resource's own account (multi-account safe), capturing any error so its kind
 	// (e.g. auth) is preserved rather than collapsed to a generic warning.
 	let usersByResourceId: Map<string, string> | undefined;
+	// The same accounts keyed by the same resource, holding the provider's stable id rather than the handle. A
+	// separate map rather than a widened value because the two are resolved and consumed independently: a
+	// provider may carry an account with no id, and `scopedProjectsWithUsers` gates on the HANDLE alone, so
+	// folding them together would drop a resource whose id happened to be missing.
+	let userIdsByResourceId: Map<string, string> | undefined;
 	let accountLookupFailed = false;
 	if (options.includeAllAssignees !== true) {
 		usersByResourceId = new Map<string, string>();
+		userIdsByResourceId = new Map<string, string>();
 		const accounts = await mapBounded(scopedResources, providerFanOutConcurrency, async resource => ({
 			resource: resource,
 			...(await runCaptured(options.providerId, domain, options.connectionId, () =>
@@ -275,7 +281,14 @@ export async function listIssueTrackerIssuesPage(
 		for (const { resource, value: account, warning: accountWarning } of accounts) {
 			const user = account?.username ?? account?.name ?? undefined;
 			if (user != null) {
-				usersByResourceId.set(resourceIdForProject(resource) ?? resource.key, user);
+				const resourceKey = resourceIdForProject(resource) ?? resource.key;
+				usersByResourceId.set(resourceKey, user);
+				// Empty-checked, not just null-checked: an account shape declares `id` as a plain string, and a
+				// provider with nothing to put there sets `''` rather than omitting it — which would otherwise
+				// reach a user-field query as an empty identity and match nothing.
+				if (account?.id != null && account.id !== '') {
+					userIdsByResourceId.set(resourceKey, account.id);
+				}
 				continue;
 			}
 
@@ -312,6 +325,13 @@ export async function listIssueTrackerIssuesPage(
 		// Some providers/tests return project descriptors without their parent resource id. When we have only
 		// one scoped resource, re-use that sole resolved user rather than silently dropping every project.
 		return fallbackUserForUnscopedProject;
+	};
+	// Deliberately NOT falling back the way `userForProject` does. That fallback exists so a project with no
+	// parent resource id still gets scoped rather than dropped, and the handle is what the drop is judged on;
+	// the id is optional everywhere it is read, so a miss degrades to the handle instead of widening the read.
+	const userIdForProject = (project: ResourceDescriptor): string | undefined => {
+		const resourceId = resourceIdForProject(project);
+		return resourceId != null ? userIdsByResourceId?.get(resourceId) : undefined;
 	};
 
 	const retryProjectKeys = new Set<string>();
@@ -441,6 +461,7 @@ export async function listIssueTrackerIssuesPage(
 				project,
 				{
 					user: userForProject(project),
+					userId: userIdForProject(project),
 					filters: options.filters,
 					sort: sort,
 				},
@@ -452,10 +473,7 @@ export async function listIssueTrackerIssuesPage(
 	// Partial project discovery means some projects' issues are missing from this page; propagate it so the
 	// page reports fetchFailed even when every discovered project's own read succeeded.
 	let fetchFailed = projectDiscoveryFailed || accountLookupFailed;
-	// A project whose internal page-drain hit its backstop (Jira/Linear cap at maxPagesPerRequest) reports
-	// `truncated`; surface it as `page.truncated` so a windowed read isn't published as having drained each
-	// project completely.
-	let projectTruncated = projectDiscoveryTruncated;
+	let truncationRecovery: 'narrow-scope' | 'none' | undefined = projectDiscoveryTruncated ? 'none' : undefined;
 	let drainMetadata: CollectionMetadata | undefined;
 	for (const { project, value: result, warning } of perProject) {
 		const key = projectKey(project);
@@ -465,7 +483,7 @@ export async function listIssueTrackerIssuesPage(
 			// single failing token repeats verbatim once per project in the window.
 			appendDedupedWarning(warnings, warning);
 			fetchFailed = true;
-			projectTruncated = true;
+			truncationRecovery = 'none';
 		}
 		// A thrown/unsupported read (e.g. Linear not-implemented) surfaces as a warning with no value;
 		// mark the aggregate as fetchFailed so an empty result isn't mistaken for "no issues".
@@ -475,7 +493,8 @@ export async function listIssueTrackerIssuesPage(
 		if (result != null) {
 			items.push(...result.values);
 			if (result.truncated) {
-				projectTruncated = true;
+				const recovery = result.recovery;
+				truncationRecovery = truncationRecovery == null || truncationRecovery === recovery ? recovery : 'none';
 			}
 			if (result.metadata != null) {
 				drainMetadata = mergeCollectionMetadata(drainMetadata, result.metadata);
@@ -497,29 +516,33 @@ export async function listIssueTrackerIssuesPage(
 	// publishes. A no-op when nothing merged, since the tracker already ordered that single run.
 	const orderedItems = ordering.order(items);
 
-	const drainAssessment = mergeAssessmentInto(
-		warnings,
-		options.providerId,
-		domain,
-		options.connectionId,
-		drainMetadata,
-	);
-	fetchFailed = fetchFailed || drainAssessment.fetchFailed;
-	projectTruncated = projectTruncated || drainAssessment.truncated;
+	const projectReadReportedTruncation = truncationRecovery != null;
+	const drainAssessment = assessCollectionMetadata(options.providerId, domain, options.connectionId, drainMetadata);
+	for (const warning of drainAssessment.warnings) {
+		// A project result already supplies the recovery semantics. Replace metadata's unstructured fallback with
+		// the structured warning below, while retaining specific failures and omissions.
+		if (projectReadReportedTruncation && !drainAssessment.fetchFailed && warning.omission == null) continue;
 
-	// A per-project read that returned data but couldn't confirm completeness (e.g. Trello's provider-native
-	// cap) sets `truncated` without a structured failure. Add one provider-neutral incompleteness warning so
-	// the caller sees the truncation, but only when no warning already explains it (avoid duplicate noise).
-	if (projectTruncated && warnings.length === 0) {
-		warnings.push(
+		appendDedupedWarning(warnings, warning);
+	}
+	fetchFailed = fetchFailed || drainAssessment.fetchFailed;
+	if (drainAssessment.truncated) {
+		truncationRecovery = 'none';
+	}
+
+	const projectTruncated = truncationRecovery != null;
+	const scopeTooLarge = !fetchFailed && truncationRecovery === 'narrow-scope';
+	if (scopeTooLarge || (!fetchFailed && projectTruncated && !warnings.some(warning => warning.omission != null))) {
+		appendDedupedWarning(
+			warnings,
 			incompleteReadWarning(
 				options.providerId,
 				domain,
 				options.connectionId,
-				'Some issues were omitted; the provider returned an incomplete result.',
-				// `exhausted`, not `page-budget`: the per-project drain's backstop is an internal constant
-				// (`maxPagesPerRequest`), not an option this read exposes, so no caller can raise it.
-				fetchFailed ? 'interrupted' : 'exhausted',
+				scopeTooLarge
+					? 'Some projects hold more issues than one read can return; narrow the scope to read the rest.'
+					: 'Some issues were omitted; the provider returned an incomplete result.',
+				scopeTooLarge ? 'scope-too-large' : 'exhausted',
 			),
 		);
 	}

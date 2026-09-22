@@ -8,7 +8,7 @@ import type {
 	PullRequestSorting,
 } from '../providerFilters.js';
 import { providersMetadata } from '../providers/models.js';
-import type { ProviderWarning } from '../results.js';
+import type { ProviderWarning, ProviderWarningOmissionRecovery } from '../results.js';
 import type { IssueSearchCriteriaRejection, PullRequestSearchCriteriaRejection } from './filters.js';
 import type { UnmergeableIssueSort, UnsupportedIssueSortRejection } from './ordering.js';
 
@@ -101,21 +101,23 @@ export function issueTrackerOnlySurfaceWarning(
 	);
 }
 
-/**
- * Why a read the facade drove itself returned less than everything. The two questions a consumer cannot
- * answer from `truncated` or from the message, kept together because they are decided together:
- *
- * - `interrupted`: the read did NOT succeed — the session went away, a later page failed. It leaves an unread
- *   tail like the others, but it is a failure: it sets `fetchFailed`, and a retry is exactly the right move.
- *   Gets no omission at all, since the omission asserts the opposite.
- * - `page-budget`: the drain stopped at its own `maxPages`, with a usable cursor still in hand. The items ARE
- *   reachable and were simply not fetched, so re-running with a higher budget returns them.
- * - `exhausted`: everything else that succeeded and came back short — the provider capped the page it served,
- *   advertised another page without a usable cursor (or with one it had already handed out), or a read could
- *   not confirm it had drained everything. The default of the three: choose it whenever a raisable budget is
- *   not demonstrably what stopped the read, so a consumer is never offered a fetch that cannot deliver.
- */
-export type IncompleteReadCause = 'interrupted' | 'page-budget' | 'exhausted';
+/** Why a facade-driven read returned fewer results than requested. */
+export type IncompleteReadCause = 'interrupted' | 'page-budget' | 'exhausted' | 'scope-too-large';
+
+function recoveryForIncompleteReadCause(cause: IncompleteReadCause): ProviderWarningOmissionRecovery {
+	switch (cause) {
+		case 'page-budget':
+			return 'page-budget';
+		case 'scope-too-large':
+			return 'narrow-scope';
+		case 'interrupted':
+		case 'exhausted':
+			return 'none';
+		default:
+			cause satisfies never;
+			return 'none';
+	}
+}
 
 /**
  * Builds the warning for a read that returned less than everything, carrying the two facts a consumer cannot
@@ -143,7 +145,7 @@ export function incompleteReadWarning(
 		...warning,
 		omission: {
 			kind: 'pagination-incomplete',
-			recovery: cause === 'page-budget' ? 'page-budget' : 'none',
+			recovery: recoveryForIncompleteReadCause(cause),
 		},
 	};
 }
@@ -192,6 +194,10 @@ function truncationMessage(id: IntegrationIds, readKind: TruncatedReadKind, caus
 			return `${readKind} read for '${id}' stopped at its page budget; more results can be read by raising it.`;
 		case 'exhausted':
 			return `${readKind} read for '${id}' was truncated and cannot be continued; results may be incomplete.`;
+		case 'scope-too-large':
+			// Says what is true — the scope is larger than a read of it — rather than blaming the provider for a
+			// ceiling that is ours, and names the remedy that exists, since no retry or budget has one.
+			return `${readKind} read for '${id}' covers more than one read can return; narrow the scope to read the rest.`;
 	}
 	// No `default`: `IncompleteReadCause` is declared in this file, so `noImplicitReturns` already fails the
 	// build here if a cause is added without its own wording. (`collectionOmissionMessage`'s `satisfies never`
@@ -253,6 +259,25 @@ export function unsupportedFiltersWarning(
 		connectionId,
 		`The requested pull request filters are not supported by '${id}'; skipped to avoid returning unfiltered results.`,
 	);
+}
+
+/**
+ * The one sentence every `unusable-scope` refusal uses — the five surfaces that validate a search scope (both
+ * searches, both count probes, and issue broadening) differ only in the noun and in whether they name a count
+ * key, so the reason a scope is unusable is written once. `prefix` is what the count probes put in front of it
+ * to name their key.
+ *
+ * NAMES the offending values, because which failure mode applied is not deducible from the value: a quote makes
+ * `git"kraken` a request for the real and different org `gitkraken`, a space makes `my org` a search of `my`
+ * filtered by the text `org`, and a value of only quotes or whitespace leaves no scope at all. The caller is the
+ * only layer that knows which scope it meant.
+ *
+ * Says how to fix it rather than what was stripped: a consumer cannot mirror this rule (unlike free-text
+ * sanitizing, whose rules are published for exactly that), so "pass the scope as the provider names it" is the
+ * actionable half.
+ */
+export function unusableSearchScopeMessage(noun: string, scopes: readonly string[], prefix?: string): string {
+	return `${prefix != null ? `${prefix}: ` : ''}The requested ${noun} (${scopes.map(s => JSON.stringify(s)).join(', ')}) cannot be used as given: a scope name cannot contain quotes, or an inner space or control character, which a query would drop or read as a second qualifier — searching a different scope, or none. Pass the scope exactly as the provider names it.`;
 }
 
 /** Warning for a filtered pull-request search the provider cannot run as requested. */

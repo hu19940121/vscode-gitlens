@@ -113,27 +113,33 @@ provider before calling the token backend; never reuse an id discovered under a 
 Every read returns `ProviderResult<T>` (`items` + `warnings` + `fetchFailed?`), and every paged read extends
 it with `page` + `hasMore` + `cursor?`. **No read throws for a provider-side failure** — see §6.
 
-| Method                       | Returns                   | Scope                                                                                 |
-| ---------------------------- | ------------------------- | ------------------------------------------------------------------------------------- |
-| `listOrgs`                   | `ProviderOrganization`    | Orgs / workspaces / groups; issue-tracker resources (Jira sites, …).                  |
-| `listProjects`               | `ProviderOrganization`    | The project tier: Azure DevOps, and issue-tracker projects.                           |
-| `listRepos`                  | `ProviderRepositoryShape` | Repos of an `org`, or account-wide user-affiliated repos when `org` is omitted.       |
-| `listPullRequestsPage`       | `PullRequestShape`        | With `repos`: those repos' PRs. Without: the user's PRs account-wide.                 |
-| `searchPullRequestsPage`     | `PullRequestShape`        | PRs involving the user that match structured criteria, optionally repo/org-scoped.    |
-| `countPullRequests`          | `PullRequestCountResult`  | How many PRs match each scope, fetching none of them. See §5.1.                       |
-| `listIssuesPage`             | `IssueShape`              | Same split, for a **git host**'s issues.                                              |
-| `searchIssuesPage`           | `IssueShape`              | Issues matching structured criteria over a repo/org scope — **no** `@me` binding.     |
-| `countIssues`                | `IssueCountResult`        | How many match each scope, fetching none of them. See §5.1.                           |
-| `listIssueTrackerIssuesPage` | `IssueShape`              | Jira / Linear / Trello (issues live under resource → project).                        |
-| `sweepPullRequests`          | `ProviderSweepResult`     | Drains **every** page across providers (`maxPages`, default 100).                     |
-| `sweepClosedPullRequests`    | `ProviderSweepResult`     | Same, pinned to `['closed','merged']`.                                                |
-| `broadenIssues`              | `ProviderBroadenResult`   | Per-org fan-out: list the org's repos, then read their issues unfiltered by assignee. |
-| `resolveRepository`          | `ResolveRepositoryResult` | Remote URL → canonical provider identity (the `gk repo resolve` equivalent).          |
-| `getSupportedFilters`        | filter capability table   | Static, connection-free. See §7.                                                      |
+| Method                       | Returns                   | Scope                                                                                   |
+| ---------------------------- | ------------------------- | --------------------------------------------------------------------------------------- |
+| `listOrgs`                   | `ProviderOrganization`    | Orgs / workspaces / groups; issue-tracker resources (Jira sites, …).                    |
+| `listProjects`               | `ProviderOrganization`    | The project tier: Azure DevOps, and issue-tracker projects.                             |
+| `listRepos`                  | `ProviderRepositoryShape` | Repos of an `org`, or account-wide user-affiliated repos when `org` is omitted.         |
+| `listPullRequestsPage`       | `PullRequestShape`        | With `repos`: those repos' PRs. Without: the user's PRs account-wide.                   |
+| `searchPullRequestsPage`     | `PullRequestShape`        | PRs involving the user that match structured criteria, optionally repo/org-scoped.      |
+| `countPullRequests`          | `PullRequestCountResult`  | How many PRs match each scope, fetching none of them. See §5.1.                         |
+| `listIssuesPage`             | `IssueShape`              | Same split, for a **git host**'s issues.                                                |
+| `searchIssuesPage`           | `IssueShape`              | Issues matching structured criteria over a repo/org scope — **no** `@me` binding.       |
+| `countIssues`                | `IssueCountResult`        | How many match each scope, fetching none of them. See §5.1.                             |
+| `getIssuesBatch`             | `IssueBatchResult`        | Resolves N `(owner, repo, number)` coordinates in one request; an absence is proven.    |
+| `getTrackerIssue`            | `TrackerIssueResult`      | Resolves ONE tracker issue by key within a resource; an absence is proven. Jira/Linear. |
+| `listIssueTrackerIssuesPage` | `IssueShape`              | Jira / Linear / Trello (issues live under resource → project).                          |
+| `sweepPullRequests`          | `ProviderSweepResult`     | Drains **every** page across providers (`maxPages`, default 100).                       |
+| `sweepClosedPullRequests`    | `ProviderSweepResult`     | Same, pinned to `['closed','merged']`.                                                  |
+| `broadenIssues`              | `ProviderBroadenResult`   | Per-org fan-out for every visible issue, unfiltered by assignee.                        |
+| `resolveRepository`          | `ResolveRepositoryResult` | Remote URL → canonical provider identity (the `gk repo resolve` equivalent).            |
+| `getSupportedFilters`        | filter capability table   | Static, connection-free. See §7.                                                        |
 
 A provider that cannot serve a surface says so explicitly — a warning explaining that the operation is
 unsupported plus `fetchFailed`, never a silent empty page. That distinction is the whole point of the result
 shape: an empty `items` with no warning means "this account genuinely has nothing".
+
+`getTrackerIssue` takes `resourceId` for both supported trackers. Jira also takes `resourceUrl`, the site URL
+returned by `listOrgs`; the REST response only supplies an API `self` link, so the caller provides the already-known
+site identity rather than making this point read perform resource discovery. Linear does not need it.
 
 ## 5. Paging
 
@@ -210,6 +216,19 @@ provider-reported pre-ceiling facet count, matching the per-search ceiling's uni
 still-reachable row count. Free text is sanitized so qualifier-shaped tokens such as `org:other` are removed
 rather than allowed to change the structured scope.
 
+The `repos`/`org` scope is held to a stricter rule than that free text, and the same one §5.1 documents: a
+scope name carrying a quote, an inner space or a control character is **refused** (warning + `fetchFailed`),
+not sanitized, and the refusal names the value; edge whitespace and control characters are stripped and
+accepted. `countPullRequests` validates each scope through the same rule, so a count never previews a query
+the read would refuse.
+
+`itemsPerPage` is **per relationship × state facet**, not per page — one axis more than §5.1's
+per-relationship fan-out, since each facet is its own aliased provider query. A page of a 3-relationship,
+2-state search returns up to `6 × itemsPerPage` items before deduplication, and fewer where the facets
+overlap; deduplication does **not** bring the page back to the requested size, since it removes only the rows
+the facets share. As in §5.1: size the list off `page.itemsPerPage`, not off the value you sent; a provider
+may cap the `itemsPerPage` it honors below what you asked for.
+
 ### 5.1 The filtered issue search and its count probe
 
 `searchIssuesPage` answers "every issue in this scope matching X", which no other issue read can: the
@@ -231,18 +250,29 @@ const result = await manager.searchIssuesPage({
 });
 ```
 
-Three parts of the contract that are decisions, not incidentals:
+Parts of the contract that are decisions, not incidentals:
 
 - **Scope is mandatory.** Pass `repos`, `org`, or a user relationship (`authored` / `assigned` / `mentioned`).
   `any-assignee` and `unassigned` do **not** scope anything — they describe the issue, not the caller, so
   either one alone matches every such issue on the host. A call carrying only those is refused (warning +
   `fetchFailed`), as is one scoping by repository **id**: a search names repositories by path, so ids would
   silently widen the read to the whole org.
+- **A scope name must name the same scope after sanitizing.** Unlike the free-form values below, a scope
+  carrying a quote, an inner space or a control character is **refused** (warning + `fetchFailed`) rather than
+  sanitized, and the refusal names the offending value. Sanitizing answers "what can I still send?", which for
+  a scope is the wrong question — the sanitized value may name a real but **different** scope. Leading and
+  trailing whitespace and control characters are the exception and are accepted: stripping them does not
+  change which scope the query names, so refusing them would reject a name the provider resolves correctly. A
+  repository descriptor is checked as its JOINED `namespace/name` path, which is what a `repo:` qualifier
+  names — an edge character on a half is an interior character of the path, and both halves must be
+  non-empty. `org: ''` still means "no org supplied" and falls through to the remaining scopes. A provider with no
+  filtered search at all is reported as such first, so an unusable scope never masks it.
 - **Ordering is always most-recently-updated-first.** Not an option: a "show the N most recent" policy at the
   result ceiling is only correct under a guaranteed order.
 - **`itemsPerPage` is per RELATIONSHIP**, since each becomes its own provider query: a page of an
   N-relationship search returns up to `N × itemsPerPage` items before deduplication, and fewer where they
-  overlap. Read `page.itemsPerPage` for what actually came back.
+  overlap. Read `page.itemsPerPage` for what actually came back and size the list off that, not off the value
+  you sent; a provider may also cap the `itemsPerPage` it honors below what you asked for.
 - **At the result ceiling the read SUCCEEDS.** More matches than the provider will serve is an _omission_, not
   a failure: `fetchFailed` stays absent, and the warning carries `omission.totalCount` (how many matched),
   `omission.limit` (how many are reachable) and `recovery: 'none'` — the rest is unreachable however you page,
@@ -330,7 +360,9 @@ on it without parsing `message`:
 if (warning.omission != null) {
 	// The read SUCCEEDED — message it as incompleteness, not failure.
 	// Whether anything would fetch the rest is a separate question; see `recovery` below.
-	if (warning.omission.recovery !== 'none') offerLoadMore(warning.omission);
+	// Switch on the VALUE. `!== 'none'` is not "fetchable": `narrow-scope` is not.
+	if (warning.omission.recovery === 'page-budget') offerLoadMore(warning.omission);
+	else if (warning.omission.recovery === 'narrow-scope') suggestNarrowingTheScope(warning.omission);
 }
 ```
 
@@ -360,19 +392,22 @@ mid-read left an unread tail too, but a retry may complete it — that one carri
 a provider that gave no usable cursor are the same kind, but only the first can be fetched. Gate a "load more"
 affordance on `recovery`, never on `kind`:
 
-| `omission.recovery` | Means                                                          | What a consumer does                                                       |
-| ------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `none`              | Nothing you can call returns the missing items.                | Say the results are capped. Do not offer to fetch more.                    |
-| `page-budget`       | Re-run the same read with a higher `maxPages` (sweep options). | Offer it — but note it re-reads from the start, so make it user-initiated. |
+| `omission.recovery` | Means                                                                                    | What a consumer does                                                       |
+| ------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `none`              | Nothing you can call returns the missing items.                                          | Say the results are capped. Do not offer to fetch more.                    |
+| `page-budget`       | Re-run the same read with a higher `maxPages` (sweep options).                           | Offer it — but note it re-reads from the start, so make it user-initiated. |
+| `narrow-scope`      | A smaller server-side scope can avoid the backstop; no budget or retry reaches the rest. | Suggest narrowing the scope. Do **not** offer to fetch more.               |
 
 `recovery` is **required** — unlike `limit`, `totalCount` and `scope`, it is never absent. An absent value
 would be indistinguishable from `none` while actually meaning "this producer didn't say", which is the
 ambiguity `omission` exists to remove.
 
 It is also **conservative**: it names only what a producer can prove, so `none` means "not known to be
-recoverable", not "proven unrecoverable". Today only a sweep that spent its own page budget reports
-`page-budget`; everything else — every provider cap, every exhausted internal budget, and every omission
-derived from SDK metadata — is `none`. A `scope` does not change that. It attributes where results were
+recoverable", not "proven unrecoverable". Only a sweep that spent its own page budget reports `page-budget`, and
+only a broad Jira project query that provably stopped at its own page backstop reports `narrow-scope`.
+Already-scoped Jira reads and Linear reads use `none` when they emit an omission because changing the public
+scope cannot make those provider requests narrower. Other caps and exhausted budgets also use `none`; a stalled
+cursor or failed page may instead be a failure with no omission. A `scope` does not change that. It attributes where results were
 withheld, and the SDK reports the same scoped shape both for a scope it merely sampled and for one whose
 cursor stalled, so re-reading it is not something this layer can promise.
 
@@ -523,8 +558,10 @@ Derived from the provider models and `providersMetadata`. ✓ supported · ✗ r
 | `countPullRequests`          |      ✓       |          ✗           |     ✗     |      ✗       |            ✗            |  ✗   |   ✗    |   ✗    |
 | Issues, repo-scoped          |      ✓       |          ✓           |     ✗     |      ✗       |            ✓            |  —   |   —    |   —    |
 | Issues, account-wide         |      ✓       |          ✓           |     ✗     |      ✗       |            ✓            |  —   |   —    |   —    |
-| `searchIssuesPage`           |      ✓       |          ✗           |     ✗     |      ✗       |            ✗            |  ✗   |   ✗    |   ✗    |
-| `countIssues`                |      ✓       |          ✗           |     ✗     |      ✗       |            ✗            |  ✗   |   ✗    |   ✗    |
+| `searchIssuesPage`           |      ✓       |          ✓           |     ✗     |      ✗       |            ✗            |  ✗   |   ✗    |   ✗    |
+| `countIssues`                |      ✓       |          ✓           |     ✗     |      ✗       |            ✗            |  ✗   |   ✗    |   ✗    |
+| `getIssuesBatch`             |      ✓       |          ✓           |     ✗     |      ✗       |            ✗            |  ✗   |   ✗    |   ✗    |
+| `getTrackerIssue`            |      ✗       |          ✗           |     ✗     |      ✗       |            ✗            |  ✓   |   ✓    |   ✗    |
 | Issues by `org`/`project`    |      ✗       |          ✗           |     ✗     |      ✗       |            ✓            |  ✓   |   ✓    |   ✓    |
 | `listIssueTrackerIssuesPage` |      —       |          —           |     —     |      —       |            —            |  ✓   |   ✓    |   ✓    |
 | `broadenIssues`              |      ✓       |          ✓           |     ✗     |      ✗       |            ✓            |  ✗   |   ✗    |   ✗    |
@@ -566,6 +603,64 @@ free text have no equivalent on either.
 
 ## 9. Per-provider behavior worth designing around
 
+### Tracker issue state
+
+`IssueShape.state` remains the normalized `'opened' | 'closed'` value used by existing consumers. Tracker issues also
+carry the provider's own workflow state in the optional `providerState` field; it is display data and is not added to
+`IssueOrPullRequest`, because pull requests' normalized `'opened' | 'closed' | 'merged'` state is complete.
+
+The field mirrors what `provider-apis` provides. `name` is the provider's untranslated display name, `color` is
+omitted when the provider returns `null`, and `category` is only present where the provider supplies it:
+
+| Provider     | `name`              | `color` | `category`                               |
+| ------------ | ------------------- | ------- | ---------------------------------------- |
+| Jira         | Status name         | Yes     | Yes, from the stable status-category key |
+| Linear       | Workflow state name | Yes     | Yes, mapped from the Linear state type   |
+| Trello       | Card list name      | No      | No                                       |
+| Azure DevOps | Work-item state     | No      | No                                       |
+| GitHub       | `open` / `closed`   | No      | No                                       |
+| GitLab       | `opened` / `closed` | No      | No                                       |
+
+For Jira, legacy reads may omit `category` when `provider-apis` only has a localized status name to classify; the
+direct issue-by-key read supplies the stable category. `name` and `color` are preserved in both cases.
+
+The normalized `state` and `closed` fields keep their existing derivation; `providerState` is additive.
+
+### Sprints and iterations
+
+`IssueShape.iterations` carries the sprints or iteration an issue belongs to. It is additive and optional, and an
+absent value means **this read could not report one**, not that the issue has no sprint — coverage varies per read,
+not just per provider:
+
+| Provider     | Read                              | `iterations`                                    |
+| ------------ | --------------------------------- | ----------------------------------------------- |
+| Jira         | Project-scoped issue reads        | Yes, every sprint the issue belongs to          |
+| Jira         | Point, account-wide, issue-by-key | No — none of those field lists requests sprints |
+| Azure DevOps | Direct and SDK-backed reads       | Yes, one iteration                              |
+| Others       | —                                 | No                                              |
+
+Jira's sprint field is a per-instance custom field that `provider-apis` resolves by its display name, so a site that
+renames or localizes it reports no sprints even on the reads that ask for it.
+
+The metadata each provider supplies differs, and nothing is invented to even it out. Jira reports `isActive` and the
+sprint dates; Azure reports only a path, so its iterations carry `id` and `name` alone. An absent `isActive`
+therefore means **unknown**, not inactive — don't filter iterations out with it.
+
+`id` is a sprint id on Jira and the verbatim iteration path on Azure, so it is only meaningful within one provider's
+project — don't correlate on it across providers, and don't persist it: Azure rewrites the path when an iteration
+node is renamed or re-parented. Both Azure routes produce the identical `id` for the same work item, because the
+direct read mirrors `provider-apis`' own normalization.
+
+### Issue body format
+
+`IssueShape.body` is not normalized to one markup language. Jira descriptions come from REST v2 as wiki markup,
+while GitHub, GitLab, and Linear descriptions are Markdown. Jira issues therefore set
+`bodyFormat: 'jira-wiki'`; an omitted `bodyFormat` means consumers should preserve the existing behavior and treat
+`body` as Markdown. The `'markdown'` value is reserved for providers that need to make that format explicit.
+
+Rendering and conversion remain consumer concerns. In particular, the Jira body is neither ADF nor converted to
+Markdown by this package.
+
 - **GitHub / GHE** — cursor-only everywhere. The filtered PR search aliases each requested relationship × state
   facet into one GraphQL request per page, dedupes facet overlap, and sorts the page most-recently-updated-first.
   With no relationships it searches every PR in the required repo/org scope. The
@@ -604,12 +699,14 @@ free text have no equivalent on either.
   recovered. `hasMore` reports only untouched forward progress. A cursor can therefore remain with
   `hasMore: false`; reusing it is an explicit manual retry of failed work, not a normal paging loop.
 
-**`broadenIssues` vs `searchIssuesPage`.** If you already know your repository set, prefer
-`searchIssuesPage({ repos })`: `broadenIssues` has to discover each org's repositories first (a paged drain)
-and then reads their issues through the SDK path with the recovery walk, so it costs strictly more for the
-same answer. It remains the read for "fan out across these orgs, whatever repos they turn out to contain",
-with per-provider attribution (`broadenedProviderIds` / `failedProviderIds` / `incompleteProviderIds`) that
-the single-provider search doesn't produce.
+**`broadenIssues` vs `searchIssuesPage`.** `broadenIssues` now reads each org through the org-scoped
+filtered search where the provider declares one (GitHub/GHE), so it no longer discovers repositories first
+and no longer routes through the SDK read's recovery walk — one request per page, per org. A provider with
+no filtered search (Azure DevOps, GitLab) still takes the repository drain, since refusing the org would be
+worse. It remains the read for "fan out across these orgs, whatever repos they turn out to contain", with
+per-provider attribution (`broadenedProviderIds` / `failedProviderIds` / `incompleteProviderIds`) that the
+single-provider search doesn't produce; reach for `searchIssuesPage` when you want ONE scope with an order
+you control.
 
 If you do migrate: broaden means **all visible** — it drops the assignee constraint entirely, so unassigned
 issues are included. The equivalent is therefore an **omitted** `relationships`, **not**

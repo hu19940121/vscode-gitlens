@@ -24,6 +24,7 @@ import {
 	pullRequestSearchCapResultWarning,
 	truncationWarning,
 	unsupportedPullRequestSearchCriteriaWarning,
+	unusableSearchScopeMessage,
 } from './warnings.js';
 
 /**
@@ -44,6 +45,7 @@ export async function searchPullRequestsPage(
 		criteria?: PullRequestSearchCriteria;
 		page?: number;
 		cursor?: string;
+		/** Per relationship × state facet, not per page; see {@link IntegrationManager.searchPullRequestsPage}. */
 		itemsPerPage?: number;
 		forceSync?: boolean;
 		connectionId?: string;
@@ -100,7 +102,7 @@ export async function searchPullRequestsPage(
 	}
 
 	const scope = resolvePullRequestSearchScope(options.providerId, options.repos, options.org, options.criteria);
-	switch (scope.rejection) {
+	switch (scope.rejection?.reason) {
 		case 'unscoped':
 			return refused(
 				otherWarning(
@@ -125,9 +127,21 @@ export async function searchPullRequestsPage(
 				unsupportedPullRequestSearchCriteriaWarning(options.providerId, domain, options.connectionId, {
 					reason: 'unsupported-criteria',
 					criteria: [
-						scope.rejection === 'unsupported-repository-scope' ? 'repositoryScope' : 'organizationScope',
+						scope.rejection.reason === 'unsupported-repository-scope'
+							? 'repositoryScope'
+							: 'organizationScope',
 					],
 				}),
+			);
+		// A scope the query cannot spell, refused rather than sanitized — see `isUsableSearchScopeName`.
+		case 'unusable-scope':
+			return refused(
+				otherWarning(
+					options.providerId,
+					domain,
+					options.connectionId,
+					unusableSearchScopeMessage('pull request search scopes', scope.rejection.scopes),
+				),
 			);
 	}
 

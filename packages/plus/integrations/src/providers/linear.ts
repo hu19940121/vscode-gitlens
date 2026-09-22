@@ -13,7 +13,12 @@ import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
 import { IssuesCloudHostIntegrationId } from '../constants.js';
 import { IntegrationReadUnavailableError } from '../errors.js';
-import type { AccountWideIssuesResult, IssuesForProjectOptions, SearchMyIssuesOptions } from '../models/issueReads.js';
+import type {
+	AccountWideIssuesResult,
+	IssuesForProjectOptions,
+	ProjectIssuesDrain,
+	SearchMyIssuesOptions,
+} from '../models/issueReads.js';
 import { IssuesIntegration } from '../models/issuesIntegration.js';
 import type { ProviderApiCollectionResult, ProviderIssue } from './models.js';
 import { fromProviderIssue, providersMetadata, toIssueShape } from './models.js';
@@ -220,7 +225,7 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		session: ProviderAuthenticationSession,
 		project: ResourceDescriptor,
 		options?: IssuesForProjectOptions,
-	): Promise<{ values: IssueShape[]; truncated: boolean; metadata?: CollectionMetadata } | undefined> {
+	): Promise<ProjectIssuesDrain | undefined> {
 		if (!isIssueResourceDescriptor(project)) return undefined;
 
 		const api = await this.getProvidersApi();
@@ -257,6 +262,8 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			requestCount += 1;
 			hasMore = result.paging?.more ?? false;
 			const nextCursor = result.paging?.cursor;
+			truncated ||= result.paging?.truncated === true;
+			collectionMetadata = mergeCollectionMetadata(collectionMetadata, result.metadata);
 			for (const issue of result.values) {
 				const shape = toIssueShape(issue, this);
 				if (shape != null) {
@@ -271,7 +278,6 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			}
 
 			cursor = nextCursor;
-			// More pages remain but we've hit the backstop: the drain is incomplete.
 			if (hasMore && requestCount >= maxPagesPerRequest) {
 				truncated = true;
 			}
@@ -295,14 +301,16 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 					'could not resolve the current user to scope issues to',
 				);
 			}
-			return {
-				values: issues.filter(issue => issue.assignees?.some(a => a.id === viewerId)),
-				truncated: truncated,
-				metadata: collectionMetadata,
-			};
+
+			const values = issues.filter(issue => issue.assignees?.some(a => a.id === viewerId));
+			return truncated
+				? { values: values, truncated: true, recovery: 'none', metadata: collectionMetadata }
+				: { values: values, truncated: false, metadata: collectionMetadata };
 		}
 
-		return { values: issues, truncated: truncated, metadata: collectionMetadata };
+		return truncated
+			? { values: issues, truncated: true, recovery: 'none', metadata: collectionMetadata }
+			: { values: issues, truncated: false, metadata: collectionMetadata };
 	}
 
 	override get id(): IssuesCloudHostIntegrationId.Linear {
@@ -434,30 +442,35 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		return result && fromProviderIssue(result, this);
 	}
 
+	protected override async getProviderIssueByResourceId(
+		session: ProviderAuthenticationSession,
+		resourceId: string,
+		id: string,
+		_resourceUrl: string | undefined,
+	): Promise<Issue | undefined> {
+		const api = await this.getProvidersApi();
+		const result = await api.getIssue(toTokenWithInfo(this.id, session), {
+			resourceId: resourceId,
+			number: id,
+		});
+		return result && fromProviderIssue(result, this);
+	}
+
 	private async getRawProviderIssue(
 		session: ProviderAuthenticationSession,
 		resource: ResourceDescriptor,
 		id: string,
 	): Promise<ProviderIssue | undefined> {
 		const api = await this.getProvidersApi();
-		try {
-			if (!isIssueResourceDescriptor(resource)) {
-				Logger.error(undefined, 'getProviderIssue: resource is not an IssueResourceDescriptor');
-				return undefined;
-			}
-
-			const result = await api.getIssue(toTokenWithInfo(this.id, session), {
-				resourceId: resource.id,
-				number: id,
-			});
-
-			if (result == null) return undefined;
-
-			return result;
-		} catch (ex) {
-			Logger.error(ex, 'getProviderIssue');
+		if (!isIssueResourceDescriptor(resource)) {
+			Logger.error(undefined, 'getProviderIssue: resource is not an IssueResourceDescriptor');
 			return undefined;
 		}
+
+		return api.getIssue(toTokenWithInfo(this.id, session), {
+			resourceId: resource.id,
+			number: id,
+		});
 	}
 	private getIssueAutolinkLikeUrl(issue: ProviderIssue): string | null {
 		const url = issue.url;

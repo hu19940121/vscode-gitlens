@@ -88,18 +88,21 @@ per provider from the resolved current user, so callers don't special-case it.
 `PullRequestRef` carries optional `cloneHttps` / `cloneSsh` / `isFork`; `PullRequest.refs.isCrossRepository`
 is always present.
 
-| Provider         | Clone URLs                               | `isCrossRepository` | `isFork`                   |
-| ---------------- | ---------------------------------------- | ------------------- | -------------------------- |
-| GitHub           | first-class                              | first-class         | best-effort                |
-| GitLab           | first-class                              | first-class         | `undefined`                |
-| Bitbucket        | first-class                              | first-class         | `undefined`                |
-| Bitbucket Server | first-class                              | first-class         | `undefined`                |
-| Azure DevOps     | first-class **with `includeRemoteInfo`** | first-class         | best-effort (`forkSource`) |
+| Provider         | Clone URLs                  | `isCrossRepository` | `isFork`                   |
+| ---------------- | --------------------------- | ------------------- | -------------------------- |
+| GitHub           | first-class                 | first-class         | best-effort                |
+| GitLab           | first-class                 | first-class         | `undefined`                |
+| Bitbucket        | first-class                 | first-class         | `undefined`                |
+| Bitbucket Server | first-class                 | first-class         | `undefined`                |
+| Azure DevOps     | per read path (see caveats) | first-class         | best-effort (`forkSource`) |
 
-**Caveats:** Azure clone URLs require an opt-in extra lookup; `getMyPullRequestsForRepos` requests
-`includeRemoteInfo` for Azure automatically. Where clone URLs are unavailable the fields are `undefined`;
-reconstruct from the repository `webUrl`. Prefer `isCrossRepository` (always present) over `isFork`
-(best-effort, provider-dependent).
+**Caveats:** Azure reports clone URLs differently per read path. The SDK-backed reads carry both fields, but
+only with an opt-in extra lookup; `getMyPullRequestsForRepos` requests `includeRemoteInfo` for Azure
+automatically. The direct reads (`getPullRequest*`, linked issue/PR) carry `cloneHttps` on both refs with no
+extra request, taken from the provider's own `remoteUrl`, and never carry `cloneSsh` — Azure's SSH URL
+answers on a different host than the API base, so the URL trust boundary cannot vouch for it. Where clone
+URLs are unavailable the fields are `undefined`; reconstruct from the repository `webUrl`. Prefer
+`isCrossRepository` (always present) over `isFork` (best-effort, provider-dependent).
 
 ## 6. Org / project scoping
 
@@ -168,11 +171,32 @@ searches, so the reported count is the **largest** of them (the total `searchPul
 via `Math.max` over facets), not their sum, and `exceedsProviderLimit` compares that max against the per-search
 ceiling. GitHub/GHE only, matching `searchPullRequestsPage`.
 
-**Not done, deliberately:** `broadenIssues` was left as-is rather than reimplemented on top of this. It is a
-multi-provider, multi-org fan-out with its own result type and per-org cursor bundle, so only its inner
-per-org read could be swapped; and its "all visible" breadth maps to an OMITTED relationship set, not to
-`any-assignee`, which excludes unassigned issues. See the note in `reads/broaden.ts` and
+**Since done:** `broadenIssues`' inner per-org read WAS swapped onto the filtered search (#5804). Only that
+inner read changed — the fan-out keeps its own result type, per-org cursor bundle and per-provider
+attribution — and its "all visible" breadth maps to an OMITTED relationship set, not to `any-assignee`,
+which excludes unassigned issues. A provider that declares no filtered search keeps the repository drain.
+See the note in `reads/broaden.ts` and
 [`integrations.md` §9](./integrations.md#9-per-provider-behavior-worth-designing-around).
+
+**Batch issue resolution (#5802).** `getIssuesBatch` resolves N `(owner, repo, number)` coordinates in one
+request, for the identity question a search cannot answer: "which issue does this branch name reference".
+It aliases the point read rather than a search, so there is no result ceiling and no ordering — and an
+absent slot is a PROVEN absence rather than "not found within a page budget", which is what lets a consumer
+CACHE a miss. A target whose chunk failed is not returned at all, so the two stay distinguishable; caching a
+failure as an absence is the bug that distinction prevents. GitHub/GHE only, matching `countIssues`.
+
+**Tracker issue resolution by key (#5810).** `getTrackerIssue` is the same identity read for an issue TRACKER,
+which `getIssuesBatch` cannot serve: its target is `(owner, repo, number)`, and a tracker issue is addressed by
+`(resourceId, ABC-123)` — no owner, no repo, and an identifier that is not a number. It answers in one request
+where the only published tracker surface (`listIssueTrackerIssuesPage`) needs a scoped page-walk that cannot
+prove absence without draining the whole scope. Same absence/failure contract as the batch read, and the same
+reason it matters: a tracker miss is the common outcome and was never cacheable.
+
+`resourceId` is required and trusted, so the read performs no resource discovery. Jira also requires
+`resourceUrl`, obtained alongside the resource ID, because the issue response's `self` is an API endpoint rather
+than a browser link; supplying both retains the one-request contract. Linear needs only the resource ID. Jira and
+Linear only; Trello refuses because its single-issue read can fall back to a capped board scan for a numeric
+identifier, where a "not found" result cannot be distinguished from a card beyond the cap.
 
 **Kepler-side follow-up:** `ProviderScopeFilter` carries a single `repo?: string` today and needs the criteria
 set; the `provider-data` adapter then routes "All visible" to `searchIssuesPage` + `countIssues`.

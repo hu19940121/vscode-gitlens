@@ -13,6 +13,7 @@ import type {
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import type { PullRequestUrlIdentity } from '@gitlens/git/utils/pullRequest.utils.js';
+import { ensureArray } from '@gitlens/utils/array.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { gate } from '@gitlens/utils/decorators/gate.js';
 import { trace } from '@gitlens/utils/decorators/log.js';
@@ -22,7 +23,11 @@ import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
-import { throwIfCallerContractError, toCollectionScopeFailure } from '../collectionMetadata.js';
+import {
+	throwIfCallerContractError,
+	toCollectionFailureError,
+	toCollectionScopeFailure,
+} from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
 import { toError } from '../errors.js';
@@ -50,7 +55,7 @@ import {
 	toProviderPullRequestStates,
 } from '../providers/models.js';
 import type { ProvidersApi } from '../providers/providersApi.js';
-import { mergeCollectionMetadata } from '../providers/utils/providerPaging.js';
+import { mergeCollectionMetadata, throwIfAllSettledFailed } from '../providers/utils/providerPaging.js';
 import type {
 	IntegrationResult,
 	IntegrationType,
@@ -113,8 +118,22 @@ function getSelfManagedApiBaseUrl(
 	}
 }
 
+/** Read options for {@link GitHostIntegration.searchMyPullRequests} and the provider hook behind it. */
 export type SearchMyPullRequestsOptions = {
+	/** Suppresses the user-facing notification when the read fails. */
+	silent?: boolean;
+	/**
+	 * PR states to include (open/closed/merged/all). Providers that cannot express it in a single query
+	 * filter the normalized results; omitted preserves the historical open-only behavior.
+	 */
+	state?: PullRequestStateFilter;
 	includeReviewRequested?: boolean;
+};
+
+/** Read options for {@link GitHostIntegration.searchPullRequests} and the provider hook behind it. */
+export type SearchPullRequestsOptions = {
+	/** PR states to include; omitted preserves the provider's default. */
+	include?: PullRequestState[];
 };
 
 type MyPullRequestsForReposOptions = {
@@ -765,10 +784,17 @@ export abstract class GitHostIntegration<
 		const customUrl =
 			options?.customUrl ?? getSelfManagedApiBaseUrl(providerId, session.domain || this.domain, session.protocol);
 
-		const api = await this.getProvidersApi();
+		let api: ProvidersApi;
+		try {
+			api = await this.getProvidersApi();
+		} catch (ex) {
+			this.handleProviderException('getIssuesForRepos', ex, { scope: scope, connectionId: connectionId });
+			return { error: toError(ex), duration: performance.now() - start };
+		}
+		const repoIdsInput = api.isRepoIdsInput(reposOrRepoIds);
 		if (
 			providerId !== GitCloudHostIntegrationId.GitLab &&
-			(api.isRepoIdsInput(reposOrRepoIds) ||
+			(repoIdsInput ||
 				(isAzureDevOpsProvider(providerId) &&
 					!reposOrRepoIds.every(repo => repo.project != null && repo.namespace != null)))
 		) {
@@ -809,7 +835,10 @@ export abstract class GitHostIntegration<
 				try {
 					userAccount = await this.getFilterAccount(api, session, customUrl, organization);
 				} catch (ex) {
-					Logger.error(ex, 'getIssuesForRepos');
+					this.handleProviderException('getIssuesForRepos', ex, {
+						scope: scope,
+						connectionId: connectionId,
+					});
 					return { error: toError(ex), duration: performance.now() - start };
 				}
 
@@ -879,6 +908,7 @@ export abstract class GitHostIntegration<
 						return { projectInput: projectInput, results: results };
 					}),
 				);
+				throwIfAllSettledFailed(settled);
 
 				for (let i = 0; i < settled.length; i++) {
 					const outcome = settled[i];
@@ -922,6 +952,7 @@ export abstract class GitHostIntegration<
 					cursor.page = options.page;
 				}
 
+				this.resetRequestExceptionCount('getIssuesForRepos');
 				return {
 					value: {
 						values: data,
@@ -939,7 +970,10 @@ export abstract class GitHostIntegration<
 					duration: performance.now() - start,
 				};
 			} catch (ex) {
-				Logger.error(ex, 'getIssuesForRepos');
+				this.handleProviderException('getIssuesForRepos', ex, {
+					scope: scope,
+					connectionId: connectionId,
+				});
 				return { error: toError(ex), duration: performance.now() - start };
 			}
 		}
@@ -955,7 +989,10 @@ export abstract class GitHostIntegration<
 			try {
 				userAccount = await this.getFilterAccount(api, session, customUrl);
 			} catch (ex) {
-				Logger.error(ex, 'getIssuesForRepos');
+				this.handleProviderException('getIssuesForRepos', ex, {
+					scope: scope,
+					connectionId: connectionId,
+				});
 				return { error: toError(ex), duration: performance.now() - start };
 			}
 
@@ -982,7 +1019,7 @@ export abstract class GitHostIntegration<
 			};
 		}
 
-		if (api.getProviderIssuesPagingMode(providerId) === PagingMode.Repo && !api.isRepoIdsInput(reposOrRepoIds)) {
+		if (api.getProviderIssuesPagingMode(providerId) === PagingMode.Repo && !repoIdsInput) {
 			const cursorInfo = this.parseCursorInfo<PagedRepoInput>(options?.cursor);
 			const cursors: PagedRepoInput[] = cursorInfo.cursors ?? [];
 			let repoInputs: PagedRepoInput[] = reposOrRepoIds.map(repo => ({ repo: repo, cursor: undefined }));
@@ -1019,6 +1056,7 @@ export abstract class GitHostIntegration<
 						return { repoInput: repoInput, results: results };
 					}),
 				);
+				throwIfAllSettledFailed(settled);
 
 				for (let i = 0; i < settled.length; i++) {
 					const outcome = settled[i];
@@ -1056,6 +1094,7 @@ export abstract class GitHostIntegration<
 					cursor.page = options.page;
 				}
 
+				this.resetRequestExceptionCount('getIssuesForRepos');
 				return {
 					value: {
 						values: data,
@@ -1073,13 +1112,17 @@ export abstract class GitHostIntegration<
 					duration: performance.now() - start,
 				};
 			} catch (ex) {
-				Logger.error(ex, 'getIssuesForRepos');
+				this.handleProviderException('getIssuesForRepos', ex, {
+					scope: scope,
+					connectionId: connectionId,
+				});
 				return { error: toError(ex), duration: performance.now() - start };
 			}
 		}
 
 		try {
-			const result = await api.getIssuesForRepos(toTokenWithInfo(providerId, session), reposOrRepoIds, {
+			const tokenWithInfo = toTokenWithInfo(providerId, session);
+			const result = await api.getIssuesForRepos(tokenWithInfo, reposOrRepoIds, {
 				...getIssuesOptions,
 				cursor: options?.cursor,
 				baseUrl: customUrl,
@@ -1088,9 +1131,28 @@ export abstract class GitHostIntegration<
 				states: states,
 				sort: options?.sort,
 			});
+			const failures = result.metadata?.failures;
+			if (
+				repoIdsInput &&
+				reposOrRepoIds.length > 0 &&
+				result.values.length === 0 &&
+				failures?.length === reposOrRepoIds.length
+			) {
+				const ex = toCollectionFailureError(failures[0], tokenWithInfo);
+				this.handleProviderException('getIssuesForRepos', ex, {
+					scope: scope,
+					connectionId: connectionId,
+				});
+				return { error: ex, duration: performance.now() - start };
+			}
+
+			this.resetRequestExceptionCount('getIssuesForRepos');
 			return { value: result, duration: performance.now() - start };
 		} catch (ex) {
-			Logger.error(ex, 'getIssuesForRepos');
+			this.handleProviderException('getIssuesForRepos', ex, {
+				scope: scope,
+				connectionId: connectionId,
+			});
 			return { error: toError(ex), duration: performance.now() - start };
 		}
 	}
@@ -1152,7 +1214,16 @@ export abstract class GitHostIntegration<
 		const customUrl =
 			options?.customUrl ?? getSelfManagedApiBaseUrl(providerId, session.domain || this.domain, session.protocol);
 
-		const api = await this.getProvidersApi();
+		let api: ProvidersApi;
+		try {
+			api = await this.getProvidersApi();
+		} catch (ex) {
+			this.handleProviderException('getPullRequestsForRepos', ex, {
+				scope: scope,
+				connectionId: connectionId,
+			});
+			return { error: toError(ex), duration: performance.now() - start };
+		}
 		if (
 			providerId !== GitCloudHostIntegrationId.GitLab &&
 			(api.isRepoIdsInput(reposOrRepoIds) ||
@@ -1200,14 +1271,20 @@ export abstract class GitHostIntegration<
 				try {
 					userAccount = await this.getFilterAccount(api, session, customUrl, organization);
 				} catch (ex) {
-					Logger.error(ex, 'getPullRequestsForRepos');
+					this.handleProviderException('getPullRequestsForRepos', ex, {
+						scope: scope,
+						connectionId: connectionId,
+					});
 					return { error: toError(ex), duration: performance.now() - start };
 				}
 			} else {
 				try {
 					userAccount = await this.getFilterAccount(api, session, customUrl);
 				} catch (ex) {
-					Logger.error(ex, 'getPullRequestsForRepos');
+					this.handleProviderException('getPullRequestsForRepos', ex, {
+						scope: scope,
+						connectionId: connectionId,
+					});
 					return { error: toError(ex), duration: performance.now() - start };
 				}
 			}
@@ -1316,6 +1393,7 @@ export abstract class GitHostIntegration<
 						return { repoInput: repoInput, results: results };
 					}),
 				);
+				throwIfAllSettledFailed(settled);
 
 				// `allSettled` preserves order, so `settled[i]` is `repoInputs[i]`.
 				settled.forEach((outcome, i) => {
@@ -1356,6 +1434,7 @@ export abstract class GitHostIntegration<
 					cursor.page = options.page;
 				}
 
+				this.resetRequestExceptionCount('getPullRequestsForRepos');
 				return {
 					value: {
 						values: data,
@@ -1373,7 +1452,10 @@ export abstract class GitHostIntegration<
 					duration: performance.now() - start,
 				};
 			} catch (ex) {
-				Logger.error(ex, 'getPullRequestsForRepos');
+				this.handleProviderException('getPullRequestsForRepos', ex, {
+					scope: scope,
+					connectionId: connectionId,
+				});
 				return { error: toError(ex), duration: performance.now() - start };
 			}
 		}
@@ -1390,80 +1472,40 @@ export abstract class GitHostIntegration<
 				includeRemoteInfo: isAzureDevOpsProvider(providerId) ? true : undefined,
 				fields: options?.summary ? summaryPullRequestFields : undefined,
 			});
+			this.resetRequestExceptionCount('getPullRequestsForRepos');
 			return { value: result, duration: performance.now() - start };
 		} catch (ex) {
-			Logger.error(ex, 'getPullRequestsForRepos');
+			this.handleProviderException('getPullRequestsForRepos', ex, {
+				scope: scope,
+				connectionId: connectionId,
+			});
 			return { error: toError(ex), duration: performance.now() - start };
 		}
 	}
 
-	async searchMyPullRequests(
-		repo?: T,
-		cancellation?: AbortSignal,
-		silent?: boolean,
-		connectionId?: string,
-		state?: PullRequestStateFilter,
-		options?: SearchMyPullRequestsOptions,
-	): Promise<IntegrationResult<PullRequest[] | undefined>>;
-	async searchMyPullRequests(
-		repos?: T[],
-		cancellation?: AbortSignal,
-		silent?: boolean,
-		connectionId?: string,
-		state?: PullRequestStateFilter,
-		options?: SearchMyPullRequestsOptions,
-	): Promise<IntegrationResult<PullRequest[] | undefined>>;
+	/** Account-wide (or repo-scoped) search for the current user's pull requests. */
 	@trace()
 	async searchMyPullRequests(
 		repos?: T | T[],
 		cancellation?: AbortSignal,
-		silent?: boolean,
-		connectionId?: string,
-		state?: PullRequestStateFilter,
-		options?: SearchMyPullRequestsOptions,
+		options?: SearchMyPullRequestsOptions & { connectionId?: string },
 	): Promise<IntegrationResult<PullRequest[] | undefined>> {
 		const scope = getScopedLogger();
+		const { connectionId, ...searchOptions } = options ?? {};
 		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
 		const session = await this.resolveReadSession(connectionId, scope);
 		if (session == null) return undefined;
 
 		const start = performance.now();
 		try {
-			// Prefer the optional metadata-aware path for account-wide reads so partial failures (e.g. one Azure
-			// org rejecting) are surfaced as a soft `{ value, error }` instead of being lost. Repo-scoped reads and
-			// providers without that override keep using the legacy array path.
-			let result: IntegrationResult<PullRequest[] | undefined>;
-			if (this.searchProviderMyPullRequestsResult != null && repos == null) {
-				result = await this.searchProviderMyPullRequestsResult(
-					session,
-					repos != null ? (Array.isArray(repos) ? repos : [repos]) : undefined,
-					cancellation,
-					silent,
-					state,
-					options,
-				);
-			} else {
-				result = {
-					value: await this.searchProviderMyPullRequests(
-						session,
-						repos != null ? (Array.isArray(repos) ? repos : [repos]) : undefined,
-						cancellation,
-						silent,
-						state,
-						options,
-					),
-				};
-			}
+			const prs = await this.searchProviderMyPullRequests(
+				session,
+				ensureArray(repos),
+				cancellation,
+				searchOptions,
+			);
 			this.resetRequestExceptionCount('searchMyPullRequests');
-			// `IntegrationResult` is a strict union of value-only or error-only (and may be `undefined`). Return the
-			// matching branch explicitly; a missing result is treated as a successful empty read.
-			if (result == null) {
-				return { value: undefined, duration: performance.now() - start };
-			}
-			if (result.error != null) {
-				return { error: result.error, duration: performance.now() - start };
-			}
-			return { value: result.value, duration: performance.now() - start };
+			return { value: prs, duration: performance.now() - start };
 		} catch (ex) {
 			this.handleProviderException('searchMyPullRequests', ex, {
 				scope: scope,
@@ -1560,33 +1602,12 @@ export abstract class GitHostIntegration<
 		}
 	}
 
-	// `state` selects which PR states to include (open/closed/merged/all). Providers that cannot express it
-	// in a single query filter the normalized results; omitted preserves the historical open-only behavior.
 	protected abstract searchProviderMyPullRequests(
 		session: ProviderAuthenticationSession,
 		repos?: T[],
 		cancellation?: AbortSignal,
-		silent?: boolean,
-		state?: PullRequestStateFilter,
 		options?: SearchMyPullRequestsOptions,
 	): Promise<PullRequest[] | undefined>;
-
-	/**
-	 * Optional metadata-aware counterpart of {@link searchProviderMyPullRequests}. Providers whose account-wide
-	 * "my PRs" read already produces {@link ProviderApiPagedResult} with completeness/failures can override
-	 * this to return a soft `{ value, error }` result so `searchMyPullRequests` surfaces partial data and a
-	 * warning instead of silently discarding the failure signal. The wrapper prefers this when present; the
-	 * abstract {@link searchProviderMyPullRequests} remains the required fallback for repo-scoped and
-	 * metadata-oblivious paths.
-	 */
-	protected searchProviderMyPullRequestsResult?(
-		session: ProviderAuthenticationSession,
-		repos?: T[],
-		cancellation?: AbortSignal,
-		silent?: boolean,
-		state?: PullRequestStateFilter,
-		options?: SearchMyPullRequestsOptions,
-	): Promise<IntegrationResult<PullRequest[] | undefined>>;
 
 	/**
 	 * Result-returning wrapper for the filtered pull-request search. Errors become the soft
@@ -1636,49 +1657,16 @@ export abstract class GitHostIntegration<
 		cancellation?: AbortSignal,
 	): Promise<ProviderPullRequestSearchPage | undefined>;
 
-	async searchPullRequests(
-		searchQuery: string,
-		repo?: T,
-		cancellation?: AbortSignal,
-		options?: { include?: PullRequestState[] },
-	): Promise<PullRequest[] | undefined>;
-	async searchPullRequests(
-		searchQuery: string,
-		repos?: T[],
-		cancellation?: AbortSignal,
-		options?: { include?: PullRequestState[] },
-	): Promise<PullRequest[] | undefined>;
-	async searchPullRequests(
-		searchQuery: string,
-		repo?: T,
-		cancellation?: AbortSignal,
-		connectionId?: string,
-		options?: { include?: PullRequestState[] },
-	): Promise<PullRequest[] | undefined>;
-	async searchPullRequests(
-		searchQuery: string,
-		repos?: T[],
-		cancellation?: AbortSignal,
-		connectionId?: string,
-		options?: { include?: PullRequestState[] },
-	): Promise<PullRequest[] | undefined>;
+	/** Free-text search across pull requests, optionally narrowed to `repos`. */
 	@trace()
 	async searchPullRequests(
 		searchQuery: string,
 		repos?: T | T[],
 		cancellation?: AbortSignal,
-		connectionIdOrOptions?: string | { include?: PullRequestState[] },
-		options?: { include?: PullRequestState[] },
+		options?: SearchPullRequestsOptions & { connectionId?: string },
 	): Promise<PullRequest[] | undefined> {
-		// `connectionId` (string) can be omitted when passing `options`; split the overlapping 4th arg.
-		// When the 4th arg isn't the options object (a string `connectionId` or `undefined`), fall back to
-		// the 5th-arg `options` so an explicit `undefined` connectionId still honors state filtering.
-		const connectionId = typeof connectionIdOrOptions === 'string' ? connectionIdOrOptions : undefined;
-		const searchOptions =
-			connectionIdOrOptions != null && typeof connectionIdOrOptions !== 'string'
-				? connectionIdOrOptions
-				: options;
 		const scope = getScopedLogger();
+		const { connectionId, ...searchOptions } = options ?? {};
 		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
 		const session = await this.resolveReadSession(connectionId, scope);
 		if (session == null) return undefined;
@@ -1687,7 +1675,7 @@ export abstract class GitHostIntegration<
 			const prs = await this.searchProviderPullRequests?.(
 				session,
 				searchQuery,
-				repos != null ? (Array.isArray(repos) ? repos : [repos]) : undefined,
+				ensureArray(repos),
 				cancellation,
 				searchOptions,
 			);
@@ -1704,7 +1692,7 @@ export abstract class GitHostIntegration<
 		searchQuery: string,
 		repos?: T[],
 		cancellation?: AbortSignal,
-		options?: { include?: PullRequestState[] },
+		options?: SearchPullRequestsOptions,
 	): Promise<PullRequest[] | undefined>;
 
 	/**
@@ -1806,6 +1794,54 @@ export abstract class GitHostIntegration<
 		scopes: readonly { repos?: ProviderRepoInput[]; org?: string; criteria?: IssueSearchCriteria }[],
 		cancellation?: AbortSignal,
 	): Promise<(number | undefined)[] | undefined>;
+
+	/**
+	 * Result-returning wrapper for the BATCH issue read: resolves several `(owner, repo, number)` coordinates in
+	 * one request. Recovers thrown errors into `{ error }` like the reads around it.
+	 *
+	 * Distinct from every search on this class, and deliberately so. A search answers "what matches"; this answers
+	 * "does this exact issue exist", which is the question a caller correlating a branch name to an issue is
+	 * actually asking. It has no result ceiling, no ordering and no cursor, and — the property that matters most —
+	 * an absent slot is a PROVEN ABSENCE rather than "not found within a page budget", so a caller can cache a
+	 * miss instead of re-walking for it forever.
+	 *
+	 * Results come back POSITIONALLY — one per input coordinate, in order — for the same reason
+	 * {@link countIssuesResult} does: a caller's key must never reach the provider query. `undefined` in a slot
+	 * means the issue does not exist or is not visible to this token, never that the read failed.
+	 */
+	async getIssuesBatchResult(
+		coordinates: readonly { owner: string; repo: string; number: number }[],
+		cancellation?: AbortSignal,
+		connectionId?: string,
+	): Promise<IntegrationResult<(IssueShape | undefined)[] | undefined>> {
+		const scope = getScopedLogger();
+		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
+		const session = await this.resolveReadSession(connectionId, scope);
+		if (session == null) return undefined;
+
+		const start = performance.now();
+		try {
+			const issues = await this.getProviderIssuesBatch?.(session, coordinates, cancellation);
+			this.resetRequestExceptionCount('getIssuesBatch');
+			return { value: issues, duration: performance.now() - start };
+		} catch (ex) {
+			this.handleProviderException('getIssuesBatch', ex, { scope: scope, connectionId: connectionId });
+			return { error: toError(ex), duration: performance.now() - start };
+		}
+	}
+
+	/**
+	 * OPTIONAL: only a provider that can resolve SEVERAL issues by coordinate in one request implements this.
+	 * GitHub aliases its point read into one document; the SDK exposes only a singular `getIssue` for every other
+	 * provider, and there is no plural variant to build on. A provider that can't answer doesn't implement it and
+	 * the facade refuses the read, so a caller keeps its own per-issue path rather than being handed a batch that
+	 * silently degraded into N requests.
+	 */
+	protected getProviderIssuesBatch?(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number }[],
+		cancellation?: AbortSignal,
+	): Promise<(IssueShape | undefined)[] | undefined>;
 
 	/** The PR twin of {@link countIssuesResult}: counts each scope's pull requests, transferring none. */
 	async countPullRequestsResult(

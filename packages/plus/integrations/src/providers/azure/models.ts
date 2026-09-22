@@ -1,4 +1,4 @@
-import type { IssueMember } from '@gitlens/git/models/issue.js';
+import type { IssueIteration, IssueMember } from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
 import type { IssueOrPullRequestState } from '@gitlens/git/models/issueOrPullRequest.js';
 import type { PullRequestMember, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
@@ -17,6 +17,7 @@ export interface AzureRepositoryDescriptor extends ResourceDescriptor {
 	owner: string;
 	name: string;
 	project?: string;
+	virtualDirectory?: string;
 }
 
 export interface AzureOrganizationDescriptor extends ResourceDescriptor {
@@ -129,7 +130,7 @@ export interface WorkItem {
 	fields: {
 		//'System.AreaPath': string;
 		'System.TeamProject': string;
-		// 'System.IterationPath': string;
+		'System.IterationPath'?: string;
 		'System.WorkItemType': string;
 		'System.State': string;
 		// 'System.Reason': string;
@@ -190,10 +191,14 @@ export interface AzureProject {
 	lastUpdateTime: string;
 }
 
-export interface AzureRepository {
+export interface AzureRepositoryReference {
 	id: string;
 	name: string;
 	url: string;
+	remoteUrl?: string;
+}
+
+export interface AzureRepository extends AzureRepositoryReference {
 	project: AzureProject;
 	size: number;
 	remoteUrl: string;
@@ -202,6 +207,13 @@ export interface AzureRepository {
 	isDisabled: boolean;
 	isInMaintenance: boolean;
 }
+
+export interface AzurePullRequestRepository extends AzureRepositoryReference {
+	project: Pick<AzureProject, 'id' | 'name'>;
+}
+
+/** The URL fields of a repository response — all the fork lookup reads, and all an older `api-version` promises. */
+export type AzureRepositoryUrls = Partial<Pick<AzureRepository, 'webUrl' | 'remoteUrl'>>;
 
 /** The `GET .../_apis/git/repositories/{repositoryId or name}` response, adding fork/default-branch fields to {@link AzureRepository}. */
 export interface AzureRepositoryWithMetadata extends AzureRepository {
@@ -290,7 +302,7 @@ export interface AzureGitForkRef {
 	name: string;
 	objectId: string;
 	peeledObjectId: string;
-	repository: AzureRepository;
+	repository: AzureRepositoryReference;
 	statuses: AzureGitStatus[];
 	url: string;
 }
@@ -317,7 +329,7 @@ export type AzurePullRequestAsyncStatus =
 	| 'succeeded';
 
 export interface AzurePullRequest {
-	repository: AzureRepository;
+	repository: AzurePullRequestRepository;
 	pullRequestId: number;
 	codeReviewId: number;
 	status: AzurePullRequestStatus;
@@ -368,70 +380,128 @@ export interface AzurePullRequestWithLinks extends AzurePullRequest {
 	workItemRefs?: AzureResourceRef[];
 }
 
-export function getVSTSOwner(url: URL): string {
-	return url.hostname.split('.')[0];
-}
 export function getAzureDevOpsOwner(url: URL): string {
 	return url.pathname.split('/')[1];
-}
-export function getAzureOwner(url: URL): string {
-	const isVSTS = url.hostname.endsWith(vstsHostnameSuffix);
-	return isVSTS ? getVSTSOwner(url) : getAzureDevOpsOwner(url);
 }
 export function isVsts(domain: string): boolean {
 	return domain.endsWith(vstsHostnameSuffix);
 }
 
-export function getAzureRepo(pr: AzurePullRequest): string {
-	return `${pr.repository.project.name}/_git/${pr.repository.name}`;
+/**
+ * `baseUrl` and `owner` are the authoritative prefix used for the API request. The payload URL cannot supply that
+ * prefix safely because it may address the repository by id or name an untrusted host.
+ */
+function getAzureRepositoryWebUrl(baseUrl: string, owner: string, projectName: string, repoName: string): string {
+	const repoPath = `${encodeURIComponent(owner)}/${encodeURIComponent(projectName)}/_git/${encodeURIComponent(repoName)}`;
+	return `${baseUrl.replace(/\/+$/, '')}/${repoPath}`;
 }
 
-// Example: https://bbbchiv.visualstudio.com/MyFirstProject/_git/test
-const azureProjectRepoRegex = /([^/]+)\/_git\/([^/]+)/;
-function parseVstsHttpsUrl(url: URL): [owner: string, project: string, repo: string] {
-	const owner = getVSTSOwner(url);
-	const match = azureProjectRepoRegex.exec(url.pathname);
-	if (match == null) {
-		throw new Error(`Invalid VSTS URL: ${url.toString()}`);
-	}
-
-	const [, project, repo] = match;
-	return [owner, project, repo];
+export function getAzurePullRequestWebUrl(pr: AzurePullRequest, baseUrl: string, owner: string): string {
+	const repoUrl = getAzureRepositoryWebUrl(baseUrl, owner, pr.repository.project.name, pr.repository.name);
+	return `${repoUrl}/pullrequest/${pr.pullRequestId}`;
 }
 
-// Example https://bbbchiv2@dev.azure.com/bbbchiv2/MyFirstProject/_git/test
-const azureHttpsUrlRegex = /([^/]+)\/([^/]+)\/_git\/([^/]+)/;
-function parseAzureNewStyleUrl(url: URL): [owner: string, project: string, repo: string] {
-	const match = azureHttpsUrlRegex.exec(url.pathname);
-	if (match == null) {
-		throw new Error(`Invalid Azure URL: ${url.toString()}`);
-	}
+/**
+ * Whether `url` and `expected` are the two cloud spellings of one organization: a cloud organization answers on both
+ * `dev.azure.com/{owner}` and the legacy `{owner}.visualstudio.com`, so those name the same host. Anything else is
+ * somewhere we didn't ask.
+ */
+function isSameAzureCloudOrganization(url: URL, expected: URL, expectedOwner: string): boolean {
+	if (url.protocol !== expected.protocol) return false;
 
-	const [, owner, project, repo] = match;
-	return [owner, project, repo];
+	const owner = expectedOwner.toLowerCase();
+	if (expected.hostname !== 'dev.azure.com' && !isVsts(expected.hostname)) return false;
+
+	if (url.hostname === 'dev.azure.com') return getAzureDevOpsOwner(url).toLowerCase() === owner;
+
+	return url.hostname === `${owner}${vstsHostnameSuffix}`;
 }
 
-export function parseAzureHttpsUrl(url: string): [owner: string, project: string, repo: string];
-export function parseAzureHttpsUrl(urlObj: URL): [owner: string, project: string, repo: string];
-export function parseAzureHttpsUrl(arg: URL | string): [owner: string, project: string, repo: string] {
-	const url = typeof arg === 'string' ? new URL(arg) : arg;
-	if (url.hostname.endsWith(vstsHostnameSuffix)) {
-		return parseVstsHttpsUrl(url);
-	}
-	return parseAzureNewStyleUrl(url);
+/**
+ * Whether `url` sits under the collection the integration is configured to talk to — `{expectedUrl}/{expectedOwner}`.
+ * A matching origin says nothing on its own: Azure organizations and self-hosted collections are path segments.
+ */
+function isUnderAzureCollection(url: URL, expected: URL, expectedOwner: string): boolean {
+	const base = expected.pathname.replace(/\/+$/, '');
+	const prefix = `${base}/${encodeURIComponent(expectedOwner)}/`.toLowerCase();
+	return `${url.pathname}/`.toLowerCase().startsWith(prefix);
 }
 
-export function getAzurePullRequestWebUrl(pr: AzurePullRequest): string {
-	const url = new URL(pr.url);
-	const baseUrl = new URL(url.origin).toString();
-	const repoPath = getAzureRepo(pr);
-	const isVSTS = url.hostname.endsWith(vstsHostnameSuffix);
-	if (isVSTS) {
-		return `${baseUrl}/${repoPath}/pullrequest/${pr.pullRequestId}`;
+/**
+ * Restricts a provider-supplied repository URL to the integration's collection and removes credentials, query, and
+ * fragment before a consumer can use it as a git remote. Takes the value as the payloads carry it — every one of
+ * these URLs is optional — so a caller never has to spell the absent case itself.
+ */
+export function sanitizeAzureRepositoryUrl(
+	value: string | undefined,
+	expectedUrl: string,
+	expectedOwner: string,
+): string | undefined {
+	if (value == null) return undefined;
+
+	let expected: URL;
+	let url: URL;
+	try {
+		expected = new URL(expectedUrl);
+		url = new URL(value);
+	} catch {
+		return undefined;
 	}
 
-	const owner = getAzureDevOpsOwner(url);
-	return `${baseUrl}/${owner}/${repoPath}/pullrequest/${pr.pullRequestId}`;
+	if (expected.protocol !== 'https:' && expected.protocol !== 'http:') return undefined;
+	if (!expectedOwner) return undefined;
+
+	if (url.origin === expected.origin) {
+		if (!isUnderAzureCollection(url, expected, expectedOwner)) return undefined;
+	} else if (!isSameAzureCloudOrganization(url, expected, expectedOwner)) {
+		return undefined;
+	}
+
+	url.username = '';
+	url.password = '';
+	url.search = '';
+	url.hash = '';
+	return url.toString();
+}
+
+/**
+ * The clone URL the payload carries for a repository, restricted to the integration's collection and then
+ * cross-checked against the repository that payload names.
+ *
+ * The collection check alone is not enough for a URL that is READ rather than built. Every other repository URL the
+ * model reports is built from the authoritative prefix, so the payload cannot move it; this one cannot be built,
+ * because Azure spells a repository for git the same way it spells it for the web only by convention. A URL under
+ * the right collection may still name a DIFFERENT repository in it, which would leave `cloneHttps` describing one
+ * repository while `url` describes another.
+ *
+ * Azure ends a clone URL with `_git/{repo}` on every host style — including the short `{owner}/_git/{repo}` form it
+ * uses when a repository carries its project's name, and the legacy `{owner}.visualstudio.com` spelling that has no
+ * organization segment at all — so the repository name is the one part comparable across all of them. A same-named
+ * repository in another project of the same organization is the single substitution this cannot catch.
+ */
+function getAzureRepositoryCloneUrl(
+	repository: AzureRepositoryReference,
+	baseUrl: string,
+	owner: string,
+): string | undefined {
+	const sanitized = sanitizeAzureRepositoryUrl(repository.remoteUrl, baseUrl, owner);
+	if (sanitized == null) return undefined;
+
+	// Safe to parse: `sanitizeAzureRepositoryUrl` returns what it already parsed.
+	const segments = new URL(sanitized).pathname.split('/').filter(s => s.length > 0);
+	const name = segments.pop();
+	if (name == null || segments.pop() !== '_git') return undefined;
+
+	let decoded: string;
+	try {
+		decoded = decodeURIComponent(name);
+	} catch {
+		return undefined;
+	}
+
+	// Azure resolves project and repository names case-insensitively, so comparing them any other way would refuse a
+	// URL the provider considers the same one.
+	return decoded.toLowerCase() === repository.name.toLowerCase() ? sanitized : undefined;
 }
 
 export function fromAzurePullRequestMergeStatusToMergeableState(
@@ -527,17 +597,47 @@ function fromAzureUserToMember(user: AzureUser, _type: 'issue' | 'pullRequest'):
 	};
 }
 
-export function fromAzurePullRequest(pr: AzurePullRequest, provider: Provider, orgName: string): PullRequest {
-	const url = new URL(pr.url);
+/**
+ * The URLs of a cross-repository pull request's fork, resolved by a lookup because the pull request payload embeds
+ * only an abbreviated reference to it: `url` is the URL the head ref reports — the fork's web URL, or its clone URL
+ * when the response carries no web URL — and `cloneHttps` its HTTPS clone URL.
+ *
+ * A fork that resolves neither is reported as no fork at all rather than as an object with nothing in it, so `url`
+ * is always present here; `cloneHttps` alone is best-effort, and is absent when the response omits it or its URL
+ * sits outside the integration's collection.
+ */
+export interface AzureForkRepositoryUrls {
+	url: string;
+	cloneHttps: string | undefined;
+}
+
+/**
+ * `baseUrl` and `owner` are the prefix the pull request was read through; every URL the model reports is built from
+ * them. The required `forkRepositoryUrls` argument makes each call site resolve the best-effort fork URLs explicitly.
+ */
+export function fromAzurePullRequest(
+	pr: AzurePullRequest,
+	provider: Provider,
+	owner: string,
+	baseUrl: string,
+	forkRepositoryUrls: AzureForkRepositoryUrls | undefined,
+): PullRequest {
+	const baseRepositoryUrl = getAzureRepositoryWebUrl(baseUrl, owner, pr.repository.project.name, pr.repository.name);
+	const baseCloneHttps = getAzureRepositoryCloneUrl(pr.repository, baseUrl, owner);
+
+	const forkRepository = pr.forkSource?.repository;
+	const headRepositoryUrl = forkRepository == null ? baseRepositoryUrl : forkRepositoryUrls?.url;
+	const headCloneHttps = forkRepository == null ? baseCloneHttps : forkRepositoryUrls?.cloneHttps;
+
 	return new PullRequest(
 		provider,
 		fromAzureUserToMember(pr.createdBy, 'pullRequest'),
 		pr.pullRequestId.toString(),
 		pr.pullRequestId.toString(),
 		pr.title,
-		getAzurePullRequestWebUrl(pr),
+		getAzurePullRequestWebUrl(pr, baseUrl, owner),
 		{
-			owner: getAzureOwner(url),
+			owner: owner,
 			repo: pr.repository.name,
 			id: pr.repository.id,
 			// TODO: Remove this assumption once actual access level is available
@@ -555,17 +655,19 @@ export function fromAzurePullRequest(pr: AzurePullRequest, provider: Provider, o
 				branch: pr.targetRefName ? normalizeAzureBranchName(pr.targetRefName) : '',
 				sha: pr.lastMergeTargetCommit?.commitId ?? '',
 				repo: pr.repository.name,
-				owner: getAzureOwner(url),
+				owner: owner,
 				exists: pr.targetRefName != null,
-				url: pr.repository.webUrl,
+				url: baseRepositoryUrl,
+				cloneHttps: baseCloneHttps,
 			},
 			head: {
 				branch: pr.sourceRefName ? normalizeAzureBranchName(pr.sourceRefName) : '',
 				sha: pr.lastMergeSourceCommit?.commitId ?? '',
-				repo: pr.forkSource?.repository != null ? pr.forkSource.repository.name : pr.repository.name,
-				owner: getAzureOwner(url),
+				repo: forkRepository?.name ?? pr.repository.name,
+				owner: owner,
 				exists: pr.sourceRefName != null,
-				url: pr.forkSource?.repository != null ? pr.forkSource.repository.webUrl : pr.repository.webUrl,
+				url: headRepositoryUrl,
+				cloneHttps: headCloneHttps,
 			},
 			isCrossRepository: pr.forkSource != null,
 		},
@@ -583,7 +685,7 @@ export function fromAzurePullRequest(pr: AzurePullRequest, provider: Provider, o
 			id: pr.repository?.project?.id,
 			name: pr.repository.project.name,
 			resourceId: '', // TODO: This is a workaround until we can get the org id here.
-			resourceName: orgName,
+			resourceName: owner,
 		},
 	);
 }
@@ -617,5 +719,29 @@ export function fromAzureWorkItem(
 		undefined,
 		workItem.fields['System.Description'],
 		project,
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		toWorkItemIterations(workItem.fields['System.IterationPath']),
 	);
+}
+
+/**
+ * Azure reports the iteration as a backslash-delimited path rooted at the project. The project root is its default
+ * for a work item with no sprint, so only a nested path names one; the path is the identity because Azure supplies
+ * no iteration id here.
+ *
+ * Mirrors `normalizeIteration` in provider-apis so the same work item yields the same identity whether it is read
+ * here or through the SDK. That contract keeps the path **verbatim** — it is what the iteration is matched back by,
+ * so it is deliberately not trimmed — and trims only the display name.
+ */
+function toWorkItemIterations(path: string | undefined): IssueIteration[] | undefined {
+	if (!path) return undefined;
+
+	const segments = path.split('\\');
+	if (segments.length < 2) return undefined;
+
+	const name = segments.at(-1)?.trim();
+	return name ? [{ id: path, name: name }] : undefined;
 }

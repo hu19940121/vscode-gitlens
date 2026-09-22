@@ -47,7 +47,13 @@ import { EntityIdentifierUtils } from '@gitkraken/provider-apis/entity-identifie
 import { GitProviderUtils } from '@gitkraken/provider-apis/provider-utils';
 import { githubSearchResultLimit } from '@gitlens/git-github/api/config.js';
 import type { Account as UserAccount } from '@gitlens/git/models/author.js';
-import type { IssueProject, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
+import type {
+	IssueIteration,
+	IssueProject,
+	IssueProviderState,
+	IssueShape,
+	IssueStateFilter,
+} from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
 import type {
 	PullRequestRef,
@@ -1229,12 +1235,36 @@ function toIssueIdentifier(value: string | number): string {
 	return String(value);
 }
 
-export function toIssueShape(issue: ProviderIssue, provider: ProviderReference): IssueShape | undefined {
+function toIssueProviderState(
+	state: ProviderIssue['state'],
+	reliableStateCategory = true,
+): IssueProviderState | undefined {
+	return state == null
+		? undefined
+		: {
+				id: state.id,
+				name: state.name,
+				color: state.color ?? undefined,
+				category: reliableStateCategory ? state.category : undefined,
+			};
+}
+
+export function toIssueShape(
+	issue: ProviderIssue,
+	provider: ProviderReference,
+	options?: { reliableStateCategory?: boolean },
+): IssueShape | undefined {
 	// TODO: Add some protections/baselines rather than killing the transformation here
 	// `author` is intentionally not required: some providers have no per-item creator (e.g. Trello cards,
 	// which the SDK maps with `author: null`), and dropping every such item would discard the whole board.
 	// Fall back to an empty author instead so these issues still surface.
 	if (issue.updatedDate == null || issue.url == null) return undefined;
+
+	// Jira SDK results derive this category from a localized display name and default unknown names to DONE.
+	// Only the direct point read opts in because it maps Jira's stable status-category key itself.
+	const reliableStateCategory =
+		provider.id !== IssuesCloudHostIntegrationId.Jira || options?.reliableStateCategory === true;
+	const closed = issue.closedDate != null || (issue.state?.category === 'DONE' && reliableStateCategory);
 
 	return {
 		type: 'issue',
@@ -1254,8 +1284,9 @@ export function toIssueShape(issue: ProviderIssue, provider: ProviderReference):
 		createdDate: issue.createdDate,
 		updatedDate: issue.updatedDate,
 		closedDate: issue.closedDate ?? undefined,
-		closed: issue.closedDate != null,
-		state: issue.closedDate != null ? 'closed' : 'opened',
+		closed: closed,
+		state: closed ? 'closed' : 'opened',
+		providerState: toIssueProviderState(issue.state, reliableStateCategory),
 		author: {
 			id: issue.author?.id ?? '',
 			// An absent name stays absent, matching {@link fromProviderAccount}; see `IssueMember.name`.
@@ -1291,8 +1322,26 @@ export function toIssueShape(issue: ProviderIssue, provider: ProviderReference):
 		commentsCount: issue.commentCount ?? undefined,
 		thumbsUpCount: issue.upvoteCount ?? undefined,
 		body: issue.description ?? undefined,
+		bodyFormat: provider.id === IssuesCloudHostIntegrationId.Jira ? 'jira-wiki' : undefined,
 		issueType: issue.type ?? undefined,
+		iterations: toIssueIterations(issue),
 	};
+}
+
+function toIssueIterations(issue: ProviderIssue): IssueIteration[] | undefined {
+	// The two sources are mutually exclusive per provider: Azure reports a single `iteration` and no sprints, Jira
+	// reports `sprints` and no iteration. Should a provider ever report both, the richer sprint metadata would be
+	// dropped here, so revisit this branch rather than assuming the exclusivity still holds.
+	if (issue.iteration != null) return [{ id: issue.iteration.path, name: issue.iteration.name }];
+	if (!issue.sprints?.length) return undefined;
+
+	return issue.sprints.map(sprint => ({
+		id: sprint.id,
+		name: sprint.name,
+		isActive: sprint.isActive,
+		startDate: sprint.startDate ?? undefined,
+		endDate: sprint.endDate ?? undefined,
+	}));
 }
 
 /**
@@ -1688,6 +1737,7 @@ export function fromProviderIssue(
 	options?: { project?: IssueProject },
 ): Issue {
 	const identifier = toIssueIdentifier(issue.number);
+	const closed = issue.closedDate != null || issue.state?.category === 'DONE';
 	return new Issue(
 		integration,
 		identifier,
@@ -1696,8 +1746,8 @@ export function fromProviderIssue(
 		issue.url ?? '',
 		issue.createdDate,
 		issue.updatedDate ?? issue.closedDate ?? issue.createdDate,
-		issue.closedDate != null,
-		issue.closedDate != null ? 'closed' : 'opened',
+		closed,
+		closed ? 'closed' : 'opened',
 		fromProviderAccount(issue.author),
 		issue.assignees?.map(fromProviderAccount) ?? undefined,
 		issue.repository != null
@@ -1729,6 +1779,9 @@ export function fromProviderIssue(
 				: undefined,
 		identifier,
 		issue.type ?? undefined,
+		toIssueProviderState(issue.state, integration.id !== IssuesCloudHostIntegrationId.Jira),
+		integration.id === IssuesCloudHostIntegrationId.Jira ? 'jira-wiki' : undefined,
+		toIssueIterations(issue),
 	);
 }
 

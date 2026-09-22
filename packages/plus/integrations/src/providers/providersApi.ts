@@ -8,7 +8,6 @@ import type {
 	TrelloList,
 } from '@gitkraken/provider-apis';
 import type { PullRequest, PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
-import { base64 } from '@gitlens/utils/base64.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { TokenOptInfo, TokenWithInfo } from '../authentication/models.js';
@@ -20,15 +19,8 @@ import {
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
 } from '../constants.js';
-import {
-	AuthenticationError,
-	AuthenticationErrorReason,
-	isRateLimitResponse,
-	RequestClientError,
-	RequestNotFoundError,
-	toError,
-	toRateLimitError,
-} from '../errors.js';
+import { RequestNotFoundError, toError } from '../errors.js';
+import { requestJiraIssueByKey } from './jiraIssueByKey.js';
 import type {
 	GetIssueFn,
 	GetIssuesForReposFn,
@@ -70,6 +62,12 @@ import type {
 } from './models.js';
 import { isRepoIdsInput, providersMetadata } from './models.js';
 import {
+	getProviderResponseBodyMessage,
+	isProviderIssueNotFoundError,
+	throwProviderError,
+	UnexpectedHtmlResponseError,
+} from './providerErrors.js';
+import {
 	collectProviderPagedResult,
 	mergeCollectionMetadata,
 	parsePageCursor,
@@ -88,7 +86,6 @@ const createProviderApis: ProviderApisFactory =
 // `Repository <x> not found`. Anchoring to that shape (rather than a loose `not found` substring) keeps
 // the message fallbacks from misclassifying unrelated GraphQL/transport failures as a confident negative.
 const repoNotFoundMessage = /^Repository .+ not found$/i;
-
 // Duck-typed rather than `ex instanceof GraphQLErrors`, because importing the class as a value makes this
 // module unloadable from plain Node ESM consumers: `@gitkraken/provider-apis` is CommonJS and declares its
 // exports through getters, which Node's `cjs-module-lexer` cannot see, so the only named exports it can
@@ -517,10 +514,6 @@ export class ProvidersApi {
 		}
 	}
 
-	private getAzurePATForOAuthToken(oauthToken: string) {
-		return base64(`PAT:${oauthToken}`);
-	}
-
 	private async ensureProviderToken<T extends IntegrationIds>(
 		tokenOptInfo: TokenOptInfo<T>,
 	): Promise<{ provider: ProviderInfo; tokenWithInfo: TokenWithInfo<T> }> {
@@ -562,43 +555,13 @@ export class ProvidersApi {
 	}
 
 	private handleProviderError<T>(tokenWithInfo: TokenWithInfo, error: any): T {
-		const { accessToken: token, ...tokenInfo } = tokenWithInfo;
 		const providerId = tokenWithInfo.providerId;
 		const provider = this.providers[providerId];
 		if (provider == null) {
 			throw new Error(`Provider with id ${providerId} not registered`);
 		}
 
-		if (error?.response?.status != null) {
-			const status: number = error.response.status;
-			switch (status) {
-				case 404: // Not found
-				case 410: // Gone
-				case 422: // Unprocessable Entity
-					throw new RequestNotFoundError(error);
-				case 429: // Too Many Requests
-					throw toRateLimitError(error, token);
-				case 401: // Unauthorized
-				case 403: // Forbidden
-					// A throttled request arrives on both statuses depending on the host (see
-					// `isRateLimitResponse`); 403 previously skipped the check, so every provider going through the
-					// SDK reported a rate limit as `auth` and asked the user to reconnect a healthy account.
-					if (isRateLimitResponse({ status: status, message: error.message })) {
-						throw toRateLimitError(error, token);
-					}
-					throw new AuthenticationError(
-						tokenInfo,
-						status === 401 ? AuthenticationErrorReason.Unauthorized : AuthenticationErrorReason.Forbidden,
-						error,
-					);
-				default:
-					if (status >= 400 && status < 500) {
-						throw new RequestClientError(error);
-					}
-			}
-		}
-
-		throw error;
+		return throwProviderError(tokenWithInfo, error);
 	}
 
 	async getPagedResult<T>(
@@ -878,7 +841,7 @@ export class ProvidersApi {
 			/** See {@link GetIssuesOptions.sort}. Linear expresses `created`/`updated`, descending only. */
 			sort?: IssueSorting;
 		},
-	): Promise<PagedResult<ProviderIssue>> {
+	): Promise<ProviderApiPagedResult<ProviderIssue>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getLinearIssuesFn',
@@ -1079,16 +1042,11 @@ export class ProvidersApi {
 			tokenOptInfo,
 			'getAzureProjectsForResourceFn',
 		);
-		const token = tokenWithInfo.accessToken;
-
-		// Azure only supports PAT for this call
-		const azureToken = options?.isPAT ? token : this.getAzurePATForOAuthToken(token);
-
 		try {
 			return await this.getPagedResult<ProviderAzureProject>(
 				{ namespace: namespace, ...options },
 				provider.getAzureProjectsForResourceFn,
-				{ ...tokenWithInfo, accessToken: azureToken },
+				tokenWithInfo,
 				options?.cursor,
 				options?.isPAT,
 				options?.baseUrl,
@@ -1392,9 +1350,6 @@ export class ProvidersApi {
 		);
 		const token = tokenWithInfo.accessToken;
 
-		// Azure only supports PAT for this call
-		const azureToken = options?.isPAT ? token : this.getAzurePATForOAuthToken(token);
-
 		try {
 			const result = await provider.getPullRequestsForAzureProjectsFn?.(
 				{
@@ -1405,9 +1360,9 @@ export class ProvidersApi {
 					states: options?.states,
 					repo: options?.repo,
 				},
-				// `azureToken` is always a PAT here (the raw token when `isPAT`, otherwise a PAT derived from
-				// the OAuth token), so it must be sent as a PAT regardless of the incoming `options?.isPAT`.
-				{ token: azureToken, isPAT: true, baseUrl: options?.baseUrl },
+				// Azure only supports a Basic credential for this call, so it is sent as one regardless of the
+				// incoming `options?.isPAT`. The secret goes over raw — provider-apis encodes it itself.
+				{ token: token, isPAT: true, baseUrl: options?.baseUrl },
 			);
 			// The SDK's multi-project aggregate preserves successful projects and reports failed/incomplete ones
 			// through `metadata` (it has no `pageInfo`); keep it so the account-wide drain can warn on the failed
@@ -1444,8 +1399,6 @@ export class ProvidersApi {
 			'getPullRequestsForAzureProjectFn',
 		);
 		const token = tokenWithInfo.accessToken;
-		// Azure only supports PAT for this call
-		const azureToken = options?.isPAT ? token : this.getAzurePATForOAuthToken(token);
 
 		try {
 			const result = await provider.getPullRequestsForAzureProjectFn?.(
@@ -1459,9 +1412,9 @@ export class ProvidersApi {
 					repo: options?.repo,
 					page: options?.page,
 				},
-				// `azureToken` is always a PAT here (already PAT-formatted when `isPAT`, otherwise derived from
-				// the OAuth token), so it must be sent as a PAT regardless of the incoming `options?.isPAT`.
-				{ token: azureToken, isPAT: true, baseUrl: options?.baseUrl },
+				// Azure only supports a Basic credential for this call, so it is sent as one regardless of the
+				// incoming `options?.isPAT`. The secret goes over raw — provider-apis encodes it itself.
+				{ token: token, isPAT: true, baseUrl: options?.baseUrl },
 			);
 			if (result == null) return undefined;
 			return { data: result.data, hasMore: result.pageInfo.hasNextPage, nextPage: result.pageInfo.nextPage };
@@ -1522,7 +1475,7 @@ export class ProvidersApi {
 		tokenOptInfo: TokenOptInfo,
 		reposOrIds: ProviderReposInput,
 		options?: GetIssuesOptions & { isPAT?: boolean; baseUrl?: string },
-	): Promise<PagedResult<ProviderIssue>> {
+	): Promise<ProviderApiPagedResult<ProviderIssue>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getIssuesForReposFn',
@@ -1837,6 +1790,24 @@ export class ProvidersApi {
 		);
 	}
 
+	async getJiraIssueByKey(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Jira>,
+		resourceId: string,
+		resourceUrl: string,
+		key: string,
+	): Promise<ProviderIssue | undefined> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+
+		try {
+			return await requestJiraIssueByKey(this.request, tokenWithInfo.accessToken, resourceId, resourceUrl, key);
+		} catch (e) {
+			const status = (e as { response?: { status?: unknown } }).response?.status;
+			if (status === 404) return undefined;
+
+			return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
+		}
+	}
+
 	async getIssue(
 		tokenOptInfo: TokenWithInfo,
 		input: { resourceId: string; number: string } | { namespace: string; name: string; number: string },
@@ -1854,6 +1825,8 @@ export class ProvidersApi {
 
 			return result?.data;
 		} catch (e) {
+			if (isProviderIssueNotFoundError(tokenWithInfo.providerId, e)) return undefined;
+
 			return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
 		}
 	}
@@ -1862,16 +1835,29 @@ export class ProvidersApi {
 // This is copied over from the shared provider library because the current version is not respecting the "forceIsFetch: true"
 // option in the config and our custom fetch function isn't being wrapped by the necessary fetch wrapper. Remove this once the library
 // properly wraps our custom fetch and use `forceIsFetch: true` in the config.
-async function parseFetchResponseForApi<T>(response: Response): Promise<ProviderRequestResponse<T>> {
-	const contentType = response.headers.get('content-type') || '';
+export async function parseFetchResponseForApi<T>(response: Response): Promise<ProviderRequestResponse<T>> {
+	// Media types are case-insensitive (RFC 9110 §8.3.1) and `fetch` hands the header back exactly as the server
+	// wrote it, so match on a lowercased copy rather than the raw value.
+	const contentType = (response.headers.get('content-type') || '').toLowerCase();
 	let body;
+	let servedHtml = false;
 
 	// parse the response body
 	if (contentType.startsWith('application/json')) {
 		const text = await response.text();
-		body = text.trim().length > 0 ? JSON.parse(text) : null;
+		// A sign-in page a server mislabels as JSON is the same page under another header, and `<` can never open
+		// valid JSON — so recognize it rather than letting JSON.parse throw a SyntaxError carrying no status.
+		if (text.trimStart().startsWith('<')) {
+			servedHtml = true;
+			body = text;
+		} else {
+			body = text.trim().length > 0 ? JSON.parse(text) : null;
+		}
 	} else if (contentType.startsWith('text/') || contentType === '') {
 		body = await response.text();
+		// An empty body is never a sign-in page, and a write answering `204` can carry a stale `text/html` from
+		// whatever its endpoint usually returns — so require actual markup, not just the header.
+		servedHtml = contentType.startsWith('text/html') && body.trim().length > 0;
 	} else if (contentType.startsWith('application/vnd.github.raw+json')) {
 		body = await response.arrayBuffer();
 	} else {
@@ -1885,6 +1871,12 @@ async function parseFetchResponseForApi<T>(response: Response): Promise<Provider
 		statusText: response.statusText,
 	};
 
+	// A 2xx carrying a page rather than data is a rejected credential wearing a success status (GKDEV-3617); a
+	// non-2xx keeps its own status error below, which is the better diagnostic.
+	if (response.ok && servedHtml) {
+		throw new UnexpectedHtmlResponseError(response.status, contentType, result);
+	}
+
 	// throw an error if the response is not ok
 	if (!response.ok) {
 		const status = `(${response.status})${response.statusText ? ` ${response.statusText}` : ''}.`;
@@ -1895,29 +1887,4 @@ async function parseFetchResponseForApi<T>(response: Response): Promise<Provider
 	}
 
 	return result;
-}
-
-const maxProviderErrorBodyLength = 500;
-
-/** Extracts the useful provider prose from an already-parsed SDK response body. */
-function getProviderResponseBodyMessage(body: unknown): string | undefined {
-	let message: string | undefined;
-	if (typeof body === 'string') {
-		message = body;
-	} else if (body != null && typeof body === 'object') {
-		const { message: direct, error } = body as { message?: unknown; error?: unknown };
-		if (typeof direct === 'string') {
-			message = direct;
-		} else if (typeof error === 'string') {
-			message = error;
-		} else if (error != null && typeof error === 'object') {
-			const nested = (error as { message?: unknown }).message;
-			if (typeof nested === 'string') {
-				message = nested;
-			}
-		}
-	}
-
-	message = message?.trim();
-	return message ? message.slice(0, maxProviderErrorBodyLength) : undefined;
 }

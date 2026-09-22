@@ -988,3 +988,646 @@ suite('GitHubApi issue-search cursor ordering fingerprint', () => {
 		);
 	});
 });
+
+/**
+ * The CEILING SLIDE (#5805): GitHub caps a search at 1,000 results PER QUERY, so a walk that runs out of pages
+ * against a capped query continues by re-issuing the search bounded to the far side of the last item served.
+ * That turns the ceiling from terminal into continuable while keeping ONE query per page, so the order across
+ * the whole read stays the provider's.
+ */
+suite('GitHubApi.searchIssuesPage ceiling slide (#5805)', () => {
+	/** A capped result: `issueCount` over the limit, and a terminal page (nothing left to page to). */
+	function cappedServe(nodes: unknown[], count = 1500) {
+		let variables: Record<string, unknown> = {};
+		const config = {
+			isWeb: false,
+			fetch: async (_url: unknown, init?: { body?: string }) => {
+				const body = JSON.parse(init?.body ?? '{}') as { query?: string; variables?: Record<string, unknown> };
+				variables = body.variables ?? {};
+				const aliases = Array.from((body.query ?? '').matchAll(/^\s*(\w+): search\(/gm), m => m[1]);
+				return new Response(
+					JSON.stringify({
+						data: Object.fromEntries(
+							aliases.map(a => [
+								a,
+								{ issueCount: count, pageInfo: { endCursor: null, hasNextPage: false }, nodes: nodes },
+							]),
+						),
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } },
+				);
+			},
+			wrapForForcedInsecureSSL: (_i: unknown, fn: () => unknown) => fn(),
+		} as unknown as GitHubApiConfig;
+		return { config: config, getVariables: () => variables };
+	}
+
+	/** One GraphQL issue node, complete enough for `fromGitHubIssue` to map it (a partial node maps to
+	 * nothing, which would silently make every page below empty and every assertion vacuous). */
+	const issue = (n: number, updatedAt: string) => ({
+		id: `i${n}`,
+		number: n,
+		title: `issue ${n}`,
+		url: `https://github.com/acme/repo/issues/${n}`,
+		createdAt: updatedAt,
+		updatedAt: updatedAt,
+		closedAt: null,
+		closed: false,
+		state: 'OPEN',
+		author: null,
+		assignees: { nodes: [] },
+		comments: { totalCount: 0 },
+		reactions: { totalCount: 0 },
+		repository: { name: 'repo', owner: { login: 'acme' }, url: 'https://github.com/acme/repo' },
+	});
+
+	test('a capped, page-exhausted walk continues with an inclusive boundary instead of reporting the ceiling', async () => {
+		const { config } = cappedServe([issue(1, '2026-05-01T10:00:00Z'), issue(2, '2026-04-01T09:30:00Z')]);
+		const api = new GitHubApi(config);
+
+		const page = await api.searchIssuesPage(provider, token, { org: 'acme' });
+
+		assert.equal(page?.truncated, false, 'a slidable ceiling is forward progress, not incompleteness');
+		assert.equal(page?.hasMore, true, 'the remainder is reachable');
+		assert.ok(page?.cursor != null);
+		// Per-alias keys: aliases slide independently, so one shared bound would sit below where an
+		// early-finishing alias stopped and re-serve what it had already delivered.
+		const cursor = JSON.parse(page.cursor) as Record<string, unknown>;
+		// INCLUSIVE (`<=`): GitHub timestamps are second-resolution and ties occur, so an exclusive bound would
+		// silently drop every issue sharing the boundary second with the last one served.
+		assert.equal(
+			cursor['slide:matched'],
+			'updated:<=2026-04-01T09:30:00Z',
+			'bounded at the last item served, inclusive',
+		);
+		assert.equal(
+			cursor['slideSeen:matched'],
+			'https://github.com/acme/repo/issues/2',
+			'the boundary second it re-serves is carried so the next page can drop it',
+		);
+	});
+
+	test('the slid query carries the boundary and drops what the boundary second already served', async () => {
+		const boundary = issue(2, '2026-04-01T09:30:00Z');
+		const { config, getVariables } = cappedServe([boundary, issue(3, '2026-03-01T08:00:00Z')], 10);
+		const api = new GitHubApi(config);
+
+		const cursor = JSON.stringify({
+			page: 2,
+			sort: 'updated:desc',
+			'slide:matched': 'updated:<=2026-04-01T09:30:00Z',
+			'slideSeen:matched': boundary.url,
+		});
+		const page = await api.searchIssuesPage(provider, token, { org: 'acme', cursor: cursor });
+
+		assert.match(
+			String(getVariables().matched),
+			/updated:<=2026-04-01T09:30:00Z/,
+			'the continuation re-issues the search bounded to the far side of what was served',
+		);
+		assert.deepEqual(
+			page?.values.map(v => v.url),
+			['https://github.com/acme/repo/issues/3'],
+			'the re-served boundary issue is dropped, so the walk emits no duplicate',
+		);
+	});
+
+	test('a capped walk with pages remaining is not yet marked truncated', async () => {
+		// The slide happens once the walk runs OUT of pages. Marking `truncated` earlier would seal it into the
+		// cursor and keep it there for the rest of the read: a completed walk reporting omitted results it fetched.
+		const { config } = serve({ matched: [issue(1, '2026-05-01T10:00:00Z')] }, { hasNextPage: true });
+		const api = new GitHubApi(config);
+
+		const page = await api.searchIssuesPage(provider, token, { org: 'acme' });
+
+		assert.equal(page?.hasMore, true);
+		assert.equal(page?.truncated, false, 'nothing is omitted while the walk can still page forward');
+	});
+
+	test('an unslidable sort key still reports the ceiling rather than continuing', async () => {
+		// `comments` has a GitHub range qualifier, but its value moves under concurrent activity: an issue that
+		// gains a comment mid-walk crosses the boundary and is dropped or repeated. Reporting the ceiling is the
+		// honest answer there.
+		const { config } = cappedServe([issue(1, '2026-05-01T10:00:00Z')]);
+		const api = new GitHubApi(config);
+
+		const page = await api.searchIssuesPage(provider, token, {
+			org: 'acme',
+			criteria: { sort: 'comments:desc' },
+		});
+
+		assert.equal(page?.truncated, true, 'an unreachable remainder is still reported as omitted');
+		assert.equal(page?.hasMore, false, 'and never advertised as continuable');
+	});
+
+	test('a foreign or malformed slide in a cursor is ignored rather than injected into the query', async () => {
+		// The slide is caller-supplied data on a round trip, so it is validated against the exact shape this
+		// emits: anything else restarts the walk instead of reaching the query.
+		const { config, getVariables } = cappedServe([issue(1, '2026-05-01T10:00:00Z')], 10);
+		const api = new GitHubApi(config);
+
+		await api.searchIssuesPage(provider, token, {
+			org: 'acme',
+			cursor: JSON.stringify({ page: 2, sort: 'updated:desc', 'slide:matched': 'org:evil-corp' }),
+		});
+
+		const query = String(getVariables().matched);
+		assert.ok(!query.includes('evil-corp'), 'an unrecognized slide never reaches the query');
+		assert.match(query, /org:acme/, 'the caller-supplied scope is the only one applied');
+	});
+});
+
+/**
+ * The ceiling slide against a FAITHFUL provider: a fixture that honours the date bound, the per-query cap and
+ * cursor paging, so a walk can actually be driven to completion and its result checked as a whole.
+ *
+ * The cases below are the ones that broke a first implementation. Each is a property of the WALK (no duplicates,
+ * no gaps, one order) rather than of a single response, and none of them is observable from one page.
+ */
+suite('GitHubApi.searchIssuesPage ceiling slide, end to end (#5805)', () => {
+	const iso = (ms: number) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+	function node(id: string, updatedAt: string) {
+		return {
+			id: id,
+			number: 1,
+			title: id,
+			url: `https://github.com/o/a/issues/${id}`,
+			createdAt: updatedAt,
+			updatedAt: updatedAt,
+			closedAt: null,
+			closed: false,
+			state: 'OPEN',
+			author: null,
+			assignees: { nodes: [] },
+			comments: { totalCount: 0 },
+			reactions: { totalCount: 0 },
+			repository: { name: 'a', owner: { login: 'o' }, url: 'https://github.com/o/a' },
+		};
+	}
+
+	/** A provider that applies the emitted `updated:` bound, caps each query, and pages. */
+	function faithful(corpusByAlias: Record<string, ReturnType<typeof node>[]>, cap = 1000, pageSize = 100) {
+		return {
+			isWeb: false,
+			wrapForForcedInsecureSSL: (_i: unknown, fn: () => unknown) => fn(),
+			fetch: async (_url: unknown, init?: { body?: string }) => {
+				const body = JSON.parse(init?.body ?? '{}') as {
+					query?: string;
+					variables?: Record<string, string | boolean | undefined>;
+				};
+				const aliases = Array.from((body.query ?? '').matchAll(/^\s*(\w+): search\(/gm), m => m[1]);
+				const data: Record<string, unknown> = {};
+				for (const alias of aliases) {
+					const q = body.variables?.[alias];
+					if (typeof q !== 'string') continue;
+
+					let items = (corpusByAlias[alias] ?? []).slice();
+					const le = /updated:<=(\S+)/.exec(q);
+					const ge = /updated:>=(\S+)/.exec(q);
+					if (le != null) {
+						items = items.filter(i => i.updatedAt <= le[1]);
+					}
+					if (ge != null) {
+						items = items.filter(i => i.updatedAt >= ge[1]);
+					}
+					const asc = q.includes('sort:updated-asc');
+					items.sort((a, b) =>
+						asc ? a.updatedAt.localeCompare(b.updatedAt) : b.updatedAt.localeCompare(a.updatedAt),
+					);
+					const total = items.length;
+					const reachable = items.slice(0, cap);
+					const after = body.variables?.[`${alias}Cursor`];
+					const start = typeof after === 'string' ? Number(after.split(':')[1]) : 0;
+					const on = body.variables?.[`include${alias[0].toUpperCase()}${alias.slice(1)}`] !== false;
+					const slice = on ? reachable.slice(start, start + pageSize) : [];
+					const next = start + slice.length;
+					const hasNextPage = on && next < reachable.length;
+					data[alias] = {
+						issueCount: total,
+						pageInfo: { endCursor: hasNextPage ? `${alias}:${next}` : null, hasNextPage: hasNextPage },
+						nodes: slice,
+					};
+				}
+				return new Response(JSON.stringify({ data: data }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			},
+		} as unknown as GitHubApiConfig;
+	}
+
+	async function drain(api: GitHubApi, options: Parameters<GitHubApi['searchIssuesPage']>[2]) {
+		const urls: string[] = [];
+		const dates: number[] = [];
+		let cursor: string | undefined;
+		let truncated = false;
+		for (let page = 1; page <= 80; page++) {
+			const r = await api.searchIssuesPage(provider, token, { ...options, cursor: cursor });
+			truncated = r?.truncated ?? false;
+			for (const v of r?.values ?? []) {
+				urls.push(v.url);
+				dates.push(v.updatedDate?.getTime() ?? 0);
+			}
+			if (r?.hasMore !== true || r.cursor == null) break;
+
+			cursor = r.cursor;
+		}
+		let inversions = 0;
+		for (let i = 1; i < dates.length; i++) {
+			if (dates[i] > dates[i - 1]) {
+				inversions++;
+			}
+		}
+		return { urls: urls, distinct: new Set(urls).size, inversions: inversions, truncated: truncated };
+	}
+
+	const spread = (n: number, prefix = 'N', from = Date.UTC(2026, 0, 1)) =>
+		Array.from({ length: n }, (_, i) => node(`${prefix}${i}`, iso(from - i * 3_600_000)));
+
+	test('a walk past the ceiling is complete, duplicate-free and in one order', async () => {
+		const corpus = spread(1205);
+		const api = new GitHubApi(faithful({ matched: corpus }));
+
+		const { urls, distinct, inversions, truncated } = await drain(api, { org: 'o' });
+
+		assert.equal(distinct, corpus.length, 'every matching issue is served');
+		assert.equal(urls.length, distinct, 'and none of them twice');
+		assert.equal(inversions, 0, 'the whole walk stays in the requested order');
+		assert.equal(truncated, false, 'nothing was omitted, so nothing is reported as omitted');
+	});
+
+	test('a walk needing several slides still completes', async () => {
+		const corpus = spread(2600);
+		const api = new GitHubApi(faithful({ matched: corpus }));
+
+		const { urls, distinct, inversions } = await drain(api, { org: 'o' });
+
+		assert.equal(distinct, corpus.length);
+		assert.equal(urls.length, distinct);
+		assert.equal(inversions, 0);
+	});
+
+	test('an ascending walk slides the other way', async () => {
+		// `updated:asc` walks toward newer, so the remainder is everything at or AFTER the boundary. Emitting
+		// `<=` here would re-request the half already served, forever.
+		const corpus = spread(1205);
+		const api = new GitHubApi(faithful({ matched: corpus }));
+
+		const { urls, distinct } = await drain(api, { org: 'o', criteria: { sort: 'updated:asc' } });
+
+		assert.equal(distinct, corpus.length);
+		assert.equal(urls.length, distinct);
+	});
+
+	test('a tied block spanning several pages is not re-served after the slide', async () => {
+		// A bulk edit stamps hundreds of issues with ONE second. When that block straddles the cap it covers more
+		// than one page, so the set of urls already served at the boundary has to accumulate across pages rather
+		// than be rebuilt from the last one.
+		const tie = iso(Date.UTC(2025, 5, 1));
+		const corpus = [
+			...spread(800),
+			...Array.from({ length: 400 }, (_, i) => node(`T${i}`, tie)),
+			...spread(50, 'O', Date.UTC(2024, 0, 1)),
+		];
+		const api = new GitHubApi(faithful({ matched: corpus }));
+
+		const { urls, distinct } = await drain(api, { org: 'o' });
+
+		assert.equal(distinct, corpus.length, 'the tied block is served in full');
+		assert.equal(urls.length, distinct, 'and no part of it twice');
+	});
+
+	test('a union of relationships slides each alias at its OWN boundary', async () => {
+		// Aliases exhaust independently, so one bound shared across the page would sit below where an
+		// early-finishing alias stopped and re-serve everything it had already delivered. Bounding each alias at
+		// its own last item is what makes a capped union both complete and duplicate-free: `authored` is capped
+		// and slides, `assigned` finishes in one page and never does.
+		const authored = spread(1200, 'A');
+		const assigned = Array.from({ length: 5 }, (_, i) =>
+			node(`B${i}`, iso(Date.UTC(2026, 0, 1) - (i * 400 + 50) * 3_600_000)),
+		);
+		const api = new GitHubApi(faithful({ authored: authored, assigned: assigned }));
+
+		const { urls, distinct, truncated } = await drain(api, {
+			org: 'o',
+			criteria: { relationships: ['authored', 'assigned'] },
+		});
+
+		assert.equal(distinct, authored.length + assigned.length, 'both relationships are served in full');
+		assert.equal(urls.length, distinct, 'and a union never double-serves');
+		assert.equal(truncated, false, 'nothing is left unreachable, so nothing is reported as omitted');
+	});
+
+	test('a union where BOTH relationships are capped slides both', async () => {
+		const authored = spread(1150, 'A');
+		// Offset by half an hour so the two never share a timestamp: distinct boundaries, slid independently.
+		const assigned = Array.from({ length: 1150 }, (_, i) =>
+			node(`B${i}`, iso(Date.UTC(2026, 0, 1) - i * 3_600_000 - 1_800_000)),
+		);
+		const api = new GitHubApi(faithful({ authored: authored, assigned: assigned }));
+
+		const { urls, distinct, truncated } = await drain(api, {
+			org: 'o',
+			criteria: { relationships: ['authored', 'assigned'] },
+		});
+
+		assert.equal(distinct, authored.length + assigned.length);
+		assert.equal(urls.length, distinct);
+		assert.equal(truncated, false);
+		// Deliberately NOT asserting global ordering here. A union is ordered within a page but only per alias
+		// across pages, and whether that shows up depends on the aliases' relative density: two evenly-matched
+		// ones advance in step and look ordered, uneven ones do not. That is a property of the union and predates
+		// the slide, so pinning it either way here would pin an accident of the fixture.
+	});
+
+	test('an uncapped search carries no slide bookkeeping in its cursor', async () => {
+		// The boundary set only matters to a slide, and only a capped alias can reach one. Sealing it on every
+		// page of every search would put a trailing second's urls in a cursor that `broadenIssues` nests once per
+		// org, for a slide that will never happen.
+		const api = new GitHubApi(faithful({ matched: spread(400) }));
+
+		let cursor: string | undefined;
+		let largest = 0;
+		for (let page = 1; page <= 10; page++) {
+			const r = await api.searchIssuesPage(provider, token, { org: 'o', cursor: cursor });
+			largest = Math.max(largest, r?.cursor?.length ?? 0);
+			if (r?.hasMore !== true || r.cursor == null) break;
+
+			cursor = r.cursor;
+		}
+
+		assert.ok(!(cursor ?? '').includes('slideSeen'), 'no boundary set is carried');
+		assert.ok(largest < 200, `the cursor stays small (was ${largest} bytes)`);
+	});
+
+	test('a bound that does nothing stops the walk instead of looping forever', async () => {
+		// Defence in depth, not a reachable state: against a provider that honours the bound no walk repeats one
+		// (a tied block larger than the cap terminates on its own, covered above). But a slide that silently did
+		// nothing would be an unbounded request loop rather than a wrong answer, and this read pages until the
+		// provider says stop, so the repeat is caught and reported as the ceiling it is.
+		const items = spread(120, 'I');
+		const config = {
+			isWeb: false,
+			wrapForForcedInsecureSSL: (_i: unknown, fn: () => unknown) => fn(),
+			fetch: async (_url: unknown, init?: { body?: string }) => {
+				const body = JSON.parse(init?.body ?? '{}') as {
+					query?: string;
+					variables?: Record<string, string | boolean | undefined>;
+				};
+				const aliases = Array.from((body.query ?? '').matchAll(/^\s*(\w+): search\(/gm), m => m[1]);
+				const data = Object.fromEntries(
+					aliases.map(alias => {
+						const after = body.variables?.[`${alias}Cursor`];
+						const start = typeof after === 'string' ? Number(after.split(':')[1]) : 0;
+						// The `updated:` bound is deliberately ignored here.
+						const slice = items.slice(start, start + 100);
+						const next = start + slice.length;
+						return [
+							alias,
+							{
+								issueCount: 5000,
+								pageInfo: {
+									endCursor: next < items.length ? `${alias}:${next}` : null,
+									hasNextPage: next < items.length,
+								},
+								nodes: slice,
+							},
+						];
+					}),
+				);
+				return new Response(JSON.stringify({ data: data }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			},
+		} as unknown as GitHubApiConfig;
+		const api = new GitHubApi(config);
+
+		let cursor: string | undefined;
+		let pages = 0;
+		let truncated = false;
+		for (; pages < 100;) {
+			const r = await api.searchIssuesPage(provider, token, { org: 'o', cursor: cursor });
+			pages++;
+			truncated = r?.truncated ?? false;
+			if (r?.hasMore !== true || r.cursor == null) break;
+
+			cursor = r.cursor;
+		}
+
+		assert.ok(pages < 100, 'the walk terminates rather than paging forever');
+		assert.equal(truncated, true, 'and reports the results it could not reach');
+	});
+
+	test('a tied block larger than the cap terminates and reports the ceiling', async () => {
+		// The nearest thing to a repeated bound that a well-behaved provider can produce. It resolves without the
+		// guard above: every page inside the block is filtered out by the per-alias `slideSeen`, so the walk ends
+		// on an empty page with no boundary to slide from.
+		const tie = iso(Date.UTC(2025, 5, 1));
+		const corpus = [
+			...Array.from({ length: 1200 }, (_, i) => node(`T${i}`, tie)),
+			...spread(50, 'O', Date.UTC(2024, 0, 1)),
+		];
+		const api = new GitHubApi(faithful({ matched: corpus }));
+
+		const { urls, distinct, truncated } = await drain(api, { org: 'o' });
+
+		assert.equal(urls.length, distinct, 'no issue is served twice');
+		assert.equal(distinct, 1000, 'the reachable window is served in full');
+		assert.equal(truncated, true, 'and the unreachable remainder is reported');
+	});
+
+	test('the account-wide read reports the ceiling when it has no order to slide by', async () => {
+		// `searchMyIssues` orders only on request, so with none there is no boundary to slide from. It must still
+		// SAY it hit the ceiling: a first pass at the per-alias slide folded that check into the slide attempt,
+		// which silently dropped it here and served 1.000 of 1.150 as if complete.
+		const api = new GitHubApi(faithful({ assigned: spread(1150, 'I') }));
+
+		let cursor: string | undefined;
+		let truncated = false;
+		const urls: string[] = [];
+		for (let page = 1; page <= 40; page++) {
+			const r = await api.searchMyIssues(provider, token, { repos: ['o/a'], cursor: cursor });
+			truncated = r?.truncated ?? false;
+			for (const v of r?.values ?? []) {
+				urls.push(v.url);
+			}
+			if (r?.hasMore !== true || r.cursor == null) break;
+
+			cursor = r.cursor;
+		}
+
+		assert.equal(new Set(urls).size, 1000, 'only the reachable window is served');
+		assert.equal(truncated, true, 'and the rest is reported as omitted, not passed off as complete');
+	});
+
+	test('the account-wide read APPLIES a slide bound it sealed, rather than recording it and ignoring it', async () => {
+		// This method composes its own query text, so it has to append the bound itself. Without that the
+		// continuation re-issues the unbounded query, re-serves the same first 1.000, has every one filtered out
+		// as already-seen, and pages through nothing until it gives up: 20 requests to do 10 requests' work.
+		const corpus = spread(1150, 'I');
+		const api = new GitHubApi(faithful({ assigned: corpus }));
+
+		let cursor: string | undefined;
+		let pages = 0;
+		let truncated = false;
+		const urls: string[] = [];
+		for (; pages < 40;) {
+			const r = await api.searchMyIssues(provider, token, {
+				repos: ['o/a'],
+				sort: 'updated:desc',
+				cursor: cursor,
+			});
+			pages++;
+			truncated = r?.truncated ?? false;
+			for (const v of r?.values ?? []) {
+				urls.push(v.url);
+			}
+			if (r?.hasMore !== true || r.cursor == null) break;
+
+			cursor = r.cursor;
+		}
+
+		assert.equal(new Set(urls).size, corpus.length, 'the walk reaches past the ceiling');
+		assert.equal(urls.length, new Set(urls).size, 'without serving anything twice');
+		assert.equal(truncated, false);
+		assert.ok(pages <= 13, `no requests wasted on fully-filtered pages (took ${pages})`);
+	});
+
+	test('an unslidable sort still reports the ceiling for a union', async () => {
+		const api = new GitHubApi(faithful({ authored: spread(1200, 'A') }));
+
+		const { truncated } = await drain(api, {
+			org: 'o',
+			criteria: { relationships: ['authored'], sort: 'comments:desc' },
+		});
+
+		assert.equal(truncated, true);
+	});
+});
+
+/**
+ * The batch issue read (#5802): N `(owner, repo, number)` coordinates in one aliased document.
+ *
+ * The case worth pinning is the PARTIAL response. GitHub answers a batch with a missing coordinate as HTTP 200
+ * carrying every resolvable alias PLUS a `NOT_FOUND` error per missing one, and the GraphQL client throws on any
+ * error by default. Since a miss is the common outcome for this read, throwing would discard the results that did
+ * resolve and make it useless for the question it answers.
+ */
+suite('GitHubApi.getIssuesBatch (#5802)', () => {
+	function batchServe(
+		byAlias: Record<string, unknown>,
+		errors?: { type: string; path: string[] }[],
+	): { config: GitHubApiConfig; getVariables: () => Record<string, unknown> } {
+		let variables: Record<string, unknown> = {};
+		const config = {
+			isWeb: false,
+			wrapForForcedInsecureSSL: (_i: unknown, fn: () => unknown) => fn(),
+			fetch: async (_url: unknown, init?: { body?: string }) => {
+				const body = JSON.parse(init?.body ?? '{}') as { variables?: Record<string, unknown> };
+				variables = body.variables ?? {};
+				return new Response(JSON.stringify({ data: byAlias, ...(errors != null ? { errors: errors } : {}) }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			},
+		} as unknown as GitHubApiConfig;
+		return { config: config, getVariables: () => variables };
+	}
+
+	const issueNode = (n: number) => ({
+		id: `i${n}`,
+		number: n,
+		title: `issue ${n}`,
+		url: `https://github.com/o/a/issues/${n}`,
+		createdAt: '2026-01-01T00:00:00Z',
+		updatedAt: '2026-01-01T00:00:00Z',
+		closedAt: null,
+		closed: false,
+		state: 'OPEN',
+		author: null,
+		assignees: { nodes: [] },
+		comments: { totalCount: 0 },
+		reactions: { totalCount: 0 },
+		repository: { name: 'a', owner: { login: 'o' }, url: 'https://github.com/o/a' },
+	});
+
+	test('resolves every coordinate in one request, positionally', async () => {
+		const { config, getVariables } = batchServe({
+			i0: { issue: issueNode(1) },
+			i1: { issue: issueNode(2) },
+		});
+		const api = new GitHubApi(config);
+
+		const out = await api.getIssuesBatch(provider, token, [
+			{ owner: 'o', repo: 'a', number: 1 },
+			{ owner: 'o', repo: 'b', number: 2 },
+		]);
+
+		// `IssueShape.id` is the issue NUMBER as a string, not the GraphQL node id.
+		assert.deepEqual(
+			out.map(i => i?.id),
+			['1', '2'],
+		);
+		// Coordinates reach the query as VARIABLES, never interpolated into it.
+		assert.equal(getVariables().o0, 'o');
+		assert.equal(getVariables().n1, 'b');
+		assert.equal(getVariables().k1, 2);
+	});
+
+	test('a NOT_FOUND alongside real results yields absences, not a thrown batch', async () => {
+		// GitHub's actual shape for a partly-resolvable batch, verified against the live API: 200, full `data`,
+		// one NOT_FOUND per missing coordinate. Throwing here would discard `i0` because `i1` does not exist.
+		const { config } = batchServe({ i0: { issue: issueNode(1) }, i1: { issue: null }, i2: null }, [
+			{ type: 'NOT_FOUND', path: ['i1', 'issue'] },
+			{ type: 'NOT_FOUND', path: ['i2'] },
+		]);
+		const api = new GitHubApi(config);
+
+		const out = await api.getIssuesBatch(provider, token, [
+			{ owner: 'o', repo: 'a', number: 1 },
+			{ owner: 'o', repo: 'a', number: 999 },
+			{ owner: 'o', repo: 'gone', number: 1 },
+		]);
+
+		assert.deepEqual(
+			out.map(i => i?.id),
+			['1', undefined, undefined],
+		);
+	});
+
+	test('an error that is NOT a NOT_FOUND still throws rather than reading as absences', async () => {
+		// The narrowing that keeps the tolerance honest: a rate limit or auth failure must not be reported as a
+		// batch of issues that do not exist, which a caller would then cache.
+		const { config } = batchServe({ i0: { issue: issueNode(1) }, i1: { issue: null } }, [
+			{ type: 'RATE_LIMITED', path: ['i1'] },
+		]);
+		const api = new GitHubApi(config);
+
+		await assert.rejects(
+			() =>
+				api.getIssuesBatch(provider, token, [
+					{ owner: 'o', repo: 'a', number: 1 },
+					{ owner: 'o', repo: 'a', number: 2 },
+				]),
+			'a real failure is not silently converted into absences',
+		);
+	});
+
+	test('no coordinates costs no request', async () => {
+		let called = false;
+		const config = {
+			isWeb: false,
+			wrapForForcedInsecureSSL: (_i: unknown, fn: () => unknown) => fn(),
+			fetch: async () => {
+				called = true;
+				return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+			},
+		} as unknown as GitHubApiConfig;
+		const api = new GitHubApi(config);
+
+		assert.deepEqual(await api.getIssuesBatch(provider, token, []), []);
+		assert.equal(called, false);
+	});
+});

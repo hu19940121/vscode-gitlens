@@ -165,11 +165,17 @@ export interface IssueShape extends IssueOrPullRequest {
 	/** `undefined` when the provider can't resolve the author, e.g. a deleted GitHub account */
 	author: IssueMember | undefined;
 	assignees: IssueMember[];
+	/** The provider's own workflow state, when it exposes one beyond the normalized open/closed state. */
+	providerState?: IssueProviderState;
 	repository?: IssueRepository;
 	labels?: IssueLabel[];
 	body?: string;
+	/** The syntax used by `body`. When omitted, consumers should treat `body` as Markdown. */
+	bodyFormat?: IssueBodyFormat;
 	project?: IssueProject;
 	issueType?: string;
+	/** An issue can belong to several Jira sprints; Azure reports one iteration. */
+	iterations?: IssueIteration[];
 }
 
 @loggable(i => i.id)
@@ -197,12 +203,17 @@ export class Issue implements IssueShape {
 		public readonly project?: IssueProject,
 		public readonly number?: string,
 		public readonly issueType?: string,
+		public readonly providerState?: IssueProviderState,
+		public readonly bodyFormat?: IssueBodyFormat,
+		public readonly iterations?: IssueIteration[],
 	) {}
 
 	static is(issue: unknown): issue is Issue {
 		return issue instanceof Issue;
 	}
 }
+
+export type IssueBodyFormat = 'markdown' | 'jira-wiki';
 
 export const enum RepositoryAccessLevel {
 	Admin = 100,
@@ -216,6 +227,23 @@ export const enum RepositoryAccessLevel {
 export interface IssueLabel {
 	color?: string;
 	name: string;
+}
+
+/**
+ * Sprint metadata is optional because some providers only report an iteration path. An absent `isActive`
+ * means unknown, not inactive, so consumers must not use it to exclude those iterations by default.
+ */
+export interface IssueIteration {
+	/**
+	 * A sprint id on Jira, the verbatim iteration path on Azure — so it is only meaningful within the provider's
+	 * project, never across providers. Unique at read time but NOT durable: Azure rewrites the path when an
+	 * iteration node is renamed or re-parented, so don't persist it as a long-lived id.
+	 */
+	id: string;
+	name: string;
+	isActive?: boolean;
+	startDate?: Date;
+	endDate?: Date;
 }
 
 export interface IssueMember {
@@ -234,6 +262,13 @@ export interface IssueMember {
 	avatarUrl?: string;
 	url?: string;
 }
+
+export type IssueProviderState = {
+	id?: string;
+	name: string;
+	color?: string;
+	category?: 'TO_DO' | 'IN_PROGRESS' | 'DONE';
+};
 
 export interface IssueProject {
 	id: string;
