@@ -32,7 +32,7 @@ export const allowedSignersStyles = css`
 	header h1 {
 		margin: 0 0 0.4rem;
 		font-size: 2rem;
-		font-weight: 600;
+		font-weight: var(--gl-font-weight-semibold);
 	}
 
 	header p {
@@ -47,7 +47,7 @@ export const allowedSignersStyles = css`
 		padding: 0.8rem 1.2rem;
 		background: var(--vscode-inputValidation-warningBackground, rgb(255 191 0 / 10%));
 		border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground));
-		border-radius: 0.4rem;
+		border-radius: var(--gl-radius-sm);
 	}
 
 	.notice--error {
@@ -61,7 +61,7 @@ export const allowedSignersStyles = css`
 		gap: 1rem;
 		padding: 1.2rem;
 		border: 1px solid var(--vscode-panel-border);
-		border-radius: 0.4rem;
+		border-radius: var(--gl-radius-sm);
 	}
 
 	.field {
@@ -71,7 +71,7 @@ export const allowedSignersStyles = css`
 	}
 
 	.field label {
-		font-weight: 600;
+		font-weight: var(--gl-font-weight-semibold);
 	}
 
 	.path-row {
@@ -103,7 +103,7 @@ export const allowedSignersStyles = css`
 		flex-direction: column;
 		overflow: hidden;
 		border: 1px solid var(--vscode-panel-border);
-		border-radius: 0.4rem;
+		border-radius: var(--gl-radius-sm);
 	}
 
 	gl-signer-row:not(:last-child) {
@@ -113,7 +113,7 @@ export const allowedSignersStyles = css`
 	.list__group {
 		padding: 0.6rem 1.2rem;
 		font-size: 1.1rem;
-		font-weight: 600;
+		font-weight: var(--gl-font-weight-semibold);
 		color: var(--vscode-descriptionForeground);
 		text-transform: uppercase;
 		letter-spacing: 0.04em;
