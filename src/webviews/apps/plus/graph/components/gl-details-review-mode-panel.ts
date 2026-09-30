@@ -215,7 +215,22 @@ export class GlDetailsReviewModePanel extends LitElement {
 			: '';
 	}
 
-	@property({ attribute: false }) excludedFiles: ReadonlySet<string> = new Set();
+	/** Live file exclusions, seeded by the host from the engaged entry. Lit re-commits object
+	 *  bindings on every parent render, so a re-push of the same seed is ignored — otherwise any
+	 *  unrelated host render would restore the seed (usually the shared empty set) and re-check
+	 *  every file the user just unchecked. Local edits write `_excludedFiles` directly. */
+	get excludedFiles(): ReadonlySet<string> {
+		return this._excludedFiles;
+	}
+	set excludedFiles(value: ReadonlySet<string>) {
+		if (value === this._excludedFilesSeed) return;
+
+		this._excludedFilesSeed = value;
+		this._excludedFiles = value;
+	}
+	private _excludedFilesSeed?: ReadonlySet<string>;
+	@state() private _excludedFiles: ReadonlySet<string> = new Set();
+
 	/** Mirrors the pane's multi-selection so the "Open Changes" chip can swap to "Open Selected". */
 	@state() private _selectedFiles: readonly { path: string }[] = [];
 
@@ -259,7 +274,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 			if (result != null) {
 				this._aiExcludedSet = result.aiExcludedSet;
 				if (result.excludedFiles != null) {
-					this.excludedFiles = result.excludedFiles;
+					this._excludedFiles = result.excludedFiles;
 				}
 			}
 		}
@@ -267,7 +282,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 		if (changedProperties.has('files')) {
 			const pruned = prunePathsToFiles(this.excludedFiles, this.files);
 			if (pruned != null) {
-				this.excludedFiles = pruned;
+				this._excludedFiles = pruned;
 			}
 			this._selectedFiles = [];
 		}
@@ -346,8 +361,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 		// close button when in this results sub-state (see `gl-details-header.inResultsView`).
 		// The Copy + Send-to-chat actions live in an always-visible footer beneath the
 		// scrollable results so they stay reachable regardless of scroll position.
-		return html`${this.renderReadyMetadataBar()}
-			<div class="review-results scrollable">
+		return html`<div class="review-results scrollable">
 				${this.stale ? this.renderStaleBanner() : nothing} ${this.renderOverview()} ${this.renderFocusAreas()}
 			</div>
 			${this.renderReadyFooter()}${this.renderRefineInput()}`;
@@ -497,59 +511,6 @@ export class GlDetailsReviewModePanel extends LitElement {
 				composed: true,
 			}),
 		);
-	}
-
-	private renderReadyMetadataBar() {
-		const scope = this.scope;
-		if (!scope) return nothing;
-
-		// Compare-style scopes render their own compact bar so the result view matches the
-		// single-commit framing. Single-commit and WIP scopes inherit the host's bar.
-		if (scope.type !== 'compare') return nothing;
-
-		const fromSha = scope.fromSha;
-		const toSha = scope.toSha;
-		if (!fromSha || !toSha) return nothing;
-
-		const includedCount = scope.includeShas?.length ?? 0;
-
-		return html`<div class="review-metadata">
-			<div class="review-metadata__left">
-				<gl-commit-sha-copy
-					class="review-metadata__sha"
-					appearance="toolbar"
-					tooltip-placement="bottom"
-					copy-label=${l10n.t('Copy SHA')}
-					copied-label=${l10n.t('Copied!')}
-					.sha=${fromSha}
-					icon="git-commit"
-				></gl-commit-sha-copy>
-				<span class="review-metadata__dots">..</span>
-				<gl-commit-sha-copy
-					class="review-metadata__sha"
-					appearance="toolbar"
-					tooltip-placement="bottom"
-					copy-label=${l10n.t('Copy SHA')}
-					copied-label=${l10n.t('Copied!')}
-					.sha=${toSha}
-					icon="git-commit"
-				></gl-commit-sha-copy>
-			</div>
-			${
-				includedCount > 0
-					? html`<div class="review-metadata__right">
-							<span class="review-metadata__count"
-								>${formatPlural(
-									l10n.t(
-										'{count, plural, one{{count} commit selected} other{{count} commits selected}}',
-									),
-									{ count: includedCount },
-								)}</span
-							>
-						</div>`
-					: nothing
-			}
-		</div>`;
 	}
 
 	private scopeSummary(): string {
@@ -943,7 +904,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 		const next = fileCheckedExclusion(e, this.excludedFiles);
 		if (next == null) return;
 
-		this.excludedFiles = next;
+		this._excludedFiles = next;
 		this.invalidateForward();
 	}
 
@@ -951,7 +912,7 @@ export class GlDetailsReviewModePanel extends LitElement {
 		const next = checkAllExclusion(e, this.excludedFiles);
 		if (next == null) return;
 
-		this.excludedFiles = next;
+		this._excludedFiles = next;
 		this.invalidateForward();
 	}
 

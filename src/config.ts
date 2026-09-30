@@ -229,7 +229,7 @@ interface AgentsConfig {
 
 interface AIConfig {
 	readonly enabled: boolean;
-	readonly openInAgent: 'ask' | 'manual' | 'agent';
+	readonly openInAgent: 'ask' | 'manual' | 'agent' | 'kepler';
 	readonly defaultAgent: string | null;
 	readonly autoRebase: {
 		/** Minimum AI confidence (0–1) required to auto-apply a conflict resolution during an automatic rebase */
@@ -1200,8 +1200,17 @@ export type CoreConfig = {
 	readonly search: {
 		readonly exclude: Record<string, boolean>;
 	};
+	readonly window: {
+		readonly density: {
+			readonly layout: 'default' | 'compact';
+		};
+	};
 	readonly workbench: {
 		readonly editorAssociations: Record<string, string> | { viewType: string; filenamePattern: string }[];
+		readonly experimental: {
+			readonly modernUI: boolean;
+			readonly modernUIUppercaseViewHeaders: boolean;
+		};
 		readonly panel: {
 			readonly visible: boolean;
 		};

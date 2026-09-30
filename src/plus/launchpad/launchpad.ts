@@ -404,6 +404,9 @@ export class LaunchpadCommand extends QuickCommand<State> {
 					case 'merge':
 						void this.container.launchpad.merge(state.item);
 						break;
+					case 'rebase-stack':
+						this.container.launchpad.rebaseStack(state.item);
+						break;
 					case 'open':
 						this.container.launchpad.open(state.item);
 						break;
@@ -460,7 +463,9 @@ export class LaunchpadCommand extends QuickCommand<State> {
 			);
 		}
 
-		if (flow.kind === 'cancel') return;
+		// The route is forced to `'agent'` and no `item` is passed, so Kepler is never resolved here;
+		// returning on it anyway keeps a Kepler result from ever falling through to creating a worktree
+		if (flow.kind === 'cancel' || flow.kind === 'kepler') return;
 
 		const agent = flow.kind === 'agent' ? flow.descriptor : undefined;
 		// Detach the review from the wizard lifetime, mirroring the sibling fire-and-forget actions in
@@ -1066,6 +1071,31 @@ export class LaunchpadCommand extends QuickCommand<State> {
 											count: count,
 										},
 									),
+									detail: detail,
+									buttons: [...gitProviderWebButtons],
+								},
+								action,
+							),
+						);
+						break;
+					}
+					case 'rebase-stack': {
+						const stack = state.item.underlyingPullRequest.stack;
+						const count = getStackedMergeCount(stack, { wholeStack: true });
+						const detail =
+							stack != null
+								? formatPlural(
+										l10n.t(
+											'{count, plural, one{Will rebase {count} branch onto {target}} other{Will rebase {count} branches onto {target}}}',
+										),
+										{ count: count, target: stack.baseRef },
+									)
+								: l10n.t('Will rebase this stack');
+
+						confirmations.push(
+							createQuickPickItemOfT(
+								{
+									label: l10n.t('Rebase Stack...'),
 									detail: detail,
 									buttons: [...gitProviderWebButtons],
 								},

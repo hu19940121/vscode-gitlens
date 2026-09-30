@@ -23,6 +23,9 @@ import type { AgentDescriptor, AgentRoute } from './plus/agents/agentDescriptor.
 import type { AutoRebaseUndoRefusalReason } from './plus/coretools/conflict/autoRebase.types.js';
 import type { OrganizationRole } from './plus/gk/models/organization.js';
 import type { Subscription, SubscriptionAccount, SubscriptionStateString } from './plus/gk/models/subscription.js';
+import type { KeplerProviderId } from './plus/kepler/keplerProviders.js';
+import type { KeplerChannel } from './plus/kepler/keplerService.js';
+import type { KeplerTaskAction, KeplerTaskIntent } from './plus/kepler/keplerTask.js';
 import type { GraphColumnConfig, GraphScopeSource } from './webviews/plus/graph/protocol.js';
 import type { TimelinePeriod, TimelineScopeType, TimelineSliceBy } from './webviews/plus/timeline/protocol.js';
 
@@ -135,6 +138,25 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	'autoRebase/undo/completed': void;
 	/** Sent when an undo is refused (branch moved, dirty working tree, etc.) */
 	'autoRebase/undo/refused': AutoRebaseUndoRefusedEvent;
+
+	/** Sent when a stack rebase run starts — rebasing every branch of a stacked pull request chain,
+	 *  bottom to top, optionally with AI conflict resolution at each step */
+	'stackRebase/started': StackRebaseStartedEvent;
+	/** Sent each time the cascade finishes rebasing one branch in the stack and advances to the next */
+	'stackRebase/branch/completed': StackRebaseBranchEvent;
+	/** Sent when the cascade pauses partway up the stack — a conflict needs manual resolution, or
+	 *  automation escalates the current branch */
+	'stackRebase/paused': StackRebasePausedEvent;
+	/** Sent when the user resumes a paused stack rebase, continuing the cascade from the branch it stopped at */
+	'stackRebase/resumed': StackRebaseBranchEvent;
+	/** Sent when every branch in the stack has been rebased and the cascade runs to completion */
+	'stackRebase/completed': StackRebaseLifecycleEvent;
+	/** Sent when the user aborts the cascade, abandoning the remaining branches in the stack */
+	'stackRebase/stopped': StackRebaseLifecycleEvent;
+	/** Sent when the cascade fails unexpectedly partway up the stack */
+	'stackRebase/failed': StackRebaseFailedEvent;
+	/** Sent when the rewritten branches from a completed stack rebase are force-pushed */
+	'stackRebase/push/completed': StackRebasePushEvent;
 
 	/** Sent when an agent hook is installed */
 	'agents/hookInstalled': AgentProviderEvent;
@@ -621,6 +643,10 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 
 	/** Sent when the user opens Kepler's product page from the "Try Kepler" CTA (Settings or Graph sidebar banner) */
 	'kepler/productPage/opened': void;
+	/** Sent when the user starts a Kepler task — a deep link into an installed Kepler's Task Composer was handed off. Records what was sent, not whether Kepler handled it */
+	'kepler/task/start': KeplerTaskStartEvent;
+	/** Sent when starting a Kepler task fails — the item's provider is one Kepler cannot serve, or the deep link could not be handed off */
+	'kepler/task/start/failed': KeplerTaskStartFailedEvent;
 
 	/** Sent when the user takes an action on the Launchpad title bar */
 	'launchpad/title/action': LaunchpadTitleActionEvent;
@@ -1151,6 +1177,49 @@ interface AutoRebaseResumedEvent {
 interface AutoRebaseUndoRefusedEvent {
 	/** Why the undo was refused */
 	reason: AutoRebaseUndoRefusalReason;
+}
+
+interface StackRebaseLifecycleEvent {
+	mode: 'manual' | 'ai';
+	/** Branches in the stack the cascade is rebasing */
+	'branches.count': number;
+	/** Branches successfully rebased so far */
+	'branches.completed.count': number;
+	/** Time from run start in milliseconds */
+	duration: number;
+}
+
+interface StackRebaseStartedEvent {
+	mode: 'manual' | 'ai';
+	'branches.count': number;
+	/** Layers that had no local branch yet, so the cascade created one from its remote-tracking ref */
+	'branches.missing.count': number;
+}
+
+interface StackRebaseBranchEvent {
+	mode: 'manual' | 'ai';
+	/** 1-based position of this branch in the cascade */
+	index: number;
+	'branches.count': number;
+}
+
+interface StackRebasePausedEvent extends StackRebaseLifecycleEvent {
+	/** Why the cascade paused */
+	reason: 'conflicts' | 'escalated';
+}
+
+interface StackRebaseFailedEvent extends StackRebaseLifecycleEvent {
+	/** Why the cascade failed */
+	reason: 'rebase-error' | 'missing-branch' | 'unexpected-error';
+}
+
+interface StackRebasePushEvent {
+	/** Branches the push was attempted for — those the user left checked in the picker */
+	'branches.count': number;
+	/** Branches the user unchecked in the push picker, leaving them un-pushed */
+	'branches.held.count': number;
+	/** Branches whose push attempt failed — a subset of `branches.count` */
+	'branches.failed.count': number;
 }
 
 export interface CLIInstallStartedEvent {
@@ -2655,6 +2724,28 @@ interface GraphKanbanPermissionResolvedEvent extends GraphContextEventData {
 	'permission.kind': string;
 }
 
+interface KeplerTaskStartEvent {
+	/** Which entry point started the task */
+	intent: KeplerTaskIntent;
+	/** The kind of item the task starts from; absent for a task started from a repository */
+	kind?: 'pr' | 'issue';
+	/** The Kepler provider id the item's provider mapped to */
+	provider?: KeplerProviderId;
+	/** Whether the item's provider mapped to a Kepler provider id; absent when there is no item. A necessary precondition for Kepler to classify the item, never proof it did */
+	'provider.mapped'?: boolean;
+	/** Whether a local clone resolved silently and was sent as an exact `repo=` match */
+	'repo.resolved': boolean;
+	/** The Kepler channel the deep link targets */
+	channel: KeplerChannel;
+	/** The Kepler action pinned by the deep link */
+	action?: KeplerTaskAction;
+}
+
+interface KeplerTaskStartFailedEvent extends KeplerTaskStartEvent {
+	/** Why the task was not started. `not-installed` = Kepler is not installed, so no link was sent; `unsupported-provider` = Kepler cannot serve the item's provider for its kind, so no link was sent; `open-failed` = the deep link could not be handed off */
+	'failure.reason': 'not-installed' | 'open-failed' | 'unsupported-provider';
+}
+
 type InspectCommitContextEventData = {
 	'context.mode': 'commit';
 	'context.autolinks': number;
@@ -2726,7 +2817,8 @@ type LaunchpadActionEvent = LaunchpadEventData & {
 		| 'pin'
 		| 'unpin'
 		| 'snooze'
-		| 'unsnooze';
+		| 'unsnooze'
+		| 'rebase-stack';
 } & Partial<Record<`item.${string}`, string | number | boolean>>;
 
 type LaunchpadAgentResolvedEvent = LaunchpadEventData & AgentResolvedEventData;
@@ -3150,7 +3242,7 @@ type StartWorkAgentResolvedEvent = StartWorkConnectedEventData & AgentResolvedEv
 
 type AgentResolvedEventData =
 	| {
-			'agent.resolution': 'manual' | 'cancel';
+			'agent.resolution': 'manual' | 'kepler' | 'cancel';
 	  }
 	| {
 			'agent.resolution': 'agent';
@@ -3443,6 +3535,7 @@ export type TrackedGlActions =
 	| 'gitlens.graph.overview.shown'
 	| 'gitlens.graph.scope.changed'
 	| 'gitlens.graph.walkthrough.started'
+	| 'gitlens.kepler.installed'
 	| 'gitlens.mcp.ipcRequest'
 	| 'gitlens.mcp.bundledMcpDefinitionProvided';
 

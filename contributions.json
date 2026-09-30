@@ -337,6 +337,10 @@
 		"gitlens.ai.autoRebase.undo": {
 			"label": "Undo Auto-Rebase"
 		},
+		"gitlens.ai.autoRebaseStack": {
+			"label": "Auto-Rebase Pull Request Stack...",
+			"commandPalette": "gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed"
+		},
 		"gitlens.ai.connectAgents": {
 			"label": "Connect AI Agents (Install MCP and Hooks)",
 			"commandPalette": "!gitlens:untrusted && gitlens:gk:cli:installed"
@@ -3171,6 +3175,10 @@
 			"icon": "$(key)",
 			"commandPalette": "gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders"
 		},
+		"gitlens.git.forcePushStack": {
+			"label": "Git Force Push Pull Request Stack...",
+			"commandPalette": "!gitlens:disabled && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders"
+		},
 		"gitlens.git.history": {
 			"label": "Git History (log)...",
 			"commandPalette": "!gitlens:disabled && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders"
@@ -3181,6 +3189,10 @@
 		},
 		"gitlens.git.rebase": {
 			"label": "Git Rebase...",
+			"commandPalette": "!gitlens:disabled && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders"
+		},
+		"gitlens.git.rebaseStack": {
+			"label": "Git Rebase Pull Request Stack...",
 			"commandPalette": "!gitlens:disabled && !gitlens:readonly && !gitlens:untrusted && !gitlens:hasVirtualFolders"
 		},
 		"gitlens.git.remote": {
@@ -5390,6 +5402,45 @@
 						"when": "viewItem =~ /gitlens:contributor\\b(?!.*?\\b\\+current\\b)/ && !listMultiSelection && gitlens:vsls && gitlens:vsls != guest",
 						"group": "1_gitlens_actions",
 						"order": 1
+					}
+				]
+			}
+		},
+		"gitlens.kepler.newTask": {
+			"label": "Start Task in Kepler",
+			"icon": "$(gitlens-kepler)",
+			"menus": {
+				"view/item/context": [
+					{
+						"when": "viewItem =~ /gitlens:(repository|repo-folder)\\b/ && !listMultiSelection && !isWeb",
+						"group": "2_gitlens_quickopen",
+						"order": 5
+					}
+				]
+			}
+		},
+		"gitlens.kepler.startReview": {
+			"label": "Start Review in Kepler",
+			"icon": "$(gitlens-kepler)",
+			"menus": {
+				"view/item/context": [
+					{
+						"when": "viewItem =~ /gitlens:(pullrequest\\b|launchpad:item\\b(?=.*?\\b\\+pr\\b))/ && !listMultiSelection && !isWeb",
+						"group": "1_gitlens_actions",
+						"order": 3
+					}
+				]
+			}
+		},
+		"gitlens.kepler.startReview:graph": {
+			"label": "Start Review in Kepler",
+			"icon": "$(gitlens-kepler)",
+			"menus": {
+				"webview/context": [
+					{
+						"when": "webviewItem =~ /gitlens:pullrequest\\b/ && !isWeb",
+						"group": "1_gitlens_actions",
+						"order": 100
 					}
 				]
 			}
