@@ -28,6 +28,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Fixed
 
+- Fixes GitKraken AI telling someone on a Pro trial to _Upgrade to GitLens Pro_ when a request is refused for lack of entitlement &mdash; it now names the trial and offers to upgrade to the trialed plan ([#5789](https://github.com/gitkraken/vscode-gitlens/issues/5789))
 - Fixes a comparison, or a file or folder history, opened in the _Commit Graph_ while signed out or before upgrading being discarded instead of opening once access is granted ([#5820](https://github.com/gitkraken/vscode-gitlens/issues/5820))
 - Fixes the _Commit Graph_'s sign-in and upgrade screens still describing the previous task when a second one arrives while they're open ([#5820](https://github.com/gitkraken/vscode-gitlens/issues/5820))
 - Fixes _Create Branch..._ discarding the branch name you entered when you choose _Create Branch in New Worktree_ ([#4501](https://github.com/gitkraken/vscode-gitlens/issues/4501)) &mdash; from a remote base the worktree step replaced your name with the remote branch's own and re-prompted with _A branch named 'main' already exists_, and from a local base that isn't checked out anywhere it quietly created the worktree on that branch instead of a new one; a requested branch name is now always honored, including the `pr/` branch _Open Worktree for Pull Request_ asks for
@@ -46,6 +47,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes autolinked pull requests and issues disappearing from _Inspect_, hovers, and views until the window is reloaded &mdash; a failed lookup (a rate limit, server error, or timeout) was remembered as "not found" for the rest of the session, and enrichment done before an integration finished connecting was kept for 30 minutes; failed lookups are now retried the next time they're needed
 - Fixes files you uncheck in the _Commit Graph_'s _Review_ and _Compose_ modes getting checked again &mdash; the details panel refreshing reset your exclusions (and, in _Compose_, your excluded commits), so an unchecked file could quietly end up back in the review or commit plan
 - Fixes the commit range appearing twice at the top of the _Commit Graph_'s _Review_ results for a commit selection
+- Fixes the _Commit Graph_'s _Next steps_ permanently listing a branch's merged or closed pull request as something to act on ([#5846](https://github.com/gitkraken/vscode-gitlens/issues/5846)) &mdash; only an open pull request is offered now, and a branch whose pull request is merged or closed gets _Create a Pull Request_ instead; the header still shows the merged or closed pull request
+- Fixes entering a reference in the _Git Command Palette_'s _show_ command discarding it and going back to the command menu ([#5855](https://github.com/gitkraken/vscode-gitlens/issues/5855)) &mdash; pressing Enter before the reference finished resolving chose _Back_, and a branch or tag name never resolved at all; Enter now waits for the reference, branch and tag names resolve to their commit in every commit step, and a reference that doesn't resolve keeps what you typed
 
 ## [19.2.0] - 2026-09-16
 

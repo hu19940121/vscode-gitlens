@@ -87,6 +87,8 @@ import {
 	compareSubscriptionPlans,
 	getSubscriptionPlanName,
 	isSubscriptionPaid,
+	isSubscriptionPaidPlan,
+	isSubscriptionTrial,
 } from '../gk/utils/subscription.utils.js';
 import { AIActions } from './aiActions.js';
 import { AIIgnoreCache } from './aiIgnoreCache.js';
@@ -153,7 +155,7 @@ export interface AIModelChangeEvent {
  * `GET v1/ai-tasks/usage` payload we consume.
  *
  * `limit === -1` means unlimited and `limit === 0` means no allowance; never conflate the two, or a
- * trial user with no allowance reads as having infinite AI.
+ * user with no allowance reads as having infinite AI.
  */
 export interface AIUsageLimits {
 	readonly limit: number;
@@ -1770,6 +1772,26 @@ export class AIProviderService implements AIService, Disposable {
 
 											if (result === upgrade) {
 												void this.container.subscription.manageSubscription(source);
+											}
+										} else if (isSubscriptionTrial(sub)) {
+											// A trial's actual plan is Community, so it must not fall through to the unpaid
+											// "upgrade to Pro" pitch. Tier-gated features are already blocked against the
+											// effective plan by `ensureFeatureAccess`, so the remedy is buying the trialed plan.
+											const effectiveId = sub.plan.effective.id;
+											const plan = isSubscriptionPaidPlan(effectiveId) ? effectiveId : 'pro';
+											const planName = getSubscriptionPlanName(plan);
+
+											const upgrade = { title: l10n.t('Upgrade to {0}', planName) };
+											const result = await window.showErrorMessage(
+												l10n.t(
+													"This AI feature isn't included in your GitLens {0} trial. Please upgrade to {0} and try again.",
+													planName,
+												),
+												upgrade,
+											);
+
+											if (result === upgrade) {
+												void this.container.subscription.upgrade(plan, source);
 											}
 										} else {
 											// Users without accounts would never get here since they would have been blocked by `ensureFeatureAccess`
