@@ -50,6 +50,8 @@ export interface GitLogForPathOptions extends Omit<GitLogOptions, 'stashes'> {
 export interface GitLogShasOptions extends GitLogOptionsBase {
 	all?: boolean;
 	authors?: GitUser[];
+	/** Leaves out commits reachable from these refs, relative to `rev` (`HEAD` when omitted) — see {@link GitRefExclusions} */
+	excluding?: GitRefExclusions;
 	merges?: boolean | 'first-parent';
 	pathOrUri?: string | Uri;
 	reverse?: boolean;
@@ -68,6 +70,21 @@ export interface IncomingActivityOptions extends GitLogOptionsBase {
 	skip?: number;
 }
 
+/**
+ * Refs whose commits a history read (`getCommitCount`, `getLogShas`) leaves out, as `--not`.
+ * `branches`/`remotes`/`tags` exclude every ref in that namespace; `except` carves full ref names or globs (`refs/heads/feat`, `refs/remotes/origin/*`)
+ * back out of an enabled namespace and is ignored otherwise; `refs` are further revisions, passed verbatim.
+ * A read is cached until a branch, remote-tracking branch or tag changes, so a `refs` entry outside those namespaces
+ * (a tool's own `refs/<tool>/…`) can move without refreshing it: pass that ref's SHA instead, which keys a new read.
+ */
+export interface GitRefExclusions {
+	branches?: boolean;
+	remotes?: boolean;
+	tags?: boolean;
+	refs?: readonly string[];
+	except?: readonly string[];
+}
+
 export interface GitCommitReachability {
 	readonly partial?: boolean;
 	readonly refs: (
@@ -78,7 +95,13 @@ export interface GitCommitReachability {
 
 export interface GitCommitsSubProvider {
 	getCommit(repoPath: string, rev: string, cancellation?: AbortSignal): Promise<GitCommit | undefined>;
-	getCommitCount(repoPath: string, rev: string, cancellation?: AbortSignal): Promise<number | undefined>;
+	/** Counts the commits reachable from `rev`, less any reachable from `excluding` — e.g. what only one branch has */
+	getCommitCount(
+		repoPath: string,
+		rev: string,
+		options?: { excluding?: GitRefExclusions },
+		cancellation?: AbortSignal,
+	): Promise<number | undefined>;
 	/** Whether `rev` has any commits not reachable from any remote-tracking ref (i.e. unpushed/unpublished).
 	 *  Cheap early-exit probe (`rev-list --not --remotes <rev> -n 1`) — it does NOT count them. Returns
 	 *  `undefined` when it can't be determined. */
@@ -99,6 +122,46 @@ export interface GitCommitsSubProvider {
 		rev: string,
 		cancellation?: AbortSignal,
 	): Promise<{ authorDate: Date; committerDate: Date } | undefined>;
+	/**
+	 * Each non-merge commit's patch ID, keyed by full SHA: git's hash of a change with line numbers and `index` lines
+	 * left out (`git patch-id`), so the same change gets the same ID wherever it was applied. It is what `git cherry`
+	 * and rebase use to skip commits already upstream, e.g. to tell whether a branch's commits already landed after a
+	 * rebase or cherry-pick. Merge commits, commits whose change is empty (after `paths`), and the boundary commits of
+	 * a shallow clone (their parents are missing, so their own change is unknowable) are absent.
+	 *
+	 * `revs` is either a list of revisions (an exclusion or a range in it is refused) or a range, which yields every
+	 * non-merge commit in it that touches `paths` (when given), including ones reached only through a merge's other
+	 * parent. In a list, abbreviated SHAs and refs are resolved first; entries that are all full SHAs are read as is,
+	 * and are trusted to be commits. Returns `undefined`, never a partial map, when more than `limit` commits match,
+	 * when git fails, when `verbatim` is requested on a git without it (< 2.39), or when `patch-id` can't hash a commit
+	 * whole (a binary change followed by other files, on git < 2.39).
+	 *
+	 * The diffs are plumbing output with every knob that could alter them pinned, so no user config changes an ID.
+	 * Attributes still apply, though: a file that `.gitattributes` (or `info/attributes`, `core.attributesFile`)
+	 * marks binary or `-diff` is hashed through its blob IDs, so its change matches only one with the same contents
+	 * before and after. Hashing is whitespace-insensitive (`--stable`) unless `verbatim` is set. `paths` are literal
+	 * paths relative to the repo root (never globs) and limit the diff too, so the ID covers only those files' changes.
+	 * IDs are cached per full SHA, `paths` and `verbatim`: commits are immutable.
+	 */
+	getCommitPatchIds?(
+		repoPath: string,
+		revs: readonly string[] | GitRevisionRange,
+		options?: { paths?: readonly string[]; verbatim?: boolean; limit?: number },
+		cancellation?: AbortSignal,
+	): Promise<Map<string, string> | undefined>;
+	/**
+	 * The patch ID (see {@link getCommitPatchIds}) of the change between two revisions, e.g. a branch's net change from
+	 * its merge base, to compare against a commit's (such as a squash commit's). `undefined` when there is no change,
+	 * when git fails, or when `verbatim` is requested on a git without it. `paths` and `verbatim` behave as in
+	 * {@link getCommitPatchIds}. Not cached: `from` and `to` may be moving refs.
+	 */
+	getDiffPatchId?(
+		repoPath: string,
+		from: string,
+		to: string,
+		options?: { paths?: readonly string[]; verbatim?: boolean },
+		cancellation?: AbortSignal,
+	): Promise<string | undefined>;
 	getCommitFiles(repoPath: string, rev: string, cancellation?: AbortSignal): Promise<GitFileChange[]>;
 	getCommitForFile(
 		repoPath: string,
@@ -152,11 +215,25 @@ export interface GitCommitsSubProvider {
 		cancellation?: AbortSignal,
 	): Promise<SearchCommitsResult>;
 
-	createUnreachableCommitFromTree?(
+	/**
+	 * Creates a commit object from a tree via `commit-tree`, with explicit (zero or more) parents and an
+	 * optional explicit author/committer — e.g. for merge commits assembled from multiple parents, or a
+	 * commit authored on behalf of someone else. Writes the commit object only; it updates no ref, so the
+	 * result is unreachable until a caller points a branch/ref at it.
+	 *
+	 * Signs the commit when `sign` is true, reporting a signing failure as a `SigningError`.
+	 */
+	createCommitFromTree?(
 		repoPath: string,
 		tree: string,
-		parent: string,
-		message: string,
+		options: {
+			parents: string[];
+			message: string;
+			author?: { name: string; email: string; date?: Date | string };
+			committer?: { name: string; email: string; date?: Date | string };
+			sign?: boolean;
+			source?: unknown;
+		},
 		cancellation?: AbortSignal,
 	): Promise<string>;
 	getCommitReachability?(

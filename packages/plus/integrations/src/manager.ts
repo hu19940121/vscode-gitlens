@@ -1,4 +1,4 @@
-import type { IssueSearchCriteria, IssueShape } from '@gitlens/git/models/issue.js';
+import type { IssueSearchCriteria, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import type {
 	PullRequestSearchCriteria,
 	PullRequestShape,
@@ -8,6 +8,7 @@ import type { Event } from '@gitlens/utils/event.js';
 import type { ConfiguredIntegrationsChangeEvent } from './authentication/configuredIntegrationService.js';
 import type { ConfiguredIntegrationDescriptor } from './authentication/models.js';
 import type { IntegrationIds } from './constants.js';
+import type { IssueEtagInclude, PullRequestEtagInclude } from './models/integration.js';
 import type { IssueFilter, IssueSorting, PullRequestFilter } from './providerFilters.js';
 import type {
 	IssueCountResult,
@@ -15,9 +16,11 @@ import type {
 	PullRequestCountResult,
 	PullRequestCountScope,
 } from './reads/counts.js';
+import type { CurrentAccountResult } from './reads/currentAccount.js';
 import type { SupportedFilters } from './reads/filters.js';
 import type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
-import type { TrackerIssueResult } from './reads/trackerIssue.js';
+import type { PullRequestBatchResult, PullRequestBatchTarget } from './reads/pullRequestBatch.js';
+import type { PullRequestBranchResult, PullRequestBranchTarget } from './reads/pullRequestBranches.js';
 import type {
 	ConnectionStateChangeEvent,
 	ProviderBroadenResult,
@@ -180,6 +183,12 @@ type PullRequestSweepCommonOptions = {
 	 */
 	includeReviews?: boolean;
 	forceSync?: boolean;
+	/**
+	 * Page budget per provider. A stop at this budget with a resumable cursor is reported as
+	 * `pagination-incomplete` with `recovery: 'page-budget'`. A part no budget reaches is reported beside it
+	 * with `recovery: 'none'`: a `provider-limit` omission when the reported match count exceeds the provider's
+	 * known result limit.
+	 */
 	maxPages?: number;
 	/**
 	 * Fired once per target as it settles, for host-side per-provider attribution.
@@ -381,7 +390,8 @@ export interface IntegrationManager {
 	 * scope.
 	 *
 	 * This is a separate read from {@link listPullRequestsPage}: free text reaches the provider instead of filtering
-	 * whichever rows happened to be loaded, and every cursor-threaded page costs exactly one upstream request.
+	 * whichever rows happened to be loaded, and on GitHub/GHE every cursor-threaded page costs exactly one upstream
+	 * request (Bitbucket Data Center spends one per repository × relationship facet it is still reading).
 	 * `criteria.relationships` and `criteria.states` are OR sets, so `[closed, merged]` expresses the complete
 	 * terminal set and `[Author, Assignee, ReviewRequested]` matches the visible PR list without falling back to
 	 * GitHub's mismatched `involves:@me`. Omit relationships only with a repository/organization scope to search
@@ -391,13 +401,23 @@ export interface IntegrationManager {
 	 * criterion — a key not in `getSupportedFilters().pullRequestSearch.sorts` refuses the whole read rather than
 	 * falling back, because at a bounded result window another order reaches another subset. The page is a union of
 	 * the provider's relationship × state facets, so it is re-ordered as a whole rather than served as concatenated
-	 * per-facet runs. Changing the sort invalidates a threaded cursor (it is part of the cursor's fingerprint,
-	 * alongside the text and the scope); drop the cursor when you change the order.
+	 * per-facet runs. The order holds within a page, not across pages: each facet advances by its own continuation, so
+	 * a later page can hold a row that sorts before the last row of an earlier one — sort the accumulated rows when a
+	 * surface shows several pages as one list. Changing the sort invalidates a threaded cursor (it is part of the
+	 * cursor's fingerprint, alongside the text and the scope); drop the cursor when you change the order.
 	 *
 	 * If the provider's result ceiling is reached, the request still succeeds and carries a warning omission with
 	 * `totalCount`, `limit`, `sort`, and `recovery: 'none'`. `totalCount` is the largest provider-reported
 	 * pre-ceiling facet count, not the reachable or returned row count; this mirrors the per-search ceiling's own
 	 * unit.
+	 *
+	 * **Azure DevOps Server** differs in how it gets there, because its pull request API can't filter by text, date or
+	 * draft: the first page drains every facet (up to 1,000 rows each) and later pages are served from that drain,
+	 * so a first page can cost many requests and a continuation none. A continuation whose drain expired is refused;
+	 * restart without the cursor. `itemsPerPage` sizes the whole page, not a
+	 * facet. Past a facet's drain bound the page is `truncated` with no `totalCount`. Scope names with spaces or
+	 * quotes are accepted there, since they reach the provider as encoded URL segments. See
+	 * `docs/integrations.md` §9.
 	 *
 	 * Check `getSupportedFilters().pullRequestSearch` before calling. A provider that reports no relationships
 	 * refuses the read rather than returning a page that never honored the criteria or scope.
@@ -416,7 +436,8 @@ export interface IntegrationManager {
 		 *
 		 * Held to a STRICTER rule than the free-form `criteria.text`, which is sanitized: a scope name carrying a
 		 * quote, or an inner space or control character, is REFUSED (warning + `fetchFailed`), and the refusal
-		 * names the value. Leading and trailing whitespace and control characters are stripped and accepted,
+		 * names the value — except on a provider whose scope names never enter a query string (Azure DevOps
+		 * Server), where only blank names and control characters are. Leading and trailing whitespace and control characters are stripped and accepted,
 		 * since removing them cannot change which scope the query names. Sanitizing a scope would answer the wrong question — the sanitized value may name a real but
 		 * DIFFERENT organization, whose result looks entirely normal. Pass the name exactly as the provider spells
 		 * it; `''` means "no org supplied" and falls through to the other scopes.
@@ -432,7 +453,8 @@ export interface IntegrationManager {
 		 * 2-state search returns up to `6 × itemsPerPage` items before deduplication, and fewer than that where
 		 * the facets overlap. Deduplication does NOT bring the page back to this size: it removes only the rows the
 		 * facets share. `page.itemsPerPage` reports what actually came back, so size the UI off that rather than
-		 * off this. A provider may also cap it below what is asked for.
+		 * off this. A provider may also cap it below what is asked for. Azure DevOps Server is the exception: it
+		 * serves one merged page, so there this is the page size (at most 100).
 		 */
 		itemsPerPage?: number;
 		forceSync?: boolean;
@@ -535,7 +557,15 @@ export interface IntegrationManager {
 	 *   matched), `limit` (how many are reachable) and `sort` (the order that window was selected under) with
 	 *   `recovery: 'none'`, so a consumer can say "19.240 matched, showing the 1.000 most recent" — naming the
 	 *   order, since which 1.000 are reachable depends on it — and know not to offer a "load more". It never falls
-	 *   back to a per-repository recovery walk.
+	 *   back to a per-repository recovery walk. A provider that can prove the ceiling was reached without counting
+	 *   past it (Azure DevOps Server, at 20,000) omits `totalCount`, so render the limit alone. An Azure DevOps Server
+	 *   that refuses the match set even with the bounded query fails the page instead (warning + `fetchFailed`),
+	 *   while its count still reports `exceedsProviderLimit`; narrow the search.
+	 *
+	 * On **Azure DevOps Server** every relationship is one WIQL query over one collection (`org`, or the
+	 * repositories' collection), so `itemsPerPage` sizes the whole page. Continuations page through the ids the
+	 * first page queried while the pagination keeps reading; one whose ids have expired is refused, and the read
+	 * must restart without the cursor. See `docs/integrations.md` §9.
 	 *
 	 * Check `getSupportedFilters().issueSearch` first: a provider with no filtered issue search reports empty
 	 * relationships (and this read refuses), and a criterion or sort key it can't express refuses the whole read
@@ -555,7 +585,8 @@ export interface IntegrationManager {
 		 *
 		 * Held to a STRICTER rule than the free-form criteria, which are sanitized: a scope name carrying a quote,
 		 * or an inner space or control character, is REFUSED (warning + `fetchFailed`), and the refusal names the
-		 * value. Leading and trailing whitespace and control characters are stripped and accepted, since removing
+		 * value — except on Azure DevOps Server, whose scope names never enter a query string, where only blank
+		 * names and control characters are. Leading and trailing whitespace and control characters are stripped and accepted, since removing
 		 * them cannot change which scope the query names.
 		 * The sanitized value may name a real but DIFFERENT org, whose result looks entirely normal. `''` means
 		 * "no org supplied" and falls through to the other scopes.
@@ -598,8 +629,8 @@ export interface IntegrationManager {
 	 *
 	 * `count: undefined` means the provider didn't report one — NOT zero, which is a real answer. Render the
 	 * difference: showing an unknown count as 0 tells the user a filter matches nothing when it may match
-	 * thousands. A provider that can't count at all (only GitHub/GHE can today) refuses the probe outright rather
-	 * than returning fabricated numbers.
+	 * thousands. A provider that can't count at all (only GitHub/GHE and Azure DevOps Server can today) refuses the
+	 * probe outright rather than returning fabricated numbers.
 	 */
 	countIssues(options: {
 		providerId: IntegrationIds;
@@ -610,60 +641,180 @@ export interface IntegrationManager {
 		domain?: string;
 	}): Promise<ProviderResult<IssueCountResult>>;
 	/**
-	 * Resolves several issues BY COORDINATE — `(owner, repo, number)` — in one request.
+	 * Resolves several issues BY IDENTITY in one call. Each target takes the form its provider addresses an issue
+	 * by: a repository coordinate `(owner, repo, number)` on GitHub/GHE, GitLab and Azure DevOps (which also needs
+	 * `project`, and ignores `repo`), or the tracker's own identifier within a resource `(resourceId, ABC-123)` on
+	 * Jira and Linear. A call carrying the other form is refused whole.
 	 *
 	 * The read for "which issue does this branch name reference", which is an IDENTITY question rather than a
 	 * search. Emulating it by paging a scoped list and matching the identifier cannot prove absence without
 	 * walking the whole scope, so a miss stays unproven, uncacheable, and repeats its whole budget on every pass.
-	 * This answers it in one request per chunk, and a miss is final.
+	 * Here a miss is final.
 	 *
 	 * Results are echoed under the caller's own `key`, so no positional matching is needed. Per-target isolation
-	 * is the rule: a chunk that fails upstream warns and drops only its own targets (with `fetchFailed` set) while
+	 * is the rule: a read that fails upstream warns and drops only its own targets (with `fetchFailed` set) while
 	 * every other target still answers.
 	 *
 	 * `issue: undefined` means PROVEN ABSENT — the issue does not exist, or is not visible to this connection —
-	 * and is safe to cache. A target whose chunk failed is NOT returned at all, so the two are distinguishable;
-	 * caching a failure as an absence is exactly the bug this distinction prevents. GitHub/GHE only: a provider
-	 * that cannot batch refuses outright rather than degrading into N requests behind the caller's back.
+	 * and is safe to cache. A target whose read failed is NOT returned at all, so the two are distinguishable;
+	 * caching a failure as an absence is exactly the bug this distinction prevents. Uncached: the caller owns
+	 * caching.
+	 *
+	 * GitHub/GHE resolve up to 25 coordinates per request. GitLab and Azure DevOps cost one request per target, with
+	 * bounded concurrency; GitLab spends a second request to confirm a miss, and Azure DevOps trusts a miss only
+	 * when its own error body says the work item or project does not exist. Jira (Cloud and Data Center) and Linear
+	 * cost one request per target, so a key asked of several resources is one call; `resourceId` is trusted and the
+	 * read does no resource discovery, and Jira Cloud also requires `resourceUrl`. Every other provider refuses
+	 * outright — Bitbucket because it has no issues, Trello because its single-issue read can fall back to a capped
+	 * board scan, which cannot prove an absence.
+	 *
+	 * Change detection: every found row carries an opaque `etag`; send it back on the target and, where the host has a
+	 * cheap check (GitHub/GHE, GitLab, Azure DevOps, Jira Cloud and Linear so far), an issue whose etag still matches comes
+	 * back `{ key, unchanged: true, etag }` without being read again. That costs up to three integration calls instead
+	 * of one — the cheap check, a full read of the targets with no etag started alongside it, and a full read of the
+	 * ones that changed — and still one when no target carries an etag. `etagIncludes: ['reactions']` widens the etag
+	 * to the thumbs-up count, which a host changes without moving the update time; only GitHub/GHE and GitLab rows
+	 * carry a real count, so it widens nothing elsewhere. A cheap check that fails falls through to the full read,
+	 * except on an auth, rate-limit or connection failure, which drops its targets with that warning. See
+	 * {@link IssueBatchResult}.
+	 *
+	 * A self-managed tracker (Jira Data Center) never falls back to the primary connection, unlike the paged reads:
+	 * the call is refused unless `domain` names a host or `connectionId` a configured connection that has one, and
+	 * every target's `resourceId` must name the host the read resolved to. Two self-hosted instances routinely issue
+	 * the same keys, and a cached absence must name the host it was proven on.
 	 */
 	getIssuesBatch(options: {
 		providerId: IntegrationIds;
 		/** Each `key` must be unique — a duplicate refuses the whole call, since keys identify results. */
 		targets: readonly IssueBatchTarget[];
 		connectionId?: string;
-		/** Self-managed host domain fallback; see {@link ProviderSweepTarget.domain}. */
+		/**
+		 * Self-managed host domain; see {@link ProviderSweepTarget.domain}. A fallback for a git host, but required
+		 * for a self-managed tracker unless `connectionId` names a configured host — see above.
+		 */
 		domain?: string;
+		/**
+		 * Widens every etag to the listed inputs; order and repeats don't matter, and an unknown value refuses the
+		 * whole call. `'reactions'` is the thumbs-up count, and costs its field in the cheap check on GitHub/GHE and
+		 * GitLab. Changes only which etag is computed (and the cheap check's selection); the full read is the same.
+		 */
+		etagIncludes?: readonly IssueEtagInclude[];
 	}): Promise<ProviderResult<IssueBatchResult>>;
 	/**
-	 * Resolves one issue-tracker issue by key within a resource — the tracker counterpart of
-	 * {@link getIssuesBatch}, which cannot serve one.
+	 * Resolves several pull requests BY COORDINATE — `(owner, repo, number)`, plus `project` on Azure DevOps — in
+	 * any state (open, closed or merged). The pull-request twin of {@link getIssuesBatch}, answering the same
+	 * identity question: "which pull request does this branch or link name".
 	 *
-	 * `issue: undefined` is a proven absence and may be cached. A failed read returns no item and sets
-	 * `fetchFailed`. `resourceId` is required and trusted; Jira also requires the resource's site URL so the result
-	 * retains its browser link. The read performs no resource discovery.
+	 * Results are echoed under the caller's own `key`, so no positional matching is needed. Per-target isolation
+	 * is the rule: a read that fails upstream warns and drops only its own targets (with `fetchFailed` set) while
+	 * every other target still answers.
 	 *
-	 * Jira and Linear only. Trello refuses: its single-issue read falls back to a capped board scan for a numeric
-	 * identifier, so it cannot prove absence.
+	 * - `{ key, pullRequest }` — found, whatever its state.
+	 * - `{ key }` with no `pullRequest` — PROVEN ABSENT: the host answered not-found for the pull request or its
+	 *   repository, or it is not visible to this connection. Safe to cache.
+	 * - No item for a key, with `fetchFailed` and a warning — the read could not check (auth, rate limit, network,
+	 *   missing session, an unmappable response). Never treat that as absent: caching a failure as an absence is
+	 *   exactly the bug this distinction prevents.
+	 *
+	 * UNCACHED, and deliberately not routed through the integration's cached single pull request read: that
+	 * cache's key carries no connection, and the GitLens host's by-id bucket never expires a miss, so a proven
+	 * absence would become permanent there — and a consumer would hold a second cache, with a different lifetime,
+	 * for the same answer. The caller owns caching.
+	 *
+	 * Request cost: GitHub/GHE resolve up to 25 targets per request (one aliased GraphQL document). Every other
+	 * host costs one request per target, run with bounded concurrency; GitLab spends a second request to confirm a
+	 * miss, and Azure DevOps one more per target (two for a fork) to fill clone URLs.
+	 *
+	 * Change detection: every found row carries an opaque `etag`; send it back on the target and, where the host has a
+	 * cheap check (GitHub/GHE, a minimal aliased document; GitLab, one minimal request per project; Azure DevOps, one
+	 * request per target without the clone URL reads, which fingerprints the title, description, target branch and
+	 * reviewers as Azure DevOps reports no update time, but stays blind to comments; Bitbucket Cloud, one list request
+	 * per repository per 50 pull requests), a pull request whose etag still matches comes back `{ key, unchanged: true,
+	 * etag }` without being read again. That costs up to three integration calls instead of one — the cheap check, a
+	 * full read of the targets with no etag started alongside it, and a full read of the ones that changed — and still
+	 * one when no target carries an etag.
+	 * `etagIncludes` widens the etag to the listed inputs (mergeability, review decision, check rollup), which a host
+	 * changes without moving the update time and each of which costs its own fields in the cheap check (the review
+	 * decision costs the most). A cheap check that fails falls through to the full read, except on an auth, rate-limit
+	 * or connection failure, which drops its targets with that warning. See {@link PullRequestBatchResult}.
 	 */
-	getTrackerIssue(options: {
+	getPullRequestsBatch(options: {
 		providerId: IntegrationIds;
-		/** Provider resource ID for the Atlassian site or Linear workspace. */
-		resourceId: string;
-		/** Jira site URL from resource discovery. Required for Jira so the result retains a browser link. */
-		resourceUrl?: string;
-		/** The provider's own key, e.g. `ABC-123`. Not a number. */
-		key: string;
+		/** Each `key` must be unique — a duplicate refuses the whole call, since keys identify results. */
+		targets: readonly PullRequestBatchTarget[];
 		connectionId?: string;
-	}): Promise<ProviderResult<TrackerIssueResult>>;
+		/** Self-managed host domain fallback; see {@link ProviderSweepTarget.domain}. */
+		domain?: string;
+		/**
+		 * Widens every etag to the listed inputs; order and repeats don't matter, and an unknown value refuses the
+		 * whole call. Each entry widens the etag to one input a host changes without moving the update time, and
+		 * costs its own fields in the cheap check; `'checks'` is the check rollup. Changes only which etag is
+		 * computed (and the cheap check's selection); the full read is the same.
+		 */
+		etagIncludes?: readonly PullRequestEtagInclude[];
+	}): Promise<ProviderResult<PullRequestBatchResult>>;
 	/**
-	 * How many pull requests match each scope, fetching none of them — the PR twin of {@link countIssues}, behind a
-	 * "this will fetch ~N pull requests" preview and a live count next to an unapplied filter. Same cost model,
-	 * per-scope isolation, `key`-echo, and `count: undefined` ≠ zero rule as the issue count; GitHub/GHE only.
+	 * Finds, for each branch, every pull request whose head is that branch — in any state (open, closed or merged),
+	 * most recently updated first, up to 10 per branch. "Which pull requests does this branch have", answered
+	 * without the user's relationship to them, so a teammate's pull request from the user's branch is found too,
+	 * which the account-wide sweeps can't do.
 	 *
-	 * The one PR-specific difference: a scope's `states` are counted as independent searches, so the reported count
-	 * is the LARGEST of them (the same total {@link searchPullRequestsPage} surfaces), not their sum. Several states
-	 * in one scope are therefore fine; only several relationships are refused — one relationship per scope, see
-	 * {@link PullRequestCountScope}.
+	 * A target names the repository the pull requests are opened AGAINST, the head branch's short name, and, for a
+	 * branch in a fork, `headOwner` (the base repository's own owner, or none, means the base repository). A pull
+	 * request matches only when its head repository is the right one — the base repository itself, or the fork
+	 * `headOwner` owns — so a `main` in the base repository never claims every fork's `main`. The match is on the
+	 * head branch NAME, so a merged pull request whose branch was since deleted is still found, and a fork is matched
+	 * by its owner, so one whose fork was since deleted still matches that `headOwner`.
+	 *
+	 * Same result contract as {@link getPullRequestsBatch}, echoed under the caller's own `key`:
+	 * - `{ key, pullRequests: [...] }` — found. `truncated` means a pull request that wasn't returned could still
+	 *   match. One exception on GitHub/GHE: on a branch name more forks share than the first request returned, a
+	 *   pull request from a since-deleted fork that request didn't return can't be found at all, so it can be
+	 *   missing from an answer, even an empty one, that isn't `truncated`.
+	 * - `{ key, pullRequests: [] }` with no `truncated` — PROVEN NONE: the host answered and nothing matched, or the
+	 *   base repository doesn't exist or isn't visible to this connection. Safe to cache.
+	 * - No item for a key, with `fetchFailed` and a warning — the read could not check. Never treat that as none.
+	 *
+	 * UNCACHED, and not routed through the integration's cached single pull request read for a branch (see
+	 * `IntegrationCacheProvider.getPullRequestForBranch`), which answers one pull request and, on several hosts,
+	 * looks the branch ref up and so answers "none" once a merged branch is deleted. The caller owns caching.
+	 *
+	 * Request cost: GitHub/GHE answer up to 25 targets per request (one aliased GraphQL document, fetching up to 10
+	 * full pull requests per target). That document matches the branch name across every fork, so a target whose
+	 * name more forks share than it returned costs one more REST request filtered by head owner, and a match only
+	 * that request found is resolved through {@link getPullRequestsBatch}'s own read, so its row is identical to the
+	 * others; the answer is the union of both requests' matches. Every other host costs one request per target, run
+	 * with bounded concurrency; GitLab and Azure DevOps then resolve each matched pull request — typically 0–1 per
+	 * branch — through {@link getPullRequestsBatch}'s own read, at that read's cost, so their rows are exactly its rows. Rows carry
+	 * the list reads' fields on GitHub/GHE and Bitbucket Data Center and Bitbucket Cloud's by-id read's on
+	 * Bitbucket Cloud. A `headOwner` naming another owner is refused on Bitbucket Data Center and Azure DevOps,
+	 * where a fork can't be found by its owner.
+	 */
+	getPullRequestsForBranches(options: {
+		providerId: IntegrationIds;
+		/** Each `key` must be unique — a duplicate refuses the whole call, since keys identify results. */
+		targets: readonly PullRequestBranchTarget[];
+		connectionId?: string;
+		/** Self-managed host domain fallback; see {@link ProviderSweepTarget.domain}. */
+		domain?: string;
+	}): Promise<ProviderResult<PullRequestBranchResult>>;
+	/**
+	 * How many pull requests match each scope — the PR twin of {@link countIssues}, behind a "this will fetch ~N pull
+	 * requests" preview and a live count next to an unapplied filter. Same per-scope isolation, `key`-echo, and
+	 * `count: undefined` ≠ zero rule as the issue count; GitHub/GHE, Bitbucket Data Center and Azure DevOps Server.
+	 *
+	 * The one PR-specific difference: on GitHub/GHE a scope's `states` are counted as independent searches, so the
+	 * reported count is the LARGEST of them (the same total {@link searchPullRequestsPage} surfaces), not their sum.
+	 * Several states in one scope are therefore fine; only several relationships are refused — one relationship per
+	 * scope, see {@link PullRequestCountScope}.
+	 *
+	 * Bitbucket Data Center has no count query: it counts by reading each facet's first page, so a count there costs
+	 * requests rather than none, and one past that page comes back as a floor with `lowerBound: true`. Reading lets it
+	 * deduplicate the rows, so it counts the exact union of the states AND of several relationships in one scope,
+	 * matching what the search it previews returns.
+	 *
+	 * Azure DevOps Server counts from the same drain its search pages through (reusing one its search read in the
+	 * last minute), so its count is the union of the states — for disjoint states their sum — and costs requests too.
 	 */
 	countPullRequests(options: {
 		providerId: IntegrationIds;
@@ -672,7 +823,6 @@ export interface IntegrationManager {
 		/** Self-managed host domain fallback; see {@link ProviderSweepTarget.domain}. */
 		domain?: string;
 	}): Promise<ProviderResult<PullRequestCountResult>>;
-	/** Issue trackers are cloud-only, so this read takes no `domain`. */
 	listIssueTrackerIssuesPage(options: {
 		providerId: IntegrationIds;
 		org?: string;
@@ -689,6 +839,11 @@ export interface IntegrationManager {
 		 * full, so which projects a round covers doesn't depend on how their issues are ordered.
 		 */
 		sort?: IssueSorting;
+		/**
+		 * Which issue states to read. Omitted reads open issues. `'closed'`/`'all'` need
+		 * `getSupportedFilters().issueStates` and are refused otherwise (warning + `fetchFailed`).
+		 */
+		state?: IssueStateFilter;
 		forceSync?: boolean;
 		page?: number;
 		/**
@@ -705,6 +860,11 @@ export interface IntegrationManager {
 		 */
 		itemsPerPage?: number;
 		connectionId?: string;
+		/**
+		 * Self-managed tracker host domain fallback; see {@link ProviderSweepTarget.domain}. Ignored for the
+		 * cloud trackers, which have a single canonical host.
+		 */
+		domain?: string;
 	}): Promise<ProviderPagedResult<IssueShape>>;
 	sweepPullRequests(options?: PullRequestSweepOptions): Promise<ProviderSweepResult<PullRequestShape>>;
 	sweepClosedPullRequests(options?: ClosedPullRequestSweepOptions): Promise<ProviderSweepResult<PullRequestShape>>;
@@ -732,4 +892,18 @@ export interface IntegrationManager {
 		 */
 		domain?: string;
 	}): Promise<ResolveRepositoryResult>;
+	/**
+	 * Who the connection is signed in as on a git host. `account` is never absent without a warning. Goes through
+	 * the host-supplied `IntegrationManagerCacheProvider.getCurrentAccount` cache rather than adding a second one.
+	 * Issue trackers refuse: they have only a per-resource account, not a per-connection one.
+	 */
+	getCurrentAccount(options: {
+		providerId: IntegrationIds;
+		connectionId?: string;
+		/**
+		 * Explicit self-managed host domain. Used only when the requested connection has no configured domain;
+		 * it must come from the trusted authentication configuration, not repository or remote data.
+		 */
+		domain?: string;
+	}): Promise<CurrentAccountResult>;
 }

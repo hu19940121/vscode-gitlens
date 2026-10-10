@@ -1,10 +1,13 @@
 import type { CollectionMetadata } from '@gitkraken/provider-apis';
-import type { IssueShape, IssueSorting } from '@gitlens/git/models/issue.js';
+import type { IssueShape, IssueSorting, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import { mapBounded } from '@gitlens/utils/promise.js';
 import { assessCollectionMetadata, mergeAssessmentInto } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import { providerFanOutConcurrency } from '../constants.js';
+import { toError } from '../errors.js';
+import type { IntegrationResult } from '../models/integration.js';
+import type { ProjectIssuesDrain } from '../models/issueReads.js';
 import { isIssuesIntegration } from '../models/issuesIntegration.js';
 import { IssueFilter, providersMetadata } from '../providers/models.js';
 import { mergeCollectionMetadata, parsePageCursor } from '../providers/utils/providerPaging.js';
@@ -22,7 +25,10 @@ import {
 	otherWarning,
 	unmergeableIssueSortWarning,
 	unsupportedIssueSortWarning,
+	unsupportedWarning,
 } from './warnings.js';
+
+const issueStateFilters: readonly IssueStateFilter[] = ['open', 'closed', 'all'];
 
 export async function listIssueTrackerIssuesPage(
 	ctx: ProviderReadContext,
@@ -50,11 +56,25 @@ export async function listIssueTrackerIssuesPage(
 		 * ordered. Only the order within a page changes.
 		 */
 		sort?: IssueSorting;
+		/**
+		 * Which issue states to read. Omitted reads open issues only.
+		 *
+		 * Applied server-side by every project read, so it narrows each project's drain rather than the merged page.
+		 * Only a tracker declaring `ProviderMetadata.supportsIssueStates` can express anything but `'open'`; asking
+		 * another for `'closed'`/`'all'` refuses the read rather than serving its open issues.
+		 */
+		state?: IssueStateFilter;
 		forceSync?: boolean;
 		page?: number;
 		cursor?: string;
 		itemsPerPage?: number;
 		connectionId?: string;
+		/**
+		 * Explicit self-managed tracker host. Used to select the instance when the requested connection has no
+		 * configured domain; it must come from the trusted authentication configuration, never from repository
+		 * or remote data. Ignored for the cloud trackers.
+		 */
+		domain?: string;
 	},
 ): Promise<ProviderPagedResult<IssueShape>> {
 	// Pagination is opt-in: only window the projects when the caller actually asked to page. A caller that
@@ -93,6 +113,7 @@ export async function listIssueTrackerIssuesPage(
 						retryPages: retry.pages ?? [],
 						retryProjects: retry.projects ?? [],
 						completedProjects: retry.completedProjects ?? [],
+						state: options.state,
 					})
 				: undefined;
 		return {
@@ -136,10 +157,10 @@ export async function listIssueTrackerIssuesPage(
 		return emptyPage(true);
 	}
 
-	const integration = await ctx.getIntegrationForRead(options.providerId, options.connectionId);
+	const integration = await ctx.getIntegrationForRead(options.providerId, options.connectionId, options.domain);
 	if (integration == null) {
-		// A supplied connectionId that no longer resolves is a broken connection, not an empty account.
-		const early = ctx.earlyReturnConnectionWarnings(options.providerId, options.connectionId);
+		// A supplied connectionId or domain that no longer resolves is a broken target, not an empty account.
+		const early = ctx.earlyReturnConnectionWarnings(options.providerId, options.connectionId, options.domain);
 		warnings.push(...early.warnings);
 		return emptyPage(early.fetchFailed);
 	}
@@ -150,7 +171,7 @@ export async function listIssueTrackerIssuesPage(
 		return emptyPage(true);
 	}
 
-	const domain = ctx.domainForRead(integration, options.providerId, options.connectionId);
+	const domain = ctx.domainForRead(integration, options.providerId, options.connectionId, options.domain);
 
 	// Before any upstream request: the discovery fan-outs below (resources, projects, per-resource accounts) are
 	// three round trips, and an order this tracker can't express refuses the read whatever they return. Placed after
@@ -164,6 +185,51 @@ export async function listIssueTrackerIssuesPage(
 	}
 
 	const sort = resolvedSort.sort;
+
+	// Refused before any request for the same reason as the sort: a state the tracker can't express would otherwise
+	// be dropped by its project reads, and their open issues published as the requested state. A value outside the
+	// vocabulary is refused too, since `toProviderIssueStates` would read it as omitted, which means open.
+	if (
+		options.state != null &&
+		(!issueStateFilters.includes(options.state) ||
+			(options.state !== 'open' && !providersMetadata[options.providerId]?.supportsIssueStates))
+	) {
+		// A known state this tracker can't express is an unsupported capability; a value outside the vocabulary is
+		// caller input the caller fixes in the request.
+		warnings.push(
+			issueStateFilters.includes(options.state)
+				? unsupportedWarning(
+						options.providerId,
+						domain,
+						options.connectionId,
+						`Issue state '${options.state}' is not supported by '${options.providerId}'.`,
+					)
+				: otherWarning(
+						options.providerId,
+						domain,
+						options.connectionId,
+						`Unknown issue state; expected one of ${issueStateFilters.join(', ')}.`,
+					),
+		);
+		return emptyPage(true);
+	}
+
+	// A cursor resumed under another state than it was minted for skips what it already covered, whose other-state
+	// issues were never read. A narrowed read only mints composite cursors, which record their state, so any other
+	// cursor came from an open read.
+	const cursorState =
+		compositeCursor != null ? (compositeCursor.state ?? 'open') : options.cursor != null ? 'open' : undefined;
+	if (cursorState != null && cursorState !== (options.state ?? 'open')) {
+		warnings.push(
+			otherWarning(
+				options.providerId,
+				domain,
+				options.connectionId,
+				'The cursor belongs to a read of another issue state; start again without it.',
+			),
+		);
+		return emptyPage(true);
+	}
 
 	await ctx.forceRefreshIfRequested(integration, options.forceSync, options.connectionId);
 
@@ -231,7 +297,7 @@ export async function listIssueTrackerIssuesPage(
 		const allSupported = supported != null && options.filters.every(f => supported.includes(f));
 		if (!allSupported) {
 			warnings.push(
-				otherWarning(
+				unsupportedWarning(
 					options.providerId,
 					domain,
 					options.connectionId,
@@ -248,7 +314,7 @@ export async function listIssueTrackerIssuesPage(
 	// the incompatible combination up front rather than publishing a differently-scoped set as the result.
 	if (options.includeAllAssignees === true && options.filters?.some(f => f !== IssueFilter.Assignee)) {
 		warnings.push(
-			otherWarning(
+			unsupportedWarning(
 				options.providerId,
 				domain,
 				options.connectionId,
@@ -454,21 +520,35 @@ export async function listIssueTrackerIssuesPage(
 		return emptyPage(true);
 	}
 
-	const perProject = await mapBounded(scopedProjects, providerFanOutConcurrency, async project => ({
-		project: project,
-		...(await runCaptured(options.providerId, domain, options.connectionId, () =>
-			integration.getIssuesForProjectWithTruncationResult(
-				project,
-				{
+	// One call for the whole window, so a tracker that can search several projects at once (Jira) does, instead
+	// of paying one drain per project. Results still come back per project, which the accounting below needs.
+	let projectReads: IntegrationResult<ProjectIssuesDrain | undefined>[];
+	try {
+		projectReads = await integration.getIssuesForProjectsWithTruncationResult(
+			scopedProjects.map(project => ({
+				project: project,
+				options: {
 					user: userForProject(project),
 					userId: userIdForProject(project),
 					filters: options.filters,
 					sort: sort,
+					state: options.state,
 				},
-				options.connectionId,
-			),
-		)),
-	}));
+			})),
+			options.connectionId,
+		);
+	} catch (ex) {
+		const error = toError(ex);
+		projectReads = scopedProjects.map(() => ({ error: error }));
+	}
+	const perProject = await Promise.all(
+		scopedProjects.map(async (project, index) => ({
+			project: project,
+			...(await runCaptured(options.providerId, domain, options.connectionId, () =>
+				Promise.resolve(projectReads[index]),
+			)),
+		})),
+	);
 
 	// Partial project discovery means some projects' issues are missing from this page; propagate it so the
 	// page reports fetchFailed even when every discovered project's own read succeeded.
@@ -564,6 +644,7 @@ export async function listIssueTrackerIssuesPage(
 			(retryPages.length > 0 || nextPage != null)
 				? [...completedProjectKeys]
 				: [],
+		state: options.state,
 	});
 	return {
 		items: orderedItems,

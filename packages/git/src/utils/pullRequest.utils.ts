@@ -156,6 +156,10 @@ export function isMaybeNonSpecificPullRequestSearchUrl(search: string): boolean 
 	return getPullRequestIdentityFromMaybeUrl(search) != null;
 }
 
+/**
+ * Deliberately leaves `projection` out: this copy drops `filesChanged`, `repository` and the class-only check rollup,
+ * commit count and `viewerCanUpdate`, so a tag would have field presence report as fetched what the copy no longer has.
+ */
 export function serializePullRequest(value: PullRequest): PullRequestShape {
 	const serialized: PullRequestShape = {
 		type: value.type,
@@ -222,6 +226,7 @@ export function serializePullRequest(value: PullRequest): PullRequestShape {
 		latestReviews: value.latestReviews,
 		assignees: value.assignees,
 		authoredByMe: value.authoredByMe,
+		viewer: value.viewer != null ? { id: value.viewer.id, username: value.viewer.username } : undefined,
 		project: value.project
 			? {
 					id: value.project.id,

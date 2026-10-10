@@ -36,7 +36,7 @@ import {
 	withProviderContext,
 } from './hierarchy.utils.js';
 import { pageToCursor, refusedPage, resolveContinuation, resolveCurrentPage, toProviderPageInfo } from './paging.js';
-import { gitHostOnlySurfaceWarning, otherWarning, truncationWarning } from './warnings.js';
+import { gitHostOnlySurfaceWarning, truncationWarning, unsupportedWarning } from './warnings.js';
 
 /**
  * Folds a flat hierarchy result's incompleteness into `warnings`, returning whether it leaves the read
@@ -126,12 +126,12 @@ export async function listOrgs(
 				}
 			}
 		} else if (!integration.supportsOrganizationDiscovery) {
-			// The provider registers no org-discovery hook (e.g. Bitbucket Data Center). Report it as
+			// The provider registers no org-discovery hook. Report it as
 			// explicitly unsupported rather than contributing a silent empty list that a caller can't
 			// tell apart from "this account has no orgs".
 			fetchFailed = true;
 			warnings.push(
-				otherWarning(id, domain, connectionId, `Organization discovery is not supported by '${id}'.`),
+				unsupportedWarning(id, domain, connectionId, `Organization discovery is not supported by '${id}'.`),
 			);
 		} else {
 			const { value, warning } = await runCaptured(
@@ -331,7 +331,7 @@ export async function listRepos(
 		return refusedPage(
 			page,
 			[
-				otherWarning(
+				unsupportedWarning(
 					options.providerId,
 					domain,
 					options.connectionId,
@@ -433,7 +433,10 @@ export async function listRepos(
 		};
 	};
 
-	const first = await readPage(options.cursor ?? pageToCursor(page));
+	const first = await readPage(
+		options.cursor ??
+			(integration.id === GitSelfManagedHostIntegrationId.BitbucketServer ? undefined : pageToCursor(page)),
+	);
 	const result = toResult(first, page, options.cursor);
 	// A numbered-page host honored the synthesized cursor, so this IS page N; a cursor-only host ignored it and
 	// answered with page 1, which the walk below advances. Decided from the provider's own paging metadata rather

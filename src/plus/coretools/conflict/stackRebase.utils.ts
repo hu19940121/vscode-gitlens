@@ -28,7 +28,7 @@ export async function resolveStackRebasePlan(
 		return {
 			ok: false,
 			reason: 'unavailable',
-			message: l10n.t('Rebasing a pull request stack is not available in this environment.'),
+			message: l10n.t('Rebasing stacked pull requests is not available in this environment.'),
 		};
 	}
 
@@ -40,13 +40,13 @@ export async function resolveStackRebasePlan(
 		return {
 			ok: false,
 			reason: 'no-integration',
-			message: l10n.t('Connect a supported integration to rebase a pull request stack.'),
+			message: l10n.t('Connect a supported integration to rebase stacked pull requests.'),
 		};
 	}
 
 	let pullRequestNumber = options?.pullRequestNumber;
 	if (pullRequestNumber == null) {
-		const branch = await svc.branches.getBranch(undefined, options?.cancellation);
+		const branch = await svc.branches.getBranch(undefined, undefined, options?.cancellation);
 		const pr = branch != null ? await getBranchAssociatedPullRequest(container, branch) : undefined;
 		// `id` is the pull request number as a string on every host with a stacks concept, but prefer
 		// the explicit `number` when the provider set it

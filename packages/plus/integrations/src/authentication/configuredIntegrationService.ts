@@ -10,8 +10,13 @@ import type {
 } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
 import { providersMetadata } from '../providers/models.js';
-import { areDomainsOnSameHost, hostFromDomain } from '../utils/domain.utils.js';
-import { isGitSelfManagedHostIntegrationId } from '../utils/integration.utils.js';
+import {
+	areDomainsOnSameHost,
+	baseUrlFromDomain,
+	hostFromDomain,
+	sameConfiguredBaseUrl,
+} from '../utils/domain.utils.js';
+import { isSelfManagedHostIntegrationId } from '../utils/integration.utils.js';
 import type { IntegrationAuthenticationSessionDescriptor } from './integrationAuthenticationProvider.js';
 import type {
 	CloudIntegrationAuthType,
@@ -28,6 +33,8 @@ interface StoredSession {
 	type: CloudIntegrationAuthType | undefined;
 	expiresAt?: string;
 	domain?: string;
+	/** See {@link ProviderAuthenticationSession.baseUrl}: the configured address, path included. */
+	baseUrl?: string;
 	protocol?: string;
 	/** The provider app key paired with the token for providers whose client needs one (e.g. Trello). */
 	appKey?: string;
@@ -41,6 +48,16 @@ export interface ConfiguredIntegrationsChangeEvent {
 export class ConfiguredIntegrationService implements Disposable {
 	private readonly _onDidChange = new Emitter<ConfiguredIntegrationsChangeEvent>();
 	private storeConfiguredQueue: Promise<void> = Promise.resolve();
+	/**
+	 * One provider's secret and descriptor mutations run one at a time, so a sign-out never interleaves with a
+	 * token being stored: storing writes the secret and then registers its descriptor, and a delete in between would
+	 * miss a connection it cannot see yet, or be undone by the pending write (#5948).
+	 */
+	private readonly _locks = new Map<IntegrationIds, Promise<void>>();
+	/** Monotonic across providers; see {@link getSignOutMark}. */
+	private _signOutEpoch = 0;
+	/** The epoch of the latest sign-out per scope: a provider, a self-managed host, or a single connection. */
+	private readonly _signOuts = new Map<string, number>();
 	get onDidChange(): Event<ConfiguredIntegrationsChangeEvent> {
 		return this._onDidChange.event;
 	}
@@ -65,6 +82,7 @@ export class ConfiguredIntegrationService implements Disposable {
 
 				const descriptors = configured.map(d => ({
 					...d,
+					baseUrl: isSelfManagedHostIntegrationId(id) ? getStoredBaseUrl(d.baseUrl, d.domain) : d.baseUrl,
 					domain: this.normalizeConfiguredDomain(id, d.domain),
 					// Backfill a stable connection id for pre-multi-account stored data: the domain for
 					// self-managed hosts, or the provider's canonical domain for cloud (which is the legacy
@@ -140,6 +158,9 @@ export class ConfiguredIntegrationService implements Disposable {
 	private async addOrUpdateConfigured(descriptor: ConfiguredIntegrationDescriptor): Promise<void> {
 		descriptor = {
 			...descriptor,
+			baseUrl: isSelfManagedHostIntegrationId(descriptor.integrationId)
+				? getStoredBaseUrl(descriptor.baseUrl, descriptor.domain)
+				: descriptor.baseUrl,
 			domain: this.normalizeConfiguredDomain(descriptor.integrationId, descriptor.domain),
 		};
 		const descriptors = this.configured.get(descriptor.integrationId) ?? [];
@@ -165,8 +186,13 @@ export class ConfiguredIntegrationService implements Disposable {
 
 		let changed: boolean;
 		if (existing != null) {
+			// `baseUrl` is compared alongside `domain`, not folded into it: `domain` is normalized to a bare
+			// host, so a connection re-pointed to another context path on the SAME host is identical by domain
+			// and would otherwise be treated as unchanged — leaving the stored descriptor, and every warm
+			// integration listening for the change, on the old address.
 			if (
 				existing.domain === normalized.domain &&
+				sameConfiguredBaseUrl(existing.baseUrl, normalized.baseUrl) &&
 				existing.expiresAt === normalized.expiresAt &&
 				existing.scopes === normalized.scopes &&
 				(existing.primary ?? false) === (normalized.primary ?? false) &&
@@ -176,9 +202,10 @@ export class ConfiguredIntegrationService implements Disposable {
 				return;
 			}
 
-			// Only fire the change event on domain/scopes/primary/type/accountName changes (ignore expiresAt churn)
+			// Only fire the change event on address/scopes/primary/type/accountName changes (ignore expiresAt churn)
 			changed =
 				existing.domain !== normalized.domain ||
+				!sameConfiguredBaseUrl(existing.baseUrl, normalized.baseUrl) ||
 				existing.scopes !== normalized.scopes ||
 				(existing.primary ?? false) !== (normalized.primary ?? false) ||
 				existing.type !== normalized.type ||
@@ -242,50 +269,128 @@ export class ConfiguredIntegrationService implements Disposable {
 		await this.storeConfigured();
 	}
 
-	async storeSession(id: IntegrationIds, session: ProviderAuthenticationSession): Promise<void> {
-		await this.writeSecret(id, session);
+	private withLock<T>(id: IntegrationIds, fn: () => Promise<T>): Promise<T> {
+		const run = (this._locks.get(id) ?? Promise.resolve()).then(fn);
+		const settled = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		this._locks.set(id, settled);
+		void settled.then(() => {
+			if (this._locks.get(id) === settled) {
+				this._locks.delete(id);
+			}
+		});
+		return run;
 	}
 
-	async getStoredSession(
+	/**
+	 * Taken before a token is read or fetched, and handed to {@link storeSession}: a sign-out that lands after it
+	 * (a disconnect, a reauthentication, the connection being removed) refuses the store, so a token fetched across
+	 * it is not written back and reconnected on the next resolution (gitkraken/kepler#3546).
+	 */
+	getSignOutMark(): number {
+		return this._signOutEpoch;
+	}
+
+	private markSignOut(scope: string): void {
+		this._signOuts.set(scope, ++this._signOutEpoch);
+	}
+
+	private getHostScope(id: IntegrationIds, domain: string): string {
+		return `${id}|host:${hostFromDomain(domain) ?? domain}`;
+	}
+
+	private isSignedOutSince(id: IntegrationIds, session: ProviderAuthenticationSession, mark: number): boolean {
+		const since = (scope: string) => (this._signOuts.get(scope) ?? 0) > mark;
+		if (since(id)) return true;
+		if (isSelfManagedHostIntegrationId(id) && session.domain && since(this.getHostScope(id, session.domain))) {
+			return true;
+		}
+		return since(`${id}|connection:${session.id}`);
+	}
+
+	/**
+	 * Stores the session's secret and descriptor together. With a `signOutMark`, nothing is stored, and `false` is
+	 * returned, when a sign-out covering the session landed after the mark was taken.
+	 */
+	storeSession(
+		id: IntegrationIds,
+		session: ProviderAuthenticationSession,
+		options?: { signOutMark?: number },
+	): Promise<boolean> {
+		return this.withLock(id, async () => {
+			if (options?.signOutMark != null && this.isSignedOutSince(id, session, options.signOutMark)) return false;
+
+			await this.writeSecret(id, session);
+			return true;
+		});
+	}
+
+	getStoredSession(
 		id: IntegrationIds,
 		descriptor: IntegrationAuthenticationSessionDescriptor,
 	): Promise<ProviderAuthenticationSession | undefined> {
-		const sessionId = this.resolveConnectionId(id, descriptor);
-		let session = descriptor.cloud === true ? undefined : await this.readSecret(id, sessionId, false);
+		// Under the lock too: reading can repair storage (a legacy local-key cloud session, a missing descriptor).
+		return this.withLock(id, async () => {
+			const sessionId = this.resolveConnectionId(id, descriptor);
+			let session = descriptor.cloud === true ? undefined : await this.readSecret(id, sessionId, false);
 
-		let cloudIfMissing = false;
-		if (session != null) {
-			// Check the `expiresAt` field
-			// If it has an expiresAt property and the key is the old type, then it's a cloud session,
-			// so delete it from the local key and
-			// store with the "cloud" type key, and then use that one.
-			// Otherwise it's a local session under the local key, so just return it.
-			if (session.expiresAt != null) {
-				cloudIfMissing = true;
-				await Promise.allSettled([this.deleteSecrets(id, session.id), this.writeSecret(id, session)]);
+			let cloudIfMissing = false;
+			if (session != null) {
+				// Check the `expiresAt` field
+				// If it has an expiresAt property and the key is the old type, then it's a cloud session,
+				// so delete it from the local key and
+				// store with the "cloud" type key, and then use that one.
+				// Otherwise it's a local session under the local key, so just return it.
+				if (session.expiresAt != null) {
+					cloudIfMissing = true;
+					try {
+						await this.deleteSecrets(id, session.id);
+						await this.writeSecret(id, session);
+					} catch {}
+				}
 			}
-		}
 
-		// If no local session we try to restore a session with the cloud key
-		if (session == null && descriptor.cloud !== false) {
-			cloudIfMissing = true;
-			session = await this.readSecret(id, sessionId, true);
-		}
+			// If no local session we try to restore a session with the cloud key
+			if (session == null && descriptor.cloud !== false) {
+				cloudIfMissing = true;
+				session = await this.readSecret(id, sessionId, true);
+			}
 
-		return convertStoredSessionToSession(session, descriptor, cloudIfMissing);
+			return convertStoredSessionToSession(session, descriptor, cloudIfMissing);
+		});
 	}
 
-	async deleteStoredSessions(
+	/**
+	 * Deletes one connection's stored session. `signOut` is for a delete that signs the integration out (a forced new
+	 * session): it also refuses the store of any token of the provider, or of the descriptor's self-managed host,
+	 * fetched before it (see {@link getSignOutMark}). A cleanup of a replaced token leaves it unset.
+	 */
+	deleteStoredSessions(
 		id: IntegrationIds,
 		descriptor: IntegrationAuthenticationSessionDescriptor,
 		cloud?: boolean,
-		options?: { preserveConfigured?: boolean },
+		options?: { preserveConfigured?: boolean; signOut?: boolean },
 	): Promise<void> {
-		await this.deleteSecrets(id, this.resolveConnectionId(id, descriptor), cloud, options);
+		return this.withLock(id, async () => {
+			if (options?.signOut) {
+				this.markSignOut(
+					isSelfManagedHostIntegrationId(id) && descriptor.domain
+						? this.getHostScope(id, descriptor.domain)
+						: id,
+				);
+			}
+			await this.deleteSecrets(id, this.resolveConnectionId(id, descriptor), cloud, options);
+		});
 	}
 
-	async deleteAllStoredSessions(id: IntegrationIds, cloud?: boolean, domain?: string): Promise<void> {
-		await this.deleteAllSecrets(id, cloud, domain);
+	/** Signs out of every stored session of the provider, or of one self-managed host when `domain` is given. */
+	deleteAllStoredSessions(id: IntegrationIds, cloud?: boolean, domain?: string): Promise<void> {
+		return this.withLock(id, async () => {
+			this.markSignOut(isSelfManagedHostIntegrationId(id) && domain != null ? this.getHostScope(id, domain) : id);
+			await this.deleteAllSecrets(id, cloud, domain);
+		});
 	}
 
 	/**
@@ -327,7 +432,7 @@ export class ConfiguredIntegrationService implements Disposable {
 		await this.ctx.storage.store('integrations:configured', remaining as StoredIntegrationConfigurations);
 	}
 
-	async deleteSecrets(
+	private async deleteSecrets(
 		id: IntegrationIds,
 		connectionId: string,
 		cloud?: boolean,
@@ -346,7 +451,7 @@ export class ConfiguredIntegrationService implements Disposable {
 		await this.removeConfigured(id, { connectionId: connectionId, cloud: cloud });
 	}
 
-	async deleteAllSecrets(id: IntegrationIds, cloud?: boolean, domain?: string): Promise<void> {
+	private async deleteAllSecrets(id: IntegrationIds, cloud?: boolean, domain?: string): Promise<void> {
 		// Delete every connection's secret (multi-account): secrets are keyed per connection id, so a
 		// single canonical-domain delete would orphan secondary tokens. When a domain is given (self-managed
 		// disconnect of one host), scope to that host so other hosts under the same provider id survive.
@@ -378,7 +483,10 @@ export class ConfiguredIntegrationService implements Disposable {
 		await this.deleteSecrets(id, providersMetadata[id]?.domain || id, cloud);
 	}
 
-	async writeSecret(id: IntegrationIds, session: ProviderAuthenticationSession | StoredSession): Promise<void> {
+	private async writeSecret(
+		id: IntegrationIds,
+		session: ProviderAuthenticationSession | StoredSession,
+	): Promise<void> {
 		await this.ctx.storage.storeSecret(
 			this.getSecretKey(id, session.id, session.cloud ?? false),
 			JSON.stringify(session),
@@ -387,7 +495,8 @@ export class ConfiguredIntegrationService implements Disposable {
 		await this.addOrUpdateConfigured({
 			id: session.id,
 			integrationId: id,
-			domain: isGitSelfManagedHostIntegrationId(id) ? session.domain : undefined,
+			domain: isSelfManagedHostIntegrationId(id) ? session.domain : undefined,
+			baseUrl: isSelfManagedHostIntegrationId(id) ? session.baseUrl : undefined,
 			expiresAt: session.expiresAt,
 			scopes: session.scopes.join(','),
 			cloud: session.cloud ?? false,
@@ -396,7 +505,7 @@ export class ConfiguredIntegrationService implements Disposable {
 		});
 	}
 
-	async readSecret(
+	private async readSecret(
 		id: IntegrationIds,
 		sessionId: string,
 		cloud: boolean = false,
@@ -410,7 +519,7 @@ export class ConfiguredIntegrationService implements Disposable {
 					const configured = this.configured.get(id);
 					const connectionId = storedSession.id ?? sessionId;
 					const sessionCloud = storedSession.cloud ?? cloud;
-					const domain = isGitSelfManagedHostIntegrationId(id)
+					const domain = isSelfManagedHostIntegrationId(id)
 						? (storedSession.domain ?? storedSession.id)
 						: undefined;
 					if (
@@ -424,6 +533,10 @@ export class ConfiguredIntegrationService implements Disposable {
 							id: connectionId,
 							integrationId: id,
 							domain: domain,
+							// Rebuilt from the secret, so it must carry the address the session does; omitting it
+							// leaves the descriptor claiming no context path and makes reconcile read every
+							// routine check-in as a re-pointed connection.
+							baseUrl: isSelfManagedHostIntegrationId(id) ? storedSession.baseUrl : undefined,
 							expiresAt: storedSession.expiresAt,
 							scopes: storedSession.scopes.join(','),
 							cloud: sessionCloud,
@@ -465,7 +578,7 @@ export class ConfiguredIntegrationService implements Disposable {
 		descriptors: ConfiguredIntegrationDescriptor[],
 		domain: string | undefined,
 	): ConfiguredIntegrationDescriptor[] {
-		return isGitSelfManagedHostIntegrationId(id)
+		return isSelfManagedHostIntegrationId(id)
 			? descriptors.filter(d => this.isInPrimaryScope(id, d, domain))
 			: descriptors;
 	}
@@ -475,7 +588,7 @@ export class ConfiguredIntegrationService implements Disposable {
 		descriptor: ConfiguredIntegrationDescriptor,
 		domain: string | undefined,
 	): boolean {
-		return !isGitSelfManagedHostIntegrationId(id) || this.domainsMatch(id, descriptor.domain, domain);
+		return !isSelfManagedHostIntegrationId(id) || this.domainsMatch(id, descriptor.domain, domain);
 	}
 
 	/**
@@ -491,7 +604,7 @@ export class ConfiguredIntegrationService implements Disposable {
 		// rather than keying a secret under an empty id.
 		if (descriptor.connectionId) return descriptor.connectionId;
 
-		const domain = isGitSelfManagedHostIntegrationId(id) ? descriptor.domain : undefined;
+		const domain = isSelfManagedHostIntegrationId(id) ? descriptor.domain : undefined;
 		const candidates = this.scopeConnectionCandidates(id, domain, descriptor.cloud);
 		return (candidates?.find(c => c.primary) ?? candidates?.[0])?.id ?? descriptor.domain;
 	}
@@ -504,8 +617,45 @@ export class ConfiguredIntegrationService implements Disposable {
 	 * token fetch to one host of a multi-host self-managed provider, or fall through to the provider-global
 	 * primary endpoint on `undefined`.
 	 */
+	/**
+	 * The address already stored for a self-managed connection — see {@link ConfiguredIntegrationDescriptor.baseUrl}.
+	 *
+	 * Exists so a session rebuilt from a backend response that omits the domain can keep the address the
+	 * connection was configured with, rather than silently falling back to the bare host and losing a context
+	 * path the user never changed. Looked up by connection id first, then by host for an unscoped fetch.
+	 */
+	/**
+	 * Whether `connectionId` names a cloud connection configured for `domain`'s host.
+	 *
+	 * The caller-facing question is "is this id evidence that a token belongs to this host". A connection id
+	 * can arrive from a caller rather than from our own configuration, so it is only evidence once it matches
+	 * a descriptor we stored for that host — see the host guard in `CloudIntegrationAuthenticationProvider`.
+	 */
+	isConnectionConfiguredForHost(
+		id: IntegrationIds,
+		connectionId: string | undefined,
+		domain: string | undefined,
+	): boolean {
+		if (connectionId == null) return false;
+
+		const connection = this.getConfigured(id, { cloud: true }).find(c => c.id === connectionId);
+		if (connection == null) return false;
+
+		return !isSelfManagedHostIntegrationId(id) || this.domainsMatch(id, connection.domain, domain);
+	}
+
+	getConfiguredBaseUrl(id: IntegrationIds, connectionId: string | undefined, domain?: string): string | undefined {
+		if (!isSelfManagedHostIntegrationId(id)) return undefined;
+
+		const configured = this.getConfigured(id, { cloud: true });
+		const byId = connectionId != null ? configured.find(c => c.id === connectionId) : undefined;
+		if (byId != null) return byId.baseUrl;
+
+		return configured.find(c => this.domainsMatch(id, c.domain, domain))?.baseUrl;
+	}
+
 	getConfiguredConnectionId(id: IntegrationIds, domain: string | undefined, cloud?: boolean): string | undefined {
-		const scoped = isGitSelfManagedHostIntegrationId(id) ? domain : undefined;
+		const scoped = isSelfManagedHostIntegrationId(id) ? domain : undefined;
 		const candidates = this.scopeConnectionCandidates(id, scoped, cloud);
 		const connection = candidates?.find(c => c.primary) ?? candidates?.[0];
 		if (connection == null) return undefined;
@@ -547,7 +697,11 @@ export class ConfiguredIntegrationService implements Disposable {
 	 * Marks the given connection as the primary/default for the provider and clears the flag on its
 	 * siblings. Persists immediately instead of relying on a session re-store to carry the primary flag.
 	 */
-	async setPrimaryConnection(id: IntegrationIds, connectionId: string): Promise<void> {
+	setPrimaryConnection(id: IntegrationIds, connectionId: string): Promise<void> {
+		return this.withLock(id, () => this.setPrimaryConnectionCore(id, connectionId));
+	}
+
+	private async setPrimaryConnectionCore(id: IntegrationIds, connectionId: string): Promise<void> {
 		const descriptors = this.configured.get(id);
 		if (descriptors == null || descriptors.length === 0) return;
 		if (!descriptors.some(d => d.id === connectionId)) return;
@@ -556,7 +710,7 @@ export class ConfiguredIntegrationService implements Disposable {
 			descriptors.find(d => d.id === connectionId && d.cloud) ?? descriptors.find(d => d.id === connectionId);
 		if (target == null) return;
 
-		const domain = isGitSelfManagedHostIntegrationId(id) ? target.domain : undefined;
+		const domain = isSelfManagedHostIntegrationId(id) ? target.domain : undefined;
 		// A connection id can have both a local (PAT) and cloud descriptor. Mark the primary on a single
 		// canonical variant (prefer cloud, since multi-account primaries are cloud-driven) within the
 		// provider/host scope, so other self-managed hosts keep their own default connection.
@@ -587,8 +741,12 @@ export class ConfiguredIntegrationService implements Disposable {
 	 * {@link deleteAllStoredSessions}, this only affects the targeted connection. Pass `cloud` to scope
 	 * the removal to the cloud/local variant when a local PAT and a cloud session share a connection id.
 	 */
-	async deleteConnection(id: IntegrationIds, connectionId: string, cloud?: boolean): Promise<void> {
-		await this.deleteSecrets(id, connectionId, cloud);
+	deleteConnection(id: IntegrationIds, connectionId: string, cloud?: boolean): Promise<void> {
+		return this.withLock(id, async () => {
+			// The connection is gone, so a token of it fetched before must not be stored back.
+			this.markSignOut(`${id}|connection:${connectionId}`);
+			await this.deleteSecrets(id, connectionId, cloud);
+		});
 	}
 
 	private _addedIds = new Set<IntegrationIds>();
@@ -596,14 +754,14 @@ export class ConfiguredIntegrationService implements Disposable {
 	private _fireChangeDebounced?: () => void;
 
 	private normalizeConfiguredDomain(id: IntegrationIds, domain: string | undefined): string | undefined {
-		if (!isGitSelfManagedHostIntegrationId(id)) return domain;
+		if (!isSelfManagedHostIntegrationId(id)) return domain;
 
 		return hostFromDomain(domain) ?? domain;
 	}
 
 	private domainsMatch(id: IntegrationIds, first: string | undefined, second: string | undefined): boolean {
 		if (first === second) return true;
-		if (!isGitSelfManagedHostIntegrationId(id)) return false;
+		if (!isSelfManagedHostIntegrationId(id)) return false;
 		if (first == null || second == null) return false;
 
 		return areDomainsOnSameHost(first, second);
@@ -647,10 +805,22 @@ function convertStoredSessionToSession(
 		cloud: storedSession.cloud ?? cloudIfMissing,
 		expiresAt: storedSession.expiresAt ? new Date(storedSession.expiresAt) : undefined,
 		domain: storedSession.domain ?? descriptor.domain,
+		baseUrl: getStoredBaseUrl(storedSession.baseUrl, storedSession.domain, storedSession.protocol),
 		protocol: storedSession.protocol,
 		type: storedSession.type,
 		// Carried for providers whose client needs an app key alongside the token (e.g. Trello); without
 		// this a rehydrated session silently loses the key and every read no-ops.
 		appKey: storedSession.appKey,
 	};
+}
+
+function getStoredBaseUrl(
+	baseUrl: string | undefined,
+	domain: string | undefined,
+	protocol?: string,
+): string | undefined {
+	if (baseUrl != null) return baseUrl;
+
+	const legacyUrl = baseUrlFromDomain(domain, protocol);
+	return legacyUrl != null && new URL(legacyUrl).pathname !== '/' ? legacyUrl : undefined;
 }

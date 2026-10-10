@@ -7,6 +7,7 @@ import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { GitHubApiConfig } from '../config.js';
 import { filterPullRequestsBySearchState, GitHubApi, toGitHubSearchStateQualifier } from '../github.js';
 import type { GitHubTokenInfo } from '../token.js';
+import { gitHubPullRequest } from './fixtures.js';
 
 /** Serves `data` to one GraphQL request and captures the query document it was asked for. */
 function captureQuery(data: unknown): { config: GitHubApiConfig; getQuery: () => string } {
@@ -105,53 +106,19 @@ suite('GitHubApi.searchPullRequests', () => {
 	};
 
 	function prNode(number: number, state: 'OPEN' | 'CLOSED' | 'MERGED') {
-		return {
-			id: `pr-${number}`,
-			number: number,
-			title: `PR ${number}`,
-			body: `Body ${number}`,
-			permalink: `https://github.com/octo/repo/pull/${number}`,
-			url: `https://github.com/octo/repo/pull/${number}`,
-			state: state,
-			createdAt: '2024-01-01T00:00:00Z',
-			updatedAt: '2024-01-02T00:00:00Z',
-			closed: state !== 'OPEN',
-			closedAt: state === 'OPEN' ? null : '2024-01-03T00:00:00Z',
-			mergedAt: state === 'MERGED' ? '2024-01-03T00:00:00Z' : null,
-			author: { login: 'octo', avatarUrl: '', url: 'https://github.com/octo' },
-			baseRefName: 'main',
-			baseRefOid: 'base',
-			headRefName: 'feature',
-			headRefOid: 'head',
-			headRepository: {
-				isFork: false,
-				name: 'repo',
-				owner: { login: 'octo' },
-				sshUrl: 'git@github.com:octo/repo.git',
-				url: 'https://github.com/octo/repo',
+		return gitHubPullRequest(
+			number,
+			{
+				id: `pr-${number}`,
+				state: state,
+				createdAt: '2024-01-01T00:00:00Z',
+				updatedAt: '2024-01-02T00:00:00Z',
+				closed: state !== 'OPEN',
+				closedAt: state === 'OPEN' ? null : '2024-01-03T00:00:00Z',
+				mergedAt: state === 'MERGED' ? '2024-01-03T00:00:00Z' : null,
 			},
-			repository: {
-				isFork: false,
-				name: 'repo',
-				owner: { login: 'octo' },
-				sshUrl: 'git@github.com:octo/repo.git',
-				url: 'https://github.com/octo/repo',
-				viewerPermission: 'WRITE',
-			},
-			isCrossRepository: false,
-			isDraft: false,
-			additions: 1,
-			deletions: 1,
-			checksUrl: '',
-			mergeable: 'MERGEABLE',
-			reviewDecision: 'APPROVED',
-			latestReviews: { nodes: [] },
-			reviewRequests: { nodes: [] },
-			assignees: { nodes: [] },
-			commits: { nodes: [] },
-			totalCommentsCount: 0,
-			viewerCanUpdate: true,
-		};
+			{ owner: 'octo', name: 'repo' },
+		);
 	}
 
 	test('aliases opened and merged searches so closed pull requests cannot consume their result slices', async () => {
@@ -312,7 +279,7 @@ suite('GitHubApi.searchMyPullRequestsPage summaries', () => {
 					JSON.stringify({
 						data: {
 							search: {
-								issueCount: 1,
+								issueCount: 1393,
 								pageInfo: { endCursor: null, hasNextPage: false },
 								nodes: [node],
 							},
@@ -337,6 +304,7 @@ suite('GitHubApi.searchMyPullRequestsPage summaries', () => {
 		assert.match(query, /search\(first: 100,/, 'the lite fragment keeps the 100-node maximum');
 		assert.equal(result.values[0].body, 'Summary body');
 		assert.equal(result.values[0].refs?.head.branch, 'feature');
+		assert.equal(result.totalCount, 1393);
 	});
 
 	test('orders by sort:updated so a page-budgeted sweep retains a recency window', async () => {
@@ -386,6 +354,22 @@ suite('GitHubApi.searchMyPullRequestsPage summaries', () => {
 		assert.equal(searches[1], 'is:merged is:pr involves:@me archived:false sort:updated');
 		assert.equal(searches[2], 'is:closed is:unmerged is:pr archived:false author:@me sort:updated');
 		assert.equal(searches[3], 'is:pr involves:@me archived:false sort:updated');
+	});
+
+	test('flags the 1,000-result ceiling only on the page that ends the walk', async () => {
+		const read = async (hasNextPage: boolean) => {
+			const { config } = captureQuery({
+				search: {
+					...emptySearchPage.search,
+					issueCount: 1005,
+					pageInfo: { endCursor: 'c', hasNextPage: hasNextPage },
+				},
+			});
+			return new GitHubApi(config).searchMyPullRequestsPage(provider, token, { state: 'merged' });
+		};
+
+		assert.equal((await read(true)).truncated, false);
+		assert.equal((await read(false)).truncated, true);
 	});
 
 	/**
@@ -562,52 +546,16 @@ suite('GitHubApi direct pull request lookups', () => {
 	};
 
 	function prNode(number: number, body: string | null = `Body ${number}`) {
-		return {
-			id: `pr-${number}`,
-			number: number,
-			title: `PR ${number}`,
-			body: body,
-			permalink: `https://github.com/octo/repo/pull/${number}`,
-			url: `https://github.com/octo/repo/pull/${number}`,
-			state: 'OPEN',
-			createdAt: '2024-01-01T00:00:00Z',
-			updatedAt: '2024-01-02T00:00:00Z',
-			closedAt: null,
-			mergedAt: null,
-			author: { login: 'octo', avatarUrl: '', url: 'https://github.com/octo' },
-			baseRefName: 'main',
-			baseRefOid: 'base',
-			headRefName: 'feature',
-			headRefOid: 'head',
-			headRepository: {
-				isFork: false,
-				name: 'repo',
-				owner: { login: 'octo' },
-				sshUrl: 'git@github.com:octo/repo.git',
-				url: 'https://github.com/octo/repo',
+		return gitHubPullRequest(
+			number,
+			{
+				id: `pr-${number}`,
+				body: body,
+				createdAt: '2024-01-01T00:00:00Z',
+				updatedAt: '2024-01-02T00:00:00Z',
 			},
-			repository: {
-				isFork: false,
-				name: 'repo',
-				owner: { login: 'octo' },
-				sshUrl: 'git@github.com:octo/repo.git',
-				url: 'https://github.com/octo/repo',
-				viewerPermission: 'WRITE',
-			},
-			isCrossRepository: false,
-			isDraft: false,
-			additions: 1,
-			deletions: 1,
-			checksUrl: '',
-			mergeable: 'MERGEABLE',
-			reviewDecision: 'APPROVED',
-			latestReviews: { nodes: [] },
-			reviewRequests: { nodes: [] },
-			assignees: { nodes: [] },
-			commits: { nodes: [] },
-			totalCommentsCount: 0,
-			viewerCanUpdate: true,
-		};
+			{ owner: 'octo', name: 'repo' },
+		);
 	}
 
 	test('getPullRequest requests and maps the body', async () => {
@@ -964,5 +912,114 @@ suite('GitHubApi rate limit classification', () => {
 		const ex = await captureError(failingConfig(403, { message: 'Resource not accessible by integration' }));
 
 		assert.ok(ex instanceof AuthenticationError, `expected AuthenticationError, got ${String(ex)}`);
+	});
+});
+
+suite('GitHubApi reads that must not prompt for reauthentication', () => {
+	const provider = {
+		id: 'github',
+		name: 'GitHub',
+		domain: 'github.com',
+		icon: 'github',
+		getIgnoreSSLErrors: () => false,
+		reauthenticate: () => Promise.resolve(),
+		trackRequestException: () => {},
+	} as unknown as Provider;
+
+	const token: GitHubTokenInfo = {
+		providerId: 'github',
+		accessToken: 'token',
+		microHash: 'hash',
+		cloud: true,
+		type: undefined,
+	};
+
+	/** Answers every request with `status`, counting the reauthentication prompts the client raises. */
+	function refusingConfig(
+		status: number,
+		body: unknown,
+		headers?: Record<string, string>,
+	): { config: GitHubApiConfig; prompts: () => number } {
+		let prompts = 0;
+		const config = {
+			isWeb: false,
+			fetch: async () =>
+				new Response(JSON.stringify(body), {
+					status: status,
+					headers: { 'content-type': 'application/json', ...headers },
+				}),
+			wrapForForcedInsecureSSL: (_ignore: unknown, fn: () => unknown) => fn(),
+			onAuthenticationFailure: () => {
+				prompts++;
+				return Promise.resolve(false);
+			},
+		} as unknown as GitHubApiConfig;
+		return { config: config, prompts: () => prompts };
+	}
+
+	async function settle(read: Promise<unknown>): Promise<unknown> {
+		try {
+			return await read;
+		} catch (ex) {
+			return ex;
+		}
+	}
+
+	test('getRepositoryAccess answers false on a 404', async () => {
+		const { config } = refusingConfig(404, { message: 'Not Found' });
+
+		assert.equal(await new GitHubApi(config).getRepositoryAccess(provider, token, 'octo', 'gone'), false);
+	});
+
+	test('getRepositoryAccess throws a refusal carrying the response, without a prompt', async () => {
+		const { config, prompts } = refusingConfig(
+			403,
+			{ message: 'the `octo` organization has enabled OAuth App access restrictions' },
+			{ 'x-oauth-client-id': 'abc123' },
+		);
+
+		const ex = await settle(new GitHubApi(config).getRepositoryAccess(provider, token, 'octo', 'hidden'));
+
+		assert.ok(ex instanceof AuthenticationError, `expected AuthenticationError, got ${String(ex)}`);
+		const response = (ex.original as { response?: { headers?: Record<string, string> } }).response;
+		assert.equal(response?.headers?.['x-oauth-client-id'], 'abc123');
+		assert.equal(prompts(), 0);
+	});
+
+	for (const status of [500, 503]) {
+		test(`getRepositoryAccess does not charge a failed confirmation to the connection (${status})`, async () => {
+			let strikes = 0;
+			let notices = 0;
+			const { config } = refusingConfig(status, { message: 'Service unavailable' });
+			config.onRequestError = () => {
+				notices++;
+			};
+			const trackedProvider: Provider = {
+				...provider,
+				trackRequestException: () => {
+					strikes++;
+				},
+			};
+
+			const ex = await settle(new GitHubApi(config).getRepositoryAccess(trackedProvider, token, 'octo', 'gone'));
+
+			assert.ok(ex instanceof Error);
+			assert.equal(strikes, 0);
+			assert.equal(notices, 0);
+		});
+	}
+
+	test('getCurrentAccount prompts on a refusal unless it is asked to be silent', async () => {
+		const loud = refusingConfig(401, { message: 'Bad credentials' });
+		assert.ok(
+			(await settle(new GitHubApi(loud.config).getCurrentAccount(provider, token))) instanceof
+				AuthenticationError,
+		);
+		assert.equal(loud.prompts(), 1);
+
+		const quiet = refusingConfig(401, { message: 'Bad credentials' });
+		const ex = await settle(new GitHubApi(quiet.config).getCurrentAccount(provider, token, { silent: true }));
+		assert.ok(ex instanceof AuthenticationError, `expected AuthenticationError, got ${String(ex)}`);
+		assert.equal(quiet.prompts(), 0);
 	});
 });

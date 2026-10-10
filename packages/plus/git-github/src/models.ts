@@ -1,8 +1,13 @@
 import type { Endpoints } from '@octokit/types';
 import { GitFileIndexStatus } from '@gitlens/git/models/fileStatus.js';
-import type { IssueLabel } from '@gitlens/git/models/issue.js';
+import type { IssueLabel, IssueProjection } from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
-import type { PullRequestMember, PullRequestStackInfo, PullRequestState } from '@gitlens/git/models/pullRequest.js';
+import type {
+	PullRequestMember,
+	PullRequestProjection,
+	PullRequestStackInfo,
+	PullRequestState,
+} from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
@@ -237,7 +242,8 @@ export interface GitHubPullRequest extends GitHubPullRequestLite {
 	reviewRequests: {
 		nodes: {
 			asCodeOwner: boolean;
-			requestedReviewer: GitHubMember | null;
+			/** Empty for a team (or anything else that isn't a user), which the `... on User` selection doesn't match. */
+			requestedReviewer: Partial<GitHubMember> | null;
 		}[];
 	};
 	commits: {
@@ -254,6 +260,46 @@ export interface GitHubPullRequest extends GitHubPullRequestLite {
 	viewerCanUpdate: boolean;
 }
 
+/**
+ * An input beyond a pull request's lifecycle fields that `GitHubApi.getPullRequestsEtagFieldsBatch` can select.
+ * Mirrors the integrations package's `PullRequestEtagInclude`, which this package cannot import.
+ */
+export type GitHubPullRequestEtagInclude = 'mergeable' | 'reviewDecision' | 'checks';
+
+/**
+ * The change state `GitHubApi.getPullRequestsEtagFieldsBatch` selects: a pull request's lifecycle fields, plus,
+ * for each requested {@link GitHubPullRequestEtagInclude}, what its etag reads. Each selection is the full
+ * fragment's own, so a value here is the one a full read would have mapped.
+ */
+export interface GitHubPullRequestEtagNode extends Pick<
+	GitHubPullRequest,
+	'id' | 'number' | 'state' | 'isDraft' | 'updatedAt' | 'headRefOid'
+> {
+	/** Only with `mergeable`. */
+	mergeable?: GitHubPullRequestMergeableState | null;
+	/** Only with `reviewDecision`. `null` on a repository that requires no review. */
+	reviewDecision?: GitHubPullRequestReviewDecision | null;
+	/** Only with `checks`. */
+	commits?: {
+		nodes: { commit: { statusCheckRollup: { state: GitHubPullRequestStatusCheckRollupState } | null } }[];
+	};
+}
+
+/**
+ * An input beyond an issue's lifecycle fields that `GitHubApi.getIssuesEtagFieldsBatch` can select. Mirrors the
+ * integrations package's `IssueEtagInclude`, which this package cannot import.
+ */
+export type GitHubIssueEtagInclude = 'reactions';
+
+/**
+ * The change state `GitHubApi.getIssuesEtagFieldsBatch` selects, plus, for each requested
+ * {@link GitHubIssueEtagInclude}, the full fragment's own selection of it.
+ */
+export interface GitHubIssueEtagNode extends Pick<GitHubIssue, 'id' | 'number' | 'state' | 'updatedAt'> {
+	/** Only with `reactions`: the thumbs-up reactions, as the full fragment selects them. */
+	reactions?: { totalCount: number };
+}
+
 export type GitHubViewerPermission =
 	| 'ADMIN' // Can read, clone, and push to this repository. Can also manage issues, pull requests, and repository settings, including adding collaborators
 	| 'MAINTAIN' // Can read, clone, and push to this repository. They can also manage issues, pull requests, and some repository settings
@@ -262,9 +308,9 @@ export type GitHubViewerPermission =
 	| 'READ' // Can read and clone this repository. Can also open and comment on issues and pull requests
 	| 'NONE';
 
-/** `ghost` is how github.com renders an actor whose account was deleted */
+/** `ghost` is how github.com renders an actor whose account was deleted, under the handle `ghost` */
 function fromGitHubMemberOrGhost(member: GitHubMember | null | undefined): PullRequestMember {
-	if (member == null) return { id: 'ghost', name: 'ghost' };
+	if (member == null) return { id: 'ghost', name: 'ghost', username: 'ghost' };
 
 	return {
 		id: member.login,
@@ -275,7 +321,11 @@ function fromGitHubMemberOrGhost(member: GitHubMember | null | undefined): PullR
 	};
 }
 
-export function fromGitHubPullRequestLite(pr: GitHubPullRequestLite, provider: Provider): PullRequest {
+export function fromGitHubPullRequestLite(
+	pr: GitHubPullRequestLite,
+	provider: Provider,
+	projection?: PullRequestProjection,
+): PullRequest {
 	return new PullRequest(
 		provider,
 		fromGitHubMemberOrGhost(pr.author),
@@ -337,6 +387,9 @@ export function fromGitHubPullRequestLite(pr: GitHubPullRequestLite, provider: P
 		fromGitHubPullRequestStack(pr),
 		undefined, // filesChanged
 		pr.body ?? undefined,
+		pr.number,
+		undefined, // authoredByMe
+		projection,
 	);
 }
 
@@ -449,7 +502,11 @@ export function fromGitHubPullRequestStatusCheckRollupState(
 	}
 }
 
-export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider): PullRequest {
+export function fromGitHubPullRequest(
+	pr: GitHubPullRequest,
+	provider: Provider,
+	projection?: PullRequestProjection,
+): PullRequest {
 	// `latestReviews` is capped, so keep the viewer's own review even when it falls outside that window, deduped
 	// by review id since the two selections overlap. Unsubmitted drafts are dropped from the union rather than
 	// from the viewer's side alone: `PENDING` is in GitHub's review-state enum on both selections, and the field
@@ -511,7 +568,7 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 		pr.additions,
 		pr.deletions,
 		pr.totalCommentsCount,
-		0, //pr.reactions.totalCount,
+		undefined, // thumbsUpCount: the fragment selects no reactions
 		fromGitHubPullRequestReviewDecision(pr.reviewDecision),
 		pr.reviewRequests.nodes
 			.map(r =>
@@ -519,7 +576,8 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 					? {
 							isCodeOwner: r.asCodeOwner,
 							reviewer: {
-								id: r.requestedReviewer.login,
+								// A team has no login: an empty id, which matches no one, rather than a missing one.
+								id: r.requestedReviewer.login ?? '',
 								name: r.requestedReviewer.login,
 								username: r.requestedReviewer.login,
 								avatarUrl: r.requestedReviewer.avatarUrl,
@@ -549,10 +607,13 @@ export function fromGitHubPullRequest(pr: GitHubPullRequest, provider: Provider)
 		fromGitHubPullRequestStack(pr),
 		pr.changedFiles,
 		pr.body ?? undefined,
+		pr.number,
+		undefined, // authoredByMe
+		projection,
 	);
 }
 
-export function fromGitHubIssue(value: GitHubIssue, provider: Provider): Issue {
+export function fromGitHubIssue(value: GitHubIssue, provider: Provider, projection?: IssueProjection): Issue {
 	return new Issue(
 		{
 			id: provider.id,
@@ -600,6 +661,13 @@ export function fromGitHubIssue(value: GitHubIssue, provider: Provider): Issue {
 		value.comments?.totalCount,
 		value.reactions?.totalCount,
 		value.body,
+		undefined, // project
+		undefined, // number
+		undefined, // issueType
+		undefined, // providerState
+		undefined, // bodyFormat
+		undefined, // iterations
+		projection,
 	);
 }
 

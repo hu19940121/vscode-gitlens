@@ -3,6 +3,7 @@ import { tmpdir } from 'os';
 import * as l10n from '@vscode/l10n';
 import type { Cache } from '@gitlens/git/cache.js';
 import type { GitServiceContext } from '@gitlens/git/context.js';
+import type { GitOperationRunOptions } from '@gitlens/git/providers/operations.js';
 import type { DisposableTemporaryGitIndex, GitStagingSubProvider } from '@gitlens/git/providers/staging.js';
 import { countStringLength } from '@gitlens/utils/array.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
@@ -108,6 +109,7 @@ export class StagingGitSubProvider implements GitStagingSubProvider {
 	@debug()
 	async stageFile(repoPath: string, pathOrUri: string | Uri): Promise<void> {
 		await this.git.run({ cwd: repoPath }, 'add', '-A', '--', toFsPath(pathOrUri));
+		this.announceIndexChanged(repoPath);
 	}
 
 	@debug()
@@ -125,25 +127,37 @@ export class StagingGitSubProvider implements GitStagingSubProvider {
 
 		// Process files in batches (will be a single batch if under the limit)
 		const batches = chunk(paths, batchSize);
-		for (const batch of batches) {
-			await this.git.run(
-				{ cwd: repoPath, env: options?.index?.env },
-				'add',
-				options?.intentToAdd ? '-N' : '-A',
-				'--',
-				...batch,
-			);
+		try {
+			for (const batch of batches) {
+				await this.git.run(
+					{ cwd: repoPath, env: options?.index?.env },
+					'add',
+					options?.intentToAdd ? '-N' : '-A',
+					'--',
+					...batch,
+				);
+			}
+		} finally {
+			// Announced even when a later batch fails, since the earlier ones already changed the index. A
+			// temporary index (used for partial-stage previews / diff building) is not the repository's real
+			// index — firing repo-change hooks for it would invalidate status caches for a mutation nothing
+			// else can observe.
+			if (options?.index == null) {
+				this.announceIndexChanged(repoPath);
+			}
 		}
 	}
 
 	@debug()
 	async stageDirectory(repoPath: string, directoryOrUri: string | Uri): Promise<void> {
 		await this.git.run({ cwd: repoPath }, 'add', '-A', '--', toFsPath(directoryOrUri));
+		this.announceIndexChanged(repoPath);
 	}
 
 	@debug()
 	async unstageFile(repoPath: string, pathOrUri: string | Uri): Promise<void> {
 		await this.git.run({ cwd: repoPath }, 'reset', '-q', '--', toFsPath(pathOrUri));
+		this.announceIndexChanged(repoPath);
 	}
 
 	@debug()
@@ -157,14 +171,20 @@ export class StagingGitSubProvider implements GitStagingSubProvider {
 
 		// Process files in batches (will be a single batch if under the limit)
 		const batches = chunk(paths, batchSize);
-		for (const batch of batches) {
-			await this.git.run({ cwd: repoPath }, 'reset', '-q', '--', ...batch);
+		try {
+			for (const batch of batches) {
+				await this.git.run({ cwd: repoPath }, 'reset', '-q', '--', ...batch);
+			}
+		} finally {
+			// Even when a later batch fails, the earlier ones already changed the index
+			this.announceIndexChanged(repoPath);
 		}
 	}
 
 	@debug()
 	async unstageDirectory(repoPath: string, directoryOrUri: string | Uri): Promise<void> {
 		await this.git.run({ cwd: repoPath }, 'reset', '-q', '--', toFsPath(directoryOrUri));
+		this.announceIndexChanged(repoPath);
 	}
 
 	@debug()
@@ -175,6 +195,7 @@ export class StagingGitSubProvider implements GitStagingSubProvider {
 		}
 		args.push('--', toFsPath(pathOrUri));
 		await this.git.run({ cwd: repoPath }, ...args);
+		this.announceIndexChanged(repoPath);
 	}
 
 	@debug()
@@ -194,18 +215,84 @@ export class StagingGitSubProvider implements GitStagingSubProvider {
 
 		// Process files in batches (will be a single batch if under the limit)
 		const batches = chunk(paths, batchSize);
-		for (const batch of batches) {
-			await this.git.run({ cwd: repoPath }, ...args, ...batch);
+		try {
+			for (const batch of batches) {
+				await this.git.run({ cwd: repoPath }, ...args, ...batch);
+			}
+		} finally {
+			// Even when a later batch fails, the earlier ones already changed the index
+			this.announceIndexChanged(repoPath);
 		}
 	}
 
 	@debug()
 	async stageAll(repoPath: string): Promise<void> {
 		await this.git.run({ cwd: repoPath }, 'add', '-A');
+		this.announceIndexChanged(repoPath);
 	}
 
 	@debug()
 	async unstageAll(repoPath: string): Promise<void> {
 		await this.git.run({ cwd: repoPath }, 'reset', '-q');
+		this.announceIndexChanged(repoPath);
+	}
+
+	@debug()
+	async clean(
+		repoPath: string,
+		options?: {
+			paths?: (string | Uri)[];
+			directories?: boolean;
+			force?: boolean;
+			ignored?: boolean;
+		},
+		runOptions?: GitOperationRunOptions,
+	): Promise<void> {
+		const args = ['clean'];
+		if (options?.force ?? true) {
+			args.push('-f');
+		}
+		if (options?.directories) {
+			args.push('-d');
+		}
+		if (options?.ignored) {
+			args.push('-x');
+		}
+
+		if (options?.paths == null) {
+			try {
+				await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...args);
+			} finally {
+				// A clean that failed or was cancelled partway may already have removed files
+				this.announceIndexChanged(repoPath);
+			}
+			return;
+		}
+
+		const paths = options.paths.map(toFsPath);
+		if (!paths.length) return;
+
+		// Calculate a safe batch size based on average path length
+		const avgPathLength = countStringLength(paths) / paths.length;
+		const batchSize = Math.max(1, Math.floor(maxGitCliLength / avgPathLength));
+
+		// Process paths in batches (will be a single batch if under the limit)
+		const batches = chunk(paths, batchSize);
+		try {
+			for (const batch of batches) {
+				await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...args, '--', ...batch);
+			}
+		} finally {
+			// Even when a later batch fails, the earlier ones already removed files
+			this.announceIndexChanged(repoPath);
+		}
+	}
+
+	/** What every index or working-tree mutation announces, so cached status is re-read and hosts are told. */
+	private announceIndexChanged(repoPath: string): void {
+		// `diff` and `tracking` too, as a watcher-observed index change clears them: a file's working-vs-index
+		// diff and whether it is tracked both change when it is staged, unstaged or removed
+		this.context.hooks?.cache?.onReset?.(repoPath, 'status', 'diff', 'tracking');
+		this.context.hooks?.repository?.onChanged?.(repoPath, ['index']);
 	}
 }

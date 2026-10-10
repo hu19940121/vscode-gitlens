@@ -1,19 +1,15 @@
 import type {
-	GitPullRequestMergeableState as GitPullRequestMergeableStateType,
 	GitPullRequestReviewState as GitPullRequestReviewStateType,
 	GitPullRequestState as GitPullRequestStateType,
 } from '@gitkraken/provider-apis';
 import type { ProviderAccount, ProviderPullRequest } from '../models.js';
 
-type GitPullRequestMergeableState = GitPullRequestMergeableStateType;
 type GitPullRequestReviewState = GitPullRequestReviewStateType;
 type GitPullRequestState = GitPullRequestStateType;
 
 // Local runtime copies of the `@gitkraken/provider-apis` PR string enums, duplicated for the same
 // CJS-from-ESM reason as the enums in `../models.ts`. Exported so the enum-parity test can guard them
-// against upstream drift. `GitPullRequestMergeableState` is an intentional subset: Bitbucket Server
-// only ever normalizes to `Unknown`, so the parity test asserts each local entry matches the SDK
-// rather than a full mirror.
+// against upstream drift.
 export const GitPullRequestState = {
 	Open: 'OPEN' as GitPullRequestState,
 	Closed: 'CLOSED' as GitPullRequestState,
@@ -25,10 +21,6 @@ export const GitPullRequestReviewState = {
 	ChangesRequested: 'CHANGES_REQUESTED' as GitPullRequestReviewState,
 	Commented: 'COMMENTED' as GitPullRequestReviewState,
 	ReviewRequested: 'REVIEW_REQUESTED' as GitPullRequestReviewState,
-} as const;
-
-export const GitPullRequestMergeableState = {
-	Unknown: 'UNKNOWN' as GitPullRequestMergeableState,
 } as const;
 
 export interface BitbucketServerLink {
@@ -128,7 +120,16 @@ export interface BitbucketServerPullRequest {
 	version: number;
 	title: string;
 	description: string;
-	state: 'OPEN' | 'MERGED' | 'DECLINED';
+	/**
+	 * `SUPERSEDED` is not in the published schema, but a server can still report it for a pull request closed by a
+	 * newer one (the Bitbucket SDK maps it too); it is a closed pull request, like `DECLINED`.
+	 */
+	state: 'OPEN' | 'MERGED' | 'DECLINED' | 'SUPERSEDED';
+	/**
+	 * Drafts shipped in Bitbucket Data Center 8.18 (8.17 exposed the field experimentally); absent means the server
+	 * has no drafts, so not a draft.
+	 */
+	draft?: boolean;
 	open: boolean;
 	closed: boolean;
 	createdDate: number;
@@ -191,6 +192,7 @@ export const normalizeBitbucketServerPullRequest = (pr: BitbucketServerPullReque
 		OPEN: GitPullRequestState.Open,
 		MERGED: GitPullRequestState.Merged,
 		DECLINED: GitPullRequestState.Closed,
+		SUPERSEDED: GitPullRequestState.Closed,
 	};
 
 	const reviewerStatusToGitState = {
@@ -224,7 +226,7 @@ export const normalizeBitbucketServerPullRequest = (pr: BitbucketServerPullReque
 		url: pr.links.self[0].href,
 		state: bitbucketStateToGitState[pr.state],
 		isCrossRepository: pr.toRef.repository.id !== pr.fromRef.repository.id,
-		isDraft: false,
+		isDraft: pr.draft === true,
 		createdDate: new Date(pr.createdDate),
 		updatedDate: new Date(pr.updatedDate),
 		closedDate: pr.closedDate ? new Date(pr.closedDate) : null,
@@ -276,7 +278,6 @@ export const normalizeBitbucketServerPullRequest = (pr: BitbucketServerPullReque
 					: null,
 		},
 		headCommit: null,
-		mergeableState: GitPullRequestMergeableState.Unknown,
 		permissions: null,
 		version: pr.version,
 	};

@@ -1,7 +1,9 @@
+import { isUnsupportedSortError } from '@gitkraken/provider-apis';
 import { AuthenticationError, RequestNotFoundError, RequestRateLimitError } from '@gitlens/git/errors.js';
 import type { IssueSorting } from '@gitlens/git/models/issue.js';
 import type { PullRequestSorting } from '@gitlens/git/models/pullRequest.js';
 import type { IntegrationIds } from './constants.js';
+import { isProviderUnreachableError } from './errors.js';
 
 export interface ConnectionStateChangeEvent {
 	key: string;
@@ -12,10 +14,19 @@ export interface ConnectionStateChangeEvent {
  * A per-provider, per-connection warning surfaced alongside (partial) read results. Consumers use
  * these to drive auth recovery, retry, or truncation messaging without the read itself throwing.
  *
- * `kind` is the programmatic discriminant (a rate-limit is retryable, a 404 is not, an auth failure
- * needs re-connection); `isAuth` is retained as a convenience mirror of `kind === 'auth'`.
+ * `kind` is the programmatic discriminant (a rate-limit is retryable, a 404 is not, an unsupported capability
+ * never succeeds on retry, an auth failure needs re-connection unless {@link ProviderWarning.scope} confines
+ * it); `isAuth` is retained as a convenience mirror of `kind === 'auth'`.
+ *
+ * `'unsupported'`: the provider — or this integration of it — lacks the capability the request asked for: a
+ * surface (issues on Bitbucket, pull requests on an issue tracker, a batch read, org/repo discovery,
+ * current-account lookup, project-scoped or account-wide issue reads), or a filter, sort, state, search
+ * criterion or option combination it cannot express. Retrying the same request never succeeds; a different
+ * provider, scope or request may. NOT unsupported (these stay `'other'`): malformed or contradictory caller
+ * input the caller fixes in the request itself (a duplicate batch key, invalid target numbers, an empty owner,
+ * an unusable scope), incompleteness or omission warnings, and unclassified errors.
  */
-export type ProviderWarningKind = 'auth' | 'rate-limit' | 'not-found' | 'no-connection' | 'other';
+export type ProviderWarningKind = 'auth' | 'rate-limit' | 'not-found' | 'no-connection' | 'unsupported' | 'other';
 
 /**
  * Why a read that SUCCEEDED still withheld results:
@@ -41,12 +52,54 @@ export type ProviderWarningOmissionKind = 'provider-limit' | 'recovery-budget' |
  */
 export type ProviderWarningOmissionRecovery = 'none' | 'page-budget' | 'narrow-scope';
 
-/** Which repository / project / resource an omission is attributed to. All fields optional; a scope may name none. */
-export interface ProviderWarningOmissionScope {
-	providerId?: string;
+/**
+ * The part of a provider a warning is confined to: one resource (organization, workspace, site), project or
+ * repository. All fields optional; see {@link ProviderWarning.scope} for when one is forwarded.
+ */
+export interface ProviderWarningScope {
+	/**
+	 * The resource as the read addressed it: its id on most reads, its name on the few that address it by name
+	 * (Azure DevOps' repo-scoped reads, Bitbucket's workspace reads). Match it against both
+	 * `ProviderOrganization.id` and `name`.
+	 */
 	resourceId?: string;
 	projectId?: string;
 	repositoryId?: string;
+}
+
+/**
+ * Why a provider request failed, when the failure itself says so:
+ * - `unreachable`: a transport failure or server-side error prevented the provider from answering. The connection
+ *   still exists; this accompanies `kind: 'other'`, never an authentication warning.
+ * - `oauth-app-not-allowed`: the organization does not let third-party OAuth apps in. On Azure DevOps this is the
+ *   organization policy "Third-party application access via OAuth", off by default for new organizations. An
+ *   organization admin enables it, or the user connects with a personal access token instead, which the policy
+ *   does not govern.
+ * - `access-denied`: the account has no access to that organization or project (not a member, or lacking the
+ *   permission). Someone who administers it has to grant access.
+ * - `conditional-access`: a Microsoft Entra Conditional Access policy blocked the request (Azure DevOps
+ *   `VS403463`). Its admin has to exempt the request, e.g. by location or device.
+ *
+ * None of these is healed by reconnecting, which is the point of naming them.
+ */
+export type ProviderWarningCauseReason =
+	| 'oauth-app-not-allowed'
+	| 'access-denied'
+	| 'conditional-access'
+	| 'unreachable';
+
+/** See {@link ProviderWarning.cause}. */
+export interface ProviderWarningCause {
+	reason: ProviderWarningCauseReason;
+	/** The provider's own error code, when it reports one (Azure DevOps `TF400813`, `VS403463`). */
+	code?: string;
+	/** Where the setting behind the refusal is changed, when this layer can address it. */
+	remedyUrl?: string;
+}
+
+/** Which repository / project / resource an omission is attributed to. All fields optional; a scope may name none. */
+export interface ProviderWarningOmissionScope extends ProviderWarningScope {
+	providerId?: string;
 }
 
 export interface ProviderWarningOmission {
@@ -88,8 +141,54 @@ export interface ProviderWarning {
 	connectionId?: string;
 	message: string;
 	kind: ProviderWarningKind;
-	/** Convenience mirror of `kind === 'auth'`. */
+	/** Convenience mirror of `kind === 'auth'`, scoped or not; read {@link scope} before prompting to reconnect. */
 	isAuth: boolean;
+	/**
+	 * Present when the failure was recorded against one sub-scope of the read (an organization, project or
+	 * repository) rather than against the connection. A scoped `auth` failure is that one scope refusing this
+	 * credential, e.g. an Azure DevOps organization that disallows third-party OAuth apps, one in another Entra
+	 * tenant, or a Conditional Access policy. Reconnecting cannot fix those, so this warning alone is no reason
+	 * to prompt for it.
+	 *
+	 * `kind` and `isAuth` are unaffected: a scoped 401 is still an authentication failure, and this field says
+	 * how far it reaches. It names at least one of its IDs, and is never set on an omission (which carries its
+	 * own {@link ProviderWarningOmission.scope}) or on a warning derived from a caught exception (see
+	 * {@link toProviderWarning}), even when that call targeted a single organization. The exception is a batch
+	 * read's refused target, which names its scope: the Azure DevOps organization and project, the repository on
+	 * other git hosts, or the tracker's resource.
+	 *
+	 * Its ABSENCE means account-wide or unattributed, so existing handling stays correct without it.
+	 *
+	 * A scoped `auth` failure also means the credential itself was accepted. A dead token can come back as nothing
+	 * but scoped refusals wherever a read reaches its scopes without an uncached request to the connection first:
+	 * discovery served from a per-token cache (Azure DevOps, Bitbucket, Jira Cloud) or an SDK fan-out across the
+	 * requested repositories (Bitbucket Data Center). So when a read's only auth failures are scoped, those providers
+	 * confirm the credential with one uncached check first, and a refused credential fails the whole read with an
+	 * unscoped `auth` warning. A batch read checks it only when every target was refused, since a target that
+	 * answered already proved it. A refusal the provider attributes to the credential itself, like Bitbucket's or Jira
+	 * Cloud's for a token missing the OAuth scopes a read needs, which a reconnect fixes, is published unscoped too,
+	 * once for the connection, while the scopes that answered keep their results.
+	 *
+	 * So the promise holds for a read that carries no unscoped `auth` warning of its own; one that does already asks
+	 * for a reconnect, and its other scoped refusals are not checked. Two exceptions stay scoped even then. A check
+	 * that could not complete or was denied (a network error, a throttle, a `403`, Bitbucket Data Center refusing a
+	 * credential it authenticated, or a Bitbucket Data Center project access token, whose user the check cannot
+	 * find) proves nothing, so the warnings are published unconfirmed, with no {@link cause}, and the next read
+	 * checks again. And a credential confirmed within the last minute is not probed again, so a revocation can take
+	 * up to a minute to surface.
+	 */
+	scope?: ProviderWarningScope;
+	/**
+	 * Why the provider request failed, when the failure itself says so: see {@link ProviderWarningCauseReason}. Switch on
+	 * `reason` to recommend a fix instead of a reconnect; `message` then carries the same explanation as prose.
+	 *
+	 * `unreachable` accompanies a transport or server failure with `kind: 'other'`. Credential refusal causes are
+	 * set only on a scoped `auth` warning whose credential was confirmed first (see {@link scope}), because the
+	 * refusals they name are indistinguishable from a dead credential until then: Azure DevOps answers a
+	 * third-party OAuth app its organization disallows exactly as it answers an expired token. Only Azure DevOps
+	 * reports one today. Its absence proves nothing about the cause.
+	 */
+	cause?: ProviderWarningCause;
 	/**
 	 * Present when this warning describes results the read could not return even though the request itself
 	 * SUCCEEDED — a provider-enforced cap, an exhausted recovery budget, a page budget, or a sub-scope the read
@@ -262,7 +361,8 @@ export interface ResolveRepositoryResult {
 
 const maxProviderWarningMessageLength = 500;
 
-function providerWarningMessage(ex: unknown): string {
+/** A caught error's message as a warning can carry it: an HTML page becomes its status, and prose is capped. */
+export function providerWarningMessage(ex: unknown): string {
 	const raw = (ex instanceof Error ? ex.message : String(ex)).trim();
 	const carrier = ex as { status?: unknown; response?: { status?: unknown } } | null | undefined;
 	const status =
@@ -333,6 +433,8 @@ export function toProviderWarning(
 		kind = 'rate-limit';
 	} else if (ex instanceof RequestNotFoundError) {
 		kind = 'not-found';
+	} else if (isUnsupportedSortError(ex)) {
+		kind = 'unsupported';
 	} else {
 		kind = 'other';
 	}
@@ -344,6 +446,7 @@ export function toProviderWarning(
 		message: providerWarningMessage(ex),
 		kind: kind,
 		isAuth: kind === 'auth',
+		...(kind === 'other' && isProviderUnreachableError(ex) ? { cause: { reason: 'unreachable' as const } } : {}),
 	};
 }
 
@@ -417,6 +520,10 @@ export function reconcileOmissionsWithFailure(warnings: ProviderWarning[], fetch
 /**
  * A stable key for deduplicating warnings accumulated across drained pages / fan-out scopes.
  *
+ * The scope and the cause are keyed for the reason the omission is (see {@link providerWarningOmissionKey}): today's
+ * failure messages happen to spell them out, but two failures that differ in either must stay two warnings even if
+ * they don't.
+ *
  * `message` stays LAST. It is the only free-form segment — provider prose, spaces and all — so anything
  * appended after it could be impersonated by a message that happens to end in the same text.
  */
@@ -426,6 +533,8 @@ function providerWarningKey(warning: ProviderWarning): string {
 		warning.connectionId ?? '',
 		warning.domain ?? '',
 		warning.kind,
+		collectionScopeKey(warning.scope),
+		warning.cause?.reason ?? '',
 		providerWarningOmissionKey(warning.omission),
 		warning.message,
 	].join(' ');
@@ -433,7 +542,7 @@ function providerWarningKey(warning: ProviderWarning): string {
 
 /**
  * Appends `warning` to `into` only when an equal warning (by provider/connection/domain/kind/message, plus the
- * structured omission when one is present) is absent.
+ * structured scope, cause and omission when present) is absent.
  */
 export function appendDedupedWarning(into: ProviderWarning[], warning: ProviderWarning): void {
 	const key = providerWarningKey(warning);

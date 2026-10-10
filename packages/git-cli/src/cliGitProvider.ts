@@ -1,8 +1,12 @@
+import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
+import type { CachedGitTypes } from '@gitlens/git/cache.js';
 import { Cache } from '@gitlens/git/cache.js';
 import type { GitServiceContext } from '@gitlens/git/context.js';
 import type { GitFileStatus } from '@gitlens/git/models/fileStatus.js';
+import type { RepositoryChange } from '@gitlens/git/models/repository.js';
 import { deletedOrMissing } from '@gitlens/git/models/revision.js';
+import type { GitOperationRunOptions } from '@gitlens/git/providers/operations.js';
 import type { GitProvider, GitProviderDescriptor } from '@gitlens/git/providers/provider.js';
 import { parseGitRemoteUrl } from '@gitlens/git/utils/remote.utils.js';
 import { isUncommitted } from '@gitlens/git/utils/revision.utils.js';
@@ -91,10 +95,31 @@ export class CliGitProvider implements GitProvider {
 	private readonly _git: Git;
 
 	readonly context: GitServiceContext;
+	/** The host's own hooks, before the provider wraps `cache.onReset` with its own clearing */
+	private readonly _hostHooks: GitServiceContext['hooks'];
 	private readonly _localRepositories: boolean;
 
 	constructor(options: CliGitProviderOptions) {
-		this.context = options.context;
+		// Every typed write announces itself through `onReset`, so the provider clears its own state there
+		// rather than trusting each host to: a host with no handler still reads fresh after a write. A write
+		// hard-evicts, so a caller after it never joins a read that started before it; watcher-driven clears
+		// reach `Cache.clearCaches` directly and keep sharing in-flight reads.
+		const hostHooks = options.context.hooks;
+		this._hostHooks = hostHooks;
+		this.context = {
+			...options.context,
+			hooks: {
+				...hostHooks,
+				cache: {
+					...hostHooks?.cache,
+					onReset: (repoPath, ...types) => {
+						this._cache.evictCaches(repoPath, ...types);
+						this._git.clearPendingCommands(this.getRepositoryPaths(repoPath));
+						hostHooks?.cache?.onReset?.(repoPath, ...types);
+					},
+				},
+			},
+		};
 		this._localRepositories = options.localRepositories ?? true;
 		this._git =
 			options.git ??
@@ -107,6 +132,10 @@ export class CliGitProvider implements GitProvider {
 			});
 		this._cacheOwned = !(options.cache instanceof Cache);
 		this._cache = options.cache instanceof Cache ? options.cache : new Cache();
+
+		// Wires a raw `git.run({ notify })` call back to this provider's own cache/host announcement —
+		// unconditionally, so a host-supplied `options.git` gets bound exactly like one we construct here.
+		this._git.bindChangeNotifier((repoPaths, changes) => this.notifyChangedCore(repoPaths, changes));
 	}
 
 	/** The underlying cache instance (for repo path registration, etc.) */
@@ -152,21 +181,139 @@ export class CliGitProvider implements GitProvider {
 		return this._git.path();
 	}
 
-	async clone(url: string, parentPath: string): Promise<string | undefined> {
-		let count = 0;
-		const [, , remotePath] = parseGitRemoteUrl(url);
-		const remoteName = remotePath.split('/').pop();
-		if (!remoteName) return undefined;
+	async clone(
+		url: string,
+		parentPath: string,
+		options?: { folderName?: string },
+		runOptions?: GitOperationRunOptions,
+	): Promise<string | undefined> {
+		let folderPath: string;
+		if (options?.folderName) {
+			folderPath = joinPaths(parentPath, options.folderName);
+		} else {
+			const [, , remotePath] = parseGitRemoteUrl(url);
+			const remoteName = remotePath.split('/').pop();
+			if (!remoteName) return undefined;
 
-		let folderPath = joinPaths(parentPath, remoteName);
-		while ((await fsExists(folderPath)) && count < 20) {
-			count++;
-			folderPath = joinPaths(parentPath, `${remoteName}-${count}`);
+			let count = 0;
+			folderPath = joinPaths(parentPath, remoteName);
+			while ((await fsExists(folderPath)) && count < 20) {
+				count++;
+				folderPath = joinPaths(parentPath, `${remoteName}-${count}`);
+			}
 		}
 
-		await this._git.run({ cwd: parentPath }, 'clone', url, folderPath);
+		// `throw`: the default handler swallows `remoteConnectionError`, which would return a folder never cloned
+		await this._git.run({ cwd: parentPath, errors: 'throw', ...runOptions }, 'clone', url, folderPath);
 
 		return folderPath;
+	}
+
+	/** Creates a new repository at `targetPath` (`git init`), creating it first if it doesn't yet exist. */
+	async init(targetPath: string, options?: { defaultBranch?: string; bare?: boolean }): Promise<void> {
+		await fs.mkdir(targetPath, { recursive: true });
+
+		const args = ['init'];
+		if (options?.defaultBranch) {
+			args.push('-b', options.defaultBranch);
+		}
+		if (options?.bare) {
+			args.push('--bare');
+		}
+
+		// Run inside the target rather than naming it from its parent: a relative `targetPath` would otherwise
+		// be resolved against the parent a second time
+		await this._git.run({ cwd: targetPath }, ...args);
+	}
+
+	/**
+	 * Notifies the provider that `repoPath` was mutated outside of a typed sub-provider method — e.g. a
+	 * consumer that ran a command through the raw `git.run`/`provider.git.run` escape hatch. Fires the same
+	 * `cache.onReset`/`repository.onChanged` hooks a typed mutator would, so, exactly as after a typed write,
+	 * the provider hard-evicts its own caches for `repoPath` and drops its pending commands for the repository
+	 * (its sibling worktrees included) before the host's handlers run.
+	 *
+	 * What is reset: `options.cache` when given (`'all'` for everything, `[]` for nothing); otherwise the
+	 * cache types `changes` map to, the same mapping a file watcher's changes get, status clock included.
+	 * An empty `changes`, or one naming `'unknown'` or `'closed'`, resets everything. Changes that map to
+	 * no cache type (e.g. `'starred'`) reset nothing, and `onReset` doesn't fire; `onChanged` always fires.
+	 */
+	notifyChanged(
+		repoPath: string,
+		changes: readonly RepositoryChange[],
+		options?: { cache?: readonly CachedGitTypes[] | 'all' },
+	): void {
+		this.notifyChangedCore([repoPath], changes, options);
+	}
+
+	/**
+	 * {@link notifyChanged} for one change seen from several paths, e.g. a `-C` shared-state verb announced
+	 * for both its target and the caller's `cwd`. Each path's caches are reset and the host's `onReset` fires
+	 * for each, since a host may keep per-worktree state, but a repository's pending commands are dropped once
+	 * however many of its worktrees are named.
+	 */
+	private notifyChangedCore(
+		repoPaths: readonly string[],
+		changes: readonly RepositoryChange[],
+		options?: { cache?: readonly CachedGitTypes[] | 'all' },
+	): void {
+		const resets: { repoPath: string; types: CachedGitTypes[] }[] = [];
+		const pendingPaths = new Set<string>();
+		for (const repoPath of repoPaths) {
+			const types = this.resetForChanges(repoPath, changes, options?.cache);
+			if (types == null) {
+				// A gk config change is reconciled outside the cache types, but its re-read must not join a pre-write run
+				if (options?.cache == null && changes.includes('gkConfig')) {
+					for (const path of this.getRepositoryPaths(repoPath)) {
+						pendingPaths.add(path);
+					}
+				}
+				continue;
+			}
+
+			resets.push({ repoPath: repoPath, types: types });
+			for (const path of this.getRepositoryPaths(repoPath)) {
+				pendingPaths.add(path);
+			}
+		}
+
+		if (pendingPaths.size) {
+			this._git.clearPendingCommands([...pendingPaths]);
+		}
+		for (const { repoPath, types } of resets) {
+			this._hostHooks?.cache?.onReset?.(repoPath, ...types);
+		}
+		for (const repoPath of repoPaths) {
+			this.context.hooks?.repository?.onChanged?.(repoPath, [...changes]);
+		}
+	}
+
+	/** Evicts what a notified change reset for `repoPath`: the types reset (`[]` = all), or `undefined` for none. */
+	private resetForChanges(
+		repoPath: string,
+		changes: readonly RepositoryChange[],
+		cache: readonly CachedGitTypes[] | 'all' | undefined,
+	): CachedGitTypes[] | undefined {
+		if (cache != null && cache !== 'all') {
+			if (!cache.length) return undefined;
+
+			this._cache.evictCaches(repoPath, ...cache);
+			return [...cache];
+		}
+
+		if (cache === 'all' || !changes.length || changes.some(c => c === 'unknown' || c === 'closed')) {
+			this._cache.evictCaches(repoPath);
+			return [];
+		}
+
+		const types = this._cache.applyRepositoryChanges(repoPath, changes, 'evict');
+		return types.length ? types : undefined;
+	}
+
+	/** `repoPath` and every worktree registered as sharing its repository, since a shared-ref write moves them all. */
+	private getRepositoryPaths(repoPath: string): string[] {
+		const commonPath = this._cache.getCommonPath(repoPath);
+		return [...new Set([repoPath, commonPath, ...this._cache.getWorktreePaths(commonPath)])];
 	}
 
 	private _blame: BlameGitSubProvider | undefined;

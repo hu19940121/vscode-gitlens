@@ -24,6 +24,7 @@ import type {
 } from '../providers/models.js';
 import { IssueFilter, PagingMode, PullRequestFilter } from '../providers/models.js';
 import { createFakeRuntime } from './fakeRuntime.js';
+import { readProjectsOneByOne } from './projectReads.js';
 
 /**
  * Verifies the IntegrationService ProviderBackend facade (#5438): page ↔ cursor round-trip, hasMore
@@ -100,6 +101,7 @@ function providerIssue(id: string): ProviderIssue {
 
 function searchPullRequest(id: string, state: 'open' | 'closed' | 'merged'): PullRequest {
 	return {
+		type: 'pullrequest',
 		id: id,
 		nodeId: `node-${id}`,
 		title: `PR ${id}`,
@@ -393,7 +395,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		assert.deepEqual(
 			result.items.map(pr => pr.body).sort(),
 			['Body of PR 1', 'Body of PR 2'],
-			'the search fragment body survives the per-state round-trip through toProviderPullRequest (#5549)',
+			'the search fragment body survives the per-state account-wide read (#5549)',
 		);
 		assert.equal(result.page.truncated, true, 'GitHub search truncation is surfaced on the page');
 		assert.equal(result.warnings.length, 1, 'a generic truncation warning is emitted when no metadata explains it');
@@ -538,6 +540,66 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		);
 		assert.equal(result.page.currentPage, 2);
 		assert.equal(result.hasMore, false);
+
+		manager.dispose();
+	});
+
+	test('listPullRequestsPage resolves account-wide GitHub authorship by login when the ids never can', async () => {
+		// GitLens' own GitHub GraphQL client keys a row's author by login, while `getCurrentAccount` answers
+		// GitHub's numeric database id — an id-only match always misses on this path, so this pins the
+		// username fallback that resolves it instead.
+		const runtime = createFakeRuntime();
+		const manager = createIntegrationManager(runtime);
+		const gh = await manager.get(GitCloudHostIntegrationId.GitHub);
+		assert.ok(gh);
+		(gh as unknown as { _session: ProviderAuthenticationSession })._session = primarySession('t');
+
+		(
+			gh as unknown as {
+				getMyPullRequestsForUserResult: () => Promise<IntegrationResult<PagedResult<ProviderPullRequest>>>;
+			}
+		).getMyPullRequestsForUserResult = () =>
+			Promise.resolve({
+				value: {
+					values: [
+						providerPr('mine', {
+							number: 1,
+							author: {
+								id: 'eamodio',
+								name: 'Eric Amodio',
+								email: null,
+								username: 'eamodio',
+								avatarUrl: null,
+								url: null,
+							},
+						}),
+						providerPr('not-mine', {
+							number: 2,
+							author: {
+								id: 'octocat',
+								name: 'The Octocat',
+								email: null,
+								username: 'octocat',
+								avatarUrl: null,
+								url: null,
+							},
+						}),
+					],
+					paging: { more: false, cursor: '{}' },
+				},
+			});
+		(gh as unknown as { getCurrentAccount: () => Promise<{ id: string; username: string }> }).getCurrentAccount =
+			() => Promise.resolve({ id: '641685', username: 'eamodio' });
+
+		const result = await manager.listPullRequestsPage({ providerId: GitCloudHostIntegrationId.GitHub });
+
+		assert.deepEqual(
+			result.items.map(pr => ({ id: pr.id, authoredByMe: pr.authoredByMe })),
+			[
+				{ id: 'mine', authoredByMe: true },
+				{ id: 'not-mine', authoredByMe: false },
+			],
+		);
 
 		manager.dispose();
 	});
@@ -2946,6 +3008,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		let capturedUser: string | undefined;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (
@@ -3000,6 +3063,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		// One failing token fails every project the same way. The per-project warning is built from the provider
 		// error alone and names no project, so all three are structurally identical.
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as { getIssuesForProjectWithTruncationResult: () => Promise<{ error: Error }> }
 		).getIssuesForProjectWithTruncationResult = () => Promise.resolve({ error: new Error('token expired') });
@@ -3046,6 +3110,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		};
 
 		const capturedReads: Array<{ projectId: string; user: string | undefined }> = [];
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (
@@ -3098,6 +3163,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 				: Promise.resolve({ error: new Error('account lookup failed') });
 
 		let issueReads = 0;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -3161,6 +3227,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		};
 
 		const reads: string[] = [];
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (project: {
@@ -3227,6 +3294,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		const readProjects: string[] = [];
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (p: {
@@ -3285,6 +3353,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			});
 		const reads: string[] = [];
 		let p1Calls = 0;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (project: {
@@ -3355,6 +3424,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			});
 		const reads: string[] = [];
 		let p2Calls = 0;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (project: {
@@ -3450,6 +3520,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 
 			const reads: string[] = [];
 			let p2Calls = 0;
+			readProjectsOneByOne(jira);
 			(
 				jira as unknown as {
 					getIssuesForProjectWithTruncationResult: (project: {
@@ -3608,6 +3679,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 				},
 			});
 		const reads: string[] = [];
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (project: {
@@ -3699,6 +3771,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			});
 		};
 		const reads: string[] = [];
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (project: {
@@ -3778,6 +3851,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			}
 		).getProjectsForResourcesWithMetadataResult = () => Promise.resolve({ value: { values: projects } });
 		let issueReads = 0;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -3827,6 +3901,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		let reads = 0;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (p: {
@@ -3866,6 +3941,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		).getProjectsForResourcesWithMetadataResult = () =>
 			Promise.resolve({ value: { values: [{ key: 't1', id: 't1', name: 'Team 1' }] } });
 		let read = false;
+		readProjectsOneByOne(linear);
 		(
 			linear as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -3915,6 +3991,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		(
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: (p: {
@@ -3953,6 +4030,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		let issueReads = 0;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -3994,6 +4072,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			linear as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		// A thrown/unsupported read (Linear's not-implemented) recovers into { error } at the result core.
+		readProjectsOneByOne(linear);
 		(
 			linear as unknown as { getIssuesForProjectWithTruncationResult: () => Promise<{ error: Error }> }
 		).getIssuesForProjectWithTruncationResult = () =>
@@ -4026,6 +4105,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: undefined }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: undefined });
 		let readCalled = false;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -4060,6 +4140,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		).getProjectsForResourcesWithMetadataResult = () =>
 			Promise.resolve({ value: { values: [{ key: 'proj', id: 'p1', name: 'Project One' }] } });
 		let readCalled = false;
+		readProjectsOneByOne(jira);
 		(
 			jira as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -4106,6 +4187,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			linear as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
 		// A provider-native cap (e.g. Trello's cards_limit) returns data but flags truncation with no cursor.
+		readProjectsOneByOne(linear);
 		(
 			linear as unknown as {
 				getIssuesForProjectWithTruncationResult: () => Promise<{
@@ -4168,7 +4250,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		assert.equal(readCalled, false, 'the read is skipped rather than run unfiltered');
 		assert.equal(result.fetchFailed, true);
 		assert.equal(result.warnings.length, 1);
-		assert.equal(result.warnings[0].kind, 'other');
+		assert.equal(result.warnings[0].kind, 'unsupported');
 
 		manager.dispose();
 	});
@@ -4204,7 +4286,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		assert.equal(readCalled, false, 'the read is skipped rather than dropping the unsupported filter');
 		assert.equal(result.fetchFailed, true);
 		assert.equal(result.warnings.length, 1);
-		assert.equal(result.warnings[0].kind, 'other');
+		assert.equal(result.warnings[0].kind, 'unsupported');
 
 		manager.dispose();
 	});
@@ -4527,7 +4609,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		manager.dispose();
 	});
 
-	test('a provider without discovery hooks (Bitbucket Data Center) reports unsupported, not empty (#5438)', async () => {
+	test('a provider without discovery hooks reports unsupported, not empty', async () => {
 		const runtime = createFakeRuntime();
 		const manager = createIntegrationManager(runtime);
 		const bbs = await manager.get(GitSelfManagedHostIntegrationId.BitbucketServer, 'https://bb.example.com');
@@ -4536,8 +4618,8 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			domain: 'bb.example.com',
 		};
 
-		// Bitbucket Data Center registers no org/repo discovery hook. listOrgs/listRepos must say so rather
-		// than return an empty list indistinguishable from a genuinely empty account.
+		assert.ok(bbs);
+		Object.assign(bbs, { getProviderOrganizationsForUser: undefined, getProviderRepositoriesForOrg: undefined });
 		const orgs = await manager.listOrgs({ providerId: GitSelfManagedHostIntegrationId.BitbucketServer });
 		assert.equal(orgs.items.length, 0);
 		assert.equal(orgs.fetchFailed, true);
@@ -4633,7 +4715,7 @@ suite('listIssuesPage project scoping', () => {
 		assert.equal(result.hasMore, false);
 		assert.ok(
 			result.warnings.some(
-				w => w.kind === 'other' && w.message.includes('Project-scoped issue reads are not supported'),
+				w => w.kind === 'unsupported' && w.message.includes('Project-scoped issue reads are not supported'),
 			),
 			'the caller is told the scope was refused, not handed an unscoped page',
 		);

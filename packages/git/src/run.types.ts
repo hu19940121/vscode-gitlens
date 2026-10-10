@@ -1,15 +1,16 @@
+import type { CancellationReason } from '@gitlens/utils/cancellation.js';
 import type { CacheController } from '@gitlens/utils/promiseCache.js';
 import type { GitWarningKey } from './errors.js';
 import type { GitHealthSlownessCategory } from './gitHealth.js';
+import type { RepositoryChange } from './models/repository.js';
 
 export type GitErrorHandling = 'throw' | 'ignore';
 
 /**
- * Why a run was aborted. DIAGNOSTIC ONLY — log it, never branch control flow on it. A timeout kill and a
- * caller abort both terminate the process with SIGTERM and surface as the same error, so this is derived
- * from a duration heuristic and can be wrong near the timeout boundary.
+ * Why a run was cancelled. Exact, read from how the process ended: a caller abort, the run's own `timeout`, or a
+ * SIGTERM from outside (`unknown`).
  */
-export type GitRunCancellation = 'aborted' | 'timeout' | 'unknown';
+export type GitRunCancellation = CancellationReason;
 
 /**
  * Why a run produced no answer. Every value is structurally distinguishable, so these are safe to branch on.
@@ -72,6 +73,7 @@ export interface GitResultCache {
 		factory: (cacheable: CacheController, signal?: AbortSignal) => Promise<GitResult<unknown>>,
 		options?: { createTTL?: number; accessTTL?: number; cancellation?: AbortSignal },
 	): Promise<GitResult<unknown>>;
+	delete(repoPath: string, key: string): void;
 }
 
 /**
@@ -87,6 +89,11 @@ export interface GitRunOptions {
 	configs?: readonly string[];
 	readonly correlationKey?: string;
 	errors?: GitErrorHandling;
+	/**
+	 * Non-zero exit codes that are answers rather than failures (e.g. `1` from `diff --quiet`, "has differences");
+	 * a listed code resolves as `exited` with that `exitCode` in every `errors` mode.
+	 */
+	expectedExitCodes?: readonly number[];
 	/** Priority level for queue ordering. If not specified, will be inferred from the command type. */
 	priority?: GitCommandPriority;
 	/** Specifies that this command should always be executed locally if possible (for live share sessions) */
@@ -116,7 +123,28 @@ export interface GitRunOptions {
 		/** The common repository path for worktree-shared caching. If not provided, defaults to cwd. */
 		commonPath?: string;
 		options?: { createTTL?: number; accessTTL?: number };
+		/**
+		 * Drops this command's cached result first, so the run neither returns the stale value nor joins
+		 * an in-flight run of it, and stores the fresh result for later unforced reads.
+		 */
+		force?: boolean;
 	};
+
+	/**
+	 * Opt-in: after the run settles (success, failure, or cancellation), announce a change to the provider
+	 * for this run's repository, the same way a typed sub-provider mutator does. `'infer'` classifies the
+	 * command's argv (a `-C <path>` re-scopes which repository); a read-only or object-store-only command
+	 * then announces nothing. An explicit array announces exactly those {@link RepositoryChange} kinds,
+	 * regardless of what the argv looks like. Left unset, nothing is classified or announced — zero cost
+	 * for every existing caller. The change is announced for `cwd`, or the `-C` target, as given: run from the
+	 * repository root, since that's the path core's caches are keyed by. A `-C`-scoped verb whose effect every
+	 * worktree shares (`branch`, `fetch`, …) is announced for the caller's `cwd` too, resetting once per repository.
+	 *
+	 * The announcement resets only the caches the announced kinds can have made stale, the same ones a file
+	 * watcher's change of those kinds clears, and drops the repository's pending git runs. A write `'infer'`
+	 * can't classify announces `[]`, which resets everything, as does `['unknown']`.
+	 */
+	notify?: 'infer' | readonly RepositoryChange[];
 
 	// Below options comes from RunOptions<BufferEncoding | 'buffer' | string>
 	cwd?: string;

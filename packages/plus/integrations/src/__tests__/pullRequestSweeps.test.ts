@@ -104,14 +104,14 @@ suite('pull request sweeps (#5438)', () => {
 		manager.dispose();
 	});
 
-	test('a capped page reaching the budget raises one warning, and the cap is what it reports', async () => {
+	test('a capped page reaching the budget reports the cap beside the budget, not instead of it', async () => {
 		const runtime = createFakeRuntime();
 		const { manager, gh } = await connectedGitHub(runtime);
 
 		// Every page is capped by the provider AND has a usable cursor, so the drain runs to `maxPages` with
-		// both facts true. They disagree about the remedy: a budget can be raised, a cap cannot. One drain must
-		// raise ONE warning, and it has to be the cap — otherwise a consumer offers a "load more" that can
-		// never return the capped part.
+		// both facts true. They describe different parts of the read: a bigger budget returns more rows, and
+		// nothing returns the capped ones. Folding them into one warning misstates one part either way — `none`
+		// alone freezes a consumer on a read it could continue, `page-budget` alone promises the capped rows.
 		let calls = 0;
 		(
 			gh as unknown as {
@@ -133,21 +133,94 @@ suite('pull request sweeps (#5438)', () => {
 			maxPages: 2,
 		});
 
-		const truncations = result.warnings.filter(w => /truncat|page budget/i.test(w.message));
-		assert.equal(truncations.length, 1, 'two truncation warnings would contradict each other');
-		assert.equal(truncations[0].omission?.recovery, 'none', 'the cap outranks the budget');
+		assert.deepEqual(
+			result.warnings.map(w => w.omission?.recovery),
+			['page-budget', 'none'],
+			'the budget stop and the capped part are each reported once',
+		);
+		assert.doesNotMatch(
+			result.warnings[1].message,
+			/cannot be continued/,
+			'the capped part does not deny the rest',
+		);
 
 		manager.dispose();
 	});
 
-	test('a cap reported through SDK metadata still outranks the budget', async () => {
+	for (const { name, moreAfterSecondPage, totalCount, expected } of [
+		{
+			name: 'a live cursor',
+			moreAfterSecondPage: true,
+			totalCount: 1393,
+			expected: [
+				{ kind: 'pagination-incomplete', recovery: 'page-budget' },
+				{ kind: 'provider-limit', recovery: 'none', limit: 1000, totalCount: 1393, sort: 'updated:desc' },
+			],
+		},
+		{
+			name: 'a final page',
+			moreAfterSecondPage: false,
+			totalCount: 1393,
+			expected: [
+				{ kind: 'provider-limit', recovery: 'none', limit: 1000, totalCount: 1393, sort: 'updated:desc' },
+			],
+		},
+		{
+			name: 'a count within the limit',
+			moreAfterSecondPage: true,
+			totalCount: 900,
+			expected: [
+				{ kind: 'pagination-incomplete', recovery: 'page-budget' },
+				{ kind: 'pagination-incomplete', recovery: 'none' },
+			],
+		},
+	]) {
+		test(`an unexplained truncation reports the omission its match count supports on ${name}`, async () => {
+			const runtime = createFakeRuntime();
+			const { manager, gh } = await connectedGitHub(runtime);
+
+			let calls = 0;
+			(
+				gh as unknown as {
+					getMyPullRequestsForUserResult: () => Promise<IntegrationResult<PagedResult<ProviderPullRequest>>>;
+				}
+			).getMyPullRequestsForUserResult = () => {
+				calls += 1;
+				const hasMore = calls < 2 || moreAfterSecondPage;
+				return Promise.resolve({
+					value: {
+						values: [providerPr(`pr-${calls}`)],
+						paging: {
+							more: hasMore,
+							cursor: hasMore ? JSON.stringify({ value: calls + 1, type: 'page' }) : '{}',
+							truncated: true,
+							totalCount: totalCount,
+						},
+					},
+				});
+			};
+
+			const result = await manager.sweepPullRequests({
+				providerIds: [GitCloudHostIntegrationId.GitHub],
+				maxPages: 2,
+			});
+
+			assert.deepEqual(
+				result.warnings.map(w => w.omission),
+				expected,
+			);
+
+			manager.dispose();
+		});
+	}
+
+	test('a cap reported through SDK metadata is not repeated beside the budget stop', async () => {
 		const runtime = createFakeRuntime();
 		const { manager, gh } = await connectedGitHub(runtime);
 
 		// GitHub's 1,000-result search cap arrives as an SDK omission, not as `paging.truncated` — the shape
 		// the sibling test above does NOT cover. `assessCollectionMetadata` already warned about it, so this
-		// drain adds no second warning; what it must not do is then report the budget as the reason, since a
-		// bigger budget cannot lift a provider cap.
+		// drain adds no cap warning of its own; it reports only its own stop, which is the budget.
 		let calls = 0;
 		(
 			gh as unknown as {
@@ -173,14 +246,212 @@ suite('pull request sweeps (#5438)', () => {
 			maxPages: 2,
 		});
 
-		// The drain also stopped at its budget, so two warnings describe this page — but they must AGREE.
-		// Raising the budget would return more of the capped set and still never all of it, and the field is
-		// deliberately conservative, so both report `none` and neither offers a load-more.
-		assert.ok(result.warnings.length >= 2, 'the cap and the drain stop are both reported');
+		// Raising the budget returns more of the capped set and never all of it: the SDK's `provider-limit`
+		// says the second, the drain's `page-budget` says the first.
 		assert.deepEqual(
-			[...new Set(result.warnings.filter(w => w.omission != null).map(w => w.omission!.recovery))],
-			['none'],
-			'no warning may offer a bigger budget once the provider itself capped the results',
+			result.warnings.filter(w => w.omission != null).map(w => [w.omission!.kind, w.omission!.recovery]),
+			[
+				['provider-limit', 'none'],
+				['pagination-incomplete', 'page-budget'],
+			],
+		);
+
+		manager.dispose();
+	});
+
+	test('a GitHub facet capped at the ceiling does not hide a sibling facet the budget can continue', async () => {
+		const runtime = createFakeRuntime();
+		const { manager, gh } = await connectedGitHub(runtime);
+
+		// The closed-PR sweep reads `merged` and `closed` as separate searches folded into one provider page. Here
+		// `merged` walks into GitHub's 1,000-result ceiling on the first page while `closed` still has a cursor, so
+		// the drain's budget stop has both a capped facet and a live one. Driven down to the GraphQL response,
+		// because the per-facet cursor bundle is what keeps the live facet reachable.
+		const githubApi = await (
+			gh as unknown as {
+				authenticationService: { apis: { github: Promise<Record<string, unknown> | undefined> } };
+			}
+		).authenticationService.apis.github;
+		assert.ok(githubApi);
+		let closedCalls = 0;
+		githubApi.graphql = (_provider: unknown, _token: unknown, _query: unknown, variables: { search: string }) => {
+			if (variables.search.includes('is:merged')) {
+				return Promise.resolve({
+					search: { issueCount: 1005, pageInfo: { endCursor: null, hasNextPage: false }, nodes: [] },
+				});
+			}
+
+			closedCalls++;
+			return Promise.resolve({
+				search: { issueCount: 1200, pageInfo: { endCursor: `c${closedCalls}`, hasNextPage: true }, nodes: [] },
+			});
+		};
+
+		const result = await manager.sweepPullRequests({
+			providerIds: [GitCloudHostIntegrationId.GitHub],
+			states: ['closed', 'merged'],
+			maxPages: 2,
+		});
+
+		assert.equal(closedCalls, 2, 'the live facet is followed to the budget');
+		assert.equal(result.page.truncated, true);
+		assert.deepEqual(
+			result.warnings.map(w => w.omission),
+			[
+				{ kind: 'pagination-incomplete', recovery: 'page-budget' },
+				{ kind: 'provider-limit', recovery: 'none', limit: 1000, totalCount: 1005, sort: 'updated:desc' },
+			],
+			'more `closed` rows are a bigger budget away; the `merged` rows past the ceiling are not',
+		);
+
+		manager.dispose();
+	});
+
+	test('a GitHub facet capped at the ceiling keeps its cap message when a sibling facet fails', async () => {
+		const runtime = createFakeRuntime();
+		const { manager, gh } = await connectedGitHub(runtime);
+
+		// The failed sibling reaches the drain as SDK metadata on the same page as the capped facet, so the page
+		// counts as explained there — but that metadata says nothing about the cap.
+		const githubApi = await (
+			gh as unknown as {
+				authenticationService: { apis: { github: Promise<Record<string, unknown> | undefined> } };
+			}
+		).authenticationService.apis.github;
+		assert.ok(githubApi);
+		githubApi.graphql = (_provider: unknown, _token: unknown, _query: unknown, variables: { search: string }) => {
+			if (variables.search.includes('is:merged')) {
+				return Promise.resolve({
+					search: { issueCount: 1005, pageInfo: { endCursor: null, hasNextPage: false }, nodes: [] },
+				});
+			}
+
+			return Promise.reject(new Error('closed facet exploded'));
+		};
+
+		const result = await manager.sweepPullRequests({
+			providerIds: [GitCloudHostIntegrationId.GitHub],
+			states: ['closed', 'merged'],
+			maxPages: 2,
+		});
+
+		assert.equal(result.fetchFailed, true);
+		assert.ok(
+			result.warnings.every(w => w.omission == null),
+			'a failed read ships no omission',
+		);
+		assert.ok(
+			result.warnings.some(w => w.message.includes('1005') && w.message.includes('1000')),
+			'the cap seen on the surviving facet is still reported',
+		);
+
+		manager.dispose();
+	});
+
+	test('a GitHub facet capped at the ceiling keeps its omission beside a sibling that lost its cursor', async () => {
+		const runtime = createFakeRuntime();
+		const { manager, gh } = await connectedGitHub(runtime);
+
+		// A sibling that reports another page with no cursor marks the page `partial` through SDK metadata while
+		// the read still succeeds, so the cap stays an omission a consumer can act on.
+		const githubApi = await (
+			gh as unknown as {
+				authenticationService: { apis: { github: Promise<Record<string, unknown> | undefined> } };
+			}
+		).authenticationService.apis.github;
+		assert.ok(githubApi);
+		githubApi.graphql = (_provider: unknown, _token: unknown, _query: unknown, variables: { search: string }) =>
+			Promise.resolve({
+				search: variables.search.includes('is:merged')
+					? { issueCount: 1005, pageInfo: { endCursor: null, hasNextPage: false }, nodes: [] }
+					: { issueCount: 400, pageInfo: { endCursor: null, hasNextPage: true }, nodes: [] },
+			});
+
+		const result = await manager.sweepPullRequests({
+			providerIds: [GitCloudHostIntegrationId.GitHub],
+			states: ['closed', 'merged'],
+			maxPages: 2,
+		});
+
+		assert.ok(!result.fetchFailed);
+		assert.ok(
+			result.warnings.some(
+				w =>
+					w.omission?.kind === 'provider-limit' &&
+					w.omission.totalCount === 1005 &&
+					w.omission.sort === 'updated:desc',
+			),
+			'the cap on the merged facet is reported beside the partial sibling',
+		);
+
+		manager.dispose();
+	});
+
+	test('a repository-scoped item total is not mistaken for a search match count', async () => {
+		const runtime = createFakeRuntime();
+		const { manager, gh } = await connectedGitHub(runtime);
+
+		// The repository-scoped read reports the provider's item total as `paging.totalCount`, not a search
+		// `issueCount`, so a large repository must not be reported as capped.
+		(
+			gh as unknown as {
+				getMyPullRequestsForReposResult: () => Promise<IntegrationResult<PagedResult<ProviderPullRequest>>>;
+			}
+		).getMyPullRequestsForReposResult = () =>
+			Promise.resolve({
+				value: {
+					values: [providerPr('pr-1')],
+					paging: { more: false, cursor: '{}', truncated: true, totalCount: 1500 },
+					metadata: { completeness: 'partial' },
+				},
+			});
+
+		const result = await manager.sweepPullRequests({
+			providerIds: [GitCloudHostIntegrationId.GitHub],
+			repos: [{ namespace: 'octocat', name: 'hello' }],
+			maxPages: 2,
+		});
+
+		assert.ok(result.warnings.every(w => w.omission?.kind !== 'provider-limit'));
+
+		manager.dispose();
+	});
+
+	test('a GitHub search past its 1,000-result ceiling stops at the budget before the ceiling does', async () => {
+		const runtime = createFakeRuntime();
+		const { manager, gh } = await connectedGitHub(runtime);
+
+		// The cap and the budget above are both arranged at the drain. This goes through the real GitHub read,
+		// down to the GraphQL response, because that is where the ceiling was reported on EVERY page once the
+		// account matched more than 1,000 — latching the cap before the walk ever reached it, so a budget stop
+		// with a live cursor came back `exhausted` and a consumer froze on a read it could have continued.
+		const githubApi = await (
+			gh as unknown as {
+				authenticationService: { apis: { github: Promise<Record<string, unknown> | undefined> } };
+			}
+		).authenticationService.apis.github;
+		assert.ok(githubApi);
+		let calls = 0;
+		githubApi.graphql = () => {
+			calls++;
+			return Promise.resolve({
+				search: { issueCount: 1005, pageInfo: { endCursor: `c${calls}`, hasNextPage: true }, nodes: [] },
+			});
+		};
+
+		const result = await manager.sweepPullRequests({
+			providerIds: [GitCloudHostIntegrationId.GitHub],
+			states: ['merged'],
+			maxPages: 2,
+		});
+
+		assert.equal(calls, 2, 'drained exactly maxPages pages');
+		assert.equal(result.page.truncated, true);
+		const truncations = result.warnings.filter(w => w.omission != null);
+		assert.deepEqual(
+			truncations.map(w => w.omission),
+			[{ kind: 'pagination-incomplete', recovery: 'page-budget' }],
+			'no page had reached the ceiling yet, so a bigger budget is what returns the rest',
 		);
 
 		manager.dispose();
@@ -301,6 +572,48 @@ suite('pull request sweeps (#5438)', () => {
 			result.warnings.every(w => w.omission == null),
 			'a failed read must ship no omission, whenever in the drain it was raised',
 		);
+
+		manager.dispose();
+	});
+
+	test('a page that fails after a capped page keeps the cap message and drops its omission', async () => {
+		const runtime = createFakeRuntime();
+		const { manager, gh } = await connectedGitHub(runtime);
+
+		let calls = 0;
+		(
+			gh as unknown as {
+				getMyPullRequestsForUserResult: () => Promise<IntegrationResult<PagedResult<ProviderPullRequest>>>;
+			}
+		).getMyPullRequestsForUserResult = () => {
+			calls += 1;
+			if (calls > 1) return Promise.reject(new Error('page 2 exploded'));
+
+			return Promise.resolve({
+				value: {
+					values: [providerPr('pr-1')],
+					paging: {
+						more: true,
+						cursor: JSON.stringify({ value: 2, type: 'page' }),
+						truncated: true,
+						totalCount: 1393,
+					},
+				},
+			});
+		};
+
+		const result = await manager.sweepPullRequests({
+			providerIds: [GitCloudHostIntegrationId.GitHub],
+			maxPages: 5,
+		});
+
+		assert.equal(result.fetchFailed, true);
+		assert.ok(
+			result.warnings.every(w => w.omission == null),
+			'a failed read must ship no omission',
+		);
+		assert.ok(result.warnings.some(w => w.message.includes('1393') && w.message.includes('1000')));
+		assert.ok(result.warnings.some(w => w.message.includes('did not complete')));
 
 		manager.dispose();
 	});

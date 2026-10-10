@@ -53,13 +53,28 @@ export interface GitOperationsSubProvider {
 	): Promise<void>;
 	fetch(
 		repoPath: string,
-		options?: {
-			all?: boolean | undefined;
-			branch?: GitBranchReference | undefined;
-			prune?: boolean | undefined;
-			pull?: boolean | undefined;
-			remote?: string | undefined;
-		},
+		options?:
+			| {
+					all?: boolean | undefined;
+					branch?: GitBranchReference | undefined;
+					prune?: boolean | undefined;
+					pull?: boolean | undefined;
+					remote?: string | undefined;
+					refspecs?: undefined;
+					/** Leaves `FETCH_HEAD` for a user's own `git pull` to read (`--no-write-fetch-head`); ignored on git older than 2.29 */
+					preserveFetchHead?: boolean | undefined;
+			  }
+			| {
+					all?: undefined;
+					branch?: undefined;
+					prune?: boolean | undefined;
+					pull?: undefined;
+					remote: string;
+					/** Passed verbatim after `remote`; never adds `-u`, so git keeps refusing to write into a checked-out branch. */
+					refspecs: readonly string[];
+					/** Leaves `FETCH_HEAD` for a user's own `git pull` to read (`--no-write-fetch-head`); ignored on git older than 2.29 */
+					preserveFetchHead?: boolean | undefined;
+			  },
 		runOptions?: GitOperationRunOptions,
 	): Promise<void>;
 	merge(
@@ -72,6 +87,12 @@ export interface GitOperationsSubProvider {
 		repoPath: string,
 		options?: {
 			branch?: GitBranchReference | undefined;
+			/**
+			 * `'only'` requires a fast-forward (`--ff-only`) and refuses rather than merging or rebasing — a
+			 * `branch` checked out nowhere is then fast-forwarded by fetching `<upstream>:<branch>`. Spelled as
+			 * `merge`'s option; `--ff`/`--no-ff` are left out because a pull configured to rebase ignores them.
+			 */
+			fastForward?: 'only' | undefined;
 			rebase?: boolean | undefined;
 			tags?: boolean | undefined;
 			source?: unknown;

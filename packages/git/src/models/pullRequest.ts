@@ -9,6 +9,30 @@ import type { RepositoryIdentityDescriptor } from './repositoryIdentities.js';
 
 export type { PullRequestState };
 
+/**
+ * The read that produced a pull request row, as a key for `getPullRequestFieldPresence` (`@gitlens/integrations`). It
+ * names a READ, not a field set: the same tag can carry different fields on different providers.
+ */
+export type PullRequestProjection =
+	/** A single-item read: by number, for a branch, or for a commit. */
+	| 'point'
+	/** The filtered search with the full projection, and the host's "my pull requests" search. */
+	| 'search'
+	/** The filtered search with `summary`. */
+	| 'search-summary'
+	/** The free-text search (`searchPullRequests`). */
+	| 'text-search'
+	/** An account-wide sweep with the full projection (`includeReviews`). */
+	| 'account'
+	/** An account-wide list or sweep with the lightweight projection. */
+	| 'account-summary'
+	/** A repository-scoped list or sweep. */
+	| 'repos'
+	/** A repository-scoped list with `summary`. */
+	| 'repos-summary'
+	/** The coordinate and branch batch reads. */
+	| 'batch';
+
 export interface PullRequestShape extends IssueOrPullRequest {
 	readonly author: PullRequestMember;
 	/**
@@ -29,10 +53,9 @@ export interface PullRequestShape extends IssueOrPullRequest {
 	readonly reviewRequests?: PullRequestReviewer[];
 	/**
 	 * Reviews already submitted, as opposed to the still-pending {@link reviewRequests}. Absent means the read
-	 * didn't fetch reviews; empty means nobody has reviewed. Those are different answers and neither substitutes
-	 * for the other, so which one you get is provider- and read-dependent: GitHub/GHE carry reviews on the
-	 * repo-scoped read and the filtered search, and on the account-wide read only where `includeReviews` opts
-	 * into the full projection, while GitLab never populates the field at all.
+	 * didn't fetch reviews; empty means nobody has reviewed — but only where the read actually fetched them, which
+	 * is provider- and read-dependent: ask `getPullRequestFieldPresence` (`@gitlens/integrations`) for the row's
+	 * `reviews` group rather than trusting an empty array.
 	 * {@link PullRequestReviewer.commitOid} is the narrower promise: only the full GitHub/GHE projection has it.
 	 */
 	readonly latestReviews?: PullRequestReviewer[];
@@ -41,6 +64,16 @@ export interface PullRequestShape extends IssueOrPullRequest {
 	readonly stack?: PullRequestStackInfo;
 	readonly number?: number;
 	readonly authoredByMe?: boolean;
+	/**
+	 * The current account as this pull request's members identify it: the identity {@link authoredByMe} was matched
+	 * against, present exactly when that was. A consumer matching {@link reviewRequests} or {@link latestReviews}
+	 * entries to the current user compares against this, not the account `getCurrentAccount` returns: Azure DevOps
+	 * Server gives one person a different id in each collection than at the server level, and the members carry the
+	 * collection's. Core matches `username` too only on GitHub and GitHub Enterprise, whose rows key people by login.
+	 */
+	readonly viewer?: { readonly id: string; readonly username?: string };
+	/** The read that produced this row. Absent means unknown: a legacy row, or a provider or read not yet tagged. */
+	readonly projection?: PullRequestProjection;
 }
 
 @loggable(i => i.id)
@@ -85,6 +118,8 @@ export class PullRequest implements PullRequestShape {
 		public readonly body?: string,
 		public readonly number?: number,
 		public readonly authoredByMe?: boolean,
+		public readonly projection?: PullRequestProjection,
+		public readonly viewer?: { readonly id: string; readonly username?: string },
 	) {}
 
 	get closed(): boolean {
@@ -291,8 +326,13 @@ export interface PullRequestSearchCapabilities {
 }
 
 export interface PullRequestRef {
-	owner: string;
-	repo: string;
+	/**
+	 * `undefined` when the ref's repository was deleted (a removed fork): GitHub's rows say so, with `exists` false.
+	 * provider-apis' converters fill `''` instead, so test for a value rather than for `undefined`.
+	 */
+	owner: string | undefined;
+	/** `undefined` (or `''`) when the ref's repository was deleted, as {@link owner}. */
+	repo: string | undefined;
 	branch: string;
 	sha: string;
 	exists: boolean;
@@ -386,6 +426,13 @@ export interface PullRequestReviewer {
 	 * repo-scoped read carries natively.
 	 */
 	commitOid?: string;
+	/**
+	 * The reviewer is a group the current user is a member of (a team or another group, directly or through a group
+	 * nested in it) rather than a person: a request to it is one the user can answer as a member, not one addressed to
+	 * them by name. Only the Azure DevOps reads that resolve the user's groups set it; absent elsewhere, including for
+	 * groups a read could not tell the user belongs to.
+	 */
+	isMyGroup?: boolean;
 }
 
 export type PullRequestRepositoryIdentityDescriptor = RequireSomeWithProps<

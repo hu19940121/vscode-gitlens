@@ -7,6 +7,7 @@ import type { IssueOrPullRequest } from '@gitlens/git/models/issueOrPullRequest.
 import type {
 	PullRequest,
 	PullRequestMergeMethod,
+	PullRequestShape,
 	PullRequestState,
 	PullRequestStateFilter,
 } from '@gitlens/git/models/pullRequest.js';
@@ -16,22 +17,35 @@ import type { PullRequestUrlIdentity } from '@gitlens/git/utils/pullRequest.util
 import { CancellationError } from '@gitlens/utils/cancellation.js';
 import type { Emitter } from '@gitlens/utils/event.js';
 import { uniqueBy } from '@gitlens/utils/iterable.js';
-import { batch } from '@gitlens/utils/promise.js';
+import { batch, mapSettledBounded } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
-import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
+import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
 import { IntegrationReadUnavailableError } from '../errors.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
 import type { SearchMyPullRequestsOptions, SearchPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
-import type { AccountWideIssuesResult, SearchMyIssuesOptions } from '../models/integration.js';
+import type {
+	AccountWideIssuesResult,
+	IssueEtagFields,
+	IssueEtagInclude,
+	PullRequestEtagFields,
+	PullRequestEtagInclude,
+	SearchMyIssuesOptions,
+} from '../models/integration.js';
 import type { GitLabIntegrationIds } from './gitlab/gitlab.utils.js';
 import { getGitLabPullRequestIdentityFromMaybeUrl, matchesGitLabOrgNamespace } from './gitlab/gitlab.utils.js';
-import { fromGitLabMergeRequestProvidersApi } from './gitlab/models.js';
+import {
+	fromGitLabMergeRequestProvidersApi,
+	gitLabEtagFieldsMaxIids,
+	gitLabEtagFieldsWithChecksMaxIids,
+	toGitLabIssueEtagFields,
+	toGitLabPullRequestEtagFields,
+} from './gitlab/models.js';
 import type {
 	ProviderApiPagedResult,
 	ProviderHierarchyResult,
@@ -40,6 +54,7 @@ import type {
 	ProviderRepository,
 } from './models.js';
 import {
+	fromProviderPullRequest,
 	getProviderPullRequestIdentity,
 	IssueFilter,
 	ProviderPullRequestReviewState,
@@ -49,7 +64,12 @@ import {
 	toProviderPullRequestStates,
 } from './models.js';
 import type { ProvidersApi } from './providersApi.js';
-import { collectProviderPagedResult, mergeCollectionMetadata } from './utils/providerPaging.js';
+import {
+	collectProviderPagedResult,
+	mergeCollectionMetadata,
+	readEtagFieldsByRepository,
+	resolveBranchPullRequests,
+} from './utils/providerPaging.js';
 
 const metadata = providersMetadata[GitCloudHostIntegrationId.GitLab];
 const authProvider: IntegrationAuthenticationProviderDescriptor = Object.freeze({
@@ -110,7 +130,12 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 	ID,
 	GitLabRepositoryDescriptor
 > {
-	protected abstract get apiBaseUrl(): string;
+	protected abstract apiBaseUrlFor(session: ProviderAuthenticationSession): string;
+
+	/** The installation base the PAT-based reads take on self-hosted GitLab; gitlab.com passes none. */
+	protected enterpriseBaseUrlFor(session: ProviderAuthenticationSession): string | undefined {
+		return this.isEnterprise ? this.getSelfManagedApiBaseUrl(session) : undefined;
+	}
 
 	/** Self-hosted GitLab uses PAT semantics and a domain-based API base; gitlab.com does not. */
 	protected get isEnterprise(): boolean {
@@ -133,7 +158,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			rev,
 			{
 				...options,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -154,7 +179,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			email,
 			{
 				...options,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -177,7 +202,9 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			const account = await this.getProviderAccountForEmail(session, repo, email);
 			if (account?.id == null) return;
 
-			const keys = await api.getUserSigningKeys(this, token, account.id, { baseUrl: this.apiBaseUrl });
+			const keys = await api.getUserSigningKeys(this, token, account.id, {
+				baseUrl: this.apiBaseUrlFor(session),
+			});
 			result.set(
 				email.toLowerCase(),
 				keys.map(k => k.key),
@@ -197,7 +224,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			repo.owner,
 			repo.name,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -214,7 +241,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			repo.name,
 			Number(id),
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -235,7 +262,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			toTokenWithInfo(this.id, session),
 			repo.owner,
 			repo.name,
-			this.apiBaseUrl,
+			this.apiBaseUrlFor(session),
 			undefined,
 		);
 		if (!repoId) {
@@ -247,10 +274,10 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			{ namespace: repo.owner, name: repo.name, number: id },
 			{
 				isPAT: this.isEnterprise,
-				baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+				baseUrl: this.enterpriseBaseUrlFor(session),
 			},
 		);
-		const issue = apiResult != null ? toIssueShape(apiResult, this) : undefined;
+		const issue = apiResult != null ? toIssueShape(apiResult, this, { projection: 'point' }) : undefined;
 		return issue != null ? { ...issue, type: 'issue' } : undefined;
 	}
 
@@ -276,7 +303,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			{
 				...opts,
 				include: include?.map(s => toGitLabMergeRequestState(s)),
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -293,7 +320,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			repo.name,
 			rev,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -310,8 +337,224 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			resource.name,
 			parseInt(id, 10),
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
+		);
+	}
+
+	/**
+	 * One request per target, settled independently so one target's failure rejects only its own slot; through the
+	 * SDK's issue read and the conversion the repo-scoped list rows take. GitLens' own GitLab client can't alias
+	 * the read instead: it fails a whole document on any GraphQL error, where a batch needs per-target errors.
+	 */
+	protected override async getProviderIssuesBatch(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<IssueShape | undefined>[] | undefined> {
+		const api = await this.getProvidersApi();
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		const baseUrl = this.enterpriseBaseUrlFor(session);
+		// The confirming read must ask the same host, over the same protocol, as the read it confirms.
+		const confirmBaseUrl = this.apiBaseUrlFor(session);
+
+		return mapSettledBounded(coordinates, providerFanOutConcurrency, async c => {
+			const issue = await api.getIssueForRepo(tokenWithInfo, { namespace: c.owner, name: c.repo }, c.number, {
+				isPAT: this.isEnterprise,
+				baseUrl: baseUrl,
+			});
+			if (issue != null) {
+				const shape = toIssueShape(issue, this, { projection: 'batch' });
+				if (shape == null) throw new Error(`GitLab returned issue ${c.number} without a URL or update time`);
+
+				return shape;
+			}
+
+			// provider-apis' "not found" can come from a reply carrying only GraphQL errors (see `getIssueForRepo`),
+			// so only our own strict read can prove the miss.
+			const gitlab = await this.authenticationService.apis.gitlab;
+			if (gitlab == null) {
+				throw new IntegrationReadUnavailableError(this.name, 'cannot confirm a missing issue');
+			}
+
+			const exists = await gitlab.hasIssue(
+				this,
+				tokenWithInfo,
+				c.owner,
+				c.repo,
+				c.number,
+				{ baseUrl: confirmBaseUrl, deferFailure: true },
+				cancellation,
+			);
+			// Our own query can't produce the list rows' shape, so a disagreement fails rather than answering thinner.
+			if (exists) throw new Error(`GitLab reported issue ${c.number} missing, then found it`);
+
+			return undefined;
+		});
+	}
+
+	/**
+	 * One request per target, settled independently so one target's failure rejects only its own slot; through
+	 * the same SDK read and conversion the manager's list rows take.
+	 */
+	protected override async getProviderPullRequestsBatch(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { currentAccount?: { id: string; username?: string } } | undefined,
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<PullRequestShape | undefined>[] | undefined> {
+		const api = await this.getProvidersApi();
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		const baseUrl = this.enterpriseBaseUrlFor(session);
+		// The confirming read must ask the same host, over the same protocol, as the read it confirms.
+		const confirmBaseUrl = this.apiBaseUrlFor(session);
+
+		return mapSettledBounded(coordinates, providerFanOutConcurrency, async c => {
+			const pr = await api.getPullRequestForRepo(tokenWithInfo, { namespace: c.owner, name: c.repo }, c.number, {
+				isPAT: this.isEnterprise,
+				baseUrl: baseUrl,
+			});
+			if (pr != null) {
+				return fromProviderPullRequest(pr, this, {
+					currentAccount: options?.currentAccount,
+					projection: 'batch',
+				});
+			}
+
+			// provider-apis' GitLab GraphQL helper ignores the response's `errors`, so a reply carrying only errors
+			// (e.g. a server-side timeout) comes back as `null`, the same as not-found. Our own client throws on
+			// `errors`, and `strict` makes it answer `undefined` only for a real miss.
+			const gitlab = await this.authenticationService.apis.gitlab;
+			if (gitlab == null) {
+				throw new IntegrationReadUnavailableError(this.name, 'cannot confirm a missing merge request');
+			}
+
+			const confirmed = await gitlab.getPullRequest(
+				this,
+				tokenWithInfo,
+				c.owner,
+				c.repo,
+				c.number,
+				{ baseUrl: confirmBaseUrl, strict: true, deferFailure: true },
+				cancellation,
+			);
+			// Our own client's row can't produce the list rows' shape (`id` is the iid, not the global id; no
+			// `authoredByMe`), so a disagreement fails rather than answering with a different identity.
+			if (confirmed != null) throw new Error(`GitLab reported pull request ${c.number} missing, then found it`);
+
+			return undefined;
+		});
+	}
+
+	/**
+	 * The cheap check behind the batch issue read's etags: GitLens' own GitLab client reads each project's issues by
+	 * iid, up to {@link gitLabEtagFieldsMaxIids} in ONE request, where {@link getProviderIssuesBatch} sends one or
+	 * two per target. Each row is converted as provider-apis and `toIssueShape` convert the full one, so both reads
+	 * compute the same etag, and `'reactions'` adds the upvote count the full row's `thumbsUpCount` comes from. A
+	 * request that throws rejects only its own targets' slots.
+	 */
+	protected override async getProviderIssuesEtagFields(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { etagIncludes?: readonly IssueEtagInclude[] },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<IssueEtagFields | undefined>[] | undefined> {
+		const gitlab = await this.authenticationService.apis.gitlab;
+		if (gitlab == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		// The host and protocol the full read's confirming read asks.
+		const baseUrl = this.apiBaseUrlFor(session);
+		const etagIncludes = options.etagIncludes ?? [];
+
+		return readEtagFieldsByRepository(
+			coordinates,
+			gitLabEtagFieldsMaxIids,
+			(owner, repo, iids) =>
+				gitlab.getIssuesEtagFields(
+					this,
+					tokenWithInfo,
+					`${owner}/${repo}`,
+					iids,
+					{ baseUrl: baseUrl, etagIncludes: etagIncludes, deferFailure: true },
+					cancellation,
+				),
+			node => toGitLabIssueEtagFields(node, etagIncludes),
+		);
+	}
+
+	/**
+	 * The cheap check behind the batch pull request read's etags: {@link getProviderIssuesEtagFields}'s requests and
+	 * failure isolation over merge requests, selecting a merge request's change state plus the fields of each of
+	 * `options.etagIncludes`. Every include is meaningful here: a full row carries a mergeability, a review decision
+	 * and a check rollup, each of which can change without moving `updatedAt`.
+	 */
+	protected override async getProviderPullRequestsEtagFields(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { etagIncludes?: readonly PullRequestEtagInclude[] },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<PullRequestEtagFields | undefined>[] | undefined> {
+		const gitlab = await this.authenticationService.apis.gitlab;
+		if (gitlab == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		// The host and protocol the full read's confirming read asks.
+		const baseUrl = this.apiBaseUrlFor(session);
+		const etagIncludes = options.etagIncludes ?? [];
+
+		return readEtagFieldsByRepository(
+			coordinates,
+			etagIncludes.includes('checks') ? gitLabEtagFieldsWithChecksMaxIids : gitLabEtagFieldsMaxIids,
+			(owner, repo, iids) =>
+				gitlab.getMergeRequestsEtagFields(
+					this,
+					tokenWithInfo,
+					`${owner}/${repo}`,
+					iids,
+					{ baseUrl: baseUrl, etagIncludes: etagIncludes, deferFailure: true },
+					cancellation,
+				),
+			node => toGitLabPullRequestEtagFields(node, etagIncludes),
+		);
+	}
+
+	/**
+	 * Two steps, because provider-apis has no source-branch filter: GitLens' own GitLab client finds each branch's
+	 * matching iids, one request per target, then {@link getProviderPullRequestsBatch} resolves them — so a row is
+	 * the one `getPullRequestsBatch` returns for that merge request, `url` and `authoredByMe` included.
+	 */
+	protected override async getProviderPullRequestsForBranches(
+		session: ProviderAuthenticationSession,
+		targets: readonly { owner: string; repo: string; project?: string; branch: string; headOwner?: string }[],
+		options: { currentAccount?: { id: string; username?: string }; limit: number },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<{ pullRequests: PullRequestShape[]; truncated: boolean }>[] | undefined> {
+		const gitlab = await this.authenticationService.apis.gitlab;
+		if (gitlab == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		// The session's own host and protocol, as the batch read's confirming read uses.
+		const apiBaseUrl = this.apiBaseUrlFor(session);
+
+		const found = await mapSettledBounded(targets, providerFanOutConcurrency, t =>
+			gitlab.getPullRequestNumbersForBranch(
+				this,
+				tokenWithInfo,
+				t.owner,
+				t.repo,
+				t.branch,
+				{ baseUrl: apiBaseUrl, headOwner: t.headOwner, limit: options.limit, deferFailure: true },
+				cancellation,
+			),
+		);
+		return resolveBranchPullRequests(targets, found, coordinates =>
+			this.getProviderPullRequestsBatch(
+				session,
+				coordinates,
+				{ currentAccount: options.currentAccount },
+				cancellation,
+			),
 		);
 	}
 
@@ -323,12 +566,12 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 	}): Promise<ProviderRepository | undefined> {
 		const api = await this.getProvidersApi();
 		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
-		const session = await this.resolveReadSession(repo.connectionId, undefined);
+		const session = await this.resolveReadSessionOrThrow(repo.connectionId, undefined);
 		if (session == null) return undefined;
 
 		return api.getRepo(toTokenWithInfo(this.id, session), repo.owner, repo.name, repo.project, {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 		});
 	}
 
@@ -343,7 +586,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			repo.owner,
 			repo.name,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 			cancellation,
 		);
@@ -355,7 +598,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 		const api = await this.getProvidersApi();
 		const result = await api.getGitlabGroupsForCurrentUser(toTokenWithInfo(this.id, session), {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 		});
 		return {
 			values: result.values.map(g => ({ id: g.id, providerId: this.id, name: g.fullPath, url: g.webUrl })),
@@ -380,7 +623,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 		const api = await this.getProvidersApi();
 		const result = await api.getReposForCurrentUser(toTokenWithInfo(this.id, session), {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 			cursor: options?.cursor,
 		});
 		return {
@@ -398,7 +641,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 		// version of the per-org read above (which pages the same source and filters by namespace).
 		return api.getReposForCurrentUser(toTokenWithInfo(this.id, session), {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 			cursor: options?.cursor,
 		});
 	}
@@ -419,7 +662,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 
 		const apiResult = await api.getPullRequestsForUser(toTokenWithInfo(this.id, session), username, {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 			states: toProviderPullRequestStates(options?.state),
 		});
 
@@ -460,7 +703,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 
 						return isAssignee || isRequestedReviewer || isAuthor;
 					})
-					.map(pr => fromGitLabMergeRequestProvidersApi(pr, this)),
+					.map(pr => fromGitLabMergeRequestProvidersApi(pr, this, 'search')),
 			],
 			r => r.url,
 			(original, _current) => original,
@@ -508,7 +751,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 				association: association,
 				result: await api.getGitLabPullRequestsForUserAssociation(tokenWithInfo, username, association, {
 					isPAT: this.isEnterprise,
-					baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+					baseUrl: this.enterpriseBaseUrlFor(session),
 					states: toProviderPullRequestStates(options?.state),
 					cursor: cursors[association],
 				}),
@@ -592,7 +835,14 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 
 		const repoIdsResult = await Promise.allSettled(
 			repos.map((r: GitLabRepositoryDescriptor): Promise<string | undefined> =>
-				api.getProjectId(this, toTokenWithInfo(this.id, session), r.owner, r.name, this.apiBaseUrl, undefined),
+				api.getProjectId(
+					this,
+					toTokenWithInfo(this.id, session),
+					r.owner,
+					r.name,
+					this.apiBaseUrlFor(session),
+					undefined,
+				),
 			) ?? [],
 		);
 		const repoInput = repoIdsResult
@@ -600,11 +850,11 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			.filter((r): r is string => r != null);
 		const apiResult = await providerApi.getIssuesForRepos(toTokenWithInfo(this.id, session), repoInput, {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 		});
 
 		return apiResult.values
-			.map(issue => toIssueShape(issue, this))
+			.map(issue => toIssueShape(issue, this, { projection: 'account' }))
 			.filter((result): result is IssueShape => result != null);
 	}
 
@@ -642,7 +892,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 		if (!options?.includeAllAssignees && username == null) return undefined;
 		if (cancellation?.aborted) throw new CancellationError();
 
-		const baseUrl = this.isEnterprise ? `https://${this.domain}` : undefined;
+		const baseUrl = this.enterpriseBaseUrlFor(session);
 		const maxPages = 20;
 		// Dedupe by `url`, not `IssueShape.id`: for GitLab `id` is the per-project `iid`, which collides across
 		// projects in an account-wide read (two repos both have issue `#1`), so an id-keyed map would silently
@@ -694,7 +944,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			);
 
 			for (const issue of result.values) {
-				const shape = toIssueShape(issue, this);
+				const shape = toIssueShape(issue, this, { projection: 'account' });
 				if (shape != null && !issuesByUrl.has(shape.url)) {
 					issuesByUrl.set(shape.url, shape);
 				}
@@ -728,7 +978,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			{
 				search: searchQuery,
 				repos: repos?.map(r => `${r.owner}/${r.name}`),
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				include: options?.include,
 			},
 			cancellation,
@@ -749,7 +999,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 			const res = await api.mergePullRequest(toTokenWithInfo(this.id, session), pr, {
 				...options,
 				isPAT: this.isEnterprise,
-				baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+				baseUrl: this.enterpriseBaseUrlFor(session),
 			});
 			return res;
 		} catch (ex) {
@@ -784,7 +1034,7 @@ abstract class GitLabIntegrationBase<ID extends GitLabIntegrationIds> extends Gi
 		const api = await this.getProvidersApi();
 		const currentUser = await api.getCurrentUser(toTokenWithInfo(this.id, session), {
 			isPAT: this.isEnterprise,
-			baseUrl: this.isEnterprise ? `https://${this.domain}` : undefined,
+			baseUrl: this.enterpriseBaseUrlFor(session),
 		});
 		if (currentUser == null) return undefined;
 
@@ -817,7 +1067,7 @@ export class GitLabIntegration extends GitLabIntegrationBase<GitCloudHostIntegra
 		return metadata.domain;
 	}
 
-	protected get apiBaseUrl(): string {
+	protected apiBaseUrlFor(_session: ProviderAuthenticationSession): string {
 		return 'https://gitlab.com/api';
 	}
 
@@ -835,8 +1085,8 @@ export class GitLabSelfHostedIntegration extends GitLabIntegrationBase<GitSelfMa
 	get domain(): string {
 		return this._domain;
 	}
-	protected override get apiBaseUrl(): string {
-		return `https://${this._domain}/api`;
+	protected override apiBaseUrlFor(session: ProviderAuthenticationSession): string {
+		return `${this.getSelfManagedApiBaseUrl(session)}/api`;
 	}
 
 	constructor(

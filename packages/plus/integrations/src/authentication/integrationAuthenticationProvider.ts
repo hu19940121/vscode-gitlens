@@ -5,7 +5,7 @@ import { Emitter } from '@gitlens/utils/event.js';
 import type { IntegrationIds } from '../constants.js';
 import type { Sources } from '../telemetry.js';
 import { areDomainsOnSameHost } from '../utils/domain.utils.js';
-import { isGitSelfManagedHostIntegrationId, isNonExpiringZeroTokenIntegrationId } from '../utils/integration.utils.js';
+import { isNonExpiringZeroTokenIntegrationId, isSelfManagedHostIntegrationId } from '../utils/integration.utils.js';
 import type { ConfiguredIntegrationService } from './configuredIntegrationService.js';
 import type { IntegrationAuthenticationService } from './integrationAuthenticationService.js';
 import type { ProviderAuthenticationSession } from './models.js';
@@ -41,12 +41,18 @@ export interface IntegrationAuthenticationSessionDescriptor {
  * a previous read), which forces a cloud `/refresh` even when the token's expiry still claims it is valid —
  * the case a purely time-based refresh cannot see. The refresh token itself never reaches the client: the GK
  * cloud performs the exchange server-side.
+ *
+ * `refetch` (sync only) fetches a fresh token instead of serving the stored one, WITHOUT deleting the stored one
+ * first: it is replaced only once the fetch returns a session. A forced re-sync used to delete it up front, so a
+ * fetch that failed transiently (a GK API 429 or 5xx) left the connection with no token at all, and every read
+ * until the next good sync reported it as gone (gitkraken/kepler#3546).
  */
 export type GetSessionOptions =
 	| {
 			createIfNeeded?: boolean;
 			forceNewSession?: boolean;
 			sync?: never;
+			refetch?: never;
 			refreshRejectedToken?: boolean;
 			source?: Sources;
 	  }
@@ -54,6 +60,7 @@ export type GetSessionOptions =
 			createIfNeeded?: never;
 			forceNewSession?: never;
 			sync: boolean;
+			refetch?: boolean;
 			refreshRejectedToken?: boolean;
 			source?: Sources;
 	  };
@@ -115,7 +122,7 @@ abstract class IntegrationAuthenticationProviderBase<
 		descriptor: IntegrationAuthenticationSessionDescriptor,
 		options?: { preserveConfigured?: boolean },
 	): Promise<void> {
-		const domain = isGitSelfManagedHostIntegrationId(this.authProviderId) ? descriptor?.domain : undefined;
+		const domain = isSelfManagedHostIntegrationId(this.authProviderId) ? descriptor?.domain : undefined;
 		const configured = this.configuredIntegrationService.getConfigured(this.authProviderId, {
 			domain: domain,
 		});
@@ -139,7 +146,7 @@ abstract class IntegrationAuthenticationProviderBase<
 	async deleteAllSessions(descriptor?: IntegrationAuthenticationSessionDescriptor): Promise<void> {
 		// Self-managed providers group every host under one provider id, so scope the clear to this
 		// descriptor's host when given; for cloud providers the domain stays undefined here, clearing every account.
-		const domain = isGitSelfManagedHostIntegrationId(this.authProviderId) ? descriptor?.domain : undefined;
+		const domain = isSelfManagedHostIntegrationId(this.authProviderId) ? descriptor?.domain : undefined;
 		const configured = this.configuredIntegrationService.getConfigured(this.authProviderId, {
 			domain: domain,
 		});
@@ -158,20 +165,33 @@ abstract class IntegrationAuthenticationProviderBase<
 	): Promise<ProviderAuthenticationSession | undefined> {
 		let session;
 		let previousToken;
+		let refetched: ProviderAuthenticationSession | undefined;
+		let signOutMark: number;
 		if (options?.forceNewSession) {
 			// Cloud-only delete (see deleteSession): scope to cloud so the cloud variant's id is cleared even
-			// when a mixed local+cloud connection's local descriptor is primary.
+			// when a mixed local+cloud connection's local descriptor is primary. A sign-out, so a token fetched before
+			// it is not stored back; the mark is taken after it, so this session's own fetch is not refused.
 			await this.configuredIntegrationService.deleteStoredSessions(
 				this.authProviderId,
 				{ ...descriptor, cloud: true },
 				true,
+				{ signOut: true },
 			);
+			signOutMark = this.configuredIntegrationService.getSignOutMark();
 		} else {
-			session = await this.configuredIntegrationService.getStoredSession(
+			// Taken before the stored-token read (a sign-out landing during the read is ordered after it by the storage
+			// lock, so it counts either way).
+			signOutMark = this.configuredIntegrationService.getSignOutMark();
+			const stored = await this.configuredIntegrationService.getStoredSession(
 				this.authProviderId,
 				options?.sync ? { ...descriptor, cloud: true } : descriptor,
 			);
-			previousToken = session?.accessToken;
+			previousToken = stored?.accessToken;
+			if (options?.sync && options.refetch) {
+				refetched = stored;
+			} else {
+				session = stored;
+			}
 		}
 
 		const isExpiredSession = session?.expiresAt != null && new Date(session.expiresAt).getTime() < Date.now();
@@ -185,9 +205,29 @@ abstract class IntegrationAuthenticationProviderBase<
 				refreshIfExpired: isExpiredSession,
 				refreshRejectedToken: refreshRejectedToken,
 			});
+			// Stored only when no sign-out landed since the mark (checked and written under the storage lock): a token
+			// read or fetched across a disconnect, a reauthentication or the connection's removal is not reconnected.
+			if (
+				session != null &&
+				!(await this.configuredIntegrationService.storeSession(this.authProviderId, session, {
+					signOutMark: signOutMark,
+				}))
+			) {
+				session = undefined;
+			}
 
 			if (session != null) {
-				await this.configuredIntegrationService.storeSession(this.authProviderId, session);
+				// The replacement belongs to a different connection (the cloud's primary moved to another
+				// account), so it was stored beside the one it replaces rather than over it. Drop the old token
+				// as the up-front delete used to, or an unscoped read would keep resolving it until the next sync.
+				if (refetched?.id != null && refetched.id !== session.id) {
+					await this.configuredIntegrationService.deleteStoredSessions(
+						this.authProviderId,
+						{ ...descriptor, connectionId: refetched.id, cloud: true },
+						true,
+						{ preserveConfigured: true },
+					);
+				}
 			}
 		}
 
@@ -297,21 +337,38 @@ export class CloudIntegrationAuthenticationProvider<
 		// through to the provider-scoped path only when nothing is configured yet (legacy/first sync).
 		const connectionId =
 			descriptor.connectionId ??
-			(isGitSelfManagedHostIntegrationId(this.authProviderId)
+			(isSelfManagedHostIntegrationId(this.authProviderId)
 				? this.configuredIntegrationService.getConfiguredConnectionId(
 						this.authProviderId,
 						descriptor.domain,
 						true,
 					)
 				: undefined);
-		let session = await cloudIntegrations.getConnectionSession(this.authProviderId, undefined, connectionId);
-		if (
+		// Refuses a session issued for a DIFFERENT host than the one this connection is keyed by, which would
+		// otherwise let host B's token serve host A.
+		//
+		// A session that names no host is accepted ONLY when it was fetched by a connection id WE have stored
+		// for this host. That descriptor is what ties the token to the host, so an absent domain then means the
+		// backend did not say rather than that the token belongs elsewhere, and refusing it would strand the
+		// refresh.
+		//
+		// A non-null id is not enough on its own: `descriptor.connectionId` can come from the caller, and with
+		// no id at all the fetch goes to the provider-GLOBAL primary endpoint whose token can belong to any
+		// configured host. In both of those cases a domainless response must be refused, or a token would be
+		// bound to — and sent to — a host it was never issued for.
+		const scopedToThisHost = this.configuredIntegrationService.isConnectionConfiguredForHost(
+			this.authProviderId,
+			connectionId,
+			descriptor.domain,
+		);
+		const isForAnotherHost = (session: { domain: string } | undefined) =>
 			session != null &&
-			isGitSelfManagedHostIntegrationId(this.authProviderId) &&
-			!areDomainsOnSameHost(session.domain, descriptor.domain)
-		) {
-			return undefined;
-		}
+			isSelfManagedHostIntegrationId(this.authProviderId) &&
+			(!scopedToThisHost || Boolean(session.domain?.trim())) &&
+			!areDomainsOnSameHost(session.domain, descriptor.domain);
+
+		let session = await cloudIntegrations.getConnectionSession(this.authProviderId, undefined, connectionId);
+		if (isForAnotherHost(session)) return undefined;
 
 		// GitHub, the cloud self-managed hosts, and Trello return `expiresIn: 0` for a token that never
 		// expires; left as 0 the session would be built with `expiresAt = now` and rejected as expired on the
@@ -332,13 +389,7 @@ export class CloudIntegrationAuthenticationProvider<
 				session.accessToken,
 				connectionId,
 			);
-			if (
-				session != null &&
-				isGitSelfManagedHostIntegrationId(this.authProviderId) &&
-				!areDomainsOnSameHost(session.domain, descriptor.domain)
-			) {
-				return undefined;
-			}
+			if (isForAnotherHost(session)) return undefined;
 		}
 
 		if (!session) return undefined;
@@ -369,6 +420,18 @@ export class CloudIntegrationAuthenticationProvider<
 			expiresAt: new Date(session.expiresIn * 1000 + Date.now()),
 			// Note: do not use the session's domain, because the format is different than in our model
 			domain: descriptor.domain,
+			// That format difference is exactly what `baseUrl` is for: the descriptor's domain is the
+			// normalized host this connection is keyed by, so a context path only survives on the wire value.
+			// When the backend reports no domain at all, KEEP the address already configured rather than
+			// writing `undefined` — `writeSecret` mirrors this onto the descriptor, so falling back to the
+			// bare host here would drop a context path the user never changed on the next refresh.
+			baseUrl:
+				session.domain ||
+				this.configuredIntegrationService.getConfiguredBaseUrl(
+					this.authProviderId,
+					connectionId,
+					descriptor.domain,
+				),
 			protocol: sessionProtocol ?? undefined,
 			// Carried for providers whose client needs an app key alongside the token (e.g. Trello).
 			appKey: session.appKey,

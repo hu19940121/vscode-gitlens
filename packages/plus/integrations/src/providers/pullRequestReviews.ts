@@ -13,11 +13,17 @@ import { fromProviderAccount, toProviderAccount } from './accounts.js';
  * the next push, which is exactly the "the PR moved past my review" situation the oid detects. Dropping such a
  * review instead would hand a consumer a PR out of the `reviewed-by:@me` set with no review row at all,
  * indistinguishable from never having reviewed it.
+ *
+ * It also carries GitHub's code-owner flag on a request, which provider-apis doesn't report, so its rows leave it
+ * unset.
  */
 export const providerPullRequestReviewStateDismissed = 'DISMISSED' as const;
 export type ProviderPullRequestReview = Omit<NonNullable<GitPullRequest['reviews']>[number], 'state'> & {
 	state: GitPullRequestReviewState | typeof providerPullRequestReviewStateDismissed;
 	commitOid?: string;
+	isCodeOwner?: boolean;
+	/** See {@link PullRequestReviewer.isMyGroup}. Only the Azure DevOps reads that resolve the user's groups set it. */
+	isMyGroup?: boolean;
 };
 /**
  * The review list as it travels on {@link ProviderPullRequest}: `null` when the read carried no review data at
@@ -54,6 +60,8 @@ export function toProviderReviews(reviewers: PullRequestReviewer[]): ProviderPul
 			reviewer: toProviderAccount(reviewer.reviewer),
 			state: toProviderPullRequestReviewState[reviewer.state] ?? GitPullRequestReviewState.ReviewRequested,
 			commitOid: reviewer.commitOid,
+			isCodeOwner: reviewer.isCodeOwner,
+			...(reviewer.isMyGroup ? { isMyGroup: true } : {}),
 		}));
 }
 
@@ -63,9 +71,10 @@ export function toReviewRequests(reviews: ProviderPullRequestReviews): PullReque
 		: reviews
 				?.filter(r => r.state === GitPullRequestReviewState.ReviewRequested)
 				.map(r => ({
-					isCodeOwner: false, // TODO: Find this value, and implement in the shared lib if needed
+					isCodeOwner: r.isCodeOwner,
 					reviewer: fromProviderAccount(r.reviewer),
 					state: PullRequestReviewState.ReviewRequested,
+					...(r.isMyGroup ? { isMyGroup: true } : {}),
 				}));
 }
 
@@ -85,10 +94,11 @@ export function toCompletedReviews(reviews: ProviderPullRequestReviews): PullReq
 						fromProviderPullRequestReviewState[r.state] != null,
 				)
 				.map(r => ({
-					isCodeOwner: false, // TODO: Find this value, and implement in the shared lib if needed
+					isCodeOwner: r.isCodeOwner,
 					reviewer: fromProviderAccount(r.reviewer),
 					state: fromProviderPullRequestReviewState[r.state],
 					commitOid: r.commitOid,
+					...(r.isMyGroup ? { isMyGroup: true } : {}),
 				}));
 }
 
@@ -120,3 +130,32 @@ export const fromPullRequestReviewDecision = {
 	[GitPullRequestReviewState.Commented]: undefined,
 	[GitPullRequestReviewState.ReviewRequested]: PullRequestReviewDecision.ReviewRequired,
 };
+
+/** provider-apis' (0.61.0) review severity (`Us` in its bundle), by which it picks a review decision. */
+const providerReviewDecisionSeverity: Partial<Record<string, number>> = {
+	[GitPullRequestReviewState.Approved]: 0,
+	[GitPullRequestReviewState.Commented]: 1,
+	[GitPullRequestReviewState.ReviewRequested]: 2,
+	[GitPullRequestReviewState.ChangesRequested]: 3,
+};
+
+/**
+ * The review decision provider-apis' GitLab and Azure DevOps mappers derive from a pull request's review states (`ne`
+ * in its bundle): the most severe state wins, starting from approved, and no states at all is no decision. A state it
+ * doesn't rank (`undefined` here, for one provider-apis doesn't know) never outranks the decision so far. For a cheap
+ * etag check, which must reproduce a full row's decision without provider-apis' mapping.
+ */
+export function decideProviderReviewDecision(
+	states: readonly (GitPullRequestReviewState | undefined)[] | undefined,
+): GitPullRequestReviewState | undefined {
+	if (!states?.length) return undefined;
+
+	return states.reduce<GitPullRequestReviewState>(
+		(decided, state) =>
+			state != null &&
+			(providerReviewDecisionSeverity[state] ?? -1) > (providerReviewDecisionSeverity[decided] ?? -1)
+				? state
+				: decided,
+		GitPullRequestReviewState.Approved,
+	);
+}

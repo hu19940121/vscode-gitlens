@@ -255,7 +255,7 @@ suite('IntegrationManager.getSupportedFilters', () => {
 	});
 
 	suite('pullRequestSearch', () => {
-		test('is always present and only GitHub/GHE declare support today', () => {
+		test('is always present and only GitHub/GHE, Bitbucket Data Center and Azure DevOps Server declare support today', () => {
 			const manager = createIntegrationManager(createFakeRuntime());
 			try {
 				for (const id of allIds) {
@@ -265,9 +265,51 @@ suite('IntegrationManager.getSupportedFilters', () => {
 				const withSearch = allIds.filter(
 					id => manager.getSupportedFilters(id).pullRequestSearch.relationships.length > 0,
 				);
+				// Azure DevOps Services keeps no search: the server search drains per collection, which Services'
+				// organization-wide scope was never measured against.
 				assert.deepEqual(
 					withSearch.sort(),
-					[GitCloudHostIntegrationId.GitHub, GitSelfManagedHostIntegrationId.CloudGitHubEnterprise].sort(),
+					[
+						GitCloudHostIntegrationId.GitHub,
+						GitSelfManagedHostIntegrationId.CloudGitHubEnterprise,
+						GitSelfManagedHostIntegrationId.BitbucketServer,
+						GitSelfManagedHostIntegrationId.AzureDevOpsServer,
+					].sort(),
+				);
+			} finally {
+				manager.dispose();
+			}
+		});
+
+		test('Bitbucket Data Center declares exactly what its REST API can express', () => {
+			const manager = createIntegrationManager(createFakeRuntime());
+			try {
+				assert.deepEqual(
+					manager.getSupportedFilters(GitSelfManagedHostIntegrationId.BitbucketServer).pullRequestSearch,
+					{
+						// No assignee on a Bitbucket pull request, and no endpoint filters by mention.
+						relationships: [
+							PullRequestFilter.Author,
+							PullRequestFilter.ReviewRequested,
+							PullRequestFilter.Reviewed,
+						],
+						states: ['open', 'closed', 'merged', 'all'],
+						text: true,
+						// No date filter, and `order` is by last update only.
+						updatedAfter: false,
+						createdAfter: false,
+						includeArchived: true,
+						draft: true,
+						repositoryScope: true,
+						// No project-wide pull-request list.
+						organizationScope: false,
+						sorts: ['updated:desc', 'updated:asc'],
+					},
+				);
+				// Bitbucket Cloud is a different API and keeps declaring no search.
+				assert.deepEqual(
+					manager.getSupportedFilters(GitCloudHostIntegrationId.Bitbucket).pullRequestSearch.relationships,
+					[],
 				);
 			} finally {
 				manager.dispose();
@@ -373,7 +415,7 @@ suite('IntegrationManager.getSupportedFilters', () => {
 			}
 		});
 
-		test('only GitHub and GHE declare a filtered issue search today', () => {
+		test('only GitHub, GHE and Azure DevOps Server declare a filtered issue search today', () => {
 			const manager = createIntegrationManager(createFakeRuntime());
 			try {
 				const withSearch = allIds.filter(
@@ -381,7 +423,11 @@ suite('IntegrationManager.getSupportedFilters', () => {
 				);
 				assert.deepEqual(
 					withSearch.sort(),
-					[GitCloudHostIntegrationId.GitHub, GitSelfManagedHostIntegrationId.CloudGitHubEnterprise].sort(),
+					[
+						GitCloudHostIntegrationId.GitHub,
+						GitSelfManagedHostIntegrationId.CloudGitHubEnterprise,
+						GitSelfManagedHostIntegrationId.AzureDevOpsServer,
+					].sort(),
 				);
 			} finally {
 				manager.dispose();

@@ -1,15 +1,11 @@
-import type { IssueRepository } from '@gitlens/git/models/issue.js';
-import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
+import type { IssueProjection, IssueRepository } from '@gitlens/git/models/issue.js';
+import { Issue } from '@gitlens/git/models/issue.js';
 import type { IssueOrPullRequestState } from '@gitlens/git/models/issueOrPullRequest.js';
-import type { PullRequestMember, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
-import {
-	PullRequest,
-	PullRequestMergeableState,
-	PullRequestReviewDecision,
-	PullRequestReviewState,
-} from '@gitlens/git/models/pullRequest.js';
+import type { PullRequestMember, PullRequestProjection, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
+import { PullRequest, PullRequestReviewDecision, PullRequestReviewState } from '@gitlens/git/models/pullRequest.js';
 import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import type { PullRequestEtagFields, PullRequestEtagInclude } from '../../models/integration.js';
 
 export interface BitbucketRepositoryDescriptor extends ResourceDescriptor {
 	owner: string;
@@ -29,16 +25,18 @@ interface BitbucketLink {
 	name?: string;
 }
 
+// Bitbucket's `account` schema: a person (`user`) or an app/bot (`app_user`, e.g. a review bot on a PR).
+// An `app_user` has no `links.html` and no `nickname`, and the schema requires none of the links.
 interface BitbucketUser {
-	type: 'user';
+	type: 'user' | 'app_user';
 	uuid: string;
 	display_name: string;
 	account_id?: string;
 	nickname?: string;
-	links: {
-		self: BitbucketLink;
-		avatar: BitbucketLink;
-		html: BitbucketLink;
+	links?: {
+		self?: BitbucketLink;
+		avatar?: BitbucketLink;
+		html?: BitbucketLink;
 	};
 }
 
@@ -186,6 +184,7 @@ export interface BitbucketPullRequest {
 	title: string;
 	description: string;
 	state: BitbucketPullRequestState;
+	draft?: boolean;
 	merge_commit: null | BitbucketBriefCommit;
 	comment_count: number;
 	task_count: number;
@@ -295,10 +294,10 @@ export function isClosedBitbucketIssueState(state: BitbucketIssueState): boolean
 
 export function fromBitbucketUser(user: BitbucketUser): PullRequestMember {
 	return {
-		avatarUrl: user.links.avatar.href,
+		avatarUrl: user.links?.avatar?.href,
 		name: user.display_name,
 		username: user.nickname,
-		url: user.links.html.href,
+		url: user.links?.html?.href,
 		id: user.uuid,
 	};
 }
@@ -322,7 +321,15 @@ export function fromBitbucketParticipantToReviewer(
 	};
 }
 
-function getBitbucketReviewDecision(pr: BitbucketPullRequest): PullRequestReviewDecision | undefined {
+/**
+ * The review decision a Bitbucket Cloud row carries, derived from its participants and reviewers. Reads only the
+ * participants' `participated_on`, `approved` and `state` and whether there are reviewers, which is what the cheap etag
+ * read selects for it.
+ */
+export function getBitbucketReviewDecision(pr: {
+	participants?: readonly Pick<BitbucketPullRequestParticipant, 'approved' | 'state' | 'participated_on'>[];
+	reviewers?: readonly unknown[];
+}): PullRequestReviewDecision | undefined {
 	if (!pr.participants?.length && pr.reviewers?.length) {
 		return PullRequestReviewDecision.ReviewRequired;
 	}
@@ -355,12 +362,10 @@ function fromBitbucketRepository(repo: BitbucketRepository): IssueRepository {
 		owner: repo.full_name.split('/')[0],
 		repo: repo.name,
 		id: repo.uuid,
-		// TODO: Remove this assumption once actual access level is available
-		accessLevel: RepositoryAccessLevel.Write,
 	};
 }
 
-export function fromBitbucketIssue(issue: BitbucketIssue, provider: Provider): Issue {
+export function fromBitbucketIssue(issue: BitbucketIssue, provider: Provider, projection?: IssueProjection): Issue {
 	return new Issue(
 		provider,
 		issue.id.toString(),
@@ -387,13 +392,24 @@ export function fromBitbucketIssue(issue: BitbucketIssue, provider: Provider): I
 					resourceId: issue.repository.project.uuid,
 					resourceName: issue.repository.project.name,
 				},
+		undefined, // number
+		undefined, // issueType
+		undefined, // providerState
+		undefined, // bodyFormat
+		undefined, // iterations
+		projection,
 	);
 }
 
-export function fromBitbucketPullRequest(pr: BitbucketPullRequest, provider: Provider): PullRequest {
+export function fromBitbucketPullRequest(
+	pr: BitbucketPullRequest,
+	provider: Provider,
+	options?: { currentAccount?: { id: string; username?: string }; projection?: PullRequestProjection },
+): PullRequest {
+	const author = fromBitbucketUser(pr.author);
 	return new PullRequest(
 		provider,
-		fromBitbucketUser(pr.author),
+		author,
 		pr.id.toString(),
 		pr.id.toString(),
 		pr.title,
@@ -404,8 +420,7 @@ export function fromBitbucketPullRequest(pr: BitbucketPullRequest, provider: Pro
 		new Date(pr.updated_on),
 		pr.closed_by ? new Date(pr.updated_on) : undefined,
 		pr.state === 'MERGED' ? new Date(pr.updated_on) : undefined,
-		// TODO: Remove this assumption once actual mergeable state is available
-		PullRequestMergeableState.Mergeable, // mergeableState
+		undefined, // mergeableState: not read
 		undefined, // viewerCanUpdate
 		{
 			base: {
@@ -426,7 +441,7 @@ export function fromBitbucketPullRequest(pr: BitbucketPullRequest, provider: Pro
 			},
 			isCrossRepository: pr.source.repository.uuid !== pr.destination.repository.uuid,
 		},
-		undefined, // isDraft
+		pr.draft,
 		undefined, // additions
 		undefined, // deletions
 		undefined, // commentsCount
@@ -442,5 +457,60 @@ export function fromBitbucketPullRequest(pr: BitbucketPullRequest, provider: Pro
 		undefined, // assignees:PullRequestMember[] -- it looks like there is no such thing as assignees on Bitbucket
 		undefined, // PullRequestStatusCheckRollupState
 		undefined, // IssueProject
+		undefined, // version
+		undefined, // commitCount
+		undefined, // stack
+		undefined, // filesChanged
+		pr.description ?? undefined,
+		pr.id,
+		options?.currentAccount != null ? author.id === options.currentAccount.id : undefined,
+		options?.projection,
+		options?.currentAccount,
 	);
+}
+
+/** The most pull request ids one etag read asks for: Bitbucket Cloud's largest page of pull requests. */
+export const bitbucketEtagFieldsMaxIds = 50;
+
+/**
+ * A pull request as the cheap etag read selects it (`BitbucketApi.getPullRequestsEtagFields`): only the fields
+ * {@link fromBitbucketPullRequest} maps into a full row's etag inputs. `participants` and `reviewers` are selected
+ * only for the `reviewDecision` include.
+ */
+export interface BitbucketPullRequestEtagNode {
+	id: number;
+	state: BitbucketPullRequestState;
+	updated_on: string;
+	draft?: boolean;
+	source: { commit: { hash: string } };
+	participants?: Pick<BitbucketPullRequestParticipant, 'approved' | 'state' | 'participated_on'>[];
+	reviewers?: unknown[];
+}
+
+/**
+ * A cheap etag read's pull request in the vocabulary {@link fromBitbucketPullRequest}'s row ends in, so both reads
+ * compute the same etag. That row reads neither a mergeability nor a check rollup, so neither does this.
+ */
+export function toBitbucketPullRequestEtagFields(
+	node: BitbucketPullRequestEtagNode,
+	etagIncludes: readonly PullRequestEtagInclude[],
+): PullRequestEtagFields {
+	const fields: PullRequestEtagFields = {
+		state: bitbucketPullRequestStateToState(node.state),
+		isDraft: node.draft,
+		updatedDate: new Date(node.updated_on),
+		headSha: node.source.commit.hash,
+	};
+
+	if (etagIncludes.includes('reviewDecision')) {
+		// The full read always has both lists, and the decision tells a missing list from an empty one, so a row
+		// without them can't be compared: it rejects, and the full read answers instead.
+		if (node.participants == null || node.reviewers == null) {
+			throw new Error(`Bitbucket returned pull request ${node.id} without its participants or reviewers`);
+		}
+
+		fields.reviewDecision = getBitbucketReviewDecision(node);
+	}
+
+	return fields;
 }

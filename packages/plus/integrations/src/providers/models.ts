@@ -30,6 +30,8 @@ import type {
 	Jira,
 	JiraProject,
 	JiraResource,
+	JiraServer,
+	JiraServerProject,
 	Linear,
 	LinearOrganization,
 	LinearTeam,
@@ -50,12 +52,14 @@ import type { Account as UserAccount } from '@gitlens/git/models/author.js';
 import type {
 	IssueIteration,
 	IssueProject,
+	IssueProjection,
 	IssueProviderState,
 	IssueShape,
 	IssueStateFilter,
 } from '@gitlens/git/models/issue.js';
 import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
 import type {
+	PullRequestProjection,
 	PullRequestRef,
 	PullRequestRefs,
 	PullRequestRepositoryIdentityDescriptor,
@@ -77,6 +81,7 @@ import {
 	GitCloudHostIntegrationId,
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
+	IssuesSelfManagedHostIntegrationId,
 } from '../constants.js';
 import type { Integration, IntegrationType } from '../models/integration.js';
 import type {
@@ -103,6 +108,12 @@ import type { ProviderRepositoryShape } from '../results.js';
 
 export type { ProviderOrganization, ProviderRepositoryShape } from '../results.js';
 import { fromProviderAccount, toProviderAccount } from './accounts.js';
+import {
+	azurePullRequestSearchSorts,
+	azureWorkItemSearchRelationships,
+	azureWorkItemSearchResultLimit,
+	azureWorkItemSearchSorts,
+} from './azure/search.js';
 import {
 	azureAccountWideIssueSorts,
 	azureIssueSorts,
@@ -209,12 +220,22 @@ export function isRepoIdsInput(input: unknown): input is (string | number)[] {
 	);
 }
 
-export type ProviderPullRequest = Omit<GitPullRequest, 'reviews'> & { reviews: ProviderPullRequestReviews };
+/**
+ * provider-apis' pull request. `mergeableState` is optional because {@link toProviderPullRequest} also converts
+ * GitLens' own rows, and a read that didn't select it has none to give.
+ */
+export type ProviderPullRequest = Omit<GitPullRequest, 'reviews' | 'mergeableState'> & {
+	reviews: ProviderPullRequestReviews;
+	mergeableState?: GitPullRequestMergeableState;
+};
 export type ProviderRepository = GitRepository;
 export type ProviderIssue = ProviderApiIssue;
 export type ProviderEnterpriseOptions = EnterpriseOptions;
 export type ProviderJiraProject = JiraProject;
 export type ProviderJiraResource = JiraResource;
+// Jira Server's project shape is its own: `/rest/api/2/project` returns only an id and a name, with no `key`
+// and no enclosing resource (the instance itself is the resource).
+export type ProviderJiraServerProject = JiraServerProject;
 export type ProviderLinearTeam = LinearTeam;
 export type ProviderLinearOrganization = LinearOrganization;
 export type ProviderAzureProject = AzureProject;
@@ -229,12 +250,14 @@ export type ProviderGitLabGroup = GitLabGroup;
  * when available so the same row still deduplicates when a later facet adds or removes its URL.
  */
 export function getProviderPullRequestIdentity(
-	pr: Pick<ProviderPullRequest, 'id' | 'repository' | 'url'>,
+	pr: Pick<ProviderPullRequest, 'id' | 'repository' | 'url'> | Pick<PullRequest, 'id' | 'repository' | 'url'>,
 ): string | undefined {
 	const repository = pr.repository as
 		| {
 				id?: string | number;
 				name?: string;
+				/** A `PullRequest`'s name for `name`, so its key matches its provider-apis form's. */
+				repo?: string;
 				namespace?: string;
 				owner?: { login?: string } | string;
 				project?: string;
@@ -247,7 +270,7 @@ export function getProviderPullRequestIdentity(
 	const repositoryId = repository.id != null ? String(repository.id).trim() : '';
 	if (repositoryId !== '') return `repository:${repositoryId}:pull-request:${pr.id}`;
 
-	const name = repository.name?.trim() ?? '';
+	const name = (repository.name ?? repository.repo)?.trim() ?? '';
 	const namespace = (repository.namespace ?? owner)?.trim() ?? '';
 	const project = repository.project?.trim() ?? '';
 	if (name !== '' && (namespace !== '' || project !== '')) {
@@ -468,6 +491,11 @@ export type GetPullRequestsForRepoFn = (
 	options?: EnterpriseOptions,
 ) => Promise<{ data: ProviderPullRequest[]; pageInfo?: PageInfo }>;
 
+export type GetPullRequestForRepoFn = (
+	input: { repo: ProviderRepoInput; number: number; includeRemoteInfo?: boolean },
+	options?: EnterpriseOptions,
+) => Promise<{ data: ProviderPullRequest | null }>;
+
 export type GetPullRequestsForUserFn = (
 	input: GetPullRequestsForUserInput | GetPullRequestsAssociatedWithUserInput,
 	options?: EnterpriseOptions,
@@ -564,6 +592,8 @@ export type GetIssuesForCurrentUserInput = PagingInput & {
 	assigneeUsername?: string;
 	authorUsername?: string;
 	pageSize?: number;
+	/** Linear only (GitLab's REST read has its own `state`, not threaded here). Omitted reads open issues. */
+	states?: GitIssueState[];
 	/** See {@link GetIssuesOptions.sort}. */
 	sort?: IssueSorting;
 };
@@ -627,10 +657,9 @@ export type GetCurrentUserForResourceFn = (
 export type GetJiraResourcesForCurrentUserFn = (options?: EnterpriseOptions) => Promise<{ data: JiraResource[] }>;
 export type GetLinearOrganizationFn = (options?: EnterpriseOptions) => Promise<{ data: LinearOrganization }>;
 export type GetLinearTeamsForCurrentUserFn = (options?: EnterpriseOptions) => Promise<{ data: LinearTeam[] }>;
-export type GetLinearIssuesFn = (
-	input: { teams?: string[]; projects?: string[]; labels?: string[] } & PagingInput,
-	options?: EnterpriseOptions,
-) => Promise<{ data: ProviderIssue[]; pageInfo?: PageInfo }>;
+// Derived from the client method, like the Jira reads below, so a filter the SDK adds (`assignees`, `states`)
+// reaches the type system instead of being smuggled through `getPagedResult`'s `any`.
+export type GetLinearIssuesFn = Linear['getIssues'];
 /**
  * Linear's current-user (viewer) query. Its raw `@linear/sdk` User isn't a `ProviderAccount` (no
  * username/avatar/url), so it's typed with the minimal fields the viewer query actually returns rather than
@@ -698,6 +727,16 @@ export type GetBitbucketServerPullRequestsForCurrentUserFn = (
 	data: GitPullRequest[];
 }>;
 export type GetIssuesForProjectFn = Jira['getIssuesForProject'];
+// Jira Server's own reads, derived from its client rather than shared with Cloud's: every one of them is
+// addressed by the instance's `baseUrl`/`resourceUrl` instead of Cloud's `resourceId`, and its project read is
+// a single unpaged call, so the shapes genuinely differ.
+export type GetJiraServerCurrentUserFn = JiraServer['getCurrentUser'];
+export type GetJiraServerProjectsFn = (options?: EnterpriseOptions) => Promise<{ data: JiraServerProject[] }>;
+export type GetJiraServerIssuesForProjectFn = JiraServer['getIssuesForProject'];
+export type GetJiraServerIssuesForProjectsFn = JiraServer['getIssuesForProjects'];
+export type GetJiraServerIssueFn = JiraServer['getIssue'];
+export type GetJiraServerIssuesForCurrentUserFn = JiraServer['getIssuesForResourceForCurrentUser'];
+export type GetIssuesForProjectsFn = Jira['getIssuesForProjects'];
 // Derived from the client method rather than hand-declared, as its project-scoped sibling above already is: the
 // hand-written shape named only `resourceId`, so every other field the SDK accepts (the cursor, the sort, the
 // transitions switch) was invisible to the type system and had to be smuggled through `getPagedResult`'s `any`.
@@ -713,11 +752,12 @@ export type GetTrelloIssuesForBoardFn = Trello['getIssuesForBoard'];
 export type GetTrelloLabelsForBoardFn = Trello['getLabelsForBoard'];
 
 export interface ProviderInfo extends ProviderMetadata {
-	provider: GitHub | GitLab | Bitbucket | BitbucketServer | Jira | Linear | Trello | AzureDevOps;
+	provider: GitHub | GitLab | Bitbucket | BitbucketServer | Jira | JiraServer | Linear | Trello | AzureDevOps;
 	getRepoFn?: GetRepoFn;
 	getRepoOfProjectFn?: GetRepoOfProjectFn;
 	getPullRequestsForReposFn?: GetPullRequestsForReposFn;
 	getPullRequestsForRepoFn?: GetPullRequestsForRepoFn;
+	getPullRequestForRepoFn?: GetPullRequestForRepoFn;
 	getPullRequestsForUserFn?: GetPullRequestsForUserFn;
 	getGitLabPullRequestsForUserAssociationFn?: GetGitLabPullRequestsForUserAssociationFn;
 	getPullRequestsForAzureProjectsFn?: GetPullRequestsForAzureProjectsFn;
@@ -740,9 +780,16 @@ export interface ProviderInfo extends ProviderMetadata {
 	getBitbucketPullRequestsAuthoredByUserForWorkspaceFn?: GetBitbucketPullRequestsAuthoredByUserForWorkspaceFn;
 	getBitbucketServerPullRequestsForCurrentUserFn?: GetBitbucketServerPullRequestsForCurrentUserFn;
 	getJiraProjectsForResourcesFn?: GetJiraProjectsForResourcesFn;
+	getJiraServerCurrentUserFn?: GetJiraServerCurrentUserFn;
+	getJiraServerProjectsFn?: GetJiraServerProjectsFn;
+	getJiraServerIssuesForProjectFn?: GetJiraServerIssuesForProjectFn;
+	getJiraServerIssuesForProjectsFn?: GetJiraServerIssuesForProjectsFn;
+	getJiraServerIssueFn?: GetJiraServerIssueFn;
+	getJiraServerIssuesForCurrentUserFn?: GetJiraServerIssuesForCurrentUserFn;
 	getJiraProjectsForResourceFn?: GetJiraProjectsForResourceFn;
 	getAzureProjectsForResourceFn?: GetAzureProjectsForResourceFn;
 	getIssuesForProjectFn?: GetIssuesForProjectFn;
+	getIssuesForProjectsFn?: GetIssuesForProjectsFn;
 	getReposForAzureProjectFn?: GetReposForAzureProjectFn;
 	getIssuesForResourceForCurrentUserFn?: GetIssuesForResourceForCurrentUserFn;
 	mergePullRequestFn?: MergePullRequestFn;
@@ -834,6 +881,16 @@ export interface ProviderMetadata {
 	 */
 	supportedAccountWideIssueSorts?: IssueSorting[];
 	/**
+	 * Whether an issue tracker's reads (the project-scoped read, which is `listIssueTrackerIssuesPage`, and its
+	 * account-wide read) can be asked for a `state` other than open, and honor it server-side.
+	 *
+	 * A tracker read is open-only unless asked otherwise, so absent does not mean the read returns every state: it
+	 * means only `'open'` is expressible, and `'closed'`/`'all'` are refused rather than served as the open list.
+	 * Server-side, because each read drains to a page backstop: dropping states afterwards would let a project full
+	 * of done work spend that budget before reaching the open issues.
+	 */
+	supportsIssueStates?: boolean;
+	/**
 	 * What the provider's FILTERED issue search (`searchIssuesPage`, and the `countIssues` probe over the same
 	 * criteria) can express server-side. A third, wider surface than either filter set above: it is not bound to
 	 * the user at all, so it takes relationships those reads have no way to name (`any-assignee`, `unassigned`),
@@ -853,6 +910,15 @@ export interface ProviderMetadata {
 	 * instead of quoting a limit that was never published.
 	 */
 	issueSearchResultLimit?: number;
+	/**
+	 * Whether the filtered searches reach the provider with scope names verbatim — as encoded URL segments, or
+	 * matched against the names discovery reported — rather than inside a query string the provider sanitizes.
+	 *
+	 * Relaxes the scope-name rule (`isUsableSearchScopeName`) for that provider to refuse only blank names and
+	 * control characters: a space or a quote can't split or alter a scope that is never parsed as a query, and
+	 * refusing them would refuse real names. Absent for a query-string search (GitHub's), where both do.
+	 */
+	exactSearchScopeNames?: boolean;
 }
 
 export type Providers = Record<IntegrationIds, ProviderInfo>;
@@ -912,6 +978,71 @@ const githubPullRequestSearchCapabilities: PullRequestSearchCapabilities = {
 	organizationScope: true,
 	// `sort:updated`, `sort:updated-asc`, `sort:created-desc`, `sort:created-asc` — see `githubPullRequestSorts`.
 	sorts: githubPullRequestSorts,
+};
+
+/**
+ * Bitbucket Data Center's filtered pull-request search (`bitbucket-server/pullRequestSearch.ts`), declared from what
+ * its REST API can express rather than from what a PR shape carries:
+ * - relationships: `role=AUTHOR`, and a reviewer's `UNAPPROVED` status for a pending review versus `APPROVED` or
+ *   `NEEDS_WORK` for one already given. A Bitbucket pull request has no assignee, and nothing filters by mention.
+ * - text is `filterText` (title or description), draft is `draft`, and archived repositories are excluded unless
+ *   asked for — all re-checked on each row, since the dashboard read has neither filter.
+ * - no date filters and no `created` ordering: `order` is only `NEWEST`/`OLDEST` by last update, and filtering a
+ *   date on the rows read would page through everything before it.
+ * - no organization scope: there is no project-wide pull-request list, only per repository and the dashboard.
+ */
+const bitbucketServerPullRequestSearchCapabilities: PullRequestSearchCapabilities = {
+	relationships: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested, PullRequestFilter.Reviewed],
+	states: ['open', 'closed', 'merged', 'all'],
+	text: true,
+	updatedAfter: false,
+	createdAfter: false,
+	includeArchived: true,
+	draft: true,
+	repositoryScope: true,
+	organizationScope: false,
+	sorts: ['updated:desc', 'updated:asc'],
+};
+
+/**
+ * Azure DevOps Server's filtered pull-request search. Azure's pull request query narrows only by creator, reviewer,
+ * status and repository, so the provider drains each facet and applies text, draft and dates to the complete facet
+ * before merging — so a criterion never narrows a page after its count, and the only sort keys are the two a merged
+ * page can be re-ordered by. What text and `updatedAfter` match is bounded by the list endpoint: see
+ * `toAzurePullRequestSearchFilter`.
+ *
+ * `Assignee` and `ReviewRequested` both read by reviewer: Azure has no assignee distinct from its reviewers.
+ * `Reviewed` and `Mention` are absent because the pull request query has no axis for either, and `includeArchived`
+ * because Azure has no archived repositories to exclude.
+ */
+const azureServerPullRequestSearchCapabilities: PullRequestSearchCapabilities = {
+	relationships: [PullRequestFilter.Author, PullRequestFilter.Assignee, PullRequestFilter.ReviewRequested],
+	states: ['open', 'closed', 'merged', 'all'],
+	text: true,
+	updatedAfter: true,
+	createdAfter: true,
+	includeArchived: false,
+	draft: true,
+	repositoryScope: true,
+	organizationScope: true,
+	sorts: azurePullRequestSearchSorts,
+};
+
+/**
+ * Azure DevOps Server's filtered work-item search: one WIQL query per collection, every criterion a clause of it.
+ * `mentioned` is absent because `@RecentMentions` only reaches back 30 days; `milestone` and
+ * `withoutLinkedPullRequest` because WIQL has no flat-query clause for either. See `azure/search.ts`.
+ */
+const azureServerIssueSearchCapabilities: IssueSearchCapabilities = {
+	relationships: azureWorkItemSearchRelationships,
+	text: true,
+	labels: true,
+	milestone: false,
+	updatedAfter: true,
+	createdAfter: true,
+	withoutLinkedPullRequest: false,
+	states: true,
+	sorts: azureWorkItemSearchSorts,
 };
 
 export const providersMetadata: ProvidersMetadata = {
@@ -1071,6 +1202,8 @@ export const providersMetadata: ProvidersMetadata = {
 		iconKey: GitSelfManagedHostIntegrationId.BitbucketServer,
 		supportedPullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
 		supportedAccountWidePullRequestFilters: [PullRequestFilter.Author, PullRequestFilter.ReviewRequested],
+		supportedPullRequestSearch: bitbucketServerPullRequestSearchCapabilities,
+		// No `pullRequestSearchResultLimit`: nothing caps how far a search pages.
 		scopes: ['Project (Read)', 'Repository (Write)'],
 	},
 	[GitCloudHostIntegrationId.AzureDevOps]: {
@@ -1133,6 +1266,10 @@ export const providersMetadata: ProvidersMetadata = {
 		// dropped from that surface for the same reason they are dropped from GitLab's.
 		supportedIssueSorts: azureIssueSorts,
 		supportedAccountWideIssueSorts: azureAccountWideIssueSorts,
+		supportedPullRequestSearch: azureServerPullRequestSearchCapabilities,
+		supportedIssueSearch: azureServerIssueSearchCapabilities,
+		issueSearchResultLimit: azureWorkItemSearchResultLimit,
+		exactSearchScopeNames: true,
 		scopes: ['vso.code', 'vso.identity', 'vso.project', 'vso.profile', 'vso.work'],
 	},
 	[IssuesCloudHostIntegrationId.Jira]: {
@@ -1181,6 +1318,26 @@ export const providersMetadata: ProvidersMetadata = {
 		// A tracker's issues live under resource -> project, so it has no account-wide surface to declare: its
 		// capability is reported under `issues`, which is what `listIssueTrackerIssuesPage` validates against.
 		supportedIssueSorts: jiraIssueSorts,
+		// `statusCategory` clauses in the same JQL, shared with Server through `jiraHelpers`.
+		supportsIssueStates: true,
+	},
+	[IssuesSelfManagedHostIntegrationId.JiraServer]: {
+		// Self-hosted: there is no canonical domain, so every read is addressed by the connection's own host
+		// (see `JiraServerIntegration.apiBaseUrl`), exactly as the self-managed git hosts do.
+		domain: '',
+		id: IssuesSelfManagedHostIntegrationId.JiraServer,
+		name: 'Jira Data Center',
+		type: 'issues',
+		// Reuses Jira's glicon: it is the same product, and the id only selects an icon.
+		iconKey: IssuesCloudHostIntegrationId.Jira,
+		// Jira Cloud's entries are Atlassian OAuth scope strings, which a self-hosted instance doesn't issue:
+		// its token is a PAT the backend stores as-is, so there is no scope set to request.
+		scopes: [],
+		// The same JQL clauses Cloud narrows with — `jiraHelpers` builds one query for both.
+		supportedIssueFilters: [IssueFilter.Author, IssueFilter.Assignee, IssueFilter.Mention],
+		// One JQL `ORDER BY` builder serves Cloud and Server, so they share a surface (see `issueSorts.ts`).
+		supportedIssueSorts: jiraIssueSorts,
+		supportsIssueStates: true,
 	},
 	[IssuesCloudHostIntegrationId.Linear]: {
 		domain: 'linear.app',
@@ -1194,6 +1351,9 @@ export const providersMetadata: ProvidersMetadata = {
 		// Both directions, and one table for both reads: they are the same root `issues` query taking the same
 		// `sort` argument, so there is no account-wide narrowing to declare.
 		supportedIssueSorts: linearIssueSorts,
+		// A workflow-state type clause on both reads (`completed`/`canceled` are closed), the same types the SDK
+		// normalizes to the `DONE` category.
+		supportsIssueStates: true,
 	},
 	[IssuesCloudHostIntegrationId.Trello]: {
 		domain: 'trello.com',
@@ -1206,6 +1366,8 @@ export const providersMetadata: ProvidersMetadata = {
 		supportedIssueFilters: [IssueFilter.Assignee],
 		// `sort:edited` / `sort:-edited`. Trello's other search sorts (`created`, `due`) have no card-order effect.
 		supportedIssueSorts: trelloIssueSorts,
+		// No `supportsIssueStates`: a card has no state beyond being archived, and the board read always sends
+		// `-is:archived`, so `'closed'`/`'all'` are refused rather than answered with the open cards.
 	},
 };
 
@@ -1252,7 +1414,7 @@ function toIssueProviderState(
 export function toIssueShape(
 	issue: ProviderIssue,
 	provider: ProviderReference,
-	options?: { reliableStateCategory?: boolean },
+	options?: { reliableStateCategory?: boolean; projection?: IssueProjection },
 ): IssueShape | undefined {
 	// TODO: Add some protections/baselines rather than killing the transformation here
 	// `author` is intentionally not required: some providers have no per-item creator (e.g. Trello cards,
@@ -1261,9 +1423,14 @@ export function toIssueShape(
 	if (issue.updatedDate == null || issue.url == null) return undefined;
 
 	// Jira SDK results derive this category from a localized display name and default unknown names to DONE.
-	// Only the direct point read opts in because it maps Jira's stable status-category key itself.
-	const reliableStateCategory =
-		provider.id !== IssuesCloudHostIntegrationId.Jira || options?.reliableStateCategory === true;
+	// Only the direct point read opts in because it maps Jira's stable status-category key itself. The whole
+	// Jira family shares that mapper (`jiraHelpers` serves Cloud and Server alike), so the gate is keyed on the
+	// family rather than the cloud id — a self-hosted instance in any non-English locale would otherwise report
+	// every open issue as closed.
+	const isJira =
+		provider.id === IssuesCloudHostIntegrationId.Jira ||
+		provider.id === IssuesSelfManagedHostIntegrationId.JiraServer;
+	const reliableStateCategory = !isJira || options?.reliableStateCategory === true;
 	const closed = issue.closedDate != null || (issue.state?.category === 'DONE' && reliableStateCategory);
 
 	return {
@@ -1315,16 +1482,20 @@ export function toIssueShape(
 				? {
 						owner: issue.repository.owner.login,
 						repo: issue.repository.name,
-						id: issue.repository.id,
+						// provider-apis sends `''` for an id it doesn't know.
+						id: issue.repository.id || undefined,
 					}
 				: undefined,
 		labels: issue.labels.map(label => ({ color: label.color ?? undefined, name: label.name })),
 		commentsCount: issue.commentCount ?? undefined,
 		thumbsUpCount: issue.upvoteCount ?? undefined,
 		body: issue.description ?? undefined,
-		bodyFormat: provider.id === IssuesCloudHostIntegrationId.Jira ? 'jira-wiki' : undefined,
+		// Both Jira flavors return `/rest/api/2` wiki markup for the description.
+		bodyFormat: isJira ? 'jira-wiki' : undefined,
 		issueType: issue.type ?? undefined,
 		iterations: toIssueIterations(issue),
+		// Only when tagged, so an untagged row keeps exactly the keys it always had.
+		...(options?.projection != null ? { projection: options.projection } : {}),
 	};
 }
 
@@ -1411,7 +1582,7 @@ export const fromProviderBuildStatusState = {
  *  carrying no verdict (cancelled, skipped, optional action required, warning) don't vote. Reads the raw
  *  state rather than `fromProviderBuildStatusState`, which drops errored and running to `undefined` and
  *  would let a lone success outvote a check still in flight. */
-function toStatusCheckRollupState(
+export function toStatusCheckRollupState(
 	statuses: GitBuildStatus[] | null | undefined,
 ): PullRequestStatusCheckRollupState | undefined {
 	if (!statuses?.length) return undefined;
@@ -1492,9 +1663,16 @@ export function toProviderPullRequestStates(
 	return states.length > 0 ? [...new Set(states)] : undefined;
 }
 
-/** Maps an issue state filter to the SDK's `states` input. `undefined`/omitted preserves the open-only default. */
+/**
+ * Maps an issue state filter to the SDK's `states` input. `undefined`/omitted preserves the open-only default.
+ *
+ * Throws on any other value, which only an untyped caller can pass: read as omitted it would serve open issues as
+ * the state that was asked for. Called before a read's first request, so the throw refuses the whole read.
+ */
 export function toProviderIssueStates(state: IssueStateFilter | undefined): GitIssueState[] | undefined {
 	switch (state) {
+		case undefined:
+			return undefined;
 		case 'open':
 			return [GitIssueState.Open];
 		case 'closed':
@@ -1502,7 +1680,7 @@ export function toProviderIssueStates(state: IssueStateFilter | undefined): GitI
 		case 'all':
 			return [GitIssueState.Open, GitIssueState.Closed];
 		default:
-			return undefined;
+			throw new Error(`Unknown issue state; expected one of open, closed, all`);
 	}
 }
 
@@ -1559,7 +1737,7 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 		commentCount: pr.commentsCount ?? null,
 		upvoteCount: pr.thumbsUpCount ?? null,
 		commitCount: pr.commitCount ?? null,
-		fileCount: null,
+		fileCount: pr.filesChanged ?? null,
 		additions: pr.additions ?? null,
 		deletions: pr.deletions ?? null,
 		author: toProviderAccount(pr.author),
@@ -1583,6 +1761,8 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 		// lets a consumer tell "nobody has reviewed this" from "this read never fetched reviews" (see
 		// `PullRequestShape.latestReviews`). An empty array from a full projection stays an empty array.
 		reviews: pr.reviewRequests == null && pr.latestReviews == null ? null : toProviderReviews(prReviews),
+		// Derived for provider-apis' categorizer (Launchpad), which reads a pending request as "waiting for review"
+		// and a comment as "reviewer commented" even where the host made no decision.
 		reviewDecision: toProviderReviewDecision(pr.reviewDecision, prReviews),
 		repository:
 			pr.repository != null
@@ -1603,7 +1783,8 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 						remoteInfo: null,
 					},
 		headRepository:
-			pr.refs?.head != null
+			// A deleted head repository has no owner or name: GitHub's rows leave them `undefined`, provider-apis' `''`.
+			pr.refs?.head?.owner && pr.refs.head.repo
 				? {
 						id: pr.refs.head.repo,
 						name: pr.refs.head.repo,
@@ -1634,25 +1815,30 @@ export function toProviderPullRequest(pr: PullRequest): ProviderPullRequest {
 			pr.viewerCanUpdate == null
 				? null
 				: {
+						// An unknown access level doesn't block a merge. Only GitHub's reads know it; any other row
+						// with a `viewerCanUpdate` got it from provider-apis' own `canMerge`, which a missing access
+						// level must not overturn. provider-apis' categorizer reads absent `permissions` the same way.
 						canMerge:
 							pr.viewerCanUpdate === true &&
-							pr.repository.accessLevel != null &&
-							pr.repository.accessLevel >= RepositoryAccessLevel.Write,
+							(pr.repository.accessLevel == null ||
+								pr.repository.accessLevel >= RepositoryAccessLevel.Write),
 						canMergeAndBypassProtections:
 							pr.viewerCanUpdate === true &&
 							pr.repository.accessLevel != null &&
 							pr.repository.accessLevel >= RepositoryAccessLevel.Admin,
 					},
-		mergeableState: pr.mergeableState
-			? toProviderPullRequestMergeableState[pr.mergeableState]
-			: GitPullRequestMergeableState.Unknown,
+		mergeableState: pr.mergeableState ? toProviderPullRequestMergeableState[pr.mergeableState] : undefined,
 	};
 }
 
 export function fromProviderPullRequest(
 	pr: ProviderPullRequest,
 	provider: Provider,
-	options?: { project?: IssueProject; currentAccountId?: string },
+	options?: {
+		project?: IssueProject;
+		currentAccount?: { id: string; username?: string };
+		projection?: PullRequestProjection;
+	},
 ): PullRequest {
 	const repository = pr.repository;
 	const repositoryName = repository?.name ?? '';
@@ -1671,9 +1857,8 @@ export function fromProviderPullRequest(
 		{
 			owner: repositoryOwner,
 			repo: repositoryName,
-			// This has to be here until we can take this information from ProviderPullRequest:
-			accessLevel: RepositoryAccessLevel.Write,
-			id: repository?.id ?? '',
+			// provider-apis sends `''` for an id it doesn't know.
+			id: repository?.id || undefined,
 		},
 		fromProviderPullRequestState(pr.state),
 		pr.createdDate,
@@ -1681,6 +1866,7 @@ export function fromProviderPullRequest(
 		pr.closedDate ?? undefined,
 		pr.mergedDate ?? undefined,
 		pr.mergeableState ? fromProviderPullRequestMergeableState[pr.mergeableState] : undefined,
+		// The SDK's `permissions` can only say "can merge", so its `false` stays unknown rather than "can't update".
 		pr.permissions?.canMerge || pr.permissions?.canMergeAndBypassProtections ? true : undefined,
 		{
 			base: {
@@ -1723,18 +1909,84 @@ export function fromProviderPullRequest(
 		options?.project,
 		pr.version,
 		pr.commitCount ?? undefined,
-		undefined, // stack — GK's proxy type has no stack concept; membership is joined host-side
+		undefined, // stack
 		pr.fileCount ?? undefined,
 		pr.description ?? undefined,
 		pr.number,
-		options?.currentAccountId != null ? pr.author?.id === options.currentAccountId : undefined,
+		options?.currentAccount != null
+			? authoredByCurrentAccount(pr.author, provider, options.currentAccount)
+			: undefined,
+		options?.projection,
+		options?.currentAccount,
 	);
+}
+
+/**
+ * A GitLens-native row (GitHub's own reads) tagged for the read that returned it, with `authoredByMe` and `viewer`
+ * resolved by the same rule {@link fromProviderPullRequest} applies. Returns a copy: the mapper's row stays as it was
+ * built.
+ */
+export function stampNativePullRequest(
+	pr: PullRequest,
+	options: { currentAccount?: { id: string; username?: string }; projection?: PullRequestProjection },
+): PullRequest {
+	return Object.assign(Object.create(PullRequest.prototype) as PullRequest, pr, {
+		authoredByMe:
+			options.currentAccount != null
+				? authoredByCurrentAccount(pr.author, pr.provider, options.currentAccount)
+				: undefined,
+		viewer: options.currentAccount,
+		projection: options.projection,
+	});
+}
+
+/**
+ * A row of an account-wide read as a `PullRequest`. GitHub's are GitLens-native, which {@link stampNativePullRequest}
+ * tags; every other host's are provider-apis', which {@link fromProviderPullRequest} converts.
+ */
+export function toPullRequestRow(
+	pr: ProviderPullRequest | PullRequest,
+	provider: Provider,
+	options: { currentAccount?: { id: string; username?: string }; projection?: PullRequestProjection },
+): PullRequest {
+	return isNativePullRequest(pr)
+		? stampNativePullRequest(pr, options)
+		: fromProviderPullRequest(pr, provider, options);
+}
+
+/**
+ * By shape rather than by class, which a second copy of the model module fails: a native row is a `'pullrequest'` that
+ * names its provider, which provider-apis' rows never do. Both, so a key provider-apis adds later can't reroute its
+ * rows.
+ */
+export function isNativePullRequest(pr: ProviderPullRequest | PullRequest): pr is PullRequest {
+	const row = pr as { type?: unknown; provider?: unknown };
+	return row.type === 'pullrequest' && row.provider != null && typeof row.provider === 'object';
+}
+
+/**
+ * GitLens' own GitHub GraphQL client keys people by login, while the current account's `id` is GitHub's
+ * numeric database id, so an id-only match always misses there. The login is a unique handle on every
+ * GitHub row shape, so the username fallback is safe there; elsewhere `toProviderAccount` fills `username`
+ * from a display name that two people can share, so only GitHub and GitHub Enterprise get the fallback.
+ */
+function authoredByCurrentAccount(
+	author: { id?: string | null; username?: string | null } | null | undefined,
+	provider: ProviderReference,
+	currentAccount: { id: string; username?: string },
+): boolean {
+	if (author?.id === currentAccount.id) return true;
+
+	const isGitHub =
+		provider.id === GitCloudHostIntegrationId.GitHub ||
+		provider.id === GitSelfManagedHostIntegrationId.CloudGitHubEnterprise;
+	return isGitHub && currentAccount.username != null && author?.username === currentAccount.username;
 }
 
 export function fromProviderIssue(
 	issue: ProviderIssue,
 	integration: Integration,
-	options?: { project?: IssueProject },
+	options?: { project?: IssueProject; projection?: IssueProjection },
 ): Issue {
 	const identifier = toIssueIdentifier(issue.number);
 	const closed = issue.closedDate != null || issue.state?.category === 'DONE';
@@ -1754,7 +2006,8 @@ export function fromProviderIssue(
 			? {
 					owner: issue.repository.owner.login ?? '',
 					repo: issue.repository.name,
-					id: issue.repository.id,
+					// provider-apis sends `''` for an id it doesn't know.
+					id: issue.repository.id || undefined,
 				}
 			: undefined,
 		issue.closedDate ?? undefined,
@@ -1782,13 +2035,23 @@ export function fromProviderIssue(
 		toIssueProviderState(issue.state, integration.id !== IssuesCloudHostIntegrationId.Jira),
 		integration.id === IssuesCloudHostIntegrationId.Jira ? 'jira-wiki' : undefined,
 		toIssueIterations(issue),
+		options?.projection,
 	);
 }
 
 export function toProviderPullRequestWithUniqueId(pr: PullRequest): PullRequestWithUniqueID {
-	const { reviews, ...providerPr } = toProviderPullRequest(pr);
+	const { reviews, mergeableState, ...providerPr } = toProviderPullRequest(pr);
 	return {
 		...providerPr,
+		// The SDK's type requires a mergeability, and its categorizer only acts on a known one, so an unfetched
+		// one goes over as its own `UNKNOWN`. Except on Bitbucket Cloud, which reports no mergeability at all:
+		// Launchpad's "Ready to merge" needs one, so its rows go over as `MERGEABLE`, as provider-apis' own
+		// Bitbucket rows already do.
+		mergeableState:
+			mergeableState ??
+			(pr.provider.id === GitCloudHostIntegrationId.Bitbucket
+				? GitPullRequestMergeableState.Mergeable
+				: GitPullRequestMergeableState.Unknown),
 		// The SDK boundary: `getActionablePullRequests` categorizes by review state and only knows
 		// provider-apis' own vocabulary, so the locally-added dismissed state is dropped here rather than
 		// handed over as a value it would fall through on. Our own projection keeps it — see

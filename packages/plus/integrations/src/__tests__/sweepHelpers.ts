@@ -1,6 +1,7 @@
+import assert from 'node:assert/strict';
 import { GitPullRequestMergeableState, GitPullRequestState } from '@gitkraken/provider-apis';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
-import { GitCloudHostIntegrationId } from '../constants.js';
+import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
 import { createIntegrationService as createIntegrationManager } from '../integrationService.js';
 import type { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type { ProviderPullRequest } from '../providers/models.js';
@@ -8,8 +9,9 @@ import type { createFakeRuntime } from './fakeRuntime.js';
 
 /**
  * Fixtures for the suites covering the pull request sweeps, the broaden fan-out, the per-provider account-wide
- * reads, and the sweep target observer — a connected GitHub manager, a session, a provider pull request, and
- * the SDK-surface swap they all read through. Not named `*.test.ts` so the runner's glob leaves it alone.
+ * reads, the sweep target observer and the batch reads — a connected manager per host, a session, a provider pull
+ * request, and the SDK-surface swap they all read through. Not named `*.test.ts` so the runner's glob leaves it
+ * alone.
  */
 
 export function primarySession(token: string): ProviderAuthenticationSession {
@@ -67,6 +69,20 @@ export function providerPr(id: string, overrides?: Partial<ProviderPullRequest>)
 	};
 }
 
+/** Records the "failed to respond" and "timed out" notices a runtime shows, and the disconnect it announces. */
+export function watchRequestFailures(runtime: ReturnType<typeof createFakeRuntime>): {
+	notices: string[];
+	disconnected?: string;
+} {
+	const watched: { notices: string[]; disconnected?: string } = { notices: [] };
+	runtime.hooks!.ui = {
+		onRequestFailed: message => void watched.notices.push(message),
+		onRequestTimedOut: name => void watched.notices.push(`${name} timed out`),
+		onDisconnectedAfterTooManyFailures: name => void (watched.disconnected = name),
+	};
+	return watched;
+}
+
 export async function connectedGitHub(
 	runtime: ReturnType<typeof createFakeRuntime>,
 ): Promise<{ manager: ReturnType<typeof createIntegrationManager>; gh: GitHostIntegration }> {
@@ -93,4 +109,53 @@ export async function connectedGitLab(
 		domain: 'gitlab.com',
 	};
 	return { manager: manager, gl: gl };
+}
+
+export async function connectedAzure(
+	runtime: ReturnType<typeof createFakeRuntime>,
+): Promise<{ manager: ReturnType<typeof createIntegrationManager>; azure: GitHostIntegration }> {
+	const manager = createIntegrationManager(runtime);
+	const azure = await manager.get(GitCloudHostIntegrationId.AzureDevOps);
+	(azure as unknown as { _session: ProviderAuthenticationSession })._session = {
+		...primarySession('t'),
+		domain: 'dev.azure.com',
+	};
+	return { manager: manager, azure: azure };
+}
+
+export async function connectedBitbucket(
+	runtime: ReturnType<typeof createFakeRuntime>,
+): Promise<{ manager: ReturnType<typeof createIntegrationManager>; integration: GitHostIntegration }> {
+	const manager = createIntegrationManager(runtime);
+	const bb = await manager.get(GitCloudHostIntegrationId.Bitbucket);
+	(bb as unknown as { _session: ProviderAuthenticationSession })._session = {
+		...primarySession('t'),
+		domain: 'bitbucket.org',
+	};
+	return { manager: manager, integration: bb };
+}
+
+export async function connectedBitbucketServer(
+	runtime: ReturnType<typeof createFakeRuntime>,
+): Promise<{ manager: ReturnType<typeof createIntegrationManager>; integration: GitHostIntegration }> {
+	await runtime.storage.store('integrations:configured', {
+		[GitSelfManagedHostIntegrationId.BitbucketServer]: [
+			{
+				id: 'bbs-1',
+				cloud: true,
+				integrationId: GitSelfManagedHostIntegrationId.BitbucketServer,
+				domain: 'https://bbs.example.com',
+				scopes: 'repo',
+				primary: true,
+			},
+		],
+	});
+	const manager = createIntegrationManager(runtime);
+	const bbs = await manager.get(GitSelfManagedHostIntegrationId.BitbucketServer, 'bbs.example.com');
+	assert.ok(bbs != null);
+	(bbs as unknown as { _session: ProviderAuthenticationSession })._session = {
+		...primarySession('t'),
+		domain: 'bbs.example.com',
+	};
+	return { manager: manager, integration: bbs };
 }

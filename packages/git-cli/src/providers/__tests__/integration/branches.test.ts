@@ -5,7 +5,15 @@ import { BranchError } from '@gitlens/git/errors.js';
 import type { GitResult, GitRunOptions } from '@gitlens/git/run.types.js';
 import { GitError } from '../../../exec/git.js';
 import type { TestRepo } from './helpers.js';
-import { addCommit, cloneTestRepo, createBranch, createTestRepo } from './helpers.js';
+import {
+	addCommit,
+	checkout,
+	cloneTestRepo,
+	createBranch,
+	createBranchAt,
+	createTestRepo,
+	getHeadSha,
+} from './helpers.js';
 
 suite('BranchesSubProvider', () => {
 	let repo: TestRepo;
@@ -419,6 +427,112 @@ suite('BranchesSubProvider — branch identity bookkeeping (end to end)', () => 
 			assert.strictEqual(ex.details.reason, 'noRemoteReference');
 		} finally {
 			stub.restore();
+		}
+	});
+});
+
+suite('BranchesSubProvider.getBranch — force bypasses the cache', () => {
+	let repo: TestRepo;
+
+	setup(() => {
+		repo = createTestRepo();
+	});
+
+	teardown(() => {
+		repo.cleanup();
+	});
+
+	test('a named branch: unforced stays stale after an external move; force sees the fresh sha and stores it', async () => {
+		createBranch(repo.path, 'moved-branch');
+		const oldSha = getHeadSha(repo.path);
+
+		const warmed = await repo.provider.branches.getBranch(repo.path, 'moved-branch');
+		assert.strictEqual(warmed?.sha, oldSha);
+
+		addCommit(repo.path, 'file-force.txt', 'content', 'Move target commit');
+		const newSha = getHeadSha(repo.path);
+		// Moves the (non-current) branch's ref outside the provider.
+		execFileSync('git', ['update-ref', 'refs/heads/moved-branch', newSha], { cwd: repo.path, stdio: 'pipe' });
+
+		const stale = await repo.provider.branches.getBranch(repo.path, 'moved-branch');
+		assert.strictEqual(stale?.sha, oldSha, 'an unforced read must still answer from the cache');
+
+		const forced = await repo.provider.branches.getBranch(repo.path, 'moved-branch', { force: true });
+		assert.strictEqual(forced?.sha, newSha, 'a forced read must see the external move');
+
+		const afterForce = await repo.provider.branches.getBranch(repo.path, 'moved-branch');
+		assert.strictEqual(afterForce?.sha, newSha, 'the forced answer must be stored for later unforced reads');
+	});
+
+	test('the current branch: unforced stays stale after an external move; force sees the fresh sha and stores it', async () => {
+		const oldSha = getHeadSha(repo.path);
+
+		const warmed = await repo.provider.branches.getBranch(repo.path);
+		assert.strictEqual(warmed?.name, 'main');
+		assert.strictEqual(warmed?.sha, oldSha);
+
+		// Advances the checked-out branch outside the provider.
+		addCommit(repo.path, 'file-force-current.txt', 'content', 'Advance current branch');
+		const newSha = getHeadSha(repo.path);
+		assert.notStrictEqual(newSha, oldSha);
+
+		const stale = await repo.provider.branches.getBranch(repo.path);
+		assert.strictEqual(stale?.sha, oldSha, 'an unforced read must still answer from the cache');
+
+		const forced = await repo.provider.branches.getBranch(repo.path, undefined, { force: true });
+		assert.strictEqual(forced?.sha, newSha, 'a forced read must see the external move');
+
+		const afterForce = await repo.provider.branches.getBranch(repo.path);
+		assert.strictEqual(afterForce?.sha, newSha, 'the forced answer must be stored for later unforced reads');
+	});
+});
+
+suite('BranchesSubProvider.getBaseBranchName — reflog fallback', () => {
+	let repo: TestRepo;
+
+	suiteSetup(() => {
+		repo = createTestRepo();
+	});
+
+	suiteTeardown(async () => {
+		// `getBaseBranchName` self-writes its answer into gk-config `void` (fire-and-forget, by design —
+		// see the comment on it) — give that a turn to finish before disposing the provider under it.
+		await new Promise(resolve => setTimeout(resolve, 50));
+		repo.cleanup();
+	});
+
+	test('a branch created from an explicit start-point resolves that branch as its base', async () => {
+		createBranchAt(repo.path, 'from-branch', 'main');
+
+		const base = await repo.provider.branches.getBaseBranchName(repo.path, 'from-branch');
+		assert.strictEqual(base, 'main');
+	});
+
+	test('a branch created via `checkout -b` (from HEAD) resolves the branch HEAD moved from as its base', async () => {
+		createBranch(repo.path, 'from-checkout', { checkout: true });
+		try {
+			const base = await repo.provider.branches.getBaseBranchName(repo.path, 'from-checkout');
+			assert.strictEqual(base, 'main');
+		} finally {
+			checkout(repo.path, 'main');
+		}
+	});
+
+	test('a ref git cannot resolve has no base, and that answer is kept rather than re-read', async () => {
+		// Unborn, or deleted since it was listed: git reports a bad revision, which answers "no base"
+		// as surely as an empty reflog does
+		const reflog = sinon.spy(repo.provider.refs, 'getReflogEntries');
+		try {
+			const base = await repo.provider.branches.getBaseBranchName(repo.path, 'vanished-branch');
+			assert.strictEqual(base, undefined);
+			const reads = reflog.callCount;
+			assert.ok(reads > 0, 'sanity: the base was looked for in the reflog');
+
+			const again = await repo.provider.branches.getBaseBranchName(repo.path, 'vanished-branch');
+			assert.strictEqual(again, undefined);
+			assert.strictEqual(reflog.callCount, reads, 'a second lookup must not re-run the reflog');
+		} finally {
+			reflog.restore();
 		}
 	});
 });

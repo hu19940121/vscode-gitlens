@@ -1,8 +1,8 @@
-import type { PullRequestShape, PullRequestStateFilter } from '@gitlens/git/models/pullRequest.js';
+import type { PullRequest, PullRequestShape, PullRequestStateFilter } from '@gitlens/git/models/pullRequest.js';
 import { mergeAssessmentInto } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import type { ProviderPullRequest, ProviderReposInput, PullRequestFilter } from '../providers/models.js';
-import { fromProviderPullRequest, PagingMode, providersMetadata } from '../providers/models.js';
+import { PagingMode, providersMetadata, toPullRequestRow } from '../providers/models.js';
 import type { ProviderPagedResult } from '../results.js';
 import { reconcileOmissionsWithFailure } from '../results.js';
 import {
@@ -11,7 +11,7 @@ import {
 	warnOnMissingSessionForDomain,
 } from '../utils/integration.utils.js';
 import type { ProviderReadContext } from './context.js';
-import { getCurrentAccountId, runCaptured } from './drains.js';
+import { getPullRequestViewers, runCaptured } from './drains.js';
 import { resolveAccountWidePullRequestFilters, resolvePullRequestFilters } from './filters.js';
 import {
 	drainToRequestedPage,
@@ -184,7 +184,7 @@ export async function listPullRequestsPage(
 		options.cursor == null &&
 		paged.page.currentPage === 1
 	) {
-		const drained = await drainToRequestedPage<ProviderPullRequest>(
+		const drained = await drainToRequestedPage<ProviderPullRequest | PullRequest>(
 			{ items: items, paged: paged, metadata: allMetadata, fetchFailed: pageFetchFailed },
 			{
 				requestedPage: page,
@@ -228,12 +228,13 @@ export async function listPullRequestsPage(
 	}
 	// A metadata omission from an earlier page asserts the read succeeded; a later page may since have failed.
 	reconcileOmissionsWithFailure(warnings, assessment.fetchFailed || pageFetchFailed);
-	const currentAccountId = items.some(pr => pr.author != null)
-		? await getCurrentAccountId(integration, options.connectionId)
-		: undefined;
+	const viewers = await getPullRequestViewers(integration, options.connectionId, items);
+	const projection = accountWide ? 'account-summary' : options.summary ? 'repos-summary' : 'repos';
 	return {
-		// Normalize the raw provider-apis PRs to the GitLens-owned shape at the surface boundary.
-		items: items.map(pr => fromProviderPullRequest(pr, integration, { currentAccountId: currentAccountId })),
+		// Normalize the raw rows to the GitLens-owned shape at the surface boundary.
+		items: items.map((pr, i) =>
+			toPullRequestRow(pr, integration, { currentAccount: viewers[i], projection: projection }),
+		),
 		warnings: warnings,
 		// The account-wide read can't take a page size, so don't echo the requested `itemsPerPage` as if it
 		// had been applied — report what came back.

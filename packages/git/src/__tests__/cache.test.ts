@@ -1,10 +1,14 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import { createDisposable } from '@gitlens/utils/disposable.js';
+import type { PagedResult } from '@gitlens/utils/paging.js';
 import { fileUri } from '@gitlens/utils/uri.js';
 import { Cache, shouldEvictBlameCacheEntry } from '../cache.js';
 import type { GitBlame, ProgressiveGitBlame } from '../models/blame.js';
+import type { GitBranch } from '../models/branch.js';
 import type { GitCommitLine } from '../models/commit.js';
+import type { GitTag } from '../models/tag.js';
+import type { GitWorktree } from '../models/worktree.js';
 
 function createCompletedBlame(lineCount: number): ProgressiveGitBlame {
 	const blame: GitBlame = {
@@ -182,6 +186,83 @@ suite('Cache.clearCaches — branchMergedStatus', () => {
 		await cache.getBranchOverview(repoPath, 'main|origin/main', overviewFactory);
 		assert.strictEqual(mergedStatusCount, 1, 'branchMergedStatus is content-keyed, so it should be preserved');
 		assert.strictEqual(overviewCount, 2, 'branchOverviews should still be cleared on a branches event');
+	});
+});
+
+suite('Cache.evictCaches vs clearCaches — in-flight shared entries', () => {
+	let cache: Cache;
+
+	setup(() => {
+		cache = new Cache();
+	});
+
+	teardown(() => {
+		cache.dispose();
+	});
+
+	function pagedBranches(name: string): PagedResult<GitBranch> {
+		return { values: [{ name: name }] as unknown as GitBranch[] };
+	}
+
+	test('clearCaches lets a new caller join an in-flight shared entry (factory runs once)', async () => {
+		const repoPath = '/test/repo';
+		let factoryCount = 0;
+		let resolveFirst!: (value: PagedResult<GitBranch>) => void;
+
+		const first = cache.branches.getOrCreate(
+			repoPath,
+			() =>
+				new Promise<PagedResult<GitBranch>>(resolve => {
+					factoryCount++;
+					resolveFirst = resolve;
+				}),
+		);
+
+		// Soft-invalidate: the entry stays in the map and is still rideable while in flight.
+		cache.clearCaches(repoPath, 'branches');
+
+		const second = cache.branches.getOrCreate(repoPath, () => {
+			factoryCount++;
+			return Promise.resolve(pagedBranches('unused'));
+		});
+
+		resolveFirst(pagedBranches('shared'));
+
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		assert.strictEqual(factoryCount, 1, 'clearCaches should let the new caller join the in-flight factory');
+		assert.strictEqual(firstResult, secondResult, 'both callers should observe the same shared result');
+	});
+
+	test("evictCaches hard-evicts so a new caller does not join, and the first caller's promise still resolves", async () => {
+		const repoPath = '/test/repo';
+		let factoryCount = 0;
+		let resolveFirst!: (value: PagedResult<GitBranch>) => void;
+		const firstValue = pagedBranches('first');
+		const secondValue = pagedBranches('second');
+
+		const first = cache.branches.getOrCreate(
+			repoPath,
+			() =>
+				new Promise<PagedResult<GitBranch>>(resolve => {
+					factoryCount++;
+					resolveFirst = resolve;
+				}),
+		);
+
+		// Hard-delete: a new caller must spawn its own factory rather than ride the in-flight one.
+		cache.evictCaches(repoPath, 'branches');
+
+		const second = cache.branches.getOrCreate(repoPath, () => {
+			factoryCount++;
+			return Promise.resolve(secondValue);
+		});
+
+		resolveFirst(firstValue);
+
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		assert.strictEqual(factoryCount, 2, 'evictCaches should force the new caller to run its own factory');
+		assert.strictEqual(firstResult, firstValue, "the first caller's promise still resolves with its own value");
+		assert.strictEqual(secondResult, secondValue);
 	});
 });
 
@@ -533,6 +614,22 @@ suite('Cache — tag-scoped invalidation', () => {
 		await cache.commitCount.getOrCreate(repoPath, 'v1.0.0', factory);
 		assert.strictEqual(factoryCount, 2, 'a force-moved or recreated tag must not serve its old count');
 	});
+
+	test('logShas is cleared when tags change', async () => {
+		let factoryCount = 0;
+		const factory = () => {
+			factoryCount++;
+			return Promise.resolve([]);
+		};
+
+		await cache.logShas.getOrCreate(repoPath, 'feat', factory);
+		assert.strictEqual(factoryCount, 1);
+
+		cache.clearCaches(repoPath, 'tags');
+
+		await cache.logShas.getOrCreate(repoPath, 'feat', factory);
+		assert.strictEqual(factoryCount, 2, 'a list excluding tags must not survive a tag create or delete');
+	});
 });
 
 suite('Cache — gkConfig watcher reconciliation', () => {
@@ -813,5 +910,81 @@ suite('Cache.getCloseGeneration', () => {
 	test('a sibling path closing does not disturb this one', () => {
 		cache.unregisterRepoPath('/test/repo-feature');
 		assert.strictEqual(cache.getCloseGeneration(repoPath), 0);
+	});
+});
+
+suite('Cache.applyRepositoryChanges', () => {
+	const repoPath = '/test/repo';
+	let cache: Cache;
+
+	setup(() => {
+		cache = new Cache();
+		cache.registerRepoPath(fileUri(repoPath), { uri: fileUri(`${repoPath}/.git`) });
+	});
+
+	teardown(() => {
+		cache.dispose();
+	});
+
+	test("an 'index' change clears only what the index feeds, and advances the status clock", () => {
+		cache.blame.set(repoPath, 'file.ts', Promise.resolve(undefined));
+		cache.branches.set(repoPath, Promise.resolve({ values: [] } satisfies PagedResult<GitBranch>));
+		cache.tags.set(repoPath, Promise.resolve({ values: [] } satisfies PagedResult<GitTag>));
+		cache.worktrees.set(repoPath, Promise.resolve([]));
+		cache.stashes.set(repoPath, 'all', Promise.resolve({ repoPath: repoPath, stashes: new Map() }));
+
+		const types = cache.applyRepositoryChanges(repoPath, ['index'], 'evict');
+
+		assert.deepStrictEqual([...types].sort(), ['blame', 'diff', 'fileLog', 'tracking']);
+		assert.strictEqual(cache.getStatusGeneration(repoPath), 1);
+		assert.strictEqual(cache.blame.get(repoPath, 'file.ts'), undefined, 'blame is fed by the index');
+		assert.ok(cache.branches.has(repoPath), 'an index change cannot move a branch');
+		assert.ok(cache.tags.has(repoPath), 'an index change cannot move a tag');
+		assert.ok(cache.worktrees.has(repoPath), 'an index change cannot add or remove a worktree');
+		assert.notStrictEqual(cache.stashes.get(repoPath, 'all'), undefined, 'an index change cannot stash');
+	});
+
+	test('a change that maps to no cache type clears nothing', () => {
+		cache.worktrees.set(repoPath, Promise.resolve([]));
+
+		const types = cache.applyRepositoryChanges(repoPath, ['starred'], 'evict');
+
+		assert.deepStrictEqual(types, []);
+		assert.ok(cache.worktrees.has(repoPath));
+		assert.strictEqual(cache.getStatusGeneration(repoPath), 0);
+	});
+
+	test("'evict' never lets a later caller join a read that started before it; 'share' does", async () => {
+		async function factoryCallsAcross(inFlight: 'share' | 'evict'): Promise<number> {
+			let calls = 0;
+			let release!: (worktrees: GitWorktree[]) => void;
+			const gate = new Promise<GitWorktree[]>(resolve => (release = resolve));
+			const factory = (): Promise<GitWorktree[]> => {
+				calls++;
+				return gate;
+			};
+
+			const before = cache.worktrees.getOrCreate(repoPath, factory);
+			cache.applyRepositoryChanges(repoPath, ['worktrees'], inFlight);
+			const after = cache.worktrees.getOrCreate(repoPath, factory);
+			release([]);
+			await Promise.all([before, after]);
+			cache.worktrees.delete(repoPath);
+			return calls;
+		}
+
+		assert.strictEqual(await factoryCallsAcross('share'), 1, 'a watcher clear keeps sharing the in-flight read');
+		assert.strictEqual(await factoryCallsAcross('evict'), 2, 'an announced write must start a fresh read');
+	});
+
+	test('the watcher path applies the same mapping, sharing in-flight reads', () => {
+		cache.blame.set(repoPath, 'file.ts', Promise.resolve(undefined));
+		cache.branches.set(repoPath, Promise.resolve({ values: [] } satisfies PagedResult<GitBranch>));
+
+		cache.onRepositoryChanged(repoPath, ['index']);
+
+		assert.strictEqual(cache.getStatusGeneration(repoPath), 1);
+		assert.strictEqual(cache.blame.get(repoPath, 'file.ts'), undefined);
+		assert.ok(cache.branches.has(repoPath));
 	});
 });

@@ -1,7 +1,7 @@
-import type { IssueIteration, IssueMember } from '@gitlens/git/models/issue.js';
-import { Issue, RepositoryAccessLevel } from '@gitlens/git/models/issue.js';
+import type { IssueIteration, IssueMember, IssueProjection } from '@gitlens/git/models/issue.js';
+import { Issue } from '@gitlens/git/models/issue.js';
 import type { IssueOrPullRequestState } from '@gitlens/git/models/issueOrPullRequest.js';
-import type { PullRequestMember, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
+import type { PullRequestMember, PullRequestProjection, PullRequestReviewer } from '@gitlens/git/models/pullRequest.js';
 import {
 	PullRequest,
 	PullRequestMergeableState,
@@ -10,8 +10,25 @@ import {
 } from '@gitlens/git/models/pullRequest.js';
 import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { ResourceDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
+import type { IssueEtagFields, PullRequestEtagFields, PullRequestEtagInclude } from '../../models/integration.js';
+import { pullRequestRevision } from '../../models/integration.js';
+import type { ProviderAccount, ProviderIssue } from '../models.js';
+import {
+	fromProviderPullRequestMergeableState,
+	fromProviderPullRequestState,
+	GitPullRequestMergeableState,
+	GitPullRequestReviewState,
+	GitPullRequestState,
+} from '../models.js';
+import type { ProviderPullRequestReview } from '../pullRequestReviews.js';
+import {
+	decideProviderReviewDecision,
+	fromPullRequestReviewDecision,
+	toCompletedReviews,
+	toReviewRequests,
+} from '../pullRequestReviews.js';
 
-const vstsHostnameSuffix = '.visualstudio.com';
+export const vstsHostnameSuffix = '.visualstudio.com';
 
 export interface AzureRepositoryDescriptor extends ResourceDescriptor {
 	owner: string;
@@ -388,6 +405,16 @@ export function isVsts(domain: string): boolean {
 }
 
 /**
+ * Encodes one route segment of an Azure DevOps request (#5878): `encodeURIComponent` leaves a dot segment as is, and
+ * the URL would resolve it away, re-scoping the request instead of failing it.
+ */
+export function encodeAzurePathSegment(value: string): string {
+	if (value === '.' || value === '..') throw new Error(`Invalid Azure path segment '${value}'.`);
+
+	return encodeURIComponent(value);
+}
+
+/**
  * `baseUrl` and `owner` are the authoritative prefix used for the API request. The payload URL cannot supply that
  * prefix safely because it may address the repository by id or name an untrusted host.
  */
@@ -621,6 +648,7 @@ export function fromAzurePullRequest(
 	owner: string,
 	baseUrl: string,
 	forkRepositoryUrls: AzureForkRepositoryUrls | undefined,
+	projection?: PullRequestProjection,
 ): PullRequest {
 	const baseRepositoryUrl = getAzureRepositoryWebUrl(baseUrl, owner, pr.repository.project.name, pr.repository.name);
 	const baseCloneHttps = getAzureRepositoryCloneUrl(pr.repository, baseUrl, owner);
@@ -640,14 +668,13 @@ export function fromAzurePullRequest(
 			owner: owner,
 			repo: pr.repository.name,
 			id: pr.repository.id,
-			// TODO: Remove this assumption once actual access level is available
-			accessLevel: RepositoryAccessLevel.Write,
 		},
 		azurePullRequestStatusToState(pr.status),
 		new Date(pr.creationDate),
 		new Date(pr.closedDate || pr.creationDate),
 		pr.closedDate ? new Date(pr.closedDate) : undefined,
 		pr.closedDate && pr.status === 'completed' ? new Date(pr.closedDate) : undefined,
+		// The read selects the merge status, so an absent one is Azure's own "not set", as provider-apis maps it.
 		fromAzurePullRequestMergeStatusToMergeableState(pr.mergeStatus ?? 'notSet'),
 		undefined,
 		{
@@ -687,6 +714,14 @@ export function fromAzurePullRequest(
 			resourceId: '', // TODO: This is a workaround until we can get the org id here.
 			resourceName: owner,
 		},
+		undefined, // version
+		undefined, // commitCount
+		undefined, // stack
+		undefined, // filesChanged
+		undefined, // body
+		undefined, // number
+		undefined, // authoredByMe
+		projection,
 	);
 }
 
@@ -695,6 +730,7 @@ export function fromAzureWorkItem(
 	provider: Provider,
 	project: AzureProjectDescriptor,
 	stateCategory?: AzureWorkItemStateCategory,
+	projection?: IssueProjection,
 ): Issue {
 	return new Issue(
 		provider,
@@ -724,6 +760,7 @@ export function fromAzureWorkItem(
 		undefined,
 		undefined,
 		toWorkItemIterations(workItem.fields['System.IterationPath']),
+		projection,
 	);
 }
 
@@ -744,4 +781,281 @@ function toWorkItemIterations(path: string | undefined): IssueIteration[] | unde
 
 	const name = segments.at(-1)?.trim();
 	return name ? [{ id: path, name: name }] : undefined;
+}
+
+/**
+ * A work item as `GET …/_apis/wit/workitems/{id}?$expand=Links` returns it. Loosely typed because
+ * {@link fromAzureWorkItemToProviderIssue} checks every field it reads, as provider-apis does.
+ */
+export interface AzureWorkItemResponse {
+	id?: unknown;
+	fields?: Record<string, unknown>;
+	_links?: { html?: { href?: unknown } };
+}
+
+/**
+ * Converts a work item exactly as provider-apis' `getIssuesForAzureProject` converts each row it reads, so a work
+ * item read by id reaches `toIssueShape` identical to the list read's row for it. provider-apis exports neither
+ * that converter nor a single work item read, so this mirrors it field for field; the batch issue tests compare
+ * the two, so a provider-apis change that this misses fails there.
+ *
+ * `undefined` for a work item the SDK would skip: no positive integer id, no title, or no valid created date.
+ * `state.name` is the raw `System.State`, as on every list read here, which passes the SDK no state-name map.
+ */
+export function fromAzureWorkItemToProviderIssue(
+	workItem: AzureWorkItemResponse,
+	namespace: string,
+	project: string,
+): ProviderIssue | undefined {
+	const fields = workItem.fields;
+	const id = workItem.id;
+	const title = fields?.['System.Title'];
+	const createdDate = parseAzureWorkItemDate(fields?.['System.CreatedDate']);
+	if (
+		fields == null ||
+		typeof id !== 'number' ||
+		!Number.isSafeInteger(id) ||
+		id <= 0 ||
+		typeof title !== 'string' ||
+		!title.trim() ||
+		createdDate == null
+	) {
+		return undefined;
+	}
+
+	const assignee = fromAzureWorkItemIdentity(fields['System.AssignedTo']);
+	const commentCount = fields['System.CommentCount'];
+	const url = workItem._links?.html?.href;
+	const tags = fields['System.Tags'];
+	const state = fields['System.State'];
+	const type = fields['System.WorkItemType'];
+	const description = fields['System.Description'];
+	return {
+		id: id.toString(),
+		number: id.toString(),
+		title: title,
+		commentCount: typeof commentCount === 'number' && Number.isFinite(commentCount) ? commentCount : null,
+		author: fromAzureWorkItemIdentity(fields['System.CreatedBy']),
+		closedDate: parseAzureWorkItemDate(fields['Microsoft.VSTS.Common.ClosedDate']),
+		createdDate: createdDate,
+		updatedDate: parseAzureWorkItemDate(fields['System.ChangedDate']),
+		url: typeof url === 'string' ? url : null,
+		assignees: assignee != null ? [assignee] : [],
+		description: typeof description === 'string' ? description : null,
+		state: typeof state === 'string' && state ? { name: state, color: null } : null,
+		type: typeof type === 'string' ? type : null,
+		iteration: toAzureWorkItemIteration(fields['System.IterationPath']),
+		repository: null,
+		project: { namespace: namespace, name: project, resourceId: null, key: null, id: null },
+		// provider-apis fills 0, but work items have no reactions.
+		upvoteCount: null,
+		labels: (typeof tags === 'string' ? tags.split(';') : []).map(tag => ({
+			color: null,
+			description: null,
+			id: null,
+			name: tag.trim(),
+		})),
+	};
+}
+
+/** An identity field, as provider-apis maps it: `name` from `uniqueName`, `username` from `displayName`. */
+function fromAzureWorkItemIdentity(value: unknown): ProviderAccount | null {
+	const identity = value as
+		| { id?: unknown; uniqueName?: unknown; displayName?: unknown; _links?: { avatar?: { href?: unknown } } }
+		| null
+		| undefined;
+	if (typeof identity?.id !== 'string' || !identity.id.trim()) return null;
+
+	const avatarUrl = identity._links?.avatar?.href;
+	return {
+		avatarUrl: typeof avatarUrl === 'string' ? avatarUrl : null,
+		email: null,
+		id: identity.id,
+		name: typeof identity.uniqueName === 'string' ? identity.uniqueName : null,
+		username: typeof identity.displayName === 'string' ? identity.displayName : null,
+		url: null,
+	};
+}
+
+/** Only a UTC ISO timestamp naming a real calendar date and time, as provider-apis accepts; anything else is `null`. */
+function parseAzureWorkItemDate(value: unknown): Date | null {
+	if (typeof value !== 'string') return null;
+
+	const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,7})?Z$/.exec(value);
+	if (match == null) return null;
+
+	const [year, month, day, hour, minute, second] = match.slice(1).map(Number);
+	const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+	const daysInMonth = [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+	if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1] || hour > 23 || minute > 59 || second > 59) {
+		return null;
+	}
+
+	const date = new Date(value);
+	return Number.isNaN(date.getTime()) ? null : date;
+}
+
+/** The SDK's `iteration`, by the same path rule as {@link toWorkItemIterations}. */
+function toAzureWorkItemIteration(path: unknown): ProviderIssue['iteration'] {
+	const [iteration] = toWorkItemIterations(typeof path === 'string' ? path : undefined) ?? [];
+	return iteration != null ? { path: iteration.id, name: iteration.name } : undefined;
+}
+
+/**
+ * The most ids one cheap work item read asks for: the most Azure DevOps' work item list (`GET …/_apis/wit/workitems`)
+ * takes.
+ */
+export const azureWorkItemsEtagFieldsMaxIds = 200;
+
+/**
+ * The fields the cheap work item read selects: only the ones a full row's etag reads, and the project the full read
+ * checks the work item against. Not `System.State`: {@link fromAzureWorkItemToProviderIssue} gives the state no
+ * category, so `toIssueShape` closes a work item by its closed date alone.
+ */
+export const azureWorkItemEtagFieldNames: readonly string[] = [
+	'System.TeamProject',
+	'System.ChangedDate',
+	'Microsoft.VSTS.Common.ClosedDate',
+];
+
+/**
+ * A cheap read's work item, as the fields its full batch row's etag reads: `toIssueShape` closes the row the full
+ * read builds (see {@link fromAzureWorkItemToProviderIssue}) exactly when it has a closed date, parsed by the same rule.
+ * Throws where the full read fails the work item: on one in another project than `project` (compared as Azure
+ * compares names), and on a missing or unparseable change date, so the target falls through to the full read.
+ */
+export function toAzureWorkItemEtagFields(workItem: AzureWorkItemResponse, project: string): IssueEtagFields {
+	const fields = workItem.fields;
+	const teamProject = fields?.['System.TeamProject'];
+	if (typeof teamProject === 'string' && teamProject.toLowerCase() !== project.toLowerCase()) {
+		throw new Error(
+			`Azure DevOps work item ${String(workItem.id)} is in project '${teamProject}', not '${project}'`,
+		);
+	}
+
+	const updatedDate = parseAzureWorkItemDate(fields?.['System.ChangedDate']);
+	if (updatedDate == null) {
+		throw new Error(`Azure DevOps returned work item ${String(workItem.id)} without a change date`);
+	}
+
+	return {
+		state: parseAzureWorkItemDate(fields?.['Microsoft.VSTS.Common.ClosedDate']) != null ? 'closed' : 'opened',
+		updatedDate: updatedDate,
+	};
+}
+
+type ProviderPullRequestState = Parameters<typeof fromProviderPullRequestState>[0];
+type ProviderMergeableState = keyof typeof fromProviderPullRequestMergeableState;
+type ProviderReviewState = keyof typeof fromPullRequestReviewDecision;
+
+// The tables below mirror provider-apis' (0.61.0) Azure DevOps pull request mapping behind `getPullRequestForRepo` (`Xe`
+// and its helpers in the bundle), which it doesn't export. A full batch row takes these values on through
+// `fromProviderPullRequest`, so the cheap check composes the same steps to compute the same etag.
+
+/** provider-apis' pull request `status` map (`bi`). It has no `notSet`, which therefore maps to `undefined`. */
+const azurePullRequestProviderStates: Partial<Record<string, ProviderPullRequestState>> = {
+	active: GitPullRequestState.Open,
+	completed: GitPullRequestState.Merged,
+	abandoned: GitPullRequestState.Closed,
+};
+
+/** provider-apis' `mergeStatus` map (`Ti`); any other status, or none, is unknown. */
+const azureMergeStatusProviderStates: Partial<Record<string, ProviderMergeableState>> = {
+	conflicts: GitPullRequestMergeableState.Conflicts,
+	failure: GitPullRequestMergeableState.FailingChecks,
+	rejectedByPolicy: GitPullRequestMergeableState.Blocked,
+	succeeded: GitPullRequestMergeableState.Mergeable,
+};
+
+/** provider-apis' reviewer `vote` map (`Di`); any other vote reads as review requested. */
+const azureVoteProviderReviewStates: Partial<Record<number, ProviderReviewState>> = {
+	10: GitPullRequestReviewState.Approved,
+	5: GitPullRequestReviewState.Approved,
+	0: GitPullRequestReviewState.ReviewRequested,
+	[-5]: GitPullRequestReviewState.ChangesRequested,
+	[-10]: GitPullRequestReviewState.ChangesRequested,
+};
+
+/** provider-apis' reviewer mapping (`ve`), with the state its vote maps to: every reviewer, required or optional. */
+function toAzureProviderReview(reviewer: AzureUserWithVote): ProviderPullRequestReview {
+	return {
+		reviewer: {
+			id: reviewer.id,
+			name: reviewer.displayName ?? null,
+			username: (reviewer.uniqueName || reviewer.displayName) ?? null,
+			email: null,
+			avatarUrl: reviewer.imageUrl ?? null,
+			url: null,
+		},
+		state: toAzureProviderReviewState(reviewer),
+	};
+}
+
+function toAzureProviderReviewState(reviewer: AzureUserWithVote): ProviderReviewState {
+	return azureVoteProviderReviewStates[reviewer.vote ?? 0] ?? GitPullRequestReviewState.ReviewRequested;
+}
+
+/**
+ * A cheap read's pull request (the same `GET …/pullrequests/{id}` provider-apis sends), as the fields its full batch
+ * row's etag reads: provider-apis' mapping (see the tables above), then `fromProviderPullRequest`'s. Azure DevOps
+ * reports no update time, so provider-apis' `updatedDate` is the close time, else the creation time, which is why
+ * the fields Azure changes without one are fingerprinted into the `revision`, from the values the full row ends up
+ * with: provider-apis' title, description (`?? null`, which the row reads `?? undefined`) and target branch, and its
+ * reviews, split into requests and completed reviews by `fromProviderPullRequest`'s own helpers.
+ *
+ * Throws where provider-apis' mapping throws, on a field it reads without a guard, so a pull request the full read
+ * fails on falls through to it rather than matching an etag. A full row never carries a check rollup (provider-apis
+ * maps none for Azure DevOps), so the `checks` include always reads `undefined`, as there.
+ */
+export function toAzurePullRequestEtagFields(
+	pr: AzurePullRequest,
+	etagIncludes: readonly PullRequestEtagInclude[],
+): PullRequestEtagFields {
+	if (
+		pr.pullRequestId == null ||
+		pr.createdBy == null ||
+		pr.repository?.project == null ||
+		pr.lastMergeSourceCommit == null ||
+		pr.lastMergeTargetCommit == null ||
+		!Array.isArray(pr.reviewers) ||
+		pr.reviewers.some(r => r == null) ||
+		typeof pr.url !== 'string' ||
+		typeof pr.sourceRefName !== 'string' ||
+		typeof pr.targetRefName !== 'string'
+	) {
+		throw new Error(`Azure DevOps returned pull request ${String(pr.pullRequestId)} without a field it maps`);
+	}
+
+	const reviews = pr.reviewers.map(toAzureProviderReview);
+	const fields: PullRequestEtagFields = {
+		// `notSet` passes `undefined` here, as its full row does.
+		state: fromProviderPullRequestState(azurePullRequestProviderStates[pr.status] as ProviderPullRequestState),
+		isDraft: pr.isDraft,
+		updatedDate: new Date(pr.closedDate || pr.creationDate),
+		headSha: pr.lastMergeSourceCommit.commitId ?? '',
+		revision: pullRequestRevision({
+			title: pr.title,
+			body: pr.description ?? undefined,
+			refs: { base: { branch: normalizeAzureBranchName(pr.targetRefName) } },
+			reviewRequests: toReviewRequests(reviews),
+			latestReviews: toCompletedReviews(reviews),
+		}),
+	};
+
+	if (etagIncludes.includes('mergeable')) {
+		const mergeable =
+			(pr.mergeStatus != null ? azureMergeStatusProviderStates[pr.mergeStatus] : undefined) ??
+			GitPullRequestMergeableState.Unknown;
+		fields.mergeableState = fromProviderPullRequestMergeableState[mergeable];
+	}
+
+	if (etagIncludes.includes('reviewDecision')) {
+		// Only the required reviewers decide.
+		const decision = decideProviderReviewDecision(
+			pr.reviewers.filter(r => r.isRequired).map(toAzureProviderReviewState),
+		);
+		fields.reviewDecision = decision ? fromPullRequestReviewDecision[decision] : undefined;
+	}
+
+	return fields;
 }

@@ -81,6 +81,7 @@ suite('OperationsGitSubProvider Test Suite', () => {
 
 		gitStub = sandbox.createStubInstance(MockGit) as unknown as sinon.SinonStubbedInstance<Git>;
 		(gitStub.run as sinon.SinonStub).resolves(successResult());
+		(gitStub.supports as sinon.SinonStub).resolves(true);
 
 		const context = {} as unknown as GitServiceContext;
 		// `checkout({ createBranch })` clears the new branch's cached and persisted base — see the note
@@ -135,6 +136,134 @@ suite('OperationsGitSubProvider Test Suite', () => {
 		stubRunFailure('fatal: Could not read from remote repository.');
 
 		await assert.rejects(operations.fetch(repoPath), (ex: unknown) => FetchError.is(ex, 'remoteConnectionFailed'));
+	});
+
+	function fetchArgs(): string[] {
+		const call = (gitStub.run as sinon.SinonStub).getCalls().find(c => c.args.includes('fetch'));
+		assert.ok(call, 'expected git.run to be invoked with fetch');
+		return (call.args as unknown[]).slice(1).filter((a): a is string => typeof a === 'string');
+	}
+
+	suite('fetch with explicit refspecs', () => {
+		let onChanged: sinon.SinonSpy;
+
+		setup(() => {
+			onChanged = sandbox.spy();
+			const context = { hooks: { repository: { onChanged: onChanged } } } as unknown as GitServiceContext;
+			const cache = {} as unknown as Cache;
+			const provider = {} as unknown as CliGitProviderInternal;
+
+			operations = new OperationsGitSubProvider(context, gitStub, cache, provider);
+		});
+
+		test('passes a single refspec after the remote', async () => {
+			await operations.fetch(repoPath, {
+				remote: 'origin',
+				refspecs: ['+refs/heads/feature:refs/remotes/origin/feature'],
+			});
+
+			assert.deepStrictEqual(fetchArgs(), ['fetch', 'origin', '+refs/heads/feature:refs/remotes/origin/feature']);
+		});
+
+		test('passes multiple refspecs after the remote', async () => {
+			await operations.fetch(repoPath, {
+				remote: 'origin',
+				refspecs: ['+refs/heads/a:refs/remotes/origin/a', '+refs/heads/b:refs/remotes/origin/b'],
+			});
+
+			assert.deepStrictEqual(fetchArgs(), [
+				'fetch',
+				'origin',
+				'+refs/heads/a:refs/remotes/origin/a',
+				'+refs/heads/b:refs/remotes/origin/b',
+			]);
+		});
+
+		test('combines refspecs with prune', async () => {
+			await operations.fetch(repoPath, {
+				remote: 'origin',
+				prune: true,
+				refspecs: ['+refs/heads/feature:refs/remotes/origin/feature'],
+			});
+
+			assert.deepStrictEqual(fetchArgs(), [
+				'fetch',
+				'--prune',
+				'origin',
+				'+refs/heads/feature:refs/remotes/origin/feature',
+			]);
+		});
+
+		test('announces only remotes for a refs/remotes/ destination', async () => {
+			await operations.fetch(repoPath, {
+				remote: 'origin',
+				refspecs: ['+refs/heads/feature:refs/remotes/origin/feature'],
+			});
+
+			assert.deepStrictEqual(onChanged.lastCall.args, [repoPath, ['remotes']]);
+		});
+
+		test('announces heads too for a bare local-branch destination', async () => {
+			await operations.fetch(repoPath, { remote: 'origin', refspecs: ['upstream-branch:local-branch'] });
+
+			assert.deepStrictEqual(onChanged.lastCall.args, [repoPath, ['remotes', 'heads']]);
+		});
+
+		test('qualifies a tags/ destination as a tag, and an empty destination as nothing stored', async () => {
+			await operations.fetch(repoPath, { remote: 'origin', refspecs: ['refs/tags/v1:tags/v1', 'main:'] });
+
+			assert.deepStrictEqual(onChanged.lastCall.args, [repoPath, ['remotes', 'tags']]);
+		});
+
+		test('announces tags too for a refs/tags/ destination', async () => {
+			await operations.fetch(repoPath, { remote: 'origin', refspecs: ['refs/tags/v1:refs/tags/v1'] });
+
+			assert.deepStrictEqual(onChanged.lastCall.args, [repoPath, ['remotes', 'tags']]);
+		});
+	});
+
+	suite('fetch with preserveFetchHead', () => {
+		test('preserveFetchHead: true adds --no-write-fetch-head for a plain remote fetch', async () => {
+			await operations.fetch(repoPath, { remote: 'origin', preserveFetchHead: true });
+
+			assert.ok(fetchArgs().includes('--no-write-fetch-head'));
+		});
+
+		test('preserveFetchHead: true adds --no-write-fetch-head for an all-remotes fetch', async () => {
+			await operations.fetch(repoPath, { all: true, preserveFetchHead: true });
+
+			assert.ok(fetchArgs().includes('--no-write-fetch-head'));
+		});
+
+		test('preserveFetchHead: true adds --no-write-fetch-head for a refspec fetch', async () => {
+			await operations.fetch(repoPath, {
+				remote: 'origin',
+				refspecs: ['+refs/heads/feature:refs/remotes/origin/feature'],
+				preserveFetchHead: true,
+			});
+
+			assert.ok(fetchArgs().includes('--no-write-fetch-head'));
+		});
+
+		test('preserveFetchHead unset omits --no-write-fetch-head', async () => {
+			await operations.fetch(repoPath, { remote: 'origin' });
+
+			assert.ok(!fetchArgs().includes('--no-write-fetch-head'));
+		});
+
+		test('preserveFetchHead: false omits --no-write-fetch-head', async () => {
+			await operations.fetch(repoPath, { remote: 'origin', preserveFetchHead: false });
+
+			assert.ok(!fetchArgs().includes('--no-write-fetch-head'));
+		});
+
+		test('omits --no-write-fetch-head when the installed git does not support it', async () => {
+			(gitStub.supports as sinon.SinonStub).withArgs('git:fetch:no-write-fetch-head').resolves(false);
+
+			await operations.fetch(repoPath, { remote: 'origin', preserveFetchHead: true });
+
+			assert.ok(!fetchArgs().includes('--no-write-fetch-head'));
+		});
 	});
 
 	test('pull surfaces an unreachable-remote failure as PullError', async () => {

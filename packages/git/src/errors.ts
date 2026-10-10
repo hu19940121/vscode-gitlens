@@ -1,6 +1,7 @@
 import * as l10n from '@vscode/l10n';
 import { getNumericFormat } from '@gitlens/utils/date.js';
 import type { GitPausedOperationStatus } from './models/pausedOperationStatus.js';
+import type { Provider } from './models/remoteProvider.js';
 
 /** The `t` surface a message builder renders through — the real `l10n` for `localizedMessage`, `english` for `message`. */
 type Translator = Pick<typeof l10n, 't'>;
@@ -56,6 +57,26 @@ export const GitWarnings = {
 } as const;
 
 export type GitWarningKey = keyof typeof GitWarnings;
+
+/** The {@link GitWarnings} entry a failure's message matches, if any */
+export function getGitWarning(ex: unknown): GitWarningKey | undefined {
+	if (!(ex instanceof Error)) return undefined;
+
+	for (const [key, warning] of Object.entries(GitWarnings) as [GitWarningKey, RegExp][]) {
+		if (warning.test(ex.message)) return key;
+	}
+	return undefined;
+}
+
+/**
+ * For a read's `.catch`: answers `undefined` for a {@link GitWarnings} failure (a folder that is no longer a repository,
+ * a bare repository) and rethrows any other, including a cancellation or timeout
+ */
+export function undefinedOnGitWarning(ex: unknown): undefined {
+	if (getGitWarning(ex) != null) return undefined;
+
+	throw ex;
+}
 
 export interface GitCommandContext {
 	readonly repoPath: string;
@@ -1160,6 +1181,8 @@ function getRevertContinueErrorMessage(
 export type PullErrorReason =
 	| 'conflict'
 	| 'gitIdentity'
+	| 'noFastForward'
+	| 'noUpstream'
 	| 'rebaseMultipleBranches'
 	| 'refLocked'
 	| 'remoteConnectionFailed'
@@ -1187,6 +1210,10 @@ export class PullError extends GitCommandError<PullErrorDetails> {
 				return l10n.t('Unable to complete pull due to conflicts which must be resolved.');
 			case 'gitIdentity':
 				return l10n.t('Unable to pull because you have not yet set up your Git identity.');
+			case 'noFastForward':
+				return l10n.t('Unable to pull because the branch cannot be fast-forwarded.');
+			case 'noUpstream':
+				return l10n.t('Unable to pull because the branch has no upstream.');
 			case 'rebaseMultipleBranches':
 				return l10n.t('Unable to pull because you are trying to rebase onto multiple branches.');
 			case 'refLocked':
@@ -1983,6 +2010,59 @@ function getGenericTagErrorMessage(tag: string, reason: TagErrorReason | undefin
 	}
 }
 
+export type ReferenceUpdateErrorReason = 'checkedOut' | 'conflict' | 'invalidObject' | 'invalidRef' | 'notFound';
+interface ReferenceUpdateErrorDetails {
+	reason?: ReferenceUpdateErrorReason;
+	action: 'update' | 'delete';
+	/** The full ref name the operation targeted */
+	ref: string;
+	gitCommand?: GitCommandContext;
+}
+
+export class ReferenceUpdateError extends GitCommandError<ReferenceUpdateErrorDetails> {
+	static override is(ex: unknown): ex is ReferenceUpdateError;
+	static override is<R extends ReferenceUpdateErrorReason>(
+		ex: unknown,
+		reason: R,
+	): ex is ReferenceUpdateError & { details: { reason: R } };
+	static override is(ex: unknown, reason?: ReferenceUpdateErrorReason): boolean {
+		return ex instanceof ReferenceUpdateError && (reason == null || ex.details.reason === reason);
+	}
+
+	protected override buildErrorMessage(details: ReferenceUpdateErrorDetails, l10n: Translator): string {
+		const ref = details.ref;
+		if (details.action === 'delete') {
+			switch (details.reason) {
+				case 'checkedOut':
+					return l10n.t("Unable to delete reference '{0}' because it is checked out in a worktree", ref);
+				case 'conflict':
+					return l10n.t("Unable to delete reference '{0}' because it changed unexpectedly", ref);
+				case 'invalidObject':
+					return l10n.t("Unable to delete reference '{0}' because the target object does not exist", ref);
+				case 'invalidRef':
+					return l10n.t("Unable to delete reference '{0}' because the name is not a valid reference", ref);
+				case 'notFound':
+					return l10n.t("Unable to delete reference '{0}' because it does not exist", ref);
+				default:
+					return l10n.t("Unable to delete reference '{0}'", ref);
+			}
+		}
+
+		switch (details.reason) {
+			case 'conflict':
+				return l10n.t("Unable to update reference '{0}' because it changed unexpectedly", ref);
+			case 'invalidObject':
+				return l10n.t("Unable to update reference '{0}' because the target object does not exist", ref);
+			case 'invalidRef':
+				return l10n.t("Unable to update reference '{0}' because the name is not a valid reference", ref);
+			case 'notFound':
+				return l10n.t("Unable to update reference '{0}' because it does not exist", ref);
+			default:
+				return l10n.t("Unable to update reference '{0}'", ref);
+		}
+	}
+}
+
 export class WorkspaceUntrustedError extends Error {
 	static is(ex: unknown): ex is WorkspaceUntrustedError {
 		return ex instanceof WorkspaceUntrustedError;
@@ -2178,6 +2258,34 @@ export class RequestRateLimitError extends Error {
 
 		Error.captureStackTrace?.(this, new.target);
 	}
+}
+
+const deferredRequestFailures = new WeakMap<Error, () => void>();
+
+/**
+ * Spends `provider`'s strike toward disconnecting for a request that failed with a server error or timed out, and
+ * shows `notify`'s notice; or, with `defer`, leaves both to the batch read that made the request, which counts its
+ * failed requests once for the whole call (see {@link getDeferredRequestFailure}). A batch fans out into a request
+ * per target, so one outage would otherwise disconnect the integration in the middle of a batch.
+ */
+export function reportRequestFailure(
+	provider: Provider | undefined,
+	ex: Error,
+	notify: () => void,
+	defer: boolean | undefined,
+): void {
+	if (defer) {
+		deferredRequestFailures.set(ex, notify);
+		return;
+	}
+
+	provider?.trackRequestException();
+	notify();
+}
+
+/** The notice a failed request left to its batch read (see {@link reportRequestFailure}), if it left one. */
+export function getDeferredRequestFailure(ex: unknown): (() => void) | undefined {
+	return ex instanceof Error ? deferredRequestFailures.get(ex) : undefined;
 }
 
 export type SigningErrorReason = 'noKey' | 'gpgNotFound' | 'sshNotFound' | 'passphraseFailed' | 'unknown';

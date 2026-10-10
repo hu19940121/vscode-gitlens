@@ -11,7 +11,7 @@ import type {
 } from '@gitlens/git/models/diff.js';
 import type { GitFile } from '@gitlens/git/models/file.js';
 import type { GitRevisionRange, GitRevisionRangeNotation } from '@gitlens/git/models/revision.js';
-import { deletedOrMissing, rootSha, uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
+import { deletedOrMissing, uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
 import {
 	parseGitApplyFiles,
 	parseGitDiff,
@@ -27,6 +27,7 @@ import type {
 } from '@gitlens/git/providers/diff.js';
 import type { DisposableTemporaryGitIndex } from '@gitlens/git/providers/staging.js';
 import type { DiffRange, RevisionUri } from '@gitlens/git/providers/types.js';
+import type { GitErrorHandling } from '@gitlens/git/run.types.js';
 import {
 	getRevisionRangeParts,
 	isRevisionRange,
@@ -61,7 +62,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 		repoPath: string,
 		to?: string,
 		from?: string,
-		options?: { uris?: (string | Uri)[]; includeUntracked?: boolean },
+		options?: { uris?: (string | Uri)[]; includeUntracked?: boolean; errors?: GitErrorHandling },
 		_cancellation?: AbortSignal,
 	): Promise<GitDiffShortStat | undefined> {
 		const scope = getScopedLogger();
@@ -77,8 +78,9 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 		}
 
 		try {
+			// A default run swallows a failure matching a git warning (not a repository, say) into empty output
 			const result = await this.git.run(
-				{ cwd: repoPath, configs: gitConfigsDiff },
+				{ cwd: repoPath, configs: gitConfigsDiff, errors: options?.errors === 'throw' ? 'throw' : undefined },
 				'diff',
 				'--shortstat',
 				'--no-ext-diff',
@@ -93,7 +95,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			// Skip when a pathspec filter is active — mixing a path-filtered diff count with an
 			// unfiltered untracked count would silently produce wrong totals.
 			if (options?.includeUntracked && !options.uris?.length && isWorkingTreeComparison(to, from)) {
-				const untracked = (await this.provider.status?.getUntrackedFiles?.(repoPath)) ?? [];
+				const untracked = await this.getUntrackedFilesForDiff(repoPath, options.errors);
 				if (untracked.length) {
 					return {
 						files: (stat?.files ?? 0) + untracked.length,
@@ -106,7 +108,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			return stat;
 		} catch (ex) {
 			const msg: string = ex?.toString() ?? '';
-			if (GitErrors.noMergeBase.test(msg) || GitErrors.badRevision.test(msg)) {
+			if (options?.errors !== 'throw' && (GitErrors.noMergeBase.test(msg) || GitErrors.badRevision.test(msg))) {
 				return undefined;
 			}
 
@@ -125,6 +127,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			index?: DisposableTemporaryGitIndex;
 			notation?: GitRevisionRangeNotation;
 			uris?: (string | Uri)[];
+			errors?: GitErrorHandling;
 		},
 		_cancellation?: AbortSignal,
 	): Promise<GitDiff | undefined> {
@@ -140,6 +143,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			}
 		}
 
+		const hasFrom = from != null;
 		from = prepareToFromDiffArgs(to, from, args, options?.notation);
 
 		let paths: Set<string> | undefined;
@@ -157,7 +161,23 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 				args.includes('--') ? undefined : '--',
 			);
 		} catch (ex) {
+			// Before its first commit HEAD names nothing, so a diff from it fails; the empty tree is what it is against
+			if (isHead(from) && (await isUnbornHeadFailure(this.provider, repoPath, ex))) {
+				const emptyTree = await this.provider.revision.getEmptyTreeSha(repoPath);
+				// With no `from`, a `to` of HEAD means the working tree against HEAD, so it is the empty tree alone
+				const retried = await this.getDiff(
+					repoPath,
+					!hasFrom && isHead(to) ? '' : to,
+					emptyTree,
+					options,
+					_cancellation,
+				);
+				return retried != null ? { ...retried, to: to } : undefined;
+			}
+
 			scope?.error(ex);
+			if (options?.errors === 'throw') throw ex;
+
 			return undefined;
 		}
 
@@ -174,6 +194,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			context?: number;
 			notation?: GitRevisionRangeNotation;
 			uris?: (string | Uri)[];
+			errors?: GitErrorHandling;
 		},
 		cancellation?: AbortSignal,
 	): Promise<ParsedGitDiff | undefined> {
@@ -216,6 +237,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			path?: string;
 			renameLimit?: number;
 			similarityThreshold?: number;
+			errors?: GitErrorHandling;
 		},
 	): Promise<GitFile[] | undefined> {
 		try {
@@ -226,7 +248,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 					? [...gitConfigsDiff, '-c', `diff.renameLimit=${options.renameLimit}`]
 					: gitConfigsDiff;
 			const result = await this.git.run(
-				{ cwd: repoPath, configs: configs },
+				{ cwd: repoPath, configs: configs, errors: options?.errors === 'throw' ? 'throw' : undefined },
 				'diff',
 				'--numstat',
 				'--summary',
@@ -254,7 +276,7 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 				filtersAllowUntracked(options.filters) &&
 				!isNonExactPathspec(options.path)
 			) {
-				const untracked = (await this.provider.status?.getUntrackedFiles?.(repoPath)) ?? [];
+				const untracked = await this.getUntrackedFilesForDiff(repoPath, options.errors);
 				if (untracked.length) {
 					const seen = new Set(files.map(f => f.path));
 					for (const file of untracked) {
@@ -267,8 +289,24 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			}
 
 			return files.length ? files : undefined;
-		} catch (_ex) {
+		} catch (ex) {
+			if (options?.errors === 'throw') throw ex;
+
 			return undefined;
+		}
+	}
+
+	/**
+	 * The untracked files a working-tree diff folds in; outside `errors: 'throw'`, a failed listing adds nothing. The diff
+	 * reads take no cancellation, so a `CancellationError` here is a timeout and degrades like any other failure.
+	 */
+	private async getUntrackedFilesForDiff(repoPath: string, errors: GitErrorHandling | undefined): Promise<GitFile[]> {
+		try {
+			return (await this.provider.status?.getUntrackedFiles?.(repoPath)) ?? [];
+		} catch (ex) {
+			if (errors === 'throw') throw ex;
+
+			return [];
 		}
 	}
 
@@ -803,9 +841,9 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 		}
 
 		if (ref1) {
-			// <sha>^3 signals an untracked file in a stash and if we are trying to find its parent, use the root sha
+			// <sha>^3 signals an untracked file in a stash and if we are trying to find its parent, use the empty tree
 			if (ref1.endsWith('^3^')) {
-				ref1 = rootSha;
+				ref1 = await this.provider.revision.getEmptyTreeSha(repoPath);
 			}
 			params.push(isUncommittedStaged(ref1) ? '--staged' : ref1);
 		}
@@ -825,9 +863,15 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			if (match !== null) {
 				const [, ref] = match;
 
-				// If the bad ref is trying to find a parent ref, assume we hit to the last commit, so try again using the root sha
+				// If the bad ref is trying to find a parent ref, assume we hit to the last commit, so try again using the empty tree
 				if (ref === ref1 && ref?.endsWith('^')) {
-					return this.diff(repoPath, fileName, rootSha, ref2, options);
+					return this.diff(
+						repoPath,
+						fileName,
+						await this.provider.revision.getEmptyTreeSha(repoPath),
+						ref2,
+						options,
+					);
 				}
 			}
 
@@ -881,9 +925,15 @@ export class DiffGitSubProvider implements GitDiffSubProvider {
 			if (match !== null) {
 				const [, matchedRef] = match;
 
-				// If the bad ref is trying to find a parent ref, assume we hit to the last commit, so try again using the root sha
+				// If the bad ref is trying to find a parent ref, assume we hit to the last commit, so try again using the empty tree
 				if (matchedRef === ref && matchedRef?.endsWith('^')) {
-					return this.diffContents(repoPath, fileName, rootSha, contents, options);
+					return this.diffContents(
+						repoPath,
+						fileName,
+						await this.provider.revision.getEmptyTreeSha(repoPath),
+						contents,
+						options,
+					);
 				}
 			}
 
@@ -1082,8 +1132,20 @@ function isWorkingTreeComparison(to: string | undefined, from: string | undefine
 
 	// `getChangedFilesCount` uses `prepareToFromDiffArgs`, which translates `to` (with no `from`)
 	// to `${to}^ ${to}` UNLESS `to` is HEAD or empty.
-	if (to.toUpperCase() === 'HEAD' && from == null) return true;
+	if (isHead(to) && from == null) return true;
 	return false;
+}
+
+function isHead(ref: string | undefined): boolean {
+	return ref?.toUpperCase() === 'HEAD';
+}
+
+/** Whether `ex` is git failing to resolve `HEAD` because the repository has no commit yet */
+async function isUnbornHeadFailure(provider: CliGitProviderInternal, repoPath: string, ex: unknown): Promise<boolean> {
+	const ref = GitErrors.badRevision.exec(String(ex))?.[1];
+	if (!isHead(ref)) return false;
+
+	return (await provider.refs.validateReference(repoPath, 'HEAD', { force: true })) == null;
 }
 
 function prepareToFromDiffArgs(
@@ -1108,7 +1170,7 @@ function prepareToFromDiffArgs(
 			from = 'HEAD';
 		}
 	} else if (from == null) {
-		if (to === '' || to.toUpperCase() === 'HEAD') {
+		if (to === '' || isHead(to)) {
 			from = 'HEAD';
 			args.push(from);
 		} else {

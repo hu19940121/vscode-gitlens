@@ -3,11 +3,12 @@ import type { PullRequestSearchCriteria } from '@gitlens/git/models/pullRequest.
 import { chunk } from '@gitlens/utils/array.js';
 import { mapBounded } from '@gitlens/utils/promise.js';
 import type { IntegrationIds } from '../constants.js';
-import { providerFanOutConcurrency } from '../constants.js';
+import { GitSelfManagedHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
+import type { ProviderSearchCount } from '../models/integration.js';
 import type { ProviderRepoInput, ProviderReposInput } from '../providers/models.js';
 import { providersMetadata } from '../providers/models.js';
 import type { ProviderResult, ProviderWarning } from '../results.js';
-import { appendDedupedWarning } from '../results.js';
+import { appendDedupedWarning, toProviderWarning } from '../results.js';
 import {
 	isGitHostIntegration,
 	isIssuesHostIntegrationId,
@@ -27,6 +28,7 @@ import {
 	otherWarning,
 	unsupportedIssueSearchCriteriaWarning,
 	unsupportedPullRequestSearchCriteriaWarning,
+	unsupportedWarning,
 	unusableSearchScopeMessage,
 } from './warnings.js';
 
@@ -46,8 +48,20 @@ const issueCountChunkSize = 25;
  * The same latency/complexity reasoning as {@link issueCountChunkSize}, kept slightly smaller because a pull-request
  * scope can fan out into one aliased count PER requested state (open/closed/merged), so a chunk of scopes carries a
  * small multiple of that many `search` aliases.
+ *
+ * A provider that counts by reading batches nothing, so it is chunked one scope at a time instead: a chunk is then
+ * just a scope, and the facade's bounded concurrency is what paces the requests.
  */
 const pullRequestCountChunkSize = 15;
+
+/**
+ * Whether a provider counts pull requests by READING the matches rather than asking for a total — Bitbucket Data
+ * Center, which has no count query. Two rules follow from it: it batches nothing, and it deduplicates the rows
+ * themselves, so a relationship set is an exact union it can count in one scope rather than a refusal.
+ */
+function countsPullRequestsByReading(providerId: IntegrationIds): boolean {
+	return providerId === GitSelfManagedHostIntegrationId.BitbucketServer;
+}
 
 /**
  * One scope to count.
@@ -113,10 +127,21 @@ export interface PullRequestCountResult {
 	key: string;
 	/**
 	 * Total matches the provider reports. `undefined` when the provider didn't report one for this scope — NEVER
-	 * zero, which is a real answer. For a multi-state scope this is the LARGEST of its per-state counts, the same
-	 * total `searchPullRequestsPage` surfaces, not their sum.
+	 * zero, which is a real answer.
+	 *
+	 * For a multi-state scope, GitHub/GHE report the LARGEST of their per-state counts (the same total
+	 * `searchPullRequestsPage` surfaces, since each state is its own capped search), not their sum. Bitbucket Data
+	 * Center has no ceiling to stay under, so it reports the exact union — the number of rows the search returns —
+	 * and so does Azure DevOps Server, which reads every state in one drain.
 	 */
 	count?: number;
+	/**
+	 * True when `count` is a FLOOR rather than the total: the provider has no count query (Bitbucket Data Center),
+	 * so it counts by reading within a budget, and this scope had more than the budget read. Render it as "N+", and
+	 * treat the scope as at least that expensive. Absent means `count` is exact — the provider's own total, or for a
+	 * provider that counts by reading, every match it read.
+	 */
+	lowerBound?: boolean;
 	/**
 	 * True when `count` exceeds the provider's own per-search result ceiling, so a full read CANNOT return
 	 * everything no matter how it is paged. This is the signal to warn before starting an expensive fetch.
@@ -274,16 +299,14 @@ export async function countIssues(
 			continue;
 		}
 
-		for (let i = 0; i < batch.length; i++) {
-			const count = value[i];
-			items.push({
-				key: batch[i].key,
-				count: count,
-				// Only a reported count can exceed a declared ceiling; unknown-vs-limit is not a comparison.
-				exceedsProviderLimit: count != null && providerLimit != null && count > providerLimit,
-				providerLimit: providerLimit,
-			});
-		}
+		fetchFailed =
+			collectCounts(batch, value, providerLimit, items, (key, error) => {
+				const warning = toProviderWarning(options.providerId, domain, options.connectionId, error);
+				appendDedupedWarning(warnings, {
+					...warning,
+					message: `Issue count scope '${key}': ${warning.message}`,
+				});
+			}) || fetchFailed;
 	}
 
 	// A provider with no count support returns `undefined` with no error, which lands as an empty `items` and no
@@ -297,6 +320,42 @@ export async function countIssues(
 	}
 
 	return { items: items, warnings: warnings, fetchFailed: fetchFailed || undefined };
+}
+
+/**
+ * Turns one batch of positional issue counts into keyed results, returning whether any scope was refused.
+ *
+ * A slot holding an `Error` is a scope the PROVIDER refused for its own reasons (a scope naming a collection it
+ * can't search, say): reported and dropped exactly like a scope the facade refuses, so its siblings in the batch
+ * still come back. `'exceeds-limit'` is a count the provider can only bound — more than its ceiling matched — which
+ * is reported as `exceedsProviderLimit` with no `count` rather than as the ceiling, which would understate it.
+ */
+function collectCounts<T extends { key: string }>(
+	batch: readonly T[],
+	value: readonly ProviderSearchCount[],
+	providerLimit: number | undefined,
+	items: { key: string; count?: number; exceedsProviderLimit: boolean; providerLimit?: number }[],
+	onRefused: (key: string, error: Error) => void,
+): boolean {
+	let refused = false;
+	for (let i = 0; i < batch.length; i++) {
+		const count = value[i];
+		if (count instanceof Error) {
+			onRefused(batch[i].key, count);
+			refused = true;
+			continue;
+		}
+
+		const exceeds = count === 'exceeds-limit';
+		items.push({
+			key: batch[i].key,
+			count: exceeds ? undefined : count,
+			// Only a reported count can exceed a declared ceiling; unknown-vs-limit is not a comparison.
+			exceedsProviderLimit: exceeds || (count != null && providerLimit != null && count > providerLimit),
+			providerLimit: providerLimit,
+		});
+	}
+	return refused;
 }
 
 /** The first key that appears twice, or `undefined` when every key is unique. */
@@ -331,7 +390,7 @@ function rejectScope(
 
 	// AFTER the criteria check, mirroring `searchIssuesPage`: a provider with no filtered issue search is the more
 	// fundamental refusal, and a count must preview the refusal its read would give.
-	const scoping = resolveIssueSearchScope(scope.repos, scope.org, scope.criteria);
+	const scoping = resolveIssueSearchScope(providerId, scope.repos, scope.org, scope.criteria);
 	switch (scoping.rejection?.reason) {
 		case 'repo-ids':
 			return otherWarning(
@@ -380,9 +439,12 @@ function rejectScope(
  *
  * Identical batching, per-scope isolation, and `key`-echo contract as {@link countIssues}; see it for the cost
  * model and the `count: undefined` ≠ zero rule. The one difference is inherent to pull requests: a scope's criteria
- * can name several STATES, which the provider counts as independent searches — the reported `count` is the LARGEST
+ * can name several STATES, which GitHub/GHE count as independent searches — the reported `count` is the LARGEST
  * of them (mirroring `searchPullRequestsPage`'s total), so an unpaged read still can't exceed a single search's
- * ceiling undetected.
+ * ceiling undetected. Bitbucket Data Center has no ceiling and no count query: it counts the exact union by reading
+ * each scope within a budget, and flags a scope that had more as `lowerBound`. Because it deduplicates rows, it is
+ * also the one provider that accepts several relationships in one scope. Azure DevOps Server counts the union of the
+ * states from the one drain its search pages through.
  */
 export async function countPullRequests(
 	ctx: ProviderReadContext,
@@ -481,7 +543,8 @@ export async function countPullRequests(
 	// Chunks are independent requests over their own slice of scopes, `runCaptured` never throws, so they run
 	// concurrently, bounded like every other fan-out on the facade. `mapBounded` returns in input order, so `items`
 	// and `warnings` stay in scope order.
-	const batches = await mapBounded(chunk(countable, pullRequestCountChunkSize), providerFanOutConcurrency, batch =>
+	const chunks = chunk(countable, countsPullRequestsByReading(options.providerId) ? 1 : pullRequestCountChunkSize);
+	const batches = await mapBounded(chunks, providerFanOutConcurrency, batch =>
 		runCaptured(
 			options.providerId,
 			domain,
@@ -512,10 +575,23 @@ export async function countPullRequests(
 		}
 
 		for (let i = 0; i < batch.length; i++) {
-			const count = value[i];
+			const slot = value[i];
+			// A scope the provider refused for its own reasons: reported and dropped like one the facade refuses.
+			if (slot instanceof Error) {
+				const warning = toProviderWarning(options.providerId, domain, options.connectionId, slot);
+				appendDedupedWarning(warnings, {
+					...warning,
+					message: `Pull request count scope '${batch[i].key}': ${warning.message}`,
+				});
+				fetchFailed = true;
+				continue;
+			}
+
+			const count = slot?.count;
 			items.push({
 				key: batch[i].key,
 				count: count,
+				...(count != null && slot?.lowerBound === true ? { lowerBound: true } : {}),
 				// Only a reported count can exceed a declared ceiling; unknown-vs-limit is not a comparison.
 				exceedsProviderLimit: count != null && providerLimit != null && count > providerLimit,
 				providerLimit: providerLimit,
@@ -596,9 +672,11 @@ function rejectPullRequestScope(
 	// Count-only, with no counterpart in the read: a relationship set is an OR across several searches, which one
 	// count can't express — summing would double-count overlaps and max would under-report. Ask the caller to count
 	// each relationship as its own scope, where the keys make the OR explicit. (States are disjoint, so a scope may
-	// still name several — the provider counts them as the max, not a refusal.)
-	if ((scope.criteria?.relationships?.length ?? 0) > 1) {
-		return otherWarning(
+	// still name several — the provider counts them as the max, not a refusal.) A provider that counts by reading
+	// deduplicates the matching rows themselves, so it counts the OR exactly, as the search it previews returns it.
+	// That makes the refusal the provider's capability, so `unsupported`; the issue twin refuses on every provider.
+	if ((scope.criteria?.relationships?.length ?? 0) > 1 && !countsPullRequestsByReading(providerId)) {
+		return unsupportedWarning(
 			providerId,
 			domain,
 			connectionId,

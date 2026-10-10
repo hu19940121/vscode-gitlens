@@ -90,6 +90,14 @@ function sanitizeErrorResponse(status: number, response: ProviderErrorResponse |
 
 const linearIssueNotFoundMessage = /^Linear issue not found: .+$/i;
 
+/**
+ * What Linear actually answers for an identifier it can't resolve: HTTP 200 with the single GraphQL error
+ * `Entity not found: Issue` (`INPUT_ERROR`), which provider-apis rethrows as `Linear GraphQL errors: <messages>`, the
+ * response not attached. Only that one message proves the miss; any other error, or another alongside it, is a
+ * failure.
+ */
+const linearIssueEntityNotFoundMessage = /^Linear GraphQL errors: Entity not found: Issue$/;
+
 type ProviderGraphQLError = {
 	message?: unknown;
 	extensions?: { code?: unknown };
@@ -104,12 +112,30 @@ function getProviderGraphQLErrors(body: unknown): ProviderGraphQLError[] {
 		: [];
 }
 
-function isAzureProviderId(providerId: IntegrationIds): boolean {
+export function isAzureProviderId(
+	providerId: IntegrationIds,
+): providerId is GitCloudHostIntegrationId.AzureDevOps | GitSelfManagedHostIntegrationId.AzureDevOpsServer {
 	return (
 		providerId === GitCloudHostIntegrationId.AzureDevOps ||
 		providerId === GitSelfManagedHostIntegrationId.AzureDevOpsServer
 	);
 }
+
+export function isGitHubProviderId(
+	providerId: IntegrationIds,
+): providerId is GitCloudHostIntegrationId.GitHub | GitSelfManagedHostIntegrationId.CloudGitHubEnterprise {
+	return (
+		providerId === GitCloudHostIntegrationId.GitHub ||
+		providerId === GitSelfManagedHostIntegrationId.CloudGitHubEnterprise
+	);
+}
+
+/**
+ * GitHub's GraphQL schema declares coordinate variables (issue/PR number) as `Int!`, a 32-bit signed integer.
+ * A number above this coerces with no `path` on the error, which fails every aliased target in the chunk rather
+ * than just the one with the bad number — so the read layer refuses the whole call up front instead.
+ */
+export const githubGraphQLInt32Max = 2147483647;
 
 function isLinearRateLimitError(providerId: IntegrationIds, ex: unknown): boolean {
 	if (providerId !== IssuesCloudHostIntegrationId.Linear) return false;
@@ -120,11 +146,40 @@ function isLinearRateLimitError(providerId: IntegrationIds, ex: unknown): boolea
 
 export function isProviderIssueNotFoundError(providerId: IntegrationIds, ex: unknown): boolean {
 	if (providerId === IssuesCloudHostIntegrationId.Linear) {
-		return ex instanceof Error && linearIssueNotFoundMessage.test(ex.message);
+		return (
+			ex instanceof Error &&
+			(linearIssueNotFoundMessage.test(ex.message) || linearIssueEntityNotFoundMessage.test(ex.message))
+		);
 	}
 
 	const status = (ex as { response?: { status?: unknown } }).response?.status;
 	return status === 404 || status === 410 || status === 422;
+}
+
+const jiraMissingProjectMessage = /^The value '.*' does not exist for the field 'project'\.?$/i;
+
+/**
+ * Jira's refusal of a search scoped to a project it cannot find: `400` with
+ * `{"errorMessages":["The value 'KPSC290' does not exist for the field 'project'."]}`, measured against Jira Data
+ * Center 10.7.3 for a deleted project key and for a numeric id that names no project. Jira answers a project the
+ * user lost browse permission on the same way, since it will not confirm a project the user cannot see.
+ *
+ * Only a `400` whose EVERY message is that one: a JQL that is wrong in some other way also answers `400`, and that
+ * is a real failure rather than a project that is simply gone. Accepts the SDK's error or the `RequestClientError`
+ * `throwProviderError` wraps it in, whose `original` keeps the response.
+ */
+export function isJiraMissingProjectError(ex: unknown): boolean {
+	for (const candidate of [ex, (ex as { original?: unknown } | undefined)?.original]) {
+		const response = (candidate as { response?: { status?: unknown; body?: unknown } } | undefined)?.response;
+		if (response?.status !== 400) continue;
+
+		const messages = (response.body as { errorMessages?: unknown } | null | undefined)?.errorMessages;
+		if (!Array.isArray(messages) || messages.length === 0) continue;
+
+		return messages.every(m => typeof m === 'string' && jiraMissingProjectMessage.test(m.trim()));
+	}
+
+	return false;
 }
 
 export function throwProviderError(tokenWithInfo: TokenWithInfo, error: unknown): never {

@@ -5,6 +5,8 @@ import { access, constants } from 'fs';
 import { stat } from 'fs/promises';
 import { join as joinPaths } from 'path';
 import * as process from 'process';
+import type { Writable } from 'stream';
+import type { CancellationReason } from '../../cancellation.js';
 import { getScopedLogger, maybeStartScopedLogger } from '../../logger.scoped.js';
 import { normalizePath } from '../../path.js';
 import { isWindows } from './platform.js';
@@ -43,12 +45,22 @@ export class RunError extends Error {
 }
 
 export class CancelledRunError extends RunError {
-	constructor(cmd: string, killed: boolean, code?: number | string | undefined, signal: NodeJS.Signals = 'SIGTERM') {
+	readonly reason: CancellationReason;
+
+	constructor(
+		cmd: string,
+		killed: boolean,
+		code?: number | string | undefined,
+		signal: NodeJS.Signals = 'SIGTERM',
+		reason: CancellationReason = 'unknown',
+	) {
 		super(
 			{ message: `Operation cancelled; command=${cmd}`, cmd: cmd, killed: killed, code: code, signal: signal },
 			'',
 			'',
 		);
+
+		this.reason = reason;
 
 		this.name = 'CancelledRunError';
 		Error.captureStackTrace?.(this, new.target);
@@ -263,6 +275,7 @@ export function run<T extends number | string>(
 								true,
 								error.code ?? undefined,
 								error.signal,
+								cancellation?.aborted ? 'aborted' : error.killed ? 'timeout' : 'unknown',
 							),
 						);
 
@@ -324,11 +337,28 @@ export function run<T extends number | string>(
 		);
 
 		if (stdin != null) {
-			proc.stdin?.end(stdin, (stdinEncoding ?? 'utf8') as BufferEncoding);
+			endStdin(proc.stdin, stdin, stdinEncoding);
 		}
 	});
 
 	return promise.finally(() => scope?.[Symbol.dispose]());
+}
+
+/**
+ * Writes a child's whole input and closes it. A child can exit, or be killed on cancellation, before reading all of
+ * it, and the pipe then errors (EPIPE, or EOF on Windows). Unlistened, that error is thrown as an uncaught exception
+ * and takes down the whole host process, so it is dropped: the child's exit status and stderr already report the
+ * failure, and a child that chose to stop reading answered from what it read.
+ */
+export function endStdin(stream: Writable | null, stdin: string | Buffer, stdinEncoding: string | undefined): void {
+	if (stream == null) return;
+
+	stream.on('error', () => {});
+	if (typeof stdin === 'string') {
+		stream.end(stdin, (stdinEncoding ?? 'utf8') as BufferEncoding);
+	} else {
+		stream.end(stdin);
+	}
 }
 
 export interface RunExitResult {
@@ -341,6 +371,8 @@ export interface RunExitResult {
 	readonly exitCode?: number;
 	/** Set when the process was terminated by a signal instead of exiting; {@link exitCode} is then absent. */
 	readonly signal?: NodeJS.Signals;
+	/** Whether Node itself killed the process (its spawn `timeout`), as opposed to an external signal. */
+	readonly killed?: boolean;
 }
 
 export interface RunResult<T extends string | Buffer> extends RunExitResult {
@@ -407,7 +439,7 @@ export function runSpawn<T extends string | Buffer>(
 
 		proc.once('error', async ex => {
 			if (ex?.name === 'AbortError') {
-				reject(new CancelledRunError(`${command} ${args.join(' ')}`, true));
+				reject(new CancelledRunError(`${command} ${args.join(' ')}`, true, undefined, undefined, 'aborted'));
 
 				return;
 			}
@@ -424,7 +456,7 @@ export function runSpawn<T extends string | Buffer>(
 				// is null exactly when the process was killed — report the signal rather than coercing to `0`,
 				// which would claim a clean success for a command that never finished. Note this returns BEFORE
 				// the SIGTERM-to-cancellation diversion below, so callers have to classify that themselves.
-				resolve({ exitCode: code ?? undefined, signal: signal ?? undefined });
+				resolve({ exitCode: code ?? undefined, signal: signal ?? undefined, killed: proc.killed });
 
 				return;
 			}
@@ -437,7 +469,17 @@ export function runSpawn<T extends string | Buffer>(
 				}
 
 				if (signal === 'SIGTERM') {
-					reject(new CancelledRunError(`${command} ${args.join(' ')}`, true, code ?? undefined, signal));
+					// Only Node's spawn `timeout` kills it (a caller abort rejected above, from `'error'`); an
+					// external SIGTERM leaves `proc.killed` false
+					reject(
+						new CancelledRunError(
+							`${command} ${args.join(' ')}`,
+							true,
+							code ?? undefined,
+							signal,
+							proc.killed ? 'timeout' : 'unknown',
+						),
+					);
 
 					return;
 				}
@@ -471,12 +513,8 @@ export function runSpawn<T extends string | Buffer>(
 			resolve({ exitCode: code ?? undefined, signal: signal ?? undefined, stdout: stdout, stderr: stderr });
 		});
 
-		if (stdin) {
-			if (typeof stdin === 'string') {
-				proc.stdin.end(stdin, (stdinEncoding ?? 'utf8') as BufferEncoding);
-			} else if (stdin instanceof Buffer) {
-				proc.stdin.end(stdin);
-			}
+		if (stdin != null) {
+			endStdin(proc.stdin, stdin, stdinEncoding);
 		}
 	});
 

@@ -6,27 +6,33 @@ import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/mo
 import type {
 	PullRequest,
 	PullRequestMergeMethod,
+	PullRequestShape,
 	PullRequestState,
 	PullRequestStateFilter,
 } from '@gitlens/git/models/pullRequest.js';
 import type { GitRemote } from '@gitlens/git/models/remote.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
+import type { PullRequestUrlIdentity } from '@gitlens/git/utils/pullRequest.utils.js';
 import { CancellationError } from '@gitlens/utils/cancellation.js';
 import { md5 } from '@gitlens/utils/crypto.js';
 import { uniqueBy } from '@gitlens/utils/iterable.js';
-import { batchResults, flatSettled, nonnullSettled } from '@gitlens/utils/promise.js';
+import { batchResults, flatSettled, mapSettledBounded, nonnullSettled } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type {
 	AuthenticationSessionLike as AuthenticationSession,
 	ProviderAuthenticationSession,
 } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
+import type { ProviderRefusal } from '../collectionMetadata.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
-import { GitCloudHostIntegrationId } from '../constants.js';
+import { GitCloudHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
 import { IntegrationReadUnavailableError } from '../errors.js';
 import type { SearchMyPullRequestsOptions, SearchPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
+import type { PullRequestEtagFields, PullRequestEtagInclude } from '../models/integration.js';
+import { getBitbucketPullRequestIdentityFromMaybeUrl } from './bitbucket/bitbucket.utils.js';
 import type { BitbucketRepositoryDescriptor, BitbucketWorkspaceDescriptor } from './bitbucket/models.js';
+import { bitbucketEtagFieldsMaxIds, toBitbucketPullRequestEtagFields } from './bitbucket/models.js';
 import type {
 	ProviderApiCollectionResult,
 	ProviderApiPagedResult,
@@ -47,6 +53,7 @@ import {
 	flatSettledOrThrow,
 	mergeCollectionMetadata,
 	parsePageCursor,
+	readEtagFieldsByRepository,
 	toPageCursor,
 } from './utils/providerPaging.js';
 
@@ -90,7 +97,7 @@ export class BitbucketIntegration extends GitHostIntegration<
 	}): Promise<ProviderRepository | undefined> {
 		const api = await this.getProvidersApi();
 		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
-		const session = await this.resolveReadSession(repo.connectionId, undefined);
+		const session = await this.resolveReadSessionOrThrow(repo.connectionId, undefined);
 		if (session == null) return undefined;
 
 		return api.getRepo(toTokenWithInfo(this.id, session), repo.owner, repo.name, repo.project, {
@@ -164,6 +171,94 @@ export class BitbucketIntegration extends GitHostIntegration<
 		);
 	}
 
+	/**
+	 * One request per target, settled independently so one target's failure rejects only its own slot:
+	 * provider-apis has no single pull request read for Bitbucket, so this uses our own.
+	 */
+	protected override async getProviderPullRequestsBatch(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { currentAccount?: { id: string; username?: string } } | undefined,
+		_cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<PullRequestShape | undefined>[] | undefined> {
+		const api = await this.authenticationService.apis.bitbucket;
+		if (api == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		return mapSettledBounded(coordinates, providerFanOutConcurrency, c =>
+			api.getPullRequest(this, tokenWithInfo, c.owner, c.repo, String(c.number), this.apiBaseUrl, {
+				currentAccount: options?.currentAccount,
+				deferFailure: true,
+				projection: 'batch',
+			}),
+		);
+	}
+
+	/**
+	 * The cheap check behind the batch pull request read's etags: GitLens' own client lists each repository's pull
+	 * requests by id, up to {@link bitbucketEtagFieldsMaxIds} in ONE request, where
+	 * {@link getProviderPullRequestsBatch} sends one per target, and selects only the fields its rows' etags read.
+	 * Each is converted as {@link fromBitbucketPullRequest} converts the full one, so both reads compute the same
+	 * etag. A request that throws rejects only its own targets' slots.
+	 *
+	 * The full row reads neither a mergeability nor a check rollup, so its etag sees a pull request's state, draft
+	 * flag, update time and head commit, plus its participants' review decision when included; the `mergeable` and
+	 * `checks` includes add nothing and cost nothing.
+	 */
+	protected override async getProviderPullRequestsEtagFields(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { etagIncludes?: readonly PullRequestEtagInclude[] },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<PullRequestEtagFields | undefined>[] | undefined> {
+		const api = await this.authenticationService.apis.bitbucket;
+		if (api == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		const etagIncludes = options.etagIncludes ?? [];
+
+		return readEtagFieldsByRepository(
+			coordinates,
+			bitbucketEtagFieldsMaxIds,
+			(owner, repo, ids) =>
+				api.getPullRequestsEtagFields(
+					this,
+					tokenWithInfo,
+					owner,
+					repo,
+					ids,
+					this.apiBaseUrl,
+					{ etagIncludes: etagIncludes, deferFailure: true },
+					cancellation,
+				),
+			node => toBitbucketPullRequestEtagFields(node, etagIncludes),
+		);
+	}
+
+	/**
+	 * One request per target, settled independently, through our own client: provider-apis' pull request list has
+	 * no source-branch filter.
+	 */
+	protected override async getProviderPullRequestsForBranches(
+		session: ProviderAuthenticationSession,
+		targets: readonly { owner: string; repo: string; project?: string; branch: string; headOwner?: string }[],
+		options: { currentAccount?: { id: string; username?: string }; limit: number },
+		_cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<{ pullRequests: PullRequestShape[]; truncated: boolean }>[] | undefined> {
+		const api = await this.authenticationService.apis.bitbucket;
+		if (api == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		return mapSettledBounded(targets, providerFanOutConcurrency, t =>
+			api.getPullRequestsForBranch(this, tokenWithInfo, t.owner, t.repo, t.branch, this.apiBaseUrl, {
+				headOwner: t.headOwner,
+				limit: options.limit,
+				currentAccount: options.currentAccount,
+				deferFailure: true,
+			}),
+		);
+	}
+
 	protected override async getProviderIssue(
 		session: ProviderAuthenticationSession,
 		repo: BitbucketRepositoryDescriptor,
@@ -213,6 +308,26 @@ export class BitbucketIntegration extends GitHostIntegration<
 		);
 	}
 
+	protected override async getProviderPullRequest(
+		session: ProviderAuthenticationSession,
+		resource: BitbucketRepositoryDescriptor,
+		id: string,
+	): Promise<PullRequest | undefined> {
+		return (await this.authenticationService.apis.bitbucket)?.getPullRequest(
+			this,
+			toTokenWithInfo(this.id, session),
+			resource.owner,
+			resource.name,
+			id,
+			this.apiBaseUrl,
+			{ projection: 'point' },
+		);
+	}
+
+	protected override getProviderPullRequestIdentityFromMaybeUrl(search: string): PullRequestUrlIdentity | undefined {
+		return getBitbucketPullRequestIdentityFromMaybeUrl(search, this.id);
+	}
+
 	protected override async getProviderRepositoryMetadata(
 		session: ProviderAuthenticationSession,
 		repo: BitbucketRepositoryDescriptor,
@@ -255,6 +370,22 @@ export class BitbucketIntegration extends GitHostIntegration<
 		}
 
 		return this._accounts.get(accessToken);
+	}
+
+	/** The profile request the account cache would otherwise answer; see `IntegrationBase.validateCredential`. */
+	protected override async validateCredential(session: ProviderAuthenticationSession): Promise<void> {
+		const api = await this.getProvidersApi();
+		if ((await api.getCurrentUser(toTokenWithInfo(this.id, session))) == null) {
+			throw new Error('Bitbucket did not confirm the credential');
+		}
+	}
+
+	/**
+	 * Bitbucket's `403` for a token missing the OAuth scopes a request needs, which a reconnect fixes by consenting to
+	 * them again; see `IntegrationBase.isCredentialRefusal`.
+	 */
+	protected override isCredentialRefusal(refusal: ProviderRefusal): boolean {
+		return refusal.status === 403 && /required privilege scopes/i.test(refusal.detail ?? '');
 	}
 
 	private _workspaces: Map<string, ProviderApiCollectionResult<BitbucketWorkspaceDescriptor> | undefined> | undefined;
@@ -355,7 +486,7 @@ export class BitbucketIntegration extends GitHostIntegration<
 				ws.slug,
 				{ states: states },
 			);
-			return prs?.data.map(pr => fromProviderPullRequest(pr, this));
+			return prs?.data.map(pr => fromProviderPullRequest(pr, this, { projection: 'search' }));
 		});
 
 		if (!options?.includeReviewRequested) {
@@ -395,7 +526,7 @@ export class BitbucketIntegration extends GitHostIntegration<
 			.getPullRequestsForRepos(toTokenWithInfo(this.id, session), workspaceRepos, {
 				query: stateClause ? `${stateClause} AND ${reviewerClause}` : reviewerClause,
 			})
-			.then(r => r.values?.map(pr => fromProviderPullRequest(pr, this)));
+			.then(r => r.values?.map(pr => fromProviderPullRequest(pr, this, { projection: 'search' })));
 
 		return [
 			...uniqueBy(
@@ -658,7 +789,7 @@ export class BitbucketIntegration extends GitHostIntegration<
 		);
 		if (cancellation?.aborted) throw new CancellationError();
 
-		return providerPullRequests.map(pr => fromProviderPullRequest(pr, this));
+		return providerPullRequests.map(pr => fromProviderPullRequest(pr, this, { projection: 'text-search' }));
 	}
 
 	private async getWorkspaceRepoInputs(): Promise<{ name: string; namespace: string }[]> {

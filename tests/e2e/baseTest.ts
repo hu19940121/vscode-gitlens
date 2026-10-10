@@ -229,6 +229,12 @@ const defaultUserSettings: Record<string, unknown> = {
 	// Use custom dialogs for consistent behavior
 	'files.simpleDialog.enable': true,
 	'window.dialogStyle': 'custom',
+	// Same reason, for menus: a spec can only read a menu the editor renders into the DOM, and this
+	// setting covers context menus too ("This also affects the context menu appearance"). Linux and
+	// Windows already draw them that way — measured, the menu specs pass there without it — so pinning
+	// it changes nothing on those and keeps macOS, where the OS draws them instead, from being a
+	// platform the suite silently cannot test.
+	'window.menuStyle': 'custom',
 
 	'gitlens.outputLevel': 'debug',
 	'gitlens.telemetry.enabled': false,
@@ -238,8 +244,9 @@ const defaultUserSettings: Record<string, unknown> = {
 	// Load-bearing for the whole MCP suite, not a preference. GitLens registers its CLI/MCP IPC
 	// handlers — and publishes the discovery file the `mcpClient` fixture matches on — inside
 	// `gkCliService.startIpc`, which only runs while AI features are enabled. With this off the
-	// fixture finds no discovery file and every `gitlens_*` call answers `-32603 "server not found"`,
-	// so a change to the packaged default would read as an unrelated MCP outage. Pinned explicitly.
+	// fixture finds no discovery file and every `gitlens_*` call answers an `isError` result carrying
+	// `"GitLens '<tool>' server not found"` — like every other handler failure since CLI v3.1.76 — so a
+	// change to the packaged default would read as an unrelated MCP outage. Pinned explicitly.
 	'gitlens.ai.enabled': true,
 
 	// Pinned off for the same class of reason. `isInsidersCLIEnabled` falls back to

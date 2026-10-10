@@ -3,7 +3,9 @@ import { Cache } from '@gitlens/git/cache.js';
 import type { GitServiceContext } from '@gitlens/git/context.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import type { CliGitProviderInternal } from '../../cliGitProvider.js';
+import { RunError } from '../../exec/exec.errors.js';
 import type { Git } from '../../exec/git.js';
+import { GitError } from '../../exec/git.js';
 import { computeDeadlockBackstopMs, StatusGitSubProvider } from '../status.js';
 
 const repoPath = '/test/repo';
@@ -288,7 +290,7 @@ suite('StatusGitSubProvider — generation-stamped dedup', () => {
 		const fake = createDeferredGit();
 		const provider = createProvider(cache, fake.git);
 
-		// Same options -> shared run; a throwOnError:true caller must NOT join a graceful run (different key).
+		// Same options -> shared run; a different priority must NOT join (it would inherit the other lane's scheduling).
 		void provider.hasWorkingChanges(repoPath, { staged: true, unstaged: true, untracked: false });
 		void provider.hasWorkingChanges(repoPath, { staged: true, unstaged: true, untracked: false });
 		await flush();
@@ -298,12 +300,30 @@ suite('StatusGitSubProvider — generation-stamped dedup', () => {
 			staged: true,
 			unstaged: true,
 			untracked: false,
-			throwOnError: true,
+			priority: 'background',
 		});
 		await flush();
 
 		assert.strictEqual(sharedRuns, 1, 'identical-option callers share one run');
-		assert.strictEqual(fake.runs, 2, 'a throwOnError:true caller must start its own run (not join a graceful one)');
+		assert.strictEqual(fake.runs, 2, 'a caller with a different priority must start its own run');
+	});
+
+	test('getUntrackedFiles rejects when git fails rather than answering empty', async () => {
+		const failure = new GitError(
+			new RunError(
+				{ message: 'Command failed with exit code 128', code: 128 },
+				'',
+				'fatal: not a git repository (or any of the parent directories): .git',
+			),
+		);
+		const git = {
+			options: { gitTimeout: 60000 },
+			supports: () => Promise.resolve(true),
+			run: () => Promise.reject(failure),
+		};
+		const provider = createProvider(cache, git as unknown as Git);
+
+		await assert.rejects(provider.getUntrackedFiles(repoPath), (ex: unknown) => ex === failure);
 	});
 
 	test('one caller cancelling does not reject or kill a co-joined caller', async () => {
@@ -325,6 +345,122 @@ suite('StatusGitSubProvider — generation-stamped dedup', () => {
 		fake.settle(0, 'shared');
 		await assert.rejects(a, 'the cancelling caller rejects');
 		assert.strictEqual((await b)?.branch, 'shared', 'the co-joined caller still resolves with the real result');
+	});
+});
+
+/** Resolves each `git.run` immediately, recording the full argv so a test can assert exact CLI flags. */
+function createArgvRecordingGit(stdout: string = porcelainV2('main')) {
+	const calls: { options: Record<string, unknown>; args: string[] }[] = [];
+	const git = {
+		options: { gitTimeout: 60000 },
+		supports: () => Promise.resolve(true),
+		run: (options: Record<string, unknown>, ...args: string[]) => {
+			calls.push({ options: options, args: args });
+			return Promise.resolve({
+				stdout: stdout,
+				stderr: '',
+				exitCode: 0,
+				completion: { status: 'exited', code: 0 },
+			});
+		},
+	};
+	return { git: git as unknown as Git, calls: calls };
+}
+
+suite('StatusGitSubProvider.getStatus — untracked/branch options', () => {
+	let cache: Cache;
+
+	setup(() => {
+		cache = new Cache();
+	});
+
+	teardown(() => {
+		cache.dispose();
+	});
+
+	test('default argv is unchanged: --branch and a plain -u', async () => {
+		const { git, calls } = createArgvRecordingGit();
+		const provider = createProvider(cache, git);
+
+		await provider.getStatus(repoPath);
+
+		assert.deepStrictEqual(calls[0].args.slice(0, 4), ['status', '--porcelain=v2', '--branch', '-u']);
+	});
+
+	test("untracked: 'no' passes -uno instead of -u", async () => {
+		const { git, calls } = createArgvRecordingGit();
+		const provider = createProvider(cache, git);
+
+		await provider.getStatus(repoPath, { untracked: 'no' });
+
+		assert.ok(calls[0].args.includes('-uno'));
+		assert.ok(!calls[0].args.includes('-u'));
+	});
+
+	test("untracked: 'normal' passes -unormal", async () => {
+		const { git, calls } = createArgvRecordingGit();
+		const provider = createProvider(cache, git);
+
+		await provider.getStatus(repoPath, { untracked: 'normal' });
+
+		assert.ok(calls[0].args.includes('-unormal'));
+	});
+
+	test("untracked: 'all' runs the default -u and shares the default run", async () => {
+		const { git, calls } = createArgvRecordingGit();
+		const provider = createProvider(cache, git);
+
+		await Promise.all([provider.getStatus(repoPath, { untracked: 'all' }), provider.getStatus(repoPath)]);
+
+		assert.strictEqual(calls.length, 1, "'all' is the default, so both callers share one run");
+		assert.ok(calls[0].args.includes('-u'));
+	});
+
+	test('branch: false omits --branch', async () => {
+		const { git, calls } = createArgvRecordingGit();
+		const provider = createProvider(cache, git);
+
+		await provider.getStatus(repoPath, { branch: false });
+
+		assert.ok(!calls[0].args.includes('--branch'));
+	});
+
+	test('branch: false skips the detached/paused-op lookup entirely', async () => {
+		// Output with no `# branch.*` lines reads as detached, which would otherwise look up a paused rebase
+		const { git } = createArgvRecordingGit('1 .M N... 100644 100644 100644 abc1234 def5678 src/foo.ts\n');
+		let pausedOpsCalls = 0;
+		const provider = new StatusGitSubProvider({ config: undefined } as unknown as GitServiceContext, git, cache, {
+			pausedOps: {
+				getPausedOperationStatus: () => {
+					pausedOpsCalls++;
+					return Promise.resolve(undefined);
+				},
+			},
+		} as unknown as CliGitProviderInternal);
+
+		const status = await provider.getStatus(repoPath, { branch: false });
+
+		assert.strictEqual(status?.detached, true, 'sanity: an empty branch name still reads as detached');
+		assert.strictEqual(pausedOpsCalls, 0, 'branch: false must skip the paused-op lookup');
+	});
+
+	test('branch: false on a clean tree (no output at all) returns an empty status, not undefined', async () => {
+		const { git } = createArgvRecordingGit('');
+		const provider = createProvider(cache, git);
+
+		const status = await provider.getStatus(repoPath, { branch: false });
+
+		assert.ok(status, 'a clean tree is a real answer, distinct from a failed read');
+		assert.strictEqual(status.files.length, 0);
+	});
+
+	test('two concurrent calls with different options produce two git.run calls, not one', async () => {
+		const { git, calls } = createArgvRecordingGit();
+		const provider = createProvider(cache, git);
+
+		await Promise.all([provider.getStatus(repoPath), provider.getStatus(repoPath, { untracked: 'no' })]);
+
+		assert.strictEqual(calls.length, 2, 'a non-default variant must not join the default run');
 	});
 });
 

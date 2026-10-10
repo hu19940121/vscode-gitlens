@@ -1,4 +1,11 @@
 import { gitHubPullRequestRelationshipQualifiers } from '@gitlens/git-github/api/pullRequestSearchQuery.js';
+import type { GitHubIssueEtagNode, GitHubPullRequestEtagNode } from '@gitlens/git-github/models.js';
+import {
+	fromGitHubIssueOrPullRequestState,
+	fromGitHubPullRequestMergeableState,
+	fromGitHubPullRequestReviewDecision,
+	fromGitHubPullRequestStatusCheckRollupState,
+} from '@gitlens/git-github/models.js';
 import type { Account, UnidentifiedAuthor } from '@gitlens/git/models/author.js';
 import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
 import type { Issue, IssueSearchCriteria, IssueShape } from '@gitlens/git/models/issue.js';
@@ -7,6 +14,7 @@ import type {
 	PullRequest,
 	PullRequestMergeMethod,
 	PullRequestSearchCriteria,
+	PullRequestShape,
 	PullRequestStackInfo,
 	PullRequestStackLayer,
 	PullRequestStackLayers,
@@ -17,31 +25,38 @@ import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.
 import type { RepositoryDescriptor } from '@gitlens/git/models/resourceDescriptor.js';
 import { getGitHubNoReplyAddressParts } from '@gitlens/git/remotes/github.js';
 import type { PullRequestUrlIdentity } from '@gitlens/git/utils/pullRequest.utils.js';
+import { chunk } from '@gitlens/utils/array.js';
 import type { Emitter } from '@gitlens/utils/event.js';
-import { batch } from '@gitlens/utils/promise.js';
+import { batch, mapBounded, mapSettledBounded } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
+import type { ProviderRefusal } from '../collectionMetadata.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
-import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
+import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
-import { IntegrationReadUnavailableError } from '../errors.js';
+import { AuthenticationError, IntegrationReadUnavailableError, RequestNotFoundError } from '../errors.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
 import type { SearchMyPullRequestsOptions, SearchPullRequestsOptions } from '../models/gitHostIntegration.js';
 import { GitHostIntegration } from '../models/gitHostIntegration.js';
 import type {
+	IssueEtagFields,
+	IssueEtagInclude,
 	ProviderIssueSearchPage,
+	ProviderPullRequestCount,
 	ProviderPullRequestSearchPage,
+	PullRequestEtagFields,
+	PullRequestEtagInclude,
 	SearchMyIssuesOptions,
 } from '../models/integration.js';
+import type { ProviderWarningCause } from '../results.js';
 import type { GitHubIntegrationIds } from './github/github.utils.js';
 import { getGitHubPullRequestIdentityFromMaybeUrl } from './github/github.utils.js';
 import type {
 	ProviderApiPagedResult,
 	ProviderHierarchyResult,
 	ProviderOrganization,
-	ProviderPullRequest,
 	ProviderRepoInput,
 	ProviderRepository,
 } from './models.js';
@@ -50,9 +65,10 @@ import {
 	IssueFilter,
 	providersMetadata,
 	PullRequestFilter,
-	toProviderPullRequest,
+	stampNativePullRequest,
 } from './models.js';
 import type { ProvidersApi } from './providersApi.js';
+import { resolveBranchPullRequests } from './utils/providerPaging.js';
 
 type GitHubPullRequestFacetCursor = Record<string, string>;
 
@@ -101,6 +117,107 @@ export type GitHubRepositoryDescriptor = RepositoryDescriptor;
 /** How many per-login SSH signing-key lookups to run concurrently, to avoid a request burst that trips rate limiting. */
 const sshSigningKeyResolveBatchSize = 10;
 
+// One aliased document costs about the same as a single read up to 25 targets; past that, latency climbs.
+const pullRequestsBatchChunkSize = 25;
+
+/**
+ * How many coordinates go into one aliased issue request.
+ *
+ * Measured rather than inherited from `issueCountChunkSize`, since that one rests on a zero-node selection and
+ * this carries the full issue projection per alias. Against the live API on all-resolving coordinates: 10 took
+ * 875ms, 25 took 890ms — so up to 25 is effectively free — 50 took 1.3s, and 75 took 2.7s. No complexity refusal
+ * appeared up to 100.
+ *
+ * 25 is where latency is still flat, with room before it degrades. It also puts any realistic correlation batch
+ * in ONE request, which is the whole point of the read.
+ */
+const issuesBatchChunkSize = 25;
+
+/**
+ * Runs an aliased batch read over `items` in chunks of `chunkSize`, with bounded concurrency, converting each
+ * fulfilled slot with `map`. Settled per target throughout: a chunk that throws rejects only its own slots, and a
+ * slot whose conversion throws rejects only itself, so one bad row never takes its chunk's siblings down with it.
+ */
+async function readChunked<T, V, R>(
+	items: readonly T[],
+	chunkSize: number,
+	read: (chunk: T[]) => Promise<PromiseSettledResult<V>[]>,
+	map: (value: V) => R,
+): Promise<PromiseSettledResult<R>[]> {
+	const settledChunks = await mapBounded(
+		chunk([...items], chunkSize),
+		providerFanOutConcurrency,
+		async (chunkItems): Promise<PromiseSettledResult<R>[]> => {
+			let slots: PromiseSettledResult<V>[];
+			try {
+				slots = await read(chunkItems);
+			} catch (ex) {
+				return chunkItems.map(() => ({ status: 'rejected', reason: ex }));
+			}
+
+			return slots.map((slot): PromiseSettledResult<R> => {
+				if (slot.status === 'rejected') return slot;
+
+				try {
+					return { status: 'fulfilled', value: map(slot.value) };
+				} catch (ex) {
+					return { status: 'rejected', reason: ex };
+				}
+			});
+		},
+	);
+	return settledChunks.flat();
+}
+
+/**
+ * A cheap etag read's pull request, as the fields its full row's etag reads, through `fromGitHubPullRequest`'s own
+ * conversions, so a cheap check and a full read of the same pull request compute the same etag.
+ */
+function toPullRequestEtagFields(
+	node: GitHubPullRequestEtagNode,
+	etagIncludes: readonly PullRequestEtagInclude[],
+): PullRequestEtagFields {
+	const fields: PullRequestEtagFields = {
+		state: fromGitHubIssueOrPullRequestState(node.state),
+		isDraft: node.isDraft,
+		updatedDate: new Date(node.updatedAt),
+		headSha: node.headRefOid,
+	};
+
+	if (etagIncludes.includes('mergeable')) {
+		fields.mergeableState =
+			node.mergeable != null ? fromGitHubPullRequestMergeableState(node.mergeable) : undefined;
+	}
+
+	if (etagIncludes.includes('reviewDecision')) {
+		// GitHub's `null` (the repository requires no review) is no decision, even while a review is requested.
+		fields.reviewDecision =
+			node.reviewDecision != null ? fromGitHubPullRequestReviewDecision(node.reviewDecision) : undefined;
+	}
+
+	if (etagIncludes.includes('checks')) {
+		fields.statusCheckRollupState = fromGitHubPullRequestStatusCheckRollupState(
+			node.commits?.nodes?.[0]?.commit.statusCheckRollup?.state,
+		);
+	}
+
+	return fields;
+}
+
+/** A cheap etag read's issue, as the fields its full row's etag reads, through `fromGitHubIssue`'s own conversions. */
+function toIssueEtagFields(node: GitHubIssueEtagNode, etagIncludes: readonly IssueEtagInclude[]): IssueEtagFields {
+	const fields: IssueEtagFields = {
+		state: fromGitHubIssueOrPullRequestState(node.state),
+		updatedDate: new Date(node.updatedAt),
+	};
+
+	if (etagIncludes.includes('reactions')) {
+		fields.thumbsUpCount = node.reactions?.totalCount;
+	}
+
+	return fields;
+}
+
 abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends GitHostIntegration<
 	ID,
 	GitHubRepositoryDescriptor
@@ -110,7 +227,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 	 * by appending GitHub Enterprise's paths. Only a GHE instance base belongs here; cloud passes `undefined`,
 	 * the sole value that selects the cloud endpoints (see the cloud subclass).
 	 */
-	protected abstract get apiBaseUrl(): string | undefined;
+	protected abstract apiBaseUrlFor(session: ProviderAuthenticationSession): string | undefined;
 
 	protected override async getProviderAccountForCommit(
 		session: ProviderAuthenticationSession,
@@ -128,7 +245,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			rev,
 			{
 				...options,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -149,7 +266,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			email,
 			{
 				...options,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -180,7 +297,9 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		}
 
 		if (toResolve.length) {
-			const resolved = await api.getAccountsForEmails(this, token, toResolve, { baseUrl: this.apiBaseUrl });
+			const resolved = await api.getAccountsForEmails(this, token, toResolve, {
+				baseUrl: this.apiBaseUrlFor(session),
+			});
 			for (const [emailLower, login] of resolved) {
 				loginByEmail.set(emailLower, login);
 			}
@@ -190,7 +309,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		// all lookups at once, to avoid a request burst that could trip secondary rate limiting. Then map keys to each email.
 		const keysByLogin = new Map<string, string[]>();
 		await batch([...new Set(loginByEmail.values())], sshSigningKeyResolveBatchSize, async login => {
-			const keys = await api.getUserSshSigningKeys(this, token, login, { baseUrl: this.apiBaseUrl });
+			const keys = await api.getUserSshSigningKeys(this, token, login, { baseUrl: this.apiBaseUrlFor(session) });
 			keysByLogin.set(
 				login,
 				keys.map(k => k.key),
@@ -214,7 +333,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			repo.owner,
 			repo.name,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -231,7 +350,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			repo.name,
 			Number(id),
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -248,7 +367,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			repo.name,
 			Number(id),
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				includeBody: true,
 			},
 		);
@@ -266,7 +385,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			repo.name,
 			parseInt(id, 10),
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -293,7 +412,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			{
 				...opts,
 				include: include?.map(s => toGitHubPullRequestState(s)),
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -310,7 +429,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			repo.name,
 			rev,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -326,7 +445,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			repo.owner,
 			repo.name,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 			cancellation,
 		);
@@ -337,14 +456,18 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 	): Promise<ProviderHierarchyResult<ProviderOrganization> | undefined> {
 		const api = await this.getProvidersApi();
 		const result = await api.getGitHubOrgsForCurrentUser(toTokenWithInfo(this.id, session), {
-			baseUrl: this.apiBaseUrl,
+			baseUrl: this.apiBaseUrlFor(session),
 		});
+		const webUrl =
+			this.id === GitSelfManagedHostIntegrationId.CloudGitHubEnterprise
+				? this.getSelfManagedInstallationUrl(session)
+				: `https://${this.domain}`;
 		return {
 			values: result.values.map(o => ({
 				id: o.id,
 				providerId: this.id,
 				name: o.username,
-				url: `https://${this.domain}/${o.username}`,
+				url: `${webUrl}/${o.username}`,
 			})),
 			...(result.truncated ? { truncated: true } : {}),
 			...(result.metadata != null ? { metadata: result.metadata } : {}),
@@ -358,7 +481,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 	): Promise<ProviderHierarchyResult<ProviderRepository> | undefined> {
 		const api = await this.getProvidersApi();
 		return api.getReposForOrg(toTokenWithInfo(this.id, session), org, {
-			baseUrl: this.apiBaseUrl,
+			baseUrl: this.apiBaseUrlFor(session),
 			cursor: options?.cursor,
 		});
 	}
@@ -372,7 +495,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		// repos — matching gkcli's org-less `provider repos github` walk (not every repo of every org).
 		return api.getReposForCurrentUser(toTokenWithInfo(this.id, session), {
 			affiliations: ['owner', 'collaborator', 'organization_member'],
-			baseUrl: this.apiBaseUrl,
+			baseUrl: this.apiBaseUrlFor(session),
 			cursor: options?.cursor,
 		});
 	}
@@ -385,14 +508,75 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 	}): Promise<ProviderRepository | undefined> {
 		const api = await this.getProvidersApi();
 		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
-		const session = await this.resolveReadSession(repo.connectionId, undefined);
+		const session = await this.resolveReadSessionOrThrow(repo.connectionId, undefined);
 		if (session == null) return undefined;
 
-		// `apiBaseUrl` is undefined for cloud (which is what selects the cloud endpoints) and the GHE instance base
+		// `apiBaseUrlFor` is undefined for cloud (which is what selects the cloud endpoints) and the GHE instance base
 		// for enterprise (inherited override).
-		return api.getRepo(toTokenWithInfo(this.id, session), repo.owner, repo.name, repo.project, {
-			baseUrl: this.apiBaseUrl,
+		try {
+			return await api.getRepo(toTokenWithInfo(this.id, session), repo.owner, repo.name, repo.project, {
+				baseUrl: this.apiBaseUrlFor(session),
+			});
+		} catch (ex) {
+			if (!(ex instanceof RequestNotFoundError)) throw ex;
+
+			// GraphQL answers a repository its organization hides from this OAuth app (OAuth App access restrictions)
+			// exactly as it answers a missing one, so a miss is confirmed over REST, which refuses such a repository
+			// with a `403` saying why. Only that refusal replaces the miss: a REST read that cannot confirm either way
+			// leaves the answer GraphQL gave.
+			const github = await this.authenticationService.apis.github;
+			try {
+				await github?.getRepositoryAccess(this, toTokenWithInfo(this.id, session), repo.owner, repo.name, {
+					baseUrl: this.apiBaseUrlFor(session),
+				});
+			} catch (refusal) {
+				if (refusal instanceof AuthenticationError) throw refusal;
+			}
+			throw ex;
+		}
+	}
+
+	/**
+	 * The profile request that proves the credential; see `IntegrationBase.validateCredential`. Silent: a refusal
+	 * here is rethrown to the read that asked, which reports it as it reports its own failure (or, for
+	 * `resolveRepository`, as the resolution's warning), so the check must not raise a prompt of its own.
+	 */
+	protected override async validateCredential(session: ProviderAuthenticationSession): Promise<void> {
+		const github = await this.authenticationService.apis.github;
+		const account = await github?.getCurrentAccount(this, toTokenWithInfo(this.id, session), {
+			baseUrl: this.apiBaseUrlFor(session),
+			silent: true,
 		});
+		if (account == null) throw new Error('GitHub did not confirm the credential');
+	}
+
+	/**
+	 * Names a confirmed credential's refusal from what GitHub said. A `403` whose explanation cites OAuth App access
+	 * restrictions is an organization that has not approved the OAuth app this token belongs to; its remedy page is
+	 * that app's page in the user's authorized apps, where they request an organization's approval, addressed by the
+	 * client id GitHub reports on the refusal. Any other refusal is left unnamed, so the warning keeps GitHub's own
+	 * words.
+	 */
+	protected override describeRefusal(
+		session: ProviderAuthenticationSession,
+		refusal: ProviderRefusal,
+	): ProviderWarningCause | undefined {
+		if (refusal.status !== 403 || !/\bOAuth App access restrictions\b/i.test(refusal.detail ?? '')) {
+			return undefined;
+		}
+
+		const webUrl =
+			this.id === GitSelfManagedHostIntegrationId.CloudGitHubEnterprise
+				? this.getSelfManagedInstallationUrl(session)
+				: `https://${this.domain}`;
+		return {
+			reason: 'oauth-app-not-allowed',
+			...(refusal.oauthClientId != null
+				? {
+						remedyUrl: `${webUrl}/settings/connections/applications/${encodeURIComponent(refusal.oauthClientId)}`,
+					}
+				: {}),
+		};
 	}
 
 	protected override async searchProviderMyPullRequests(
@@ -406,7 +590,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			toTokenWithInfo(this.id, session),
 			{
 				repos: repos?.map(r => `${r.owner}/${r.name}`),
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				silent: options?.silent,
 				state: options?.state,
 			},
@@ -423,7 +607,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			filters?: PullRequestFilter[];
 			summary?: boolean;
 		},
-	): Promise<ProviderApiPagedResult<ProviderPullRequest> | undefined> {
+	): Promise<ProviderApiPagedResult<PullRequest> | undefined> {
 		const explicitFilters = options?.filters?.length ? [...new Set(options.filters)] : undefined;
 		// Every account-wide read goes through our own facet search — there is deliberately no SDK
 		// `getPullRequestsForUser` fallback. It could express neither a state set, nor exact relationships (its
@@ -478,7 +662,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			facetsToQuery.map(async facet => ({
 				key: facet.key,
 				result: await github.searchMyPullRequestsPage(this, toTokenWithInfo(this.id, session), {
-					baseUrl: this.apiBaseUrl,
+					baseUrl: this.apiBaseUrlFor(session),
 					state: facet.state,
 					cursor: cursors[facet.key],
 					summary: options?.summary,
@@ -491,11 +675,12 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			if (first?.status === 'rejected') throw first.reason;
 		}
 
-		const values = new Map<string, ProviderPullRequest>();
+		const values = new Map<string, PullRequest>();
 		const nextCursors: GitHubPullRequestFacetCursor = {};
 		const failures = [];
 		let hasMore = false;
 		let truncated = false;
+		let totalCount: number | undefined;
 		let structuralIncompleteness = false;
 		let unkeyedPullRequest = 0;
 		for (const outcome of results) {
@@ -507,10 +692,9 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 
 			const { key, result } = outcome.value;
 			for (const pr of result.values) {
-				const mapped = toProviderPullRequest(pr);
-				const identity = getProviderPullRequestIdentity(mapped) ?? `unkeyed:${unkeyedPullRequest++}`;
+				const identity = getProviderPullRequestIdentity(pr) ?? `unkeyed:${unkeyedPullRequest++}`;
 				if (!values.has(identity)) {
-					values.set(identity, mapped);
+					values.set(identity, pr);
 				}
 			}
 			if (result.hasMore) {
@@ -524,6 +708,9 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			}
 			if (result.truncated) {
 				truncated = true;
+				if (result.totalCount != null) {
+					totalCount = Math.max(totalCount ?? 0, result.totalCount);
+				}
 			}
 		}
 
@@ -533,6 +720,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				more: hasMore,
 				cursor: hasMore ? JSON.stringify({ type: 'cursor', cursors: nextCursors }) : '{}',
 				truncated: truncated || undefined,
+				...(totalCount != null ? { totalCount: totalCount } : undefined),
 			},
 			...(failures.length || structuralIncompleteness
 				? {
@@ -582,7 +770,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			toTokenWithInfo(this.id, session),
 			{
 				repos: repos?.map(r => `${r.owner}/${r.name}`),
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				includeBody: true,
 				includeAllAssignees: options?.includeAllAssignees,
 				cursor: options?.cursor,
@@ -624,7 +812,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				repos: options.repos?.map(r => `${r.namespace}/${r.name}`),
 				org: options.org,
 				criteria: options.criteria,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				cursor: options.cursor,
 				pageSize: options.pageSize,
 				summary: options.summary,
@@ -659,7 +847,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				repos: options.repos?.map(r => `${r.namespace}/${r.name}`),
 				org: options.org,
 				criteria: options.criteria,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				includeBody: true,
 				cursor: options.cursor,
 				pageSize: options.pageSize,
@@ -685,27 +873,236 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				org: s.org,
 				criteria: s.criteria,
 			})),
-			{ baseUrl: this.apiBaseUrl },
+			{ baseUrl: this.apiBaseUrlFor(session) },
 			cancellation,
 		);
 	}
 
 	/**
-	 * Resolves several issues by `(owner, repo, number)` in ONE request, by aliasing the point read rather than a
-	 * search — see {@link GitHubApi.getIssuesBatch} for why that distinction is the whole design.
+	 * Resolves several issues by `(owner, repo, number)` by aliasing the point read rather than a search — see
+	 * {@link GitHubApi.getIssuesBatch} for why that distinction is the whole design — chunked into requests of up
+	 * to {@link issuesBatchChunkSize} coordinates, run with bounded concurrency. Settled per target already: a
+	 * coordinate whose alias fails on its own (e.g. an org enforcing SAML SSO the token isn't authorized for)
+	 * rejects only that slot, and a chunk that throws rejects only its own slots.
 	 */
 	protected override async getProviderIssuesBatch(
 		session: ProviderAuthenticationSession,
-		coordinates: readonly { owner: string; repo: string; number: number }[],
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
 		cancellation?: AbortSignal,
-	): Promise<(IssueShape | undefined)[] | undefined> {
-		return (await this.authenticationService.apis.github)?.getIssuesBatch(
-			this,
-			toTokenWithInfo(this.id, session),
+	): Promise<PromiseSettledResult<IssueShape | undefined>[] | undefined> {
+		const github = await this.authenticationService.apis.github;
+		if (github == null) return undefined;
+
+		return readChunked(
 			coordinates,
-			{ baseUrl: this.apiBaseUrl, includeBody: true },
-			cancellation,
+			issuesBatchChunkSize,
+			chunkCoordinates =>
+				github.getIssuesBatch(
+					this,
+					toTokenWithInfo(this.id, session),
+					chunkCoordinates.map(c => ({ owner: c.owner, repo: c.repo, number: c.number })),
+					{ baseUrl: this.apiBaseUrlFor(session), includeBody: true },
+					cancellation,
+				),
+			issue => issue,
 		);
+	}
+
+	/**
+	 * Resolves several pull requests by `(owner, repo, number)` by aliasing the point read — see
+	 * {@link GitHubApi.getPullRequestsBatch} — chunked into requests of up to {@link pullRequestsBatchChunkSize}
+	 * coordinates, run with bounded concurrency. Rows take the same conversion as the account-wide list rows, so a
+	 * pull request reads the same whichever of the two returned it.
+	 *
+	 * A chunk that throws rejects only its own slots, so its sibling chunks still answer.
+	 */
+	protected override async getProviderPullRequestsBatch(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { currentAccount?: { id: string; username?: string } } | undefined,
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<PullRequestShape | undefined>[] | undefined> {
+		const github = await this.authenticationService.apis.github;
+		if (github == null) return undefined;
+
+		const currentAccount = options?.currentAccount;
+		return readChunked(
+			coordinates,
+			pullRequestsBatchChunkSize,
+			chunkCoordinates =>
+				github.getPullRequestsBatch(
+					this,
+					toTokenWithInfo(this.id, session),
+					chunkCoordinates.map(c => ({ owner: c.owner, repo: c.repo, number: c.number })),
+					{ baseUrl: this.apiBaseUrlFor(session) },
+					cancellation,
+				),
+			(pr): PullRequestShape | undefined =>
+				pr != null
+					? stampNativePullRequest(pr, { currentAccount: currentAccount, projection: 'batch' })
+					: undefined,
+		);
+	}
+
+	/**
+	 * The cheap check behind the batch issue read's etags: {@link getProviderIssuesBatch}'s chunks and failure
+	 * isolation over {@link GitHubApi.getIssuesEtagFieldsBatch}, which selects only an issue's change state plus the
+	 * selection of each of `options.etagIncludes`.
+	 */
+	protected override async getProviderIssuesEtagFields(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { etagIncludes?: readonly IssueEtagInclude[] },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<IssueEtagFields | undefined>[] | undefined> {
+		const github = await this.authenticationService.apis.github;
+		if (github == null) return undefined;
+
+		const etagIncludes = options.etagIncludes ?? [];
+		return readChunked(
+			coordinates,
+			issuesBatchChunkSize,
+			chunkCoordinates =>
+				github.getIssuesEtagFieldsBatch(
+					this,
+					toTokenWithInfo(this.id, session),
+					chunkCoordinates.map(c => ({ owner: c.owner, repo: c.repo, number: c.number })),
+					{ baseUrl: this.apiBaseUrlFor(session), etagIncludes: etagIncludes },
+					cancellation,
+				),
+			(node): IssueEtagFields | undefined => (node != null ? toIssueEtagFields(node, etagIncludes) : undefined),
+		);
+	}
+
+	/**
+	 * The cheap check behind the batch pull request read's etags: {@link getProviderPullRequestsBatch}'s chunks and
+	 * failure isolation over {@link GitHubApi.getPullRequestsEtagFieldsBatch}, which selects only a pull request's
+	 * change state plus the selection of each of `options.etagIncludes`.
+	 */
+	protected override async getProviderPullRequestsEtagFields(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly { owner: string; repo: string; number: number; project?: string }[],
+		options: { etagIncludes?: readonly PullRequestEtagInclude[] },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<PullRequestEtagFields | undefined>[] | undefined> {
+		const github = await this.authenticationService.apis.github;
+		if (github == null) return undefined;
+
+		const etagIncludes = options.etagIncludes ?? [];
+		return readChunked(
+			coordinates,
+			pullRequestsBatchChunkSize,
+			chunkCoordinates =>
+				github.getPullRequestsEtagFieldsBatch(
+					this,
+					toTokenWithInfo(this.id, session),
+					chunkCoordinates.map(c => ({ owner: c.owner, repo: c.repo, number: c.number })),
+					{ baseUrl: this.apiBaseUrlFor(session), etagIncludes: etagIncludes },
+					cancellation,
+				),
+			(node): PullRequestEtagFields | undefined =>
+				node != null ? toPullRequestEtagFields(node, etagIncludes) : undefined,
+		);
+	}
+
+	/**
+	 * Finds each branch's pull requests by aliasing a head-ref-name query per target — see
+	 * {@link GitHubApi.getPullRequestsForBranches} — chunked and converted exactly as
+	 * {@link getProviderPullRequestsBatch} is, with the same per-target and per-chunk failure isolation.
+	 *
+	 * That query matches the branch NAME across every fork and filters by head repository afterwards, so a name
+	 * many forks share (`main`, `patch-1`) comes back `truncated` whether or not anything it left out could match.
+	 * Only those targets take a second step: {@link GitHubApi.getPullRequestNumbersForBranch} asks REST, which
+	 * filters by head owner on the server, for the numbers that match, and any number the first step didn't return
+	 * is resolved through {@link getProviderPullRequestsBatch}, so its row is identical to the others. The answer
+	 * is the UNION of both steps: REST can't see a pull request from a since-deleted fork, which the first step still
+	 * matches by its owner, so a deleted fork's pull request on the first step's page is kept. One past that page
+	 * can't be found by either step, so on such a target a deleted fork's pull request may be missing from an
+	 * answer that isn't `truncated`. A target whose second step fails is rejected, never answered from the first
+	 * step alone.
+	 */
+	protected override async getProviderPullRequestsForBranches(
+		session: ProviderAuthenticationSession,
+		targets: readonly { owner: string; repo: string; project?: string; branch: string; headOwner?: string }[],
+		options: { currentAccount?: { id: string; username?: string }; limit: number },
+		cancellation?: AbortSignal,
+	): Promise<PromiseSettledResult<{ pullRequests: PullRequestShape[]; truncated: boolean }>[] | undefined> {
+		const github = await this.authenticationService.apis.github;
+		if (github == null) return undefined;
+
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		const baseUrl = this.apiBaseUrlFor(session);
+		const currentAccount = options.currentAccount;
+		const slots = await readChunked(
+			targets,
+			pullRequestsBatchChunkSize,
+			chunkTargets =>
+				github.getPullRequestsForBranches(
+					this,
+					tokenWithInfo,
+					chunkTargets.map(t => ({ owner: t.owner, repo: t.repo, branch: t.branch, headOwner: t.headOwner })),
+					{ baseUrl: baseUrl, limit: options.limit },
+					cancellation,
+				),
+			(found): { pullRequests: PullRequestShape[]; truncated: boolean } => ({
+				pullRequests: found.pullRequests.map(pr =>
+					stampNativePullRequest(pr, { currentAccount: currentAccount, projection: 'batch' }),
+				),
+				truncated: found.truncated,
+			}),
+		);
+
+		const ambiguous = slots.flatMap((slot, i) =>
+			slot.status === 'fulfilled' && slot.value.truncated ? [{ index: i, found: slot.value.pullRequests }] : [],
+		);
+		if (!ambiguous.length) return slots;
+
+		const heads = await mapSettledBounded(ambiguous, providerFanOutConcurrency, async a => {
+			const t = targets[a.index];
+			const head = await github.getPullRequestNumbersForBranch(
+				this,
+				tokenWithInfo,
+				t.owner,
+				t.repo,
+				t.branch,
+				{ baseUrl: baseUrl, headOwner: t.headOwner, limit: options.limit },
+				cancellation,
+			);
+			const found = new Set(a.found.map(pr => pr.number));
+			return { numbers: head.numbers.filter(n => !found.has(n)), truncated: head.truncated };
+		});
+		const extras = await resolveBranchPullRequests(
+			ambiguous.map(a => targets[a.index]),
+			heads,
+			coordinates =>
+				this.getProviderPullRequestsBatch(
+					session,
+					coordinates,
+					{ currentAccount: currentAccount },
+					cancellation,
+				),
+		);
+
+		const settled = [...slots];
+		ambiguous.forEach((a, i) => {
+			const extra = extras[i];
+			if (extra.status === 'rejected') {
+				settled[a.index] = extra;
+				return;
+			}
+
+			const pullRequests = [...a.found, ...extra.value.pullRequests].sort(
+				(x, y) => y.updatedDate.getTime() - x.updatedDate.getTime(),
+			);
+			settled[a.index] = {
+				status: 'fulfilled',
+				value: {
+					pullRequests: pullRequests.slice(0, options.limit),
+					truncated: extra.value.truncated || pullRequests.length > options.limit,
+				},
+			};
+		});
+		return settled;
 	}
 
 	/**
@@ -716,8 +1113,10 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		session: ProviderAuthenticationSession,
 		scopes: readonly { repos?: ProviderRepoInput[]; org?: string; criteria?: PullRequestSearchCriteria }[],
 		cancellation?: AbortSignal,
-	): Promise<(number | undefined)[] | undefined> {
-		return (await this.authenticationService.apis.github)?.countPullRequests(
+	): Promise<ProviderPullRequestCount[] | undefined> {
+		const counts = await (
+			await this.authenticationService.apis.github
+		)?.countPullRequests(
 			this,
 			toTokenWithInfo(this.id, session),
 			scopes.map(s => ({
@@ -725,9 +1124,11 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				org: s.org,
 				criteria: s.criteria,
 			})),
-			{ baseUrl: this.apiBaseUrl },
+			{ baseUrl: this.apiBaseUrlFor(session) },
 			cancellation,
 		);
+		// `issueCount` is the search's own total, never a floor, so no slot is a lower bound.
+		return counts?.map(count => ({ count: count }));
 	}
 
 	protected override async searchProviderPullRequests(
@@ -743,7 +1144,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			{
 				search: searchQuery,
 				repos: repos?.map(r => `${r.owner}/${r.name}`),
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 				...options,
 			},
 			cancellation,
@@ -766,9 +1167,9 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		repo: string,
 		cancellation?: AbortSignal,
 	): Promise<Map<number, PullRequestStackInfo> | undefined> {
-		// The shared read path — it refreshes an expired session before use, which a bare `getSession()`
-		// does not (it returns the cached session verbatim once one exists, expired or not).
-		const session = await this.resolveReadSession(undefined, undefined);
+		// The shared read path: like `getSession()` it refreshes an expired session before use, but it throws a
+		// failed refresh as the failure rather than answering as if not connected.
+		const session = await this.resolveReadSessionOrThrow(undefined, undefined);
 		if (session == null) return undefined;
 
 		const stacks = await (
@@ -779,7 +1180,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			owner,
 			repo,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 			cancellation,
 		);
@@ -824,9 +1225,9 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 		pullRequestNumber: number,
 		cancellation?: AbortSignal,
 	): Promise<PullRequestStackLayers | undefined> {
-		// The shared read path — it refreshes an expired session before use, which a bare `getSession()`
-		// does not (it returns the cached session verbatim once one exists, expired or not).
-		const session = await this.resolveReadSession(undefined, undefined);
+		// The shared read path: like `getSession()` it refreshes an expired session before use, but it throws a
+		// failed refresh as the failure rather than answering as if not connected.
+		const session = await this.resolveReadSessionOrThrow(undefined, undefined);
 		if (session == null) return undefined;
 
 		const stacks = await (
@@ -837,7 +1238,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			owner,
 			repo,
 			{
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 			cancellation,
 		);
@@ -905,7 +1306,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 					headRefSha,
 					{
 						mergeMethod: options?.mergeMethod,
-						baseUrl: this.apiBaseUrl,
+						baseUrl: this.apiBaseUrlFor(session),
 					},
 					cancellation,
 				)) ?? false
@@ -920,7 +1321,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 				headRefSha,
 				{
 					mergeMethod: options?.mergeMethod,
-					baseUrl: this.apiBaseUrl,
+					baseUrl: this.apiBaseUrlFor(session),
 				},
 				cancellation,
 			) ?? false
@@ -936,7 +1337,7 @@ abstract class GitHubIntegrationBase<ID extends GitHubIntegrationIds> extends Gi
 			toTokenWithInfo(this.id, session),
 			{
 				...options,
-				baseUrl: this.apiBaseUrl,
+				baseUrl: this.apiBaseUrlFor(session),
 			},
 		);
 	}
@@ -955,7 +1356,7 @@ export class GitHubIntegration extends GitHubIntegrationBase<GitCloudHostIntegra
 		return metadata.domain;
 	}
 
-	protected override get apiBaseUrl(): string | undefined {
+	protected override apiBaseUrlFor(_session: ProviderAuthenticationSession): string | undefined {
 		// Undefined on purpose, NOT 'https://api.github.com'. `@gitkraken/provider-apis` treats this value as an
 		// *enterprise* base and derives both endpoints from it by appending GitHub Enterprise's paths:
 		// `getRESTBaseUrl` appends `/api/v3` and `getGraphQLEndpoint` appends `/api/graphql` (githubHelpers.ts).
@@ -979,10 +1380,7 @@ export class GitHubIntegration extends GitHubIntegrationBase<GitCloudHostIntegra
 		if (session == null && this.maybeConnected) {
 			void this.disconnect({ silent: true });
 		} else {
-			if (session?.accessToken !== this._session?.accessToken) {
-				this._session = undefined;
-			}
-			super.refresh();
+			void this.resyncSessionIfTokenChanged(session?.accessToken);
 		}
 	}
 }
@@ -996,8 +1394,8 @@ export class GitHubEnterpriseIntegration extends GitHubIntegrationBase<GitSelfMa
 		return this._domain;
 	}
 
-	protected override get apiBaseUrl(): string {
-		return `https://${this._domain}/api/v3`;
+	protected override apiBaseUrlFor(session: ProviderAuthenticationSession): string {
+		return this.getSelfManagedApiBaseUrl(session);
 	}
 
 	constructor(

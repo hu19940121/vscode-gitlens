@@ -133,6 +133,7 @@ interface Caches {
 	ignoreRevsFile: PromiseCache<string, boolean> | undefined;
 	leftRightCommitCount: RepoPromiseCacheMap<string, LeftRightCommitCountResult | undefined> | undefined;
 	mergeBase: RepoPromiseCacheMap<string, string | undefined> | undefined;
+	patchIds: RepoPromiseCacheMap<string, string | undefined> | undefined;
 	pausedOperationStatus: PromiseMap<RepoPath, GitPausedOperationStatus | undefined> | undefined;
 	reachability: RepoPromiseCacheMap<string, GitCommitReachability | undefined> | undefined;
 	resolvedRevisions: RepoPromiseCacheMap<string, ResolvedRevision> | undefined;
@@ -152,6 +153,8 @@ interface SharedCaches {
 	contributorsLite: RepoPromiseCacheMap<string, GitContributor[]> | undefined;
 	contributorsStats: RepoPromiseCacheMap<string, GitContributorsStats | undefined> | undefined;
 	defaultBranchName: RepoPromiseCacheMap<string, string | undefined> | undefined;
+	/** The empty tree's id — a property of the repository's object format, which never changes for its lifetime. */
+	emptyTreeSha: PromiseMap<RepoPath, string> | undefined;
 	gitResults: RepoPromiseCacheMap<string, GitResult> | undefined;
 	gkConfigMap: PromiseMap<RepoPath, Map<string, string>> | undefined;
 	initialCommitSha: PromiseMap<RepoPath, string | undefined> | undefined;
@@ -183,6 +186,7 @@ const sharedCacheKeys: ReadonlySet<keyof AllCaches> = new Set(
 		'contributorsLite',
 		'contributorsStats',
 		'defaultBranchName',
+		'emptyTreeSha',
 		'gitResults',
 		'gkConfigMap',
 		'initialCommitSha',
@@ -214,6 +218,7 @@ function createEmptyCaches(): AllCaches {
 		ignoreRevsFile: undefined,
 		leftRightCommitCount: undefined,
 		mergeBase: undefined,
+		patchIds: undefined,
 		configKeys: undefined,
 		configPatterns: undefined,
 		conflictDetection: undefined,
@@ -225,6 +230,7 @@ function createEmptyCaches(): AllCaches {
 		currentBranchReference: undefined,
 		currentUser: undefined,
 		defaultBranchName: undefined,
+		emptyTreeSha: undefined,
 		gitDir: undefined,
 		gitIgnore: undefined,
 		gitResults: undefined,
@@ -429,6 +435,10 @@ export class Cache implements Disposable {
 		return (this._caches.defaultBranchName ??= new RepoPromiseCacheMap<string, string | undefined>());
 	}
 
+	get emptyTreeSha(): PromiseMap<RepoPath, string> {
+		return (this._caches.emptyTreeSha ??= new PromiseMap<RepoPath, string>());
+	}
+
 	get gitDir(): Map<RepoPath, GitDir> {
 		return (this._caches.gitDir ??= new Map<RepoPath, GitDir>());
 	}
@@ -479,6 +489,20 @@ export class Cache implements Disposable {
 		return (this._caches.mergeBase ??= new RepoPromiseCacheMap<string, string | undefined>({
 			accessTTL: 1000 * 60 * 60, // 60 minutes
 			capacity: 50,
+		}));
+	}
+
+	/**
+	 * Patch IDs keyed by full commit sha (plus `paths` and `verbatim`). A commit's content is immutable, so no
+	 * ref or worktree event can make an entry stale and nothing clears it short of a full cache reset. A cached
+	 * `undefined` is a real answer (a merge commit, or a change that is empty after `paths`). Kept per worktree,
+	 * not per repository, since an ID depends on the attributes of the checkout it was read from. Sized above a range
+	 * read of a couple thousand commits, so one read doesn't evict its own ids before the next.
+	 */
+	get patchIds(): RepoPromiseCacheMap<string, string | undefined> {
+		return (this._caches.patchIds ??= new RepoPromiseCacheMap<string, string | undefined>({
+			accessTTL: 1000 * 60 * 60, // 60 minutes
+			capacity: 5000,
 		}));
 	}
 
@@ -563,6 +587,25 @@ export class Cache implements Disposable {
 
 	@debug({ onlyExit: true })
 	clearCaches(repoPath: string | undefined, ...types: CachedGitTypes[]): void {
+		this.clearCachesCore('share', repoPath, ...types);
+	}
+
+	/**
+	 * Hard-evicts the same cache keys {@link clearCaches} would clear for `repoPath`, but a shared
+	 * (commonPath-keyed) entry that is still in flight is deleted outright instead of soft-invalidated —
+	 * a caller after this call never joins a read that started before it. Use for a forced read/write
+	 * that must not be answered from pre-change work; `clearCaches` remains the right call whenever
+	 * letting an in-flight read complete and share its answer with new callers is fine.
+	 */
+	evictCaches(repoPath: string, ...types: CachedGitTypes[]): void {
+		this.clearCachesCore('evict', repoPath, ...types);
+	}
+
+	private clearCachesCore(
+		inFlight: 'share' | 'evict',
+		repoPath: string | undefined,
+		...types: CachedGitTypes[]
+	): void {
 		const keysToClear = new Set<keyof AllCaches>();
 
 		if (!types.length) {
@@ -631,6 +674,8 @@ export class Cache implements Disposable {
 				keysToClear.add('logShas');
 				keysToClear.add('refs');
 				keysToClear.add('refTips');
+				// No change type clears `emptyTreeSha`: a repository's object format never changes. A full reset
+				// (no types) still clears it, along with everything else
 			}
 
 			if (types.includes('config')) {
@@ -704,6 +749,10 @@ export class Cache implements Disposable {
 				// `branch`/`branches` cascade above clears for.
 				keysToClear.add('commit');
 				keysToClear.add('commitCount');
+				// Same drift for a tag-named rev, and a `getLogShas` excluding tags lists different commits once a tag moves
+				keysToClear.add('logShas');
+				// Keyed by the revision as given, so a tag name resolves to wherever the tag pointed when first read
+				keysToClear.add('resolvedRevisions');
 			}
 
 			if (types.includes('tracking')) {
@@ -728,7 +777,7 @@ export class Cache implements Disposable {
 			if (repoPath == null) {
 				cache.clear();
 			} else if (sharedCacheKeys.has(key)) {
-				this.evictShared(key, repoPath);
+				this.evictShared(key, repoPath, inFlight);
 			} else {
 				cache.delete(repoPath);
 			}
@@ -737,18 +786,23 @@ export class Cache implements Disposable {
 
 	/**
 	 * Evicts a single shared (commonPath-keyed) cache entry for `repoPath` and its sibling worktrees.
-	 * Prefers `invalidate` where supported so in-flight work is shared across new callers and
-	 * self-evicts on settle rather than spawning a duplicate factory. `invalidate` does the right
-	 * thing per-entry: entries with a `CacheController` (created via `getOrCreate`) are marked
-	 * invalidated; entries without one (created via plain `.set()`, e.g. per-worktree mapper results)
-	 * are hard-deleted. Caches that don't support `invalidate` fall back to `delete`.
+	 * When `inFlight` is `'share'` (the default), prefers `invalidate` where supported so in-flight work
+	 * is shared across new callers and self-evicts on settle rather than spawning a duplicate factory.
+	 * `invalidate` does the right thing per-entry: entries with a `CacheController` (created via
+	 * `getOrCreate`) are marked invalidated; entries without one (created via plain `.set()`, e.g.
+	 * per-worktree mapper results) are hard-deleted. Caches that don't support `invalidate` fall back to
+	 * `delete`.
+	 *
+	 * When `inFlight` is `'evict'`, always hard-deletes regardless of `invalidate` support — a new caller
+	 * must never join a read that started before this eviction (see {@link evictCaches}).
 	 */
-	private evictShared(key: keyof AllCaches, repoPath: string): void {
+	private evictShared(key: keyof AllCaches, repoPath: string, inFlight: 'share' | 'evict' = 'share'): void {
 		const cache = this._caches[key];
 		if (cache == null) return;
 
 		const commonPath = this.getCommonPath(repoPath);
-		const invalidate = (cache as { invalidate?: (k: string) => void }).invalidate;
+		const invalidate =
+			inFlight === 'share' ? (cache as { invalidate?: (k: string) => void }).invalidate : undefined;
 		if (typeof invalidate === 'function') {
 			invalidate.call(cache, commonPath);
 			for (const worktreePath of this.getWorktreePaths(commonPath)) {
@@ -964,16 +1018,33 @@ export class Cache implements Disposable {
 		this._caches = createEmptyCaches();
 	}
 
+	/** Applies a watcher-observed change, sharing reads still in flight (see {@link applyRepositoryChanges}). */
 	@debug({ onlyExit: true })
 	onRepositoryChanged(repoPath: string, changes: Iterable<RepositoryChange>): void {
 		const changesSet = new Set(changes);
-
-		const hasAny = (...c: RepositoryChange[]) => c.some(ch => changesSet.has(ch));
-
-		if (hasAny('unknown', 'closed')) {
+		if (changesSet.has('unknown') || changesSet.has('closed')) {
 			this.unregisterRepoPath(repoPath);
 			return;
 		}
+
+		this.applyRepositoryChanges(repoPath, changesSet, 'share');
+	}
+
+	/**
+	 * Clears what `changes` can have made stale for `repoPath`, advances its status clock, and reconciles a
+	 * `'gkConfig'` change, returning the cache types it cleared. `inFlight` is as {@link clearCaches}
+	 * (`'share'`) vs {@link evictCaches} (`'evict'`). `'unknown'` and `'closed'` map to nothing here: the
+	 * watcher unregisters the path on them, and an announced write resets everything instead.
+	 */
+	@debug({ onlyExit: true })
+	applyRepositoryChanges(
+		repoPath: string,
+		changes: Iterable<RepositoryChange>,
+		inFlight: 'share' | 'evict',
+	): CachedGitTypes[] {
+		const changesSet = new Set(changes);
+
+		const hasAny = (...c: RepositoryChange[]) => c.some(ch => changesSet.has(ch));
 
 		// Advance the status clock (see {@link getStatusGeneration}) for changes that alter `git status` output but
 		// aren't mapped to the `'status'` cache type below: files (index/head/heads), untracked set (ignores/config),
@@ -1053,8 +1124,9 @@ export class Cache implements Disposable {
 		}
 
 		if (types.size) {
-			this.clearCaches(repoPath, ...types);
+			this.clearCachesCore(inFlight, repoPath, ...types);
 		}
+		return [...types];
 	}
 
 	/**
@@ -1575,6 +1647,11 @@ export class Cache implements Disposable {
 		factory: (commonPath: string) => PromiseOrValue<string | undefined>,
 	): Promise<string | undefined> {
 		return this.getSharedSimple(this.initialCommitSha, repoPath, factory);
+	}
+
+	/** A rejected factory is never cached (`PromiseMap` evicts on rejection) — a failed read retries next time. */
+	getEmptyTreeSha(repoPath: string, factory: (commonPath: string) => PromiseOrValue<string>): Promise<string> {
+		return this.getSharedSimple(this.emptyTreeSha, repoPath, factory);
 	}
 
 	getLastFetchedTimestamp(

@@ -2,7 +2,7 @@
 	"name": "gitlens",
 	"displayName": "%gitlens.displayName%",
 	"description": "%gitlens.description%",
-	"version": "19.2.0",
+	"version": "19.3.0",
 	"engines": {
 		"node": ">= 24",
 		"pnpm": ">= 11.0.0",
@@ -1655,6 +1655,20 @@
 						"tags": [
 							"experimental"
 						]
+					}
+				}
+			},
+			{
+				"id": "start-work",
+				"title": "%config.section.start-work.title%",
+				"order": 55,
+				"properties": {
+					"gitlens.startWork.branchNameFormat": {
+						"type": "string",
+						"default": "${id}-${title}",
+						"markdownDescription": "%config.startWork.branchNameFormat.markdownDescription%",
+						"scope": "window",
+						"order": 10
 					}
 				}
 			},
@@ -3688,6 +3702,13 @@
 						"markdownDescription": "%config.views.searchAndCompare.files.compact.markdownDescription%",
 						"scope": "window",
 						"order": 22
+					},
+					"gitlens.views.searchAndCompare.files.openDiffOnClick": {
+						"type": "boolean",
+						"default": true,
+						"markdownDescription": "%config.views.searchAndCompare.files.openDiffOnClick.markdownDescription%",
+						"scope": "window",
+						"order": 23
 					},
 					"gitlens.views.searchAndCompare.files.icon": {
 						"type": "string",

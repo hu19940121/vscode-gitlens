@@ -4,9 +4,13 @@ import type {
 	CollectionOmission,
 	CollectionScopeFailure,
 } from '@gitkraken/provider-apis';
+import type { PullRequestShape } from '@gitlens/git/models/pullRequest.js';
+import { chunk } from '@gitlens/utils/array.js';
 import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { uniqueBy } from '@gitlens/utils/iterable.js';
+import { mapSettledBounded } from '@gitlens/utils/promise.js';
 import { throwIfCallerContractError, toCollectionScopeFailure } from '../../collectionMetadata.js';
+import { providerFanOutConcurrency } from '../../constants.js';
 import { collectionScopeKey } from '../../results.js';
 import type { ProviderApiPagedResult, ProviderHierarchyResult } from '../models.js';
 
@@ -37,6 +41,144 @@ export function throwIfAllSettledFailed<T>(results: PromiseSettledResult<T>[]): 
 
 	const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
 	if (rejected != null) throw rejected.reason;
+}
+
+/**
+ * The answer a pull-requests-by-branch read gives for one branch: the rows `matchesHead` accepts, newest first, at
+ * most `limit` of them, each passed through `map`. Rows are filtered before they're mapped, so a non-matching row
+ * can't fail the answer. `more` says the host holds rows it didn't return; the filter can't see those, so they make
+ * the answer `truncated` however few rows passed it.
+ */
+export function selectBranchPullRequests<T, R>(
+	rows: readonly T[],
+	options: {
+		matchesHead: (row: T) => boolean;
+		updatedAt: (row: T) => number;
+		map: (row: T) => R;
+		limit: number;
+		more: boolean;
+	},
+): { values: R[]; truncated: boolean } {
+	const matched = rows.filter(options.matchesHead).sort((a, b) => options.updatedAt(b) - options.updatedAt(a));
+	return {
+		values: matched.slice(0, options.limit).map(options.map),
+		truncated: options.more || matched.length > options.limit,
+	};
+}
+
+/**
+ * The second step of a pull-requests-by-branch read on a host whose branch query can't return the batch read's
+ * rows: resolves each target's matched numbers through `resolve` (the host's `getProviderPullRequestsBatch`), so a
+ * pull request comes back identical whichever read found it.
+ *
+ * One `resolve` call for every target's numbers, so the host's own fan-out bounds the concurrency. A number it
+ * reports absent (deleted between the two steps) is dropped; one it couldn't check rejects the whole target, since
+ * a partial list would read as a complete one. The first step's order is kept.
+ */
+export async function resolveBranchPullRequests(
+	targets: readonly { owner: string; repo: string; project?: string }[],
+	found: readonly PromiseSettledResult<{ numbers: number[]; truncated: boolean }>[],
+	resolve: (
+		coordinates: { owner: string; repo: string; number: number; project?: string }[],
+	) => Promise<PromiseSettledResult<PullRequestShape | undefined>[] | undefined>,
+): Promise<PromiseSettledResult<{ pullRequests: PullRequestShape[]; truncated: boolean }>[]> {
+	const coordinates = found.flatMap((slot, i) =>
+		slot.status === 'fulfilled'
+			? slot.value.numbers.map(number => ({
+					owner: targets[i].owner,
+					repo: targets[i].repo,
+					number: number,
+					project: targets[i].project,
+				}))
+			: [],
+	);
+
+	let resolved: PromiseSettledResult<PullRequestShape | undefined>[] = [];
+	if (coordinates.length > 0) {
+		try {
+			resolved =
+				(await resolve(coordinates)) ??
+				coordinates.map(() => ({
+					status: 'rejected',
+					reason: new Error('Pull requests could not be resolved'),
+				}));
+		} catch (ex) {
+			resolved = coordinates.map(() => ({ status: 'rejected', reason: ex }));
+		}
+	}
+
+	let offset = 0;
+	return found.map(slot => {
+		if (slot.status === 'rejected') return slot;
+
+		const slots = resolved.slice(offset, offset + slot.value.numbers.length);
+		offset += slot.value.numbers.length;
+
+		const failure = slots.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+		if (failure != null) return failure;
+
+		return {
+			status: 'fulfilled',
+			value: {
+				pullRequests: slots.flatMap(s => (s.status === 'fulfilled' && s.value != null ? [s.value] : [])),
+				truncated: slot.value.truncated,
+			},
+		};
+	});
+}
+
+/**
+ * Runs a cheap etag read over `coordinates` with one request per repository and chunk of `chunkSize` numbers, with
+ * bounded concurrency, and maps the answers back to the coordinates positionally (`read` answers one entry per
+ * number, in order, `undefined` for a proven absence). Settled per target: a request that throws rejects only its
+ * own slots, and a slot whose conversion throws rejects only itself.
+ */
+export async function readEtagFieldsByRepository<Node, Fields>(
+	coordinates: readonly { owner: string; repo: string; number: number }[],
+	chunkSize: number,
+	read: (owner: string, repo: string, numbers: number[]) => Promise<(Node | undefined)[]>,
+	map: (node: Node) => Fields,
+): Promise<PromiseSettledResult<Fields | undefined>[]> {
+	const byRepository = new Map<string, number[]>();
+	for (const [index, c] of coordinates.entries()) {
+		const key = `${c.owner}/${c.repo}`;
+		let indices = byRepository.get(key);
+		if (indices == null) {
+			indices = [];
+			byRepository.set(key, indices);
+		}
+		indices.push(index);
+	}
+
+	const requests = [...byRepository.values()].flatMap(indices =>
+		chunk(indices, chunkSize).map(chunkIndices => ({ indices: chunkIndices })),
+	);
+	const answers = await mapSettledBounded(requests, providerFanOutConcurrency, r => {
+		const { owner, repo } = coordinates[r.indices[0]];
+		return read(
+			owner,
+			repo,
+			r.indices.map(i => coordinates[i].number),
+		);
+	});
+
+	const slots = new Array<PromiseSettledResult<Fields | undefined>>(coordinates.length);
+	for (const [i, answer] of answers.entries()) {
+		for (const [j, index] of requests[i].indices.entries()) {
+			if (answer.status === 'rejected') {
+				slots[index] = answer;
+				continue;
+			}
+
+			const node = answer.value[j];
+			try {
+				slots[index] = { status: 'fulfilled', value: node != null ? map(node) : undefined };
+			} catch (ex) {
+				slots[index] = { status: 'rejected', reason: ex };
+			}
+		}
+	}
+	return slots;
 }
 
 export function flatSettledResultsOrThrow<T>(results: PromiseSettledResult<T[]>[]): T[] {

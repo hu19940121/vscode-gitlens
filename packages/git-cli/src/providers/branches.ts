@@ -56,7 +56,16 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 	) {}
 
 	@debug()
-	async getBranch(repoPath: string, name?: string, cancellation?: AbortSignal): Promise<GitBranch | undefined> {
+	async getBranch(
+		repoPath: string,
+		name?: string,
+		options?: { force?: boolean },
+		cancellation?: AbortSignal,
+	): Promise<GitBranch | undefined> {
+		if (options?.force) {
+			this.cache.evictCaches(repoPath, 'branches');
+		}
+
 		if (name != null) {
 			const {
 				values: [branch],
@@ -485,7 +494,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 			if (mergeTarget == null && options?.associatedPullRequest != null) {
 				const pr = await options.associatedPullRequest;
 				if (pr?.refs?.base != null) {
-					const branch = await this.getBranch(repoPath, ref, cancellation);
+					const branch = await this.getBranch(repoPath, ref, undefined, cancellation);
 					if (branch == null) return undefined;
 
 					mergeTarget = `${branch.remoteName}/${pr.refs.base.branch}`;
@@ -906,12 +915,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		try {
 			await this.git.run({ cwd: repoPath }, ...args);
 			for (const branch of branches) {
-				this.cache.deleteBaseBranchName(repoPath, branch);
-				// Drop the persisted gk metadata too, not just the cached resolution. `getBaseBranchName`
-				// reads `branch.<ref>.gk-merge-base` before falling back to the reflog, so leaving it behind
-				// would hand a later branch reusing this name its predecessor's base — evicting the cache
-				// alone just forces a re-derivation that reads the same stale value back.
-				await this.provider.config.removeGkConfigBranchSection(repoPath, branch);
+				await this.forgetDeletedBranch(repoPath, branch);
 			}
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
 			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
@@ -955,6 +959,17 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 					),
 			);
 		}
+	}
+
+	/**
+	 * Drops what GitLens keeps for a local branch beyond its ref, for both ways one is deleted
+	 * (`deleteLocalBranch` and `refs.deleteReference`). The persisted gk metadata goes too, not just the
+	 * cached resolution: `getBaseBranchName` reads `branch.<ref>.gk-merge-base` before falling back to the
+	 * reflog, so leaving it behind would hand a later branch reusing this name its predecessor's base.
+	 */
+	async forgetDeletedBranch(repoPath: string, name: string): Promise<void> {
+		this.cache.deleteBaseBranchName(repoPath, name);
+		await this.provider.config.removeGkConfigBranchSection(repoPath, name);
 	}
 
 	/**
@@ -1002,8 +1017,7 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 				if (surviving.has(name)) continue;
 
 				anyDeleted = true;
-				this.cache.deleteBaseBranchName(repoPath, name);
-				await this.provider.config.removeGkConfigBranchSection(repoPath, name);
+				await this.forgetDeletedBranch(repoPath, name);
 			}
 
 			return anyDeleted;
@@ -1647,18 +1661,16 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		const priorityOpts = priority != null ? { priority: priority } : undefined;
 
 		try {
-			let result = await this.git.run(
-				{ cwd: repoPath, cancellation: cancellation, ...priorityOpts },
-				'reflog',
+			let entries = await this.provider.refs.getReflogEntries(
+				repoPath,
 				ref,
-				'--grep-reflog=branch: Created from *.',
+				{ grep: 'branch: Created from *.', priority: priority },
+				cancellation,
 			);
-
-			let entries = result.stdout.split('\n').filter(entry => Boolean(entry));
 			if (entries.length !== 1) return { branch: undefined, failed: false };
 
 			// Check if branch created from an explicit branch
-			let match = entries[0].match(/branch: Created from (.*)$/);
+			let match = entries[0].message.match(/branch: Created from (.*)$/);
 			if (match?.length === 2) {
 				let name: string | undefined = match[1];
 				if (name !== 'HEAD') {
@@ -1677,17 +1689,15 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 			}
 
 			// Check if branch was created from HEAD
-			result = await this.git.run(
-				{ cwd: repoPath, cancellation: cancellation, ...priorityOpts },
-				'reflog',
+			entries = await this.provider.refs.getReflogEntries(
+				repoPath,
 				'HEAD',
-				`--grep-reflog=checkout: moving from .* to ${ref.replace('refs/heads/', '')}`,
+				{ grep: `checkout: moving from .* to ${ref.replace('refs/heads/', '')}`, priority: priority },
+				cancellation,
 			);
-
-			entries = result.stdout.split('\n').filter(entry => Boolean(entry));
 			if (!entries.length) return { branch: undefined, failed: false };
 
-			match = entries.at(-1)!.match(/checkout: moving from ([^\s]+)\s/);
+			match = entries.at(-1)!.message.match(/checkout: moving from ([^\s]+)\s/);
 			if (match?.length === 2) {
 				let name: string | undefined = match[1];
 				if (options?.upstream) {
@@ -1705,8 +1715,18 @@ export class BranchesGitSubProvider implements GitBranchesSubProvider {
 		} catch (ex) {
 			if (isCancellationError(ex)) throw ex;
 
-			// The reads use default error handling, so a spawn failure, queue rejection or swallowed
-			// `GitWarnings` match lands here rather than producing an empty answer.
+			// A ref that is unborn, or gone since it was listed, has no reflog to read: an answer, not a failure
+			const msg: string = ex?.toString() ?? '';
+			const stderr = ex instanceof GitError ? ex.stderr : undefined;
+			if (
+				[GitErrors.badRevision, GitErrors.ambiguousArgument].some(
+					error => error.test(msg) || (stderr != null && error.test(stderr)),
+				)
+			) {
+				return { branch: undefined, failed: false };
+			}
+
+			// `getReflogEntries` rejects on a failed read, so a read that never happened isn't taken as "no base"
 			return { branch: undefined, failed: true };
 		}
 

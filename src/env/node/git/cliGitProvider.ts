@@ -7,6 +7,7 @@ import { fetch } from '@env/fetch.js';
 import { isLinux, isWindows } from '@env/platform.js';
 import type { CliGitProviderOptions } from '@gitlens/git-cli/cliGitProvider.js';
 import { CliGitProvider } from '@gitlens/git-cli/cliGitProvider.js';
+import type { Git } from '@gitlens/git-cli/exec/git.js';
 import { slowCallWarningThreshold } from '@gitlens/git-cli/exec/git.js';
 import type { GitLocation } from '@gitlens/git-cli/exec/locator.js';
 import { findGitPath, InvalidGitConfigError, UnableToFindGitError } from '@gitlens/git-cli/exec/locator.js';
@@ -16,6 +17,7 @@ import { RemoteResourceType } from '@gitlens/git/models/remoteResource.js';
 import type { GitDir } from '@gitlens/git/models/repository.js';
 import { forcedRepositoryChanges } from '@gitlens/git/models/repository.js';
 import { deletedOrMissing, uncommitted } from '@gitlens/git/models/revision.js';
+import type { GitOperationRunOptions } from '@gitlens/git/providers/operations.js';
 import type { GitProvider } from '@gitlens/git/providers/provider.js';
 import type { GitProviderDescriptor, RepositoryVisibility } from '@gitlens/git/providers/types.js';
 import type { UnsafeGit } from '@gitlens/git/run.types.js';
@@ -29,6 +31,7 @@ import {
 } from '@gitlens/git/utils/revision.utils.js';
 import type { RevisionUriData, RevisionUriOptions } from '@gitlens/git/utils/uriAuthority.js';
 import { encodeGitLensRevisionUriAuthority } from '@gitlens/git/utils/uriAuthority.js';
+import { isCancellationError } from '@gitlens/utils/cancellation.js';
 import { debounce } from '@gitlens/utils/debounce.js';
 import { debug, trace } from '@gitlens/utils/decorators/log.js';
 import type { UnifiedDisposable } from '@gitlens/utils/disposable.js';
@@ -56,6 +59,7 @@ import { Schemes } from '../../../constants.js';
 import type { Source } from '../../../constants.telemetry.js';
 import type { Container } from '../../../container.js';
 import { getPresentableErrorMessage } from '../../../errors.js';
+import type { GitCacheResetEvent } from '../../../eventBus.js';
 import type { Features } from '../../../features.js';
 import { gitMinimumVersion } from '../../../features.js';
 import type {
@@ -89,6 +93,19 @@ const RepoSearchWarnings = {
 };
 
 const driveLetterRegex = /(?<=^\/?)([a-zA-Z])(?=:\/)/;
+
+/**
+ * Drops the in-flight git runs a cache reset makes stale: only the reset repository's, so identical reads
+ * running at once in other repositories keep sharing a process, or every run for a reset naming no repository.
+ */
+export function clearPendingCommandsForReset(
+	git: Pick<Git, 'clearPendingCommands'>,
+	reset: GitCacheResetEvent['data'],
+): void {
+	if (reset.types?.length && reset.types.every(t => t === 'providers')) return;
+
+	git.clearPendingCommands(reset.repoPath != null ? [reset.repoPath] : undefined);
+}
 
 export class GlCliGitProvider implements GlGitProvider {
 	readonly descriptor: GitProviderDescriptor = { id: 'git', name: 'Git', virtual: false };
@@ -186,11 +203,10 @@ export class GlCliGitProvider implements GlGitProvider {
 							scheme === Schemes.GitLens
 						);
 					}),
-					// Clear pending commands on @gitlens/git-cli's Git when the cache resets
 					this.container.events.on('git:cache:reset', e => {
-						if (e.data.types?.every(t => t === 'providers')) return;
+						if (this._provider == null) return;
 
-						this._provider?.git.clearPendingCommands();
+						clearPendingCommandsForReset(this._provider.git, e.data);
 					}),
 				);
 			} finally {
@@ -1257,12 +1273,19 @@ export class GlCliGitProvider implements GlGitProvider {
 	}
 
 	@debug()
-	async clone(url: string, parentPath: string): Promise<string | undefined> {
+	async clone(
+		url: string,
+		parentPath: string,
+		options?: { folderName?: string },
+		runOptions?: GitOperationRunOptions,
+	): Promise<string | undefined> {
 		const scope = getScopedLogger();
 
 		try {
-			return await this.provider.clone?.(url, parentPath);
+			return await this.provider.clone?.(url, parentPath, options, runOptions);
 		} catch (ex) {
+			if (isCancellationError(ex)) return undefined;
+
 			scope?.error(ex);
 			void showGenericErrorMessage(l10n.t("Unable to clone '{0}'", url));
 		}

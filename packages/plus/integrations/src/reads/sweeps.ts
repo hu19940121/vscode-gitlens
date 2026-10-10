@@ -8,12 +8,12 @@ import type {
 	ProviderSweepTargetEvent,
 	PullRequestSweepOptions,
 } from '../manager.js';
-import { fromProviderPullRequest } from '../providers/models.js';
+import { toPullRequestRow } from '../providers/models.js';
 import type { ProviderSweepResult, ProviderWarning } from '../results.js';
 import { appendDedupedWarning } from '../results.js';
 import { isGitHostIntegration, isIssuesHostIntegrationId } from '../utils/integration.utils.js';
 import type { ProviderReadContext } from './context.js';
-import { drainPullRequests, getCurrentAccountId, resolvePullRequestSweepTargets } from './drains.js';
+import { drainPullRequests, getPullRequestViewers, resolvePullRequestSweepTargets } from './drains.js';
 import { resolveAccountWidePullRequestFilters, resolvePullRequestFilters } from './filters.js';
 import {
 	gitHostOnlySurfaceWarning,
@@ -116,14 +116,16 @@ async function sweepTarget(
 		maxPages,
 		attributeUnavailableProviders,
 	);
-	const currentAccountId = drain.items.some(pr => pr.author != null)
-		? await getCurrentAccountId(integration, connectionId)
-		: undefined;
-	// Normalize the raw provider-apis PRs to the GitLens-owned shape here, where the per-provider
-	// `integration` (the mapper's provider reference) is in scope; the aggregation below only sees drains.
+	const viewers = await getPullRequestViewers(integration, connectionId, drain.items);
+	// Mirrors the projection `drainPullRequests` requests.
+	const projection = accountWide ? (options?.includeReviews ? 'account' : 'account-summary') : 'repos';
+	// Normalize the raw rows to the GitLens-owned shape here, where the per-provider `integration` (the
+	// mapper's provider reference) is in scope; the aggregation below only sees drains.
 	return {
 		...drain,
-		items: drain.items.map(pr => fromProviderPullRequest(pr, integration, { currentAccountId: currentAccountId })),
+		items: drain.items.map((pr, i) =>
+			toPullRequestRow(pr, integration, { currentAccount: viewers[i], projection: projection }),
+		),
 		providerId: id,
 	};
 }

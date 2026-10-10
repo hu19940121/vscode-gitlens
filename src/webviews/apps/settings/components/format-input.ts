@@ -8,6 +8,7 @@ import { focusOutline } from '@gitlens/components/components/styles/lit/a11y.css
 import { boxSizingBase, linkBase } from '@gitlens/components/components/styles/lit/base.css.js';
 import { localizedContent } from '@gitlens/components/localizedContent.js';
 import { debounce } from '@gitlens/utils/debounce.js';
+import type { GenerateFormatPreviewParams } from '../../../settings/settingsService.js';
 import type {
 	CompletionItem,
 	CompletionSelectEvent,
@@ -44,7 +45,7 @@ const tzMinutes = String(tzAbs % 60).padStart(2, '0');
 const sampleDate = new Date(`Wed Jul 25 2018 19:18:00 GMT${tzSign}${tzHours}${tzMinutes}`);
 
 /** Which token set (if any) the input offers, and the grammar affordances it exposes. */
-type TokenMode = 'commit' | 'hover' | 'file' | 'date';
+type TokenMode = 'commit' | 'hover' | 'file' | 'branch-name' | 'date';
 
 /** The mutually-exclusive width modifier flag — the grammar accepts ONE flag after the width, never both. */
 type WidthFlag = '' | '?' | '-';
@@ -419,7 +420,7 @@ export class GlFormatInput extends SignalWatcher(LitElement) {
 		this.updateExample();
 	}
 
-	private readonly requestPreview = debounce((type: 'commit' | 'commit-uncommitted' | 'file', format: string) => {
+	private readonly requestPreview = debounce((type: GenerateFormatPreviewParams['type'], format: string) => {
 		const key = this.descriptor.key;
 		// Hover/tooltip formats render as markdown at runtime, so their preview must too
 		const markdown = this.tokenMode === 'hover';
@@ -459,6 +460,7 @@ export class GlFormatInput extends SignalWatcher(LitElement) {
 		switch (preview.type) {
 			case 'commit':
 			case 'commit-uncommitted':
+			case 'branch-name':
 			case 'file': {
 				// Empty value falls back to the literal default FIRST, then the lookup key (legacy order)
 				if (!value) {
@@ -592,6 +594,7 @@ export class GlFormatInput extends SignalWatcher(LitElement) {
 		if (this.descriptor.preview?.type === 'date') return 'date';
 
 		const tokens = this.descriptor.tokens;
+		if (tokens === 'branch-name') return 'branch-name';
 		if (tokens === 'file') return 'file';
 		if (tokens === 'hover') return 'hover';
 		if (tokens === true) return 'commit';
@@ -870,7 +873,7 @@ export class GlFormatInput extends SignalWatcher(LitElement) {
 
 	private renderTokenMenu(mode: TokenMode): unknown {
 		const tokens = this.filteredTokens;
-		const docsUrl = mode === 'date' ? dateDocsUrl : commitDocsUrl;
+		const docsUrl = mode === 'branch-name' ? undefined : mode === 'date' ? dateDocsUrl : commitDocsUrl;
 
 		return html`<gl-popover
 			trigger="click"
@@ -931,19 +934,23 @@ export class GlFormatInput extends SignalWatcher(LitElement) {
 					}
 				</div>
 				${mode !== 'date' ? this.renderModifiers() : nothing}
-				<span class="tokens__hint">
-					${localizedContent(
-						l10n.t({
-							message: '{link} about formatting options',
-							comment: ['{link} is the “Learn more” action.'],
-						}),
-						{
-							link: html`<a href=${docsUrl} title=${l10n.t('Open formatting docs')}
-								>${l10n.t('Learn more')}</a
-							>`,
-						},
-					)}
-				</span>
+				${
+					docsUrl != null
+						? html`<span class="tokens__hint">
+								${localizedContent(
+									l10n.t({
+										message: '{link} about formatting options',
+										comment: ['{link} is the “Learn more” action.'],
+									}),
+									{
+										link: html`<a href=${docsUrl} title=${l10n.t('Open formatting docs')}
+											>${l10n.t('Learn more')}</a
+										>`,
+									},
+								)}
+							</span>`
+						: nothing
+				}
 			</div>
 		</gl-popover>`;
 	}

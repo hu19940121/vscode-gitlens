@@ -1,3 +1,4 @@
+import { RequestRateLimitError } from '@gitlens/git/errors.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import type { IntegrationIds } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
@@ -52,6 +53,16 @@ function isTerminalStatus(status: number): boolean {
 	}
 }
 
+/**
+ * The error for a token fetch the backend refused for a reason a retry can fix. A 429 is typed as a rate limit so
+ * a read that needed the token reports a throttle rather than a broken connection (gitkraken/kepler#3546); every
+ * other status stays a plain error.
+ */
+function retryableTokenFetchError(status: number, message: string): Error {
+	const error = new Error(message);
+	return status === 429 ? new RequestRateLimitError(error, undefined, undefined) : error;
+}
+
 function toSession(data: GKProviderToken): CloudIntegrationAuthenticationSession {
 	// Normalize the backend's `tokenId` onto our `id` so callers get a stable per-connection identity.
 	return {
@@ -65,6 +76,14 @@ function toSession(data: GKProviderToken): CloudIntegrationAuthenticationSession
 	};
 }
 
+async function getResponseError(response: Response): Promise<unknown> {
+	try {
+		return ((await response.json()) as { error?: unknown })?.error;
+	} catch {
+		return undefined;
+	}
+}
+
 export class CloudIntegrationService {
 	constructor(private readonly ctx: IntegrationServiceContext) {}
 
@@ -73,7 +92,7 @@ export class CloudIntegrationService {
 
 		const providersRsp = await this.ctx.account.fetchGkApi('v1/provider-tokens', { method: 'GET' });
 		if (!providersRsp.ok) {
-			const error = ((await providersRsp.json()) as { error?: unknown })?.error;
+			const error = await getResponseError(providersRsp);
 			const errorMessage =
 				typeof error === 'string'
 					? error
@@ -160,7 +179,7 @@ export class CloudIntegrationService {
 			: `v1/provider-tokens/${cloudIntegrationType}${refresh ? '/refresh' : ''}`;
 		const tokenRsp = await this.ctx.account.fetchGkApi(path, reqInitOptions);
 		if (!tokenRsp.ok) {
-			const error = ((await tokenRsp.json()) as { error?: unknown })?.error;
+			const error = await getResponseError(tokenRsp);
 			const errorMessage =
 				typeof error === 'string' ? error : ((error as { message?: string })?.message ?? tokenRsp.statusText);
 			if (error != null) {
@@ -196,12 +215,18 @@ export class CloudIntegrationService {
 
 				if (isTerminalStatus(newTokenRsp.status)) return undefined;
 
-				throw new Error(`Retryable failure (${newTokenRsp.status}) refreshing ${id} token from cloud`);
+				throw retryableTokenFetchError(
+					newTokenRsp.status,
+					`Retryable failure (${newTokenRsp.status}) refreshing ${id} token from cloud`,
+				);
 			}
 
 			if (isTerminalStatus(tokenRsp.status)) return undefined;
 
-			throw new Error(`Retryable failure (${tokenRsp.status}) getting ${id} token from cloud`);
+			throw retryableTokenFetchError(
+				tokenRsp.status,
+				`Retryable failure (${tokenRsp.status}) getting ${id} token from cloud`,
+			);
 		}
 
 		const data = ((await tokenRsp.json()) as { data?: GKProviderToken })?.data;
@@ -221,7 +246,7 @@ export class CloudIntegrationService {
 			method: 'DELETE',
 		});
 		if (!tokenRsp.ok) {
-			const error = ((await tokenRsp.json()) as { error?: unknown })?.error;
+			const error = await getResponseError(tokenRsp);
 			const errorMessage =
 				typeof error === 'string' ? error : ((error as { message?: string })?.message ?? tokenRsp.statusText);
 			if (error != null) {
@@ -250,7 +275,7 @@ export class CloudIntegrationService {
 			{ method: 'DELETE' },
 		);
 		if (!tokenRsp.ok) {
-			const error = ((await tokenRsp.json()) as { error?: unknown })?.error;
+			const error = await getResponseError(tokenRsp);
 			const errorMessage =
 				typeof error === 'string' ? error : ((error as { message?: string })?.message ?? tokenRsp.statusText);
 			if (error != null) {
@@ -275,7 +300,7 @@ export class CloudIntegrationService {
 			{ method: 'POST' },
 		);
 		if (!tokenRsp.ok) {
-			const error = ((await tokenRsp.json()) as { error?: unknown })?.error;
+			const error = await getResponseError(tokenRsp);
 			const errorMessage =
 				typeof error === 'string' ? error : ((error as { message?: string })?.message ?? tokenRsp.statusText);
 			if (error != null) {

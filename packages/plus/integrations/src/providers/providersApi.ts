@@ -1,6 +1,7 @@
 import ProviderApis from '@gitkraken/provider-apis';
 import type {
 	CollectionMetadata,
+	GitIssueState,
 	GitPullRequestState,
 	GraphQLError,
 	GraphQLErrors,
@@ -8,6 +9,7 @@ import type {
 	TrelloList,
 } from '@gitkraken/provider-apis';
 import type { PullRequest, PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
+import { base64 } from '@gitlens/utils/base64.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { TokenOptInfo, TokenWithInfo } from '../authentication/models.js';
@@ -18,9 +20,25 @@ import {
 	GitCloudHostIntegrationId,
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
+	IssuesSelfManagedHostIntegrationId,
 } from '../constants.js';
 import { RequestNotFoundError, toError } from '../errors.js';
-import { requestJiraIssueByKey } from './jiraIssueByKey.js';
+import type { ProviderPullRequestCount, ProviderPullRequestSearchPage } from '../models/pullRequestReads.js';
+import type { AzurePullRequest, AzureWorkItemResponse } from './azure/models.js';
+import {
+	azureWorkItemEtagFieldNames,
+	encodeAzurePathSegment,
+	fromAzureWorkItemToProviderIssue,
+} from './azure/models.js';
+import { requestBitbucketServerProjects, requestBitbucketServerRepositories } from './bitbucket-server/discovery.js';
+import {
+	countBitbucketServerPullRequests,
+	searchBitbucketServerPullRequestsPage,
+} from './bitbucket-server/pullRequestSearch.js';
+import type { JiraIssueEtagResponse } from './jiraIssueByKey.js';
+import { requestJiraIssueByKey, requestJiraIssuesEtagFields } from './jiraIssueByKey.js';
+import type { LinearIssueEtagNode } from './linearIssuesEtag.js';
+import { requestLinearIssuesEtagFields } from './linearIssuesEtag.js';
 import type {
 	GetIssueFn,
 	GetIssuesForReposFn,
@@ -48,8 +66,10 @@ import type {
 	ProviderIssue,
 	ProviderJiraProject,
 	ProviderJiraResource,
+	ProviderJiraServerProject,
 	ProviderLinearOrganization,
 	ProviderLinearTeam,
+	ProviderOrganization,
 	ProviderPullRequest,
 	ProviderRepoInput,
 	ProviderReposInput,
@@ -63,6 +83,7 @@ import type {
 import { isRepoIdsInput, providersMetadata } from './models.js';
 import {
 	getProviderResponseBodyMessage,
+	isAzureProviderId,
 	isProviderIssueNotFoundError,
 	throwProviderError,
 	UnexpectedHtmlResponseError,
@@ -128,6 +149,46 @@ function isGraphQLRepoNotFoundError(ex: unknown): boolean {
 	return ex instanceof Error && repoNotFoundMessage.test(ex.message);
 }
 
+// provider-apis' GitLab `getIssue` throws a plain Error with exactly this message for a null issue (and
+// `repoNotFoundMessage`'s for a null project). Its GraphQL helper ignores `errors`, so a reply carrying only errors
+// throws the same messages; neither proves a miss on its own.
+const gitLabIssueNotFoundMessage = /^Issue .+ not found$/i;
+
+// The `typeKey`s Azure DevOps itself uses for "this pull request/repository/project does not exist". A 404 can
+// also come from a wrong path (e.g. an Azure DevOps Server virtual directory or collection misconfigured), which
+// answers with an HTML error page instead of this shape, so the body must be checked, not just the status.
+const azurePullRequestNotFoundTypeKeys = new Set([
+	'GitPullRequestNotFoundException',
+	'GitRepositoryNotFoundException',
+	'ProjectDoesNotExistWithNameException',
+]);
+
+// The same for a work item. Azure answers a missing work item with TF401232, "Work item N does not exist, or you
+// do not have permissions to read it" — one type for both, so absent here means "not visible to this connection",
+// as it does for every other batch read.
+const azureWorkItemNotFoundTypeKeys = new Set([
+	'WorkItemUnauthorizedAccessException',
+	'ProjectDoesNotExistWithNameException',
+]);
+
+function isAzureNotFoundResponse(ex: unknown, typeKeys: ReadonlySet<string>): boolean {
+	const response = (ex as { response?: { status?: unknown; body?: unknown } } | undefined)?.response;
+	if (response?.status !== 404 || response.body == null || typeof response.body !== 'object') return false;
+
+	const typeKey = (response.body as { typeKey?: unknown }).typeKey;
+	return typeof typeKey === 'string' && typeKeys.has(typeKey);
+}
+
+/** The credential provider-apis sends Azure DevOps: a PAT as Basic (encoded here, as it does), anything else as a bearer. */
+function azureAuthorization(token: string, isPAT: boolean | undefined): string {
+	return isPAT ? `Basic ${base64(`:${token}`)}` : `Bearer ${token}`;
+}
+
+const azureDevOpsBaseUrl = 'https://dev.azure.com';
+/** The most group descriptors one identity batch read resolves. */
+const azureIdentityBatchSize = 100;
+/** Azure DevOps Services serves the identity APIs from its own host, below the organization like the main one. */
+const azureDevOpsIdentityBaseUrl = 'https://vssps.dev.azure.com';
 const trelloBaseUrl = 'https://api.trello.com';
 
 /**
@@ -282,6 +343,7 @@ export class ProvidersApi {
 					providerApis.gitlab,
 				) as GetPullRequestsForReposFn,
 				getPullRequestsForRepoFn: providerApis.gitlab.getPullRequestsForRepo.bind(providerApis.gitlab),
+				getPullRequestForRepoFn: providerApis.gitlab.getPullRequestForRepo.bind(providerApis.gitlab),
 				getPullRequestsForUserFn: providerApis.gitlab.getPullRequestsAssociatedWithUser.bind(
 					providerApis.gitlab,
 				) as GetPullRequestsForUserFn,
@@ -307,6 +369,7 @@ export class ProvidersApi {
 					providerApis.gitlab,
 				) as GetPullRequestsForReposFn,
 				getPullRequestsForRepoFn: providerApis.gitlab.getPullRequestsForRepo.bind(providerApis.gitlab),
+				getPullRequestForRepoFn: providerApis.gitlab.getPullRequestForRepo.bind(providerApis.gitlab),
 				getPullRequestsForUserFn: providerApis.gitlab.getPullRequestsAssociatedWithUser.bind(
 					providerApis.gitlab,
 				) as GetPullRequestsForUserFn,
@@ -371,6 +434,7 @@ export class ProvidersApi {
 				getPullRequestsForRepoFn: providerApis.azureDevOps.getPullRequestsForRepo.bind(
 					providerApis.azureDevOps,
 				),
+				getPullRequestForRepoFn: providerApis.azureDevOps.getPullRequestForRepo.bind(providerApis.azureDevOps),
 				getPullRequestsForAzureProjectsFn: providerApis.azureDevOps.getPullRequestsForProjects.bind(
 					providerApis.azureDevOps,
 				),
@@ -403,6 +467,7 @@ export class ProvidersApi {
 				getPullRequestsForRepoFn: providerApis.azureDevOps.getPullRequestsForRepo.bind(
 					providerApis.azureDevOps,
 				),
+				getPullRequestForRepoFn: providerApis.azureDevOps.getPullRequestForRepo.bind(providerApis.azureDevOps),
 				getPullRequestsForAzureProjectsFn: providerApis.azureDevOps.getPullRequestsForProjects.bind(
 					providerApis.azureDevOps,
 				),
@@ -428,8 +493,25 @@ export class ProvidersApi {
 				getJiraProjectsForResourceFn: providerApis.jira.getJiraProjectsForResource.bind(providerApis.jira),
 				getIssueFn: providerApis.jira.getIssue.bind(providerApis.jira) as GetIssueFn,
 				getIssuesForProjectFn: providerApis.jira.getIssuesForProject.bind(providerApis.jira),
+				getIssuesForProjectsFn: providerApis.jira.getIssuesForProjects.bind(providerApis.jira),
 				getIssuesForResourceForCurrentUserFn: providerApis.jira.getIssuesForResourceForCurrentUser.bind(
 					providerApis.jira,
+				),
+			},
+			[IssuesSelfManagedHostIntegrationId.JiraServer]: {
+				...providersMetadata[IssuesSelfManagedHostIntegrationId.JiraServer],
+				provider: providerApis.jiraServer,
+				getJiraServerCurrentUserFn: providerApis.jiraServer.getCurrentUser.bind(providerApis.jiraServer),
+				getJiraServerProjectsFn: providerApis.jiraServer.getJiraProjects.bind(providerApis.jiraServer),
+				getJiraServerIssuesForProjectFn: providerApis.jiraServer.getIssuesForProject.bind(
+					providerApis.jiraServer,
+				),
+				getJiraServerIssuesForProjectsFn: providerApis.jiraServer.getIssuesForProjects.bind(
+					providerApis.jiraServer,
+				),
+				getJiraServerIssueFn: providerApis.jiraServer.getIssue.bind(providerApis.jiraServer),
+				getJiraServerIssuesForCurrentUserFn: providerApis.jiraServer.getIssuesForResourceForCurrentUser.bind(
+					providerApis.jiraServer,
 				),
 			},
 			[IssuesCloudHostIntegrationId.Linear]: {
@@ -718,6 +800,325 @@ export class ProvidersApi {
 		}
 	}
 
+	/**
+	 * One pull request by repository and number, in any state. `undefined` when the provider reports it absent:
+	 * a `null` from GitLab (which alone is NOT proof — see the GitLab batch hook), or, from Azure DevOps, a 404
+	 * whose body names the pull request, repository or project as not found (see
+	 * {@link azurePullRequestNotFoundTypeKeys}). Any other Azure error, including a 410 or a 404 that isn't that
+	 * shape (e.g. a wrong path answering with an HTML page), goes through `handleProviderError` and fails instead.
+	 */
+	async getPullRequestForRepo(
+		tokenOptInfo: TokenOptInfo,
+		repo: ProviderRepoInput,
+		number: number,
+		options?: { isPAT?: boolean; baseUrl?: string; includeRemoteInfo?: boolean },
+	): Promise<ProviderPullRequest | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getPullRequestForRepoFn',
+		);
+		const providerId = tokenWithInfo.providerId;
+
+		try {
+			const result = await provider.getPullRequestForRepoFn?.(
+				{ repo: repo, number: number, includeRemoteInfo: options?.includeRemoteInfo },
+				{ token: tokenWithInfo.accessToken, isPAT: options?.isPAT, baseUrl: options?.baseUrl },
+			);
+			return result?.data ?? undefined;
+		} catch (e) {
+			// Azure DevOps throws on a missing pull request instead of answering `{ data: null }`.
+			if (isAzureProviderId(providerId) && isAzureNotFoundResponse(e, azurePullRequestNotFoundTypeKeys)) {
+				return undefined;
+			}
+
+			return this.handleProviderError<ProviderPullRequest | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * Azure DevOps pull requests into a repository whose source is `refs/heads/{branch}`, in every status, as Azure
+	 * returns them, at most `top`. provider-apis' pull request list has no source-branch filter, so this asks Azure
+	 * directly, with the credential provider-apis would send.
+	 *
+	 * `undefined` only when Azure itself says the repository or project doesn't exist, by the same rule as
+	 * {@link getPullRequestForRepo}; every other failure, including a 404 that isn't that shape, throws.
+	 */
+	async getAzurePullRequestsForBranch(
+		tokenOptInfo: TokenOptInfo,
+		repo: { namespace: string; project: string; name: string },
+		branch: string,
+		top: number,
+		options: { isPAT?: boolean; baseUrl?: string },
+	): Promise<AzurePullRequest[] | undefined> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+		const token = tokenWithInfo.accessToken;
+
+		const baseUrl = (options.baseUrl ?? azureDevOpsBaseUrl).replace(/\/$/, '');
+		const params = new URLSearchParams({
+			'searchCriteria.sourceRefName': `refs/heads/${branch}`,
+			'searchCriteria.status': 'all',
+			$top: String(top),
+		});
+		const url = `${baseUrl}/${encodeAzurePathSegment(repo.namespace)}/${encodeAzurePathSegment(repo.project)}/_apis/git/repositories/${encodeAzurePathSegment(repo.name)}/pullrequests?${params.toString()}`;
+
+		try {
+			const result = await this.request<{ value?: AzurePullRequest[] }>({
+				url: url,
+				headers: { Authorization: azureAuthorization(token, options.isPAT) },
+			});
+			const pullRequests = result.body?.value;
+			if (pullRequests == null) throw new Error('Azure DevOps returned no pull requests');
+
+			return pullRequests;
+		} catch (e) {
+			if (isAzureNotFoundResponse(e, azurePullRequestNotFoundTypeKeys)) return undefined;
+
+			return this.handleProviderError<AzurePullRequest[] | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * The ids of every group `userId` is a member of in one Azure DevOps organization (Azure DevOps Server: one
+	 * collection), directly or through other groups: its teams and security groups, in every project and at the
+	 * organization level. A group is an identity like a person, so these are the ids a pull request lists a group under
+	 * as a reviewer. provider-apis has no identity read, so this asks Azure directly, with the credential provider-apis
+	 * would send.
+	 *
+	 * Two requests, however many groups: the user's expanded membership, which names its groups only by descriptor,
+	 * then one batch read resolving those descriptors to ids. Azure DevOps Services serves identities from its
+	 * `vssps` host; Azure DevOps Server from the collection itself.
+	 */
+	async getAzureGroupIdsForUser(
+		tokenOptInfo: TokenOptInfo,
+		namespace: string,
+		userId: string,
+		options: { isPAT?: boolean; baseUrl?: string },
+	): Promise<string[]> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+		const token = tokenWithInfo.accessToken;
+
+		const base =
+			options.baseUrl != null
+				? `${options.baseUrl.replace(/\/$/, '')}/${encodeAzurePathSegment(namespace)}`
+				: `${azureDevOpsIdentityBaseUrl}/${encodeAzurePathSegment(namespace)}`;
+		const headers = {
+			Authorization: azureAuthorization(token, options.isPAT),
+			'Content-Type': 'application/json',
+		};
+
+		let memberOf: unknown;
+		try {
+			const params = new URLSearchParams({
+				identityIds: userId,
+				queryMembership: 'Expanded',
+				'api-version': '5.0',
+			});
+			const user = await this.request<{ value?: { memberOf?: unknown }[] }>({
+				url: `${base}/_apis/identities?${params.toString()}`,
+				headers: headers,
+			});
+			memberOf = user.body?.value?.[0]?.memberOf;
+		} catch (e) {
+			return this.handleProviderError<string[]>(tokenWithInfo, e);
+		}
+
+		// Checked before the batch read, so a malformed answer fails instead of reading as no groups.
+		if (!Array.isArray(memberOf) || memberOf.some(d => typeof d !== 'string')) {
+			throw new Error('Azure DevOps returned no group membership for the current user');
+		}
+		if (memberOf.length === 0) return [];
+
+		// Resolved one batch at a time, so a member of very many groups never sends Azure more than a batch at once.
+		const chunks: string[][] = [];
+		for (let i = 0; i < memberOf.length; i += azureIdentityBatchSize) {
+			chunks.push(memberOf.slice(i, i + azureIdentityBatchSize));
+		}
+		const batches: unknown[] = [];
+		try {
+			for (const descriptors of chunks) {
+				const batch = await this.request<{ value?: unknown }>({
+					url: `${base}/_apis/identitybatch?api-version=5.0-preview.1`,
+					method: 'POST',
+					headers: headers,
+					body: JSON.stringify({ descriptors: descriptors, queryMembership: 'None' }),
+				});
+				batches.push(batch.body?.value);
+			}
+		} catch (e) {
+			return this.handleProviderError<string[]>(tokenWithInfo, e);
+		}
+
+		// A group left unresolved could never be matched to a reviewer, and dropping it would narrow the read silently.
+		if (batches.some((batch, i) => !Array.isArray(batch) || batch.length !== chunks[i].length)) {
+			throw new Error('Azure DevOps did not resolve every group of the current user');
+		}
+
+		const groups = (batches as ({ id?: unknown } | null)[][]).flat();
+		// A descriptor Azure no longer resolves (a deleted group) answers `null`: it can't be anyone's reviewer.
+		return groups.flatMap((g: { id?: unknown } | null) => {
+			if (g == null) return [];
+			if (typeof g.id !== 'string') throw new Error('Azure DevOps returned a group without its id');
+
+			return [g.id];
+		});
+	}
+
+	/**
+	 * One issue by repository and number through provider-apis' GitLab `getIssue`, in the shape its list reads
+	 * return. Strict, unlike {@link getIssue}: `undefined` only when provider-apis reports the project or issue
+	 * missing, which alone is NOT proof (see the GitLab batch hook), and never for an HTTP status — a 404 there
+	 * means a wrong endpoint, so it fails instead of reading as absent.
+	 */
+	async getIssueForRepo(
+		tokenOptInfo: TokenOptInfo,
+		repo: { namespace: string; name: string },
+		number: number,
+		options?: { isPAT?: boolean; baseUrl?: string },
+	): Promise<ProviderIssue | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(tokenOptInfo, 'getIssueFn');
+
+		try {
+			const result = await provider.getIssueFn?.(
+				{ namespace: repo.namespace, name: repo.name, number: String(number) },
+				{ token: tokenWithInfo.accessToken, isPAT: options?.isPAT, baseUrl: options?.baseUrl },
+			);
+			if (result?.data == null) throw new Error(`No data returned for issue ${number}`);
+
+			return result.data;
+		} catch (e) {
+			if (
+				e instanceof Error &&
+				(repoNotFoundMessage.test(e.message) || gitLabIssueNotFoundMessage.test(e.message))
+			) {
+				return undefined;
+			}
+
+			return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * One Azure DevOps work item by id, converted as provider-apis converts its list rows (see
+	 * {@link fromAzureWorkItemToProviderIssue}). provider-apis has no single work item read, so this asks Azure
+	 * directly, with the credential provider-apis would send, and expands links as its list read does: the HTML
+	 * link is the issue's `url`.
+	 *
+	 * `undefined` only when Azure itself says the work item or the project doesn't exist (see
+	 * {@link azureWorkItemNotFoundTypeKeys}). Every other failure throws, including a 410, a 404 that isn't that
+	 * shape, an empty response, a work item the SDK's conversion would skip, and one in another project.
+	 */
+	async getAzureWorkItem(
+		tokenOptInfo: TokenOptInfo,
+		scope: { namespace: string; project: string },
+		id: number,
+		options: { isPAT?: boolean; baseUrl?: string },
+	): Promise<ProviderIssue | undefined> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+		const token = tokenWithInfo.accessToken;
+
+		const baseUrl = (options.baseUrl ?? azureDevOpsBaseUrl).replace(/\/$/, '');
+		const params = new URLSearchParams({ $expand: 'Links', 'api-version': '6.0' });
+		const url = `${baseUrl}/${encodeAzurePathSegment(scope.namespace)}/${encodeAzurePathSegment(scope.project)}/_apis/wit/workitems/${id}?${params.toString()}`;
+
+		let workItem: AzureWorkItemResponse | null | undefined;
+		try {
+			const result = await this.request<AzureWorkItemResponse | null>({
+				url: url,
+				headers: { Authorization: azureAuthorization(token, options.isPAT) },
+			});
+			workItem = result.body;
+		} catch (e) {
+			if (isAzureNotFoundResponse(e, azureWorkItemNotFoundTypeKeys)) return undefined;
+
+			return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
+		}
+
+		const issue =
+			workItem != null ? fromAzureWorkItemToProviderIssue(workItem, scope.namespace, scope.project) : undefined;
+		if (issue == null) throw new Error(`Azure DevOps returned no readable work item ${id}`);
+
+		// The route's project is not trusted to scope the read: work item ids are unique across the organization, and
+		// one from another project must not answer for this coordinate. Azure compares project names
+		// case-insensitively.
+		const project = workItem?.fields?.['System.TeamProject'];
+		if (typeof project === 'string' && project.toLowerCase() !== scope.project.toLowerCase()) {
+			throw new Error(`Azure DevOps work item ${id} is in project '${project}', not '${scope.project}'`);
+		}
+
+		return issue;
+	}
+
+	/**
+	 * The cheap check behind the batch issue read's etags: `ids` (at most `azureWorkItemsEtagFieldsMaxIds`) in ONE
+	 * request, where {@link getAzureWorkItem} reads one work item per request, selecting only
+	 * `azureWorkItemEtagFieldNames`. Asked with `errorPolicy=omit`, without which one missing id fails the whole
+	 * request; Azure then leaves out every id it can't return, for whatever reason, so a caller matches the work items
+	 * to its ids by `id`, never by position, and reads an omission as unknown rather than absent. Every failure throws,
+	 * classified as {@link getAzureWorkItem} classifies it.
+	 */
+	async getAzureWorkItemsEtagFields(
+		tokenOptInfo: TokenOptInfo,
+		scope: { namespace: string; project: string },
+		ids: readonly number[],
+		options: { isPAT?: boolean; baseUrl?: string },
+	): Promise<AzureWorkItemResponse[]> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+		const token = tokenWithInfo.accessToken;
+
+		const baseUrl = (options.baseUrl ?? azureDevOpsBaseUrl).replace(/\/$/, '');
+		// Commas left unencoded, as Azure documents these lists. The same `api-version` as `getAzureWorkItem`, so a
+		// server that serves the full read also serves this check.
+		const query = `ids=${ids.join(',')}&fields=${azureWorkItemEtagFieldNames.join(',')}&errorPolicy=omit&api-version=6.0`;
+		const url = `${baseUrl}/${encodeAzurePathSegment(scope.namespace)}/${encodeAzurePathSegment(scope.project)}/_apis/wit/workitems?${query}`;
+
+		try {
+			const result = await this.request<{ value?: (AzureWorkItemResponse | null)[] } | null>({
+				url: url,
+				headers: { Authorization: options.isPAT ? `Basic ${base64(`:${token}`)}` : `Bearer ${token}` },
+			});
+			const workItems = result.body?.value;
+			if (!Array.isArray(workItems)) throw new Error('Azure DevOps returned no work items');
+
+			// Documented to answer an omitted id with `null` in its place; it has been seen to drop it instead.
+			return workItems.filter(w => w != null);
+		} catch (e) {
+			return this.handleProviderError<AzureWorkItemResponse[]>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * The cheap check behind the batch pull request read's etags: one pull request as Azure DevOps returns it, by the
+	 * same request {@link getPullRequestForRepo} has provider-apis send, but without the repository read it adds for
+	 * clone URLs. `undefined` only by the same not-found rule as {@link getPullRequestForRepo}; every other failure
+	 * throws.
+	 */
+	async getAzurePullRequest(
+		tokenOptInfo: TokenOptInfo,
+		repo: { namespace: string; project: string; name: string },
+		id: number,
+		options: { isPAT?: boolean; baseUrl?: string },
+	): Promise<AzurePullRequest | undefined> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+		const token = tokenWithInfo.accessToken;
+
+		const baseUrl = (options.baseUrl ?? azureDevOpsBaseUrl).replace(/\/$/, '');
+		const url = `${baseUrl}/${encodeAzurePathSegment(repo.namespace)}/${encodeAzurePathSegment(repo.project)}/_apis/git/repositories/${encodeAzurePathSegment(repo.name)}/pullrequests/${id}?api-version=6.0`;
+
+		try {
+			const result = await this.request<AzurePullRequest | null>({
+				url: url,
+				headers: { Authorization: options.isPAT ? `Basic ${base64(`:${token}`)}` : `Bearer ${token}` },
+			});
+			if (result.body == null) throw new Error(`Azure DevOps returned no pull request ${id}`);
+
+			return result.body;
+		} catch (e) {
+			if (isAzureNotFoundResponse(e, azurePullRequestNotFoundTypeKeys)) return undefined;
+
+			return this.handleProviderError<AzurePullRequest | undefined>(tokenWithInfo, e);
+		}
+	}
+
 	async getCurrentUser(
 		tokenOptInfo: TokenOptInfo,
 		options?: { isPAT?: boolean; baseUrl?: string },
@@ -830,13 +1231,20 @@ export class ProvidersApi {
 	}
 
 	/**
-	 * Reads issues scoped to Linear teams/projects/labels (Linear's issue-list filter). One page per call —
-	 * follow `paging.cursor`. Linear's `getIssues` has no author/assignee filter, so per-user scoping is
-	 * applied client-side by the caller.
+	 * Reads issues scoped to Linear teams/projects/labels/assignees (Linear's issue-list filter). One page per
+	 * call — follow `paging.cursor`. `assignees` takes Linear user ids (the viewer's `id`), not names.
 	 */
 	async getLinearIssues(
 		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Linear>,
-		input: { teams?: string[]; projects?: string[]; labels?: string[] },
+		input: {
+			teams?: string[];
+			projects?: string[];
+			labels?: string[];
+			/** Linear user ids (the viewer's `id`), not names. */
+			assignees?: string[];
+			/** Omitted reads open issues (workflow state type other than `completed`/`canceled`). */
+			states?: GitIssueState[];
+		},
 		options?: PagingInput & {
 			/** See {@link GetIssuesOptions.sort}. Linear expresses `created`/`updated`, descending only. */
 			sort?: IssueSorting;
@@ -852,6 +1260,24 @@ export class ProvidersApi {
 			tokenWithInfo,
 			options?.cursor ?? undefined,
 		);
+	}
+
+	/**
+	 * The change state of up to `linearIssuesEtagMaxNumbers` issues of one Linear team, by number, in one GraphQL
+	 * request. Its failures are classified as {@link getIssue}'s are, so a throttled or refused check reads the same.
+	 */
+	async getLinearIssuesEtagFields(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Linear>,
+		teamKey: string,
+		numbers: readonly number[],
+	): Promise<LinearIssueEtagNode[]> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+
+		try {
+			return await requestLinearIssuesEtagFields(this.request, tokenWithInfo.accessToken, teamKey, numbers);
+		} catch (e) {
+			return this.handleProviderError<LinearIssueEtagNode[]>(tokenWithInfo, e);
+		}
 	}
 
 	/** Resolves Linear's current user (viewer). The viewer query returns only id/name/email/displayName. */
@@ -1151,6 +1577,44 @@ export class ProvidersApi {
 			options?.isPAT,
 			options?.baseUrl,
 		);
+	}
+
+	async getBitbucketServerProjects(
+		tokenWithInfo: TokenWithInfo<GitSelfManagedHostIntegrationId.BitbucketServer>,
+		baseUrl: string,
+		connectionId: string,
+	): Promise<ProviderHierarchyResult<ProviderOrganization>> {
+		const { paging: _paging, ...result } = await collectProviderPagedResult(
+			cursor => requestBitbucketServerProjects(this.request, tokenWithInfo, baseUrl, connectionId, cursor),
+			20,
+			{ providerId: tokenWithInfo.providerId },
+		);
+		return result;
+	}
+
+	getBitbucketServerRepositories(
+		tokenWithInfo: TokenWithInfo<GitSelfManagedHostIntegrationId.BitbucketServer>,
+		baseUrl: string,
+		connectionId: string,
+		options?: { project?: string; cursor?: string },
+	): Promise<ProviderApiPagedResult<ProviderRepository>> {
+		return requestBitbucketServerRepositories(this.request, tokenWithInfo, baseUrl, connectionId, options);
+	}
+
+	searchBitbucketServerPullRequestsPage(
+		tokenWithInfo: TokenWithInfo<GitSelfManagedHostIntegrationId.BitbucketServer>,
+		options: Parameters<typeof searchBitbucketServerPullRequestsPage>[2],
+		cancellation?: AbortSignal,
+	): Promise<ProviderPullRequestSearchPage> {
+		return searchBitbucketServerPullRequestsPage(this.request, tokenWithInfo, options, cancellation);
+	}
+
+	countBitbucketServerPullRequests(
+		tokenWithInfo: TokenWithInfo<GitSelfManagedHostIntegrationId.BitbucketServer>,
+		options: Parameters<typeof countBitbucketServerPullRequests>[2],
+		cancellation?: AbortSignal,
+	): Promise<ProviderPullRequestCount> {
+		return countBitbucketServerPullRequests(this.request, tokenWithInfo, options, cancellation);
 	}
 
 	async getReposForCurrentUser(
@@ -1527,6 +1991,8 @@ export class ProvidersApi {
 			 */
 			authorUsername?: string;
 			pageSize?: number;
+			/** Linear only; GitLab's REST read ignores it. Omitted reads open issues. */
+			states?: GitIssueState[];
 			/** See {@link GetIssuesOptions.sort}. Forwarded to the provider fn; ordering is translated in the SDK. */
 			sort?: IssueSorting;
 			isPAT?: boolean;
@@ -1544,6 +2010,7 @@ export class ProvidersApi {
 				authorUsername: options?.authorUsername,
 				page: options?.page,
 				pageSize: options?.pageSize,
+				states: options?.states,
 				sort: options?.sort,
 			},
 			provider.getIssuesForCurrentUserFn,
@@ -1627,6 +2094,216 @@ export class ProvidersApi {
 			const result = await provider.getIssuesForProjectFn?.(
 				{
 					projectKey: project,
+					resourceId: resourceId,
+					...options,
+					includeTransitions: jiraListIncludeTransitions,
+				},
+				{ token: token },
+			);
+			if (result == null) return undefined;
+			return {
+				data: result.data,
+				hasMore: result.pageInfo?.hasNextPage ?? false,
+				nextCursor: result.pageInfo?.endCursor ?? undefined,
+			};
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	// Jira Server reads. Every one of them is addressed by `baseUrl` — the connection's own host — rather than
+	// by a resource id: a self-hosted instance IS the resource, and routing by anything else would send one
+	// host's token to another. `baseUrl` is therefore required, not optional, on all of them.
+	async getJiraServerCurrentUser(
+		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
+		baseUrl: string,
+	): Promise<ProviderAccount | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraServerCurrentUserFn',
+		);
+
+		try {
+			const result = await provider.getJiraServerCurrentUserFn?.({
+				token: tokenWithInfo.accessToken,
+				baseUrl: baseUrl,
+			});
+			return result?.data;
+		} catch (e) {
+			return this.handleProviderError<ProviderAccount | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * Jira Server's project list, which is a single unpaged `/rest/api/2/project` read rather than Cloud's
+	 * paged `project/search`, so there is no cursor to thread and the result is always the complete set.
+	 */
+	async getJiraServerProjects(
+		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
+		baseUrl: string,
+	): Promise<ProviderJiraServerProject[] | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraServerProjectsFn',
+		);
+
+		try {
+			const result = await provider.getJiraServerProjectsFn?.({
+				token: tokenWithInfo.accessToken,
+				baseUrl: baseUrl,
+			});
+			return result?.data;
+		} catch (e) {
+			return this.handleProviderError<ProviderJiraServerProject[] | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * One page of a Jira Server project's issues, preserving the SDK's `pageInfo` so the integration can drain
+	 * every page — the same contract as {@link getIssuesForProjectPaged} on Cloud.
+	 */
+	async getJiraServerIssuesForProjectPaged(
+		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
+		baseUrl: string,
+		projectKey: string,
+		options?: GetIssuesOptions,
+	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraServerIssuesForProjectFn',
+		);
+
+		try {
+			const result = await provider.getJiraServerIssuesForProjectFn?.(
+				{ projectKey: projectKey, ...options, includeTransitions: jiraListIncludeTransitions },
+				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
+			);
+			if (result == null) return undefined;
+
+			return {
+				data: result.data,
+				hasMore: result.pageInfo?.hasNextPage ?? false,
+				nextCursor: result.pageInfo?.endCursor ?? undefined,
+			};
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * Single page of one issue search across several projects of a Jira Server instance — the contract of
+	 * {@link getIssuesForProjectsPaged} on Cloud: the page and its cursor are global to the project set, and at
+	 * most `JIRA_MAX_PROJECT_KEYS_PER_REQUEST` keys are accepted per call.
+	 */
+	async getJiraServerIssuesForProjectsPaged(
+		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
+		baseUrl: string,
+		projectKeys: string[],
+		options?: GetIssuesOptions,
+	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraServerIssuesForProjectsFn',
+		);
+
+		try {
+			const result = await provider.getJiraServerIssuesForProjectsFn?.(
+				{ projectKeys: projectKeys, ...options, includeTransitions: jiraListIncludeTransitions },
+				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
+			);
+			if (result == null) return undefined;
+
+			return {
+				data: result.data,
+				hasMore: result.pageInfo?.hasNextPage ?? false,
+				nextCursor: result.pageInfo?.endCursor ?? undefined,
+			};
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	async getJiraServerIssue(
+		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
+		baseUrl: string,
+		number: string,
+	): Promise<ProviderIssue | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraServerIssueFn',
+		);
+
+		try {
+			const result = await provider.getJiraServerIssueFn?.(
+				{ number: number },
+				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
+			);
+			return result?.data;
+		} catch (e) {
+			// A key that names no issue is a lookup MISS, not a failure: both callers
+			// (`getProviderLinkedIssueOrPullRequest`, `getProviderIssue`) read an autolink or a stored
+			// reference that may simply be gone, and translating it would surface a `RequestNotFoundError`
+			// where Jira Cloud's `getJiraIssueByKey` and the generic `getIssue` both return undefined.
+			if (isProviderIssueNotFoundError(tokenWithInfo.providerId, e)) return undefined;
+
+			return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/** The account-wide read: every issue related to the current user on this instance, no project needed. */
+	async getJiraServerIssuesForCurrentUser(
+		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
+		baseUrl: string,
+		options?: { cursor?: string; states?: GitIssueState[]; sort?: IssueSorting },
+	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getJiraServerIssuesForCurrentUserFn',
+		);
+
+		try {
+			const result = await provider.getJiraServerIssuesForCurrentUserFn?.(
+				{
+					cursor: options?.cursor,
+					states: options?.states,
+					sort: options?.sort,
+					includeTransitions: jiraListIncludeTransitions,
+				},
+				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
+			);
+			if (result == null) return undefined;
+
+			return {
+				data: result.data,
+				hasMore: result.pageInfo?.hasNextPage ?? false,
+				nextCursor: result.pageInfo?.endCursor ?? undefined,
+			};
+		} catch (e) {
+			return this.handleProviderError(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * Single page of one issue search across several projects of the same Jira site. The page, its cursor and
+	 * `hasMore` are global to the whole project set, not per project; at most `JIRA_MAX_PROJECT_KEYS_PER_REQUEST`
+	 * keys are accepted per call (the SDK throws past it), so the caller chunks.
+	 */
+	async getIssuesForProjectsPaged(
+		tokenOptInfo: TokenWithInfo,
+		projectKeys: string[],
+		resourceId: string,
+		options?: GetIssuesOptions,
+	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
+			tokenOptInfo,
+			'getIssuesForProjectsFn',
+		);
+		const token = tokenWithInfo.accessToken;
+
+		try {
+			const result = await provider.getIssuesForProjectsFn?.(
+				{
+					projectKeys: projectKeys,
 					resourceId: resourceId,
 					...options,
 					includeTransitions: jiraListIncludeTransitions,
@@ -1771,6 +2448,8 @@ export class ProvidersApi {
 			 * field of it would give whoever adds that option no ordering and no error.
 			 */
 			sort?: IssueSorting;
+			/** Omitted reads open issues (`statusCategory != Done`). */
+			states?: GitIssueState[];
 			isPAT?: boolean;
 			baseUrl?: string;
 		},
@@ -1781,7 +2460,12 @@ export class ProvidersApi {
 		);
 
 		return this.getPagedResult<ProviderIssue>(
-			{ resourceId: resourceId, sort: options?.sort, includeTransitions: jiraListIncludeTransitions },
+			{
+				resourceId: resourceId,
+				states: options?.states,
+				sort: options?.sort,
+				includeTransitions: jiraListIncludeTransitions,
+			},
 			provider.getIssuesForResourceForCurrentUserFn,
 			tokenWithInfo,
 			options?.cursor,
@@ -1805,6 +2489,24 @@ export class ProvidersApi {
 			if (status === 404) return undefined;
 
 			return this.handleProviderError<ProviderIssue | undefined>(tokenWithInfo, e);
+		}
+	}
+
+	/**
+	 * The change state of up to `jiraBulkFetchMaxKeys` issues of one Jira Cloud site, in one bulk fetch. Unlike
+	 * {@link getJiraIssueByKey}, a 404 is a failure: it names a wrong site or endpoint, never an absent issue.
+	 */
+	async getJiraIssuesEtagFields(
+		tokenOptInfo: TokenWithInfo<IssuesCloudHostIntegrationId.Jira>,
+		resourceId: string,
+		keys: readonly string[],
+	): Promise<{ issues: JiraIssueEtagResponse[]; errorCount: number }> {
+		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
+
+		try {
+			return await requestJiraIssuesEtagFields(this.request, tokenWithInfo.accessToken, resourceId, keys);
+		} catch (e) {
+			return this.handleProviderError<{ issues: JiraIssueEtagResponse[]; errorCount: number }>(tokenWithInfo, e);
 		}
 	}
 

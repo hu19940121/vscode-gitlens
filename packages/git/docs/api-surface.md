@@ -261,7 +261,7 @@ Each sub-provider interface is defined in its own file under `providers/`:
 | Method                                                                             | Returns                                   |
 | ---------------------------------------------------------------------------------- | ----------------------------------------- |
 | `getCommit(repoPath, rev, cancellation?)`                                          | `GitCommit \| undefined`                  |
-| `getCommitCount(repoPath, rev, cancellation?)`                                     | `number \| undefined`                     |
+| `getCommitCount(repoPath, rev, options?, cancellation?)`                           | `number \| undefined`                     |
 | `getCommitFiles(repoPath, rev, cancellation?)`                                     | `GitFileChange[]`                         |
 | `getCommitForFile(repoPath, pathOrUri, rev?, options?, cancellation?)`             | `GitCommit \| undefined`                  |
 | `getLeftRightCommitCount(repoPath, range, options?, cancellation?)`                | `LeftRightCommitCountResult \| undefined` |
@@ -274,6 +274,8 @@ Each sub-provider interface is defined in its own file under `providers/`:
 | `searchCommits(repoPath, search, options?, cancellation?)`                         | `SearchCommitsResult`                     |
 | `getIncomingActivity?(repoPath, options?, cancellation?)`                          | `GitReflog \| undefined`                  |
 | `getInitialCommitSha?(repoPath, cancellation?)`                                    | `string \| undefined`                     |
+| `getCommitPatchIds?(repoPath, revs, options?, cancellation?)`                      | `Map<string, string> \| undefined`        |
+| `getDiffPatchId?(repoPath, from, to, options?, cancellation?)`                     | `string \| undefined`                     |
 | `createUnreachableCommitFromTree?(repoPath, tree, parent, message, cancellation?)` | `string`                                  |
 | `getCommitReachability?(repoPath, rev, cancellation?)`                             | `GitCommitReachability \| undefined`      |
 | `getCommitSignature?(repoPath, sha)`                                               | `CommitSignature \| undefined`            |

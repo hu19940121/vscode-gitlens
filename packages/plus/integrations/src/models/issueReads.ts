@@ -40,7 +40,25 @@ export type ProviderIssueSearchPage = {
 	hasMore: boolean;
 	page: number;
 	totalCount?: number;
+	/**
+	 * The provider's declared result ceiling was reached, whether or not it reported how many matched. Lets the
+	 * facade report the ceiling as a `provider-limit` omission for a provider that can prove more matched than it
+	 * serves but can't say how many (Azure DevOps Server's WIQL), instead of a generic "was truncated".
+	 */
+	limitReached?: boolean;
 };
+
+/**
+ * One scope's answer from the issue count probe (`countIssuesResult`), positionally. The pull-request probe's slots
+ * are `ProviderPullRequestCount | Error`, with the same meaning for an `Error`.
+ *
+ * - a number is the match count;
+ * - `'exceeds-limit'` means more matched than the provider's declared result ceiling, and it can't say how many;
+ * - an `Error` refuses that ONE scope for its own reasons (the facade warns and drops only it, as it does for a
+ *   scope it refuses itself);
+ * - `undefined` means the provider reported nothing for it — never zero matches.
+ */
+export type ProviderSearchCount = number | 'exceeds-limit' | Error | undefined;
 
 /**
  * Options for an issue tracker's PROJECT-scoped read (`IssuesIntegration.getIssuesForProject*`), which is the
@@ -78,6 +96,19 @@ export type IssuesForProjectOptions = {
 	 * no normalized issue carries; this option orders one project's query.
 	 */
 	sort?: IssueSorting;
+	/**
+	 * Which issue states to read. Omitted reads open issues only, which is every tracker's own default.
+	 *
+	 * Validated by the facade against `ProviderMetadata.supportsIssueStates`. A tracker that can't express a state
+	 * (Trello) refuses anything but `'open'` rather than serving its open cards as if they were the closed ones.
+	 */
+	state?: IssueStateFilter;
+};
+
+/** One project of a batched tracker read (`IssuesIntegration.getIssuesForProjectsWithTruncationResult`). */
+export type ProjectIssuesRequest<T> = {
+	project: T;
+	options: IssuesForProjectOptions;
 };
 
 export type ProjectIssuesDrain = {
@@ -158,6 +189,13 @@ export type SearchMyIssuesOptions = {
 	 */
 	org?: string;
 	project?: string;
+	/**
+	 * Which issue states to read. Omitted reads open issues only.
+	 *
+	 * Honored by the issue trackers that declare `ProviderMetadata.supportsIssueStates` (Jira, Jira Data Center,
+	 * Linear). The git hosts' account-wide reads ignore it and keep their own open-only default.
+	 */
+	state?: IssueStateFilter;
 	/**
 	 * How the provider should order the read, as `field:direction`.
 	 *

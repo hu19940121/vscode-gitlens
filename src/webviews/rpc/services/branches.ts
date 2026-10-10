@@ -139,7 +139,7 @@ export class BranchesService {
 		const svc = this.container.git.getRepositoryService(repoPath);
 		// `getBranch(undefined)` rather than `getCurrentBranch()` — the latter hardcodes a zeroed tracking
 		// state, and this must agree with the `BranchState` the button renders from, which is built the same way.
-		const branch = await svc.branches.getBranch(undefined, signal);
+		const branch = await svc.branches.getBranch(undefined, undefined, signal);
 		signal?.throwIfAborted();
 
 		const upstream = branch?.upstream;
@@ -293,7 +293,7 @@ export class BranchesService {
 	): Promise<BranchEnrichment | undefined> {
 		signal?.throwIfAborted();
 		const svc = this.container.git.getRepositoryService(repoPath);
-		const branch = await svc.branches.getBranch(branchName, signal);
+		const branch = await svc.branches.getBranch(branchName, undefined, signal);
 		signal?.throwIfAborted();
 		if (branch == null) return undefined;
 
@@ -348,7 +348,7 @@ export class BranchesService {
 	}
 
 	/**
-	 * Unassociate an issue from a branch by its stable identifier (Issue.nodeId).
+	 * Unassociate an issue from a branch by its provider- and host-scoped identifier.
 	 * The association is persisted in git config; this removes its entry.
 	 */
 	async removeAssociatedIssue(repoPath: string, branchName: string, entityId: string): Promise<void> {
@@ -371,13 +371,13 @@ export class BranchesService {
 		const issues = result.paused ? await result.value : result.value;
 		signal?.throwIfAborted();
 		return (
-			issues?.map(i => ({
+			issues?.map(({ id, issue: i }) => ({
 				type: 'issue' as const,
 				id: i.number || i.id,
 				title: i.title,
 				state: i.state,
 				url: i.url,
-				entityId: i.nodeId,
+				entityId: id,
 			})) ?? []
 		);
 	}

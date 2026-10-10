@@ -33,12 +33,12 @@ import { isConflictStatus } from '@gitlens/git/utils/fileStatus.utils.js';
 import { serializePullRequest } from '@gitlens/git/utils/pullRequest.utils.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
 import { isSha, isUncommitted } from '@gitlens/git/utils/revision.utils.js';
-import type { IntegrationIds, IssuesCloudHostIntegrationId } from '@gitlens/integrations/constants.js';
-import { supportedOrderedCloudIssuesIntegrationIds } from '@gitlens/integrations/constants.js';
+import type { IntegrationIds } from '@gitlens/integrations/constants.js';
 import type { ConnectionStateChangeEvent } from '@gitlens/integrations/index.js';
 import {
 	isGitCloudHostIntegrationId,
 	isGitSelfManagedHostIntegrationId,
+	isIssuesHostIntegrationId,
 } from '@gitlens/integrations/utils/integration.utils.js';
 import { ensureArray, filterMap } from '@gitlens/utils/array.js';
 import { CancellationError, isCancellationError } from '@gitlens/utils/cancellation.js';
@@ -4543,16 +4543,17 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 		void this.notifyDidChangeRepoConnection();
 
+		// Self-managed keys carry their domain (`<id>:<domain>`), so every check below matches on the id half.
+		const integrationId = e.key.split(':', 1)[0] as IntegrationIds;
+
 		// If an issue integration connected/disconnected, update metadata state
-		if (supportedOrderedCloudIssuesIntegrationIds.includes(e.key as IssuesCloudHostIntegrationId)) {
+		if (isIssuesHostIntegrationId(integrationId)) {
 			void this._producers.onIssueIntegrationConnectionChanged(e.reason === 'connected');
 			return;
 		}
 
 		// A git host integration connect/disconnect is the pull-requests panel's whole story — it decides
-		// both whether there's a list to fetch and whether the panel pitches Connect. Self-managed keys
-		// carry their domain (`<id>:<domain>`), so match on the id half.
-		const integrationId = e.key.split(':', 1)[0] as IntegrationIds;
+		// both whether there's a list to fetch and whether the panel pitches Connect.
 		if (isGitCloudHostIntegrationId(integrationId) || isGitSelfManagedHostIntegrationId(integrationId)) {
 			this._panels.onIntegrationConnectionChanged();
 		}
@@ -4681,7 +4682,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this._lastAutoFetchAttemptAt = Date.now();
 			// Skip the interactive Fetch wizard (and its progress notification) — auto-fetch is silent
 			// by design; the live "Fetch (now)" label will reflect completion via the lastFetched event.
-			await repo.git.fetch({ progress: false });
+			// `preserveFetchHead`, as a timed fetch landing mid-way through the user's own `git pull` would
+			// swap out the FETCH_HEAD that pull is about to merge
+			await repo.git.fetch({ preserveFetchHead: true, progress: false });
 			this.host.sendTelemetryEvent('graph/autoFetch', {
 				intervalSeconds: intervalSeconds,
 				sinceLastFetchedMs: sinceLastFetchedMs,
@@ -5694,7 +5697,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		const promises = Promise.allSettled([
 			this.getGraphAccess(),
 			this._wip.getWorkingTreeStatsAndPausedOperations(undefined, cancellation.token),
-			this.repository.git.branches.getBranch(undefined, toAbortSignal(cancellation.token)),
+			this.repository.git.branches.getBranch(undefined, undefined, toAbortSignal(cancellation.token)),
 			this.repository.getLastFetched(),
 			// Anchor/label topology only — NO clean/dirty probing here. The probe fans `git diff`/
 			// `ls-files` out across every worktree; awaiting it gated the ENTIRE initial state on the
@@ -5803,7 +5806,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// the gate, and the next build supplies a stamped value.
 		let branchStateRevision: number | undefined;
 		try {
-			const reread = await this.repository.git.branches.getBranch(undefined, toAbortSignal(cancellation.token));
+			const reread = await this.repository.git.branches.getBranch(
+				undefined,
+				undefined,
+				toAbortSignal(cancellation.token),
+			);
 			if (reread != null) {
 				branch = reread;
 				branchStateRevision = this._producers.nextBranchStateRevision();
@@ -5890,7 +5897,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					(
 						await this.container.git
 							.getRepositoryService(branch.repoPath)
-							.branches.getBranch(upstreamName, toAbortSignal(cancellation.token))
+							.branches.getBranch(upstreamName, undefined, toAbortSignal(cancellation.token))
 					)?.sha;
 			}
 		}

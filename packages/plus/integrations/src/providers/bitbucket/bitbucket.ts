@@ -1,9 +1,10 @@
 import * as l10n from '@vscode/l10n';
+import { reportRequestFailure } from '@gitlens/git/errors.js';
 import type { Account, CommitAuthor, UnidentifiedAuthor } from '@gitlens/git/models/author.js';
 import type { DefaultBranch } from '@gitlens/git/models/defaultBranch.js';
 import type { Issue } from '@gitlens/git/models/issue.js';
 import type { IssueOrPullRequest, IssueOrPullRequestType } from '@gitlens/git/models/issueOrPullRequest.js';
-import type { PullRequest } from '@gitlens/git/models/pullRequest.js';
+import type { PullRequest, PullRequestProjection } from '@gitlens/git/models/pullRequest.js';
 import type { Provider } from '@gitlens/git/models/remoteProvider.js';
 import type { RepositoryMetadata } from '@gitlens/git/models/repositoryMetadata.js';
 import { CancellationError, isCancellationError } from '@gitlens/utils/cancellation.js';
@@ -13,6 +14,7 @@ import { Logger } from '@gitlens/utils/logger.js';
 import type { ScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
+import { equalsIgnoreCase } from '@gitlens/utils/string.js';
 import type { TokenWithInfo } from '../../authentication/models.js';
 import type { IntegrationServiceContext } from '../../context.js';
 import {
@@ -24,18 +26,33 @@ import {
 	RequestNotFoundError,
 	toRateLimitError,
 } from '../../errors.js';
+import type { PullRequestEtagInclude } from '../../models/integration.js';
 import type { ProviderApiConfig } from '../apiConfig.js';
 import { baseProviderApiConfig } from '../apiConfig.js';
 import type { BitbucketServerCommit, BitbucketServerPullRequest } from '../bitbucket-server/models.js';
 import { normalizeBitbucketServerPullRequest } from '../bitbucket-server/models.js';
 import { fromProviderPullRequest } from '../models.js';
-import type { BitbucketCommit, BitbucketIssue, BitbucketPullRequest, BitbucketRepository } from './models.js';
+import { selectBranchPullRequests } from '../utils/providerPaging.js';
+import type {
+	BitbucketCommit,
+	BitbucketIssue,
+	BitbucketPullRequest,
+	BitbucketPullRequestEtagNode,
+	BitbucketPullRequestState,
+	BitbucketRepository,
+} from './models.js';
 import {
+	bitbucketEtagFieldsMaxIds,
 	bitbucketIssueStateToState,
 	fromBitbucketIssue,
 	fromBitbucketPullRequest,
 	parseRawBitbucketAuthor,
 } from './models.js';
+
+/** `handleRequestError` maps 410 and 422 to the same error as a 404, but only a 404 proves the resource absent. */
+function isNotFoundResponse(ex: unknown): boolean {
+	return RequestNotFoundError.is(ex) && ex.original instanceof ProviderFetchError && ex.original.status === 404;
+}
 
 export class BitbucketApi implements Disposable {
 	private readonly _disposable: Disposable | undefined;
@@ -89,7 +106,7 @@ export class BitbucketApi implements Disposable {
 		if (!response?.values?.length) {
 			return undefined;
 		}
-		return fromBitbucketPullRequest(response.values[0], provider);
+		return fromBitbucketPullRequest(response.values[0], provider, { projection: 'point' });
 	}
 
 	@trace({
@@ -133,7 +150,7 @@ export class BitbucketApi implements Disposable {
 		}
 
 		const providersPr = normalizeBitbucketServerPullRequest(response.values[0]);
-		const gitlensPr = fromProviderPullRequest(providersPr, provider);
+		const gitlensPr = fromProviderPullRequest(providersPr, provider, { projection: 'point' });
 		return gitlensPr;
 	}
 
@@ -177,7 +194,7 @@ export class BitbucketApi implements Disposable {
 		if (!response?.values?.length) {
 			return undefined;
 		}
-		return response.values.map(issue => fromBitbucketIssue(issue, provider));
+		return response.values.map(issue => fromBitbucketIssue(issue, provider, 'account'));
 	}
 
 	@trace({
@@ -213,7 +230,7 @@ export class BitbucketApi implements Disposable {
 			);
 
 			if (response) {
-				return fromBitbucketIssue(response, provider);
+				return fromBitbucketIssue(response, provider, 'point');
 			}
 			return undefined;
 		} catch (ex) {
@@ -247,25 +264,11 @@ export class BitbucketApi implements Disposable {
 
 		if (options?.type === undefined || options?.type === 'pullrequest') {
 			try {
-				const prResponse = await this.request<BitbucketPullRequest>(
-					provider,
-					token,
-					baseUrl,
-					`repositories/${owner}/${repo}/pullrequests/${id}?fields=%2Bvalues.reviewers,%2Bvalues.participants`,
-					{
-						method: 'GET',
-					},
-					scope,
-				);
-
-				if (prResponse) {
-					return fromBitbucketPullRequest(prResponse, provider);
-				}
+				const pr = await this.getPullRequest(provider, token, owner, repo, id, baseUrl);
+				if (pr != null) return pr;
 			} catch (ex) {
-				if (ex.original?.status !== 404) {
-					scope?.error(ex);
-					return undefined;
-				}
+				scope?.error(ex);
+				return undefined;
 			}
 		}
 
@@ -326,7 +329,190 @@ export class BitbucketApi implements Disposable {
 		const scope = getScopedLogger();
 
 		try {
-			const prResponse = await this.request<BitbucketServerPullRequest>(
+			return await this.getServerPullRequest(provider, token, owner, repo, id, baseUrl);
+		} catch (ex) {
+			scope?.error(ex);
+			return undefined;
+		}
+	}
+
+	/**
+	 * A Bitbucket Cloud pull request by id. Strict, unlike {@link getIssueOrPullRequest}: `undefined` means a 404,
+	 * and every other failure throws, so the answer can be cached as a proven absence.
+	 */
+	@trace({
+		args: (provider, token, owner, repo, id, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+			baseUrl: baseUrl,
+		}),
+	})
+	public async getPullRequest(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		repo: string,
+		id: string,
+		baseUrl: string,
+		options?: {
+			currentAccount?: { id: string; username?: string };
+			deferFailure?: boolean;
+			/** The calling read, stamped on the row. */
+			projection?: PullRequestProjection;
+		},
+	): Promise<PullRequest | undefined> {
+		const scope = getScopedLogger();
+
+		try {
+			const pr = await this.request<BitbucketPullRequest>(
+				provider,
+				token,
+				baseUrl,
+				`repositories/${owner}/${repo}/pullrequests/${id}?fields=%2Bvalues.reviewers,%2Bvalues.participants`,
+				{
+					method: 'GET',
+				},
+				scope,
+				undefined,
+				options?.deferFailure,
+			);
+			if (pr == null) throw new Error(`Bitbucket returned no pull request for ${owner}/${repo}#${id}`);
+
+			return fromBitbucketPullRequest(pr, provider, {
+				currentAccount: options?.currentAccount,
+				projection: options?.projection,
+			});
+		} catch (ex) {
+			if (isNotFoundResponse(ex)) return undefined;
+
+			throw ex;
+		}
+	}
+
+	/**
+	 * The change state of pull requests `ids` in `owner/repo` — the cheap check behind the batch read's etags — in ONE
+	 * request for up to {@link bitbucketEtagFieldsMaxIds} ids, selecting only what {@link getPullRequest}'s row reads
+	 * into its etag (plus the participants and reviewers for the `reviewDecision` include). One entry per input id, in
+	 * order.
+	 *
+	 * Strict like {@link getPullRequest}: `undefined` is a PROVEN ABSENCE, for an id missing from a complete page, or
+	 * for every id when the repository is a 404, as each id's own read would be. A page with more (`next`) and every
+	 * other failure throw. Every state is asked for, since the list answers only open pull requests by default.
+	 */
+	@trace({
+		args: (provider, token, owner, repo, ids) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			ids: ids.length,
+		}),
+	})
+	public async getPullRequestsEtagFields(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		repo: string,
+		ids: readonly number[],
+		baseUrl: string,
+		options: { etagIncludes: readonly PullRequestEtagInclude[]; deferFailure?: boolean },
+		cancellation?: AbortSignal,
+	): Promise<(BitbucketPullRequestEtagNode | undefined)[]> {
+		const scope = getScopedLogger();
+
+		if (!ids.length) return [];
+		if (ids.length > bitbucketEtagFieldsMaxIds) {
+			throw new Error(
+				`Cannot read more than ${bitbucketEtagFieldsMaxIds} Bitbucket pull requests in one request`,
+			);
+		}
+
+		const fields = [
+			'values.id',
+			'values.state',
+			'values.draft',
+			'values.updated_on',
+			'values.source.commit.hash',
+			'next',
+		];
+		if (options.etagIncludes.includes('reviewDecision')) {
+			fields.push(
+				'values.participants.approved',
+				'values.participants.state',
+				'values.participants.participated_on',
+				'values.reviewers.uuid',
+			);
+		}
+
+		const params = new URLSearchParams({
+			q: `id IN (${ids.join(',')})`,
+			fields: fields.join(','),
+			pagelen: String(ids.length),
+		});
+		for (const state of ['OPEN', 'MERGED', 'DECLINED', 'SUPERSEDED'] satisfies BitbucketPullRequestState[]) {
+			params.append('state', state);
+		}
+
+		try {
+			const response = await this.request<{ values?: BitbucketPullRequestEtagNode[]; next?: string }>(
+				provider,
+				token,
+				baseUrl,
+				`repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pullrequests?${params.toString()}`,
+				{ method: 'GET' },
+				scope,
+				cancellation,
+				options.deferFailure,
+			);
+			if (response?.values == null) {
+				throw new Error(`Bitbucket returned no pull requests for ${owner}/${repo}`);
+			}
+			if (response.next != null) throw new Error(`Bitbucket returned a partial page of ${owner}/${repo}`);
+
+			const byId = new Map(response.values.map(pr => [pr.id, pr]));
+			return ids.map(id => byId.get(id));
+		} catch (ex) {
+			if (isNotFoundResponse(ex)) return ids.map(() => undefined);
+
+			throw ex;
+		}
+	}
+
+	/**
+	 * A Bitbucket Data Center pull request by id. Strict, unlike {@link getServerPullRequestById}: `undefined` means
+	 * a 404, and every other failure throws, so the answer can be cached as a proven absence.
+	 */
+	@trace({
+		args: (provider, token, owner, repo, id, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			id: id,
+			baseUrl: baseUrl,
+		}),
+	})
+	public async getServerPullRequest(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		repo: string,
+		id: string,
+		baseUrl: string,
+		options?: {
+			currentAccount?: { id: string; username?: string };
+			deferFailure?: boolean;
+			/** The calling read, stamped on the row. */
+			projection?: PullRequestProjection;
+		},
+	): Promise<PullRequest | undefined> {
+		const scope = getScopedLogger();
+
+		try {
+			const pr = await this.request<BitbucketServerPullRequest>(
 				provider,
 				token,
 				baseUrl,
@@ -335,21 +521,181 @@ export class BitbucketApi implements Disposable {
 					method: 'GET',
 				},
 				scope,
+				undefined,
+				options?.deferFailure,
 			);
+			if (pr == null) throw new Error(`Bitbucket returned no pull request for ${owner}/${repo}#${id}`);
 
-			if (prResponse) {
-				const providersPr = normalizeBitbucketServerPullRequest(prResponse);
-				const gitlensPr = fromProviderPullRequest(providersPr, provider);
-				return gitlensPr;
-			}
+			return fromProviderPullRequest(normalizeBitbucketServerPullRequest(pr), provider, {
+				currentAccount: options?.currentAccount,
+				projection: options?.projection,
+			});
 		} catch (ex) {
-			if (ex.original?.status !== 404) {
-				scope?.error(ex);
-				return undefined;
-			}
-		}
+			if (isNotFoundResponse(ex)) return undefined;
 
-		return undefined;
+			throw ex;
+		}
+	}
+
+	/**
+	 * Every Bitbucket Cloud pull request into `owner/repo` whose source is `branch`, in any state, newest first, at
+	 * most `limit`: from the repository itself when `headOwner` is omitted, otherwise from a fork in the `headOwner`
+	 * workspace. Keyed on the source branch NAME, so a merged pull request whose branch was deleted still matches.
+	 *
+	 * Strict like {@link getPullRequest}: a 404 (a missing repository) is an empty list, and every other failure
+	 * throws.
+	 */
+	@trace({
+		args: (provider, token, owner, repo, branch, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			branch: branch,
+			baseUrl: baseUrl,
+		}),
+	})
+	public async getPullRequestsForBranch(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		repo: string,
+		branch: string,
+		baseUrl: string,
+		options: {
+			headOwner?: string;
+			limit: number;
+			currentAccount?: { id: string; username?: string };
+			deferFailure?: boolean;
+		},
+	): Promise<{ pullRequests: PullRequest[]; truncated: boolean }> {
+		const scope = getScopedLogger();
+
+		const escapedBranch = branch.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+		const params = new URLSearchParams({
+			// Every state named: Bitbucket answers only OPEN pull requests unless asked for the others.
+			q: `source.branch.name="${escapedBranch}" AND (state="OPEN" OR state="MERGED" OR state="DECLINED" OR state="SUPERSEDED")`,
+			sort: '-updated_on',
+			pagelen: String(options.limit),
+			fields: '+values.reviewers,+values.participants',
+		});
+
+		try {
+			const response = await this.request<{ values: BitbucketPullRequest[]; next?: string }>(
+				provider,
+				token,
+				baseUrl,
+				`repositories/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pullrequests?${params.toString()}`,
+				{ method: 'GET' },
+				scope,
+				undefined,
+				options.deferFailure,
+			);
+			if (response?.values == null) {
+				throw new Error(`Bitbucket returned no pull requests for ${owner}/${repo}:${branch}`);
+			}
+
+			const headOwner = options.headOwner;
+			const { values, truncated } = selectBranchPullRequests(response.values, {
+				matchesHead: pr => {
+					const source = pr.source.repository;
+					if (pr.source.branch.name !== branch || source == null) return false;
+					if (headOwner == null) return source.uuid === pr.destination.repository.uuid;
+
+					return (
+						source.uuid !== pr.destination.repository.uuid &&
+						equalsIgnoreCase(source.full_name.split('/')[0], headOwner)
+					);
+				},
+				updatedAt: pr => Date.parse(pr.updated_on),
+				map: pr =>
+					fromBitbucketPullRequest(pr, provider, {
+						currentAccount: options.currentAccount,
+						projection: 'batch',
+					}),
+				limit: options.limit,
+				more: response.next != null,
+			});
+			return { pullRequests: values, truncated: truncated };
+		} catch (ex) {
+			if (isNotFoundResponse(ex)) return { pullRequests: [], truncated: false };
+
+			throw ex;
+		}
+	}
+
+	/**
+	 * Every Bitbucket Data Center pull request whose source is `branch` in `owner/repo` and whose target is that same
+	 * repository, in any state, newest first, at most `limit`. Asked of the repository the branch lives in
+	 * (`direction=OUTGOING`), which is why a fork's pull requests can't be found through the repository they target.
+	 *
+	 * Strict like {@link getServerPullRequest}: a 404 (a missing repository) is an empty list, and every other
+	 * failure throws.
+	 */
+	@trace({
+		args: (provider, token, owner, repo, branch, baseUrl) => ({
+			provider: provider.name,
+			token: `<token:${token.microHash}>`,
+			owner: owner,
+			repo: repo,
+			branch: branch,
+			baseUrl: baseUrl,
+		}),
+	})
+	public async getServerPullRequestsForBranch(
+		provider: Provider,
+		token: TokenWithInfo,
+		owner: string,
+		repo: string,
+		branch: string,
+		baseUrl: string,
+		options: { limit: number; currentAccount?: { id: string; username?: string }; deferFailure?: boolean },
+	): Promise<{ pullRequests: PullRequest[]; truncated: boolean }> {
+		const scope = getScopedLogger();
+
+		const ref = `refs/heads/${branch}`;
+		const params = new URLSearchParams({
+			at: ref,
+			direction: 'OUTGOING',
+			state: 'ALL',
+			order: 'NEWEST',
+			limit: String(options.limit),
+		});
+
+		try {
+			const response = await this.request<{ values: BitbucketServerPullRequest[]; isLastPage?: boolean }>(
+				provider,
+				token,
+				baseUrl,
+				`projects/${encodeURIComponent(owner)}/repos/${encodeURIComponent(repo)}/pull-requests?${params.toString()}`,
+				{ method: 'GET' },
+				scope,
+				undefined,
+				options.deferFailure,
+			);
+			if (response?.values == null) {
+				throw new Error(`Bitbucket returned no pull requests for ${owner}/${repo}:${branch}`);
+			}
+
+			const { values, truncated } = selectBranchPullRequests(response.values, {
+				// `OUTGOING` also lists this branch's pull requests into other repositories, e.g. the upstream of a
+				// repository that is itself a fork.
+				matchesHead: pr => pr.fromRef.id === ref && pr.fromRef.repository.id === pr.toRef.repository.id,
+				updatedAt: pr => pr.updatedDate,
+				map: pr =>
+					fromProviderPullRequest(normalizeBitbucketServerPullRequest(pr), provider, {
+						currentAccount: options.currentAccount,
+						projection: 'batch',
+					}),
+				limit: options.limit,
+				more: response.isLastPage !== true,
+			});
+			return { pullRequests: values, truncated: truncated };
+		} catch (ex) {
+			if (isNotFoundResponse(ex)) return { pullRequests: [], truncated: false };
+
+			throw ex;
+		}
 	}
 
 	@trace({
@@ -580,7 +926,7 @@ export class BitbucketApi implements Disposable {
 			if (!prResponse) return undefined;
 
 			const providersPr = normalizeBitbucketServerPullRequest(prResponse);
-			const gitlensPr = fromProviderPullRequest(providersPr, provider);
+			const gitlensPr = fromProviderPullRequest(providersPr, provider, { projection: 'point' });
 			return gitlensPr;
 		} catch (ex) {
 			scope?.error(ex);
@@ -639,7 +985,7 @@ export class BitbucketApi implements Disposable {
 				undefined,
 			);
 			if (!pr) return undefined;
-			return fromBitbucketPullRequest(pr, provider);
+			return fromBitbucketPullRequest(pr, provider, { projection: 'point' });
 		} catch (ex) {
 			if (ex.original instanceof ProviderFetchError) {
 				const json = await ex.original.response.json();
@@ -794,6 +1140,7 @@ export class BitbucketApi implements Disposable {
 		options?: { method: RequestInit['method'] } & Record<string, unknown>,
 		scope?: ScopedLogger | undefined,
 		cancellation?: AbortSignal | undefined,
+		deferFailure?: boolean,
 	): Promise<T | undefined> {
 		const { accessToken } = token;
 		const url = `${baseUrl}/${route}`;
@@ -824,7 +1171,7 @@ export class BitbucketApi implements Disposable {
 			}
 		} catch (ex) {
 			if (ex instanceof ProviderFetchError || ex.name === 'AbortError') {
-				this.handleRequestError(provider, token, ex, scope);
+				this.handleRequestError(provider, token, ex, scope, deferFailure);
 			} else if (Logger.isDebugging) {
 				this.config.onError?.(`Bitbucket request failed: ${ex.message}`);
 			}
@@ -838,6 +1185,7 @@ export class BitbucketApi implements Disposable {
 		token: TokenWithInfo,
 		ex: ProviderFetchError | (Error & { name: 'AbortError' }),
 		scope: ScopedLogger | undefined,
+		deferFailure: boolean | undefined,
 	): void {
 		if (ex.name === 'AbortError' || !(ex instanceof ProviderFetchError)) throw new CancellationError(ex);
 
@@ -861,14 +1209,19 @@ export class BitbucketApi implements Disposable {
 			case 500: // Internal Server Error
 				scope?.error(ex);
 				if (ex.response != null) {
-					provider?.trackRequestException();
-					this.config.onRequestFailed?.(
-						provider == null || provider.id === 'bitbucket'
-							? l10n.t(
-									'{0} failed to respond and might be experiencing issues. Please visit the [Bitbucket status page](https://bitbucket.status.atlassian.com/) for more information.',
-									provider?.name ?? 'Bitbucket',
-								)
-							: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
+					reportRequestFailure(
+						provider,
+						ex,
+						() =>
+							this.config.onRequestFailed?.(
+								provider == null || provider.id === 'bitbucket'
+									? l10n.t(
+											'{0} failed to respond and might be experiencing issues. Please visit the [Bitbucket status page](https://bitbucket.status.atlassian.com/) for more information.',
+											provider?.name ?? 'Bitbucket',
+										)
+									: l10n.t('{0} failed to respond and might be experiencing issues.', provider.name),
+							),
+						deferFailure,
 					);
 				}
 				return;

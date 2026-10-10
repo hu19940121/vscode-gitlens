@@ -8,17 +8,49 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
-- Adds task-specific messaging to the _Commit Graph_'s sign-in and upgrade screens ([#5820](https://github.com/gitkraken/vscode-gitlens/issues/5820), [#5784](https://github.com/gitkraken/vscode-gitlens/issues/5784)) &mdash; opening a commit, branch, tag, or stash, a file or folder's history, a comparison, your working changes, a branch focus, or an automatic rebase summary now names that task on the screen that interrupts it, and confirms it will open in the _Commit Graph_ once you have access. Ctrl-clicking a commit hash in the terminal no longer lands on an unexplained sign-in screen &mdash; it names the commit and holds it until you're signed in
-- Adds start actions to the _Commit Graph_'s no-repository empty state &mdash; grouped ways to get going: open a folder, clone a repository, or start a new project (open a remote repository on the web), alongside _Start Work on an Issue_ and _Start Review on a PR_
-  - Adds _Start Work_ and _Start PR Review_ support when no repository is open &mdash; both now list your issues and pull requests across your connected integrations, and offer to locate the repository in a local folder before continuing, or to clone it when the integration supplies a repository URL (every pull request, and GitHub issues)
-  - _Start Work_ now tells you when a connected integration can't search issues account-wide, instead of letting it contribute nothing to a seemingly empty list &mdash; Bitbucket has no account-wide issue search, so it now says so and points you to open a repository
+- Adds configurable branch names for _Start Work_ with `gitlens.startWork.branchNameFormat`, using `${id}` and `${title}` tokens, plus a format editor and live preview in GitLens Settings ([#5925](https://github.com/gitkraken/vscode-gitlens/issues/5925))
+
+- Adds _Jira Data Center_ to the integrations in _GitLens Settings_, so a self-hosted Jira Server or Data Center instance can be connected alongside Jira Cloud ([#5864](https://github.com/gitkraken/vscode-gitlens/issues/5864)). It connects through your GitKraken account like the other self-hosted integrations, and each configured host is its own connection. The rest of the wiring &mdash; the _Commit Graph_'s issue tracker picker, autolinks &mdash; is not there yet, so apart from branch associations a connected instance is not yet read anywhere else in GitLens
+  - The _Commit Graph_'s check for whether any issue integration is connected now looks at every configured host of a self-hosted tracker, so disconnecting one host no longer turns off issue enrichment while another is still connected
+  - Reads a branch's associated _Jira Data Center_ issues from the instance the association names, never from another configured host that happens to be primary ([#5872](https://github.com/gitkraken/vscode-gitlens/issues/5872))
+- Adds a `gitlens.views.searchAndCompare.files.openDiffOnClick` setting to specify whether to open the changes or the working file when clicking a file in the _Search & Compare_ view ([#1651](https://github.com/gitkraken/vscode-gitlens/issues/1651)) &mdash; thanks to [PR #2845](https://github.com/gitkraken/vscode-gitlens/pull/2845) by Steven Vaught ([@Svaught598](https://github.com/Svaught598)) and [PR #3583](https://github.com/gitkraken/vscode-gitlens/pull/3583) by Ehab Younes ([@EhabY](https://github.com/EhabY))
+
+### Fixed
+
+- Fixes pressing <kbd>Space</kbd> on a _Git Command Palette_ confirmation step breaking the command &mdash; e.g. _Delete Worktree_ would stop responding and never delete the worktree
+- Fixes force-deleting a worktree skipping the uncommitted-changes warning when GitLens couldn't check the worktree for changes &mdash; it now asks before deleting a worktree it couldn't check
+- Fixes a repository or worktree with no commits yet showing no changes when it has staged or modified files
+- Fixes features treating a failed check for changes as "no changes": _Auto-Rebase_ could report a commit as skipped for being empty, applying a patch could skip offering to stash your changes, and _Copy Changes_ could leave out untracked files without saying so
+- Fixes diffs against a repository's first commit failing in a SHA-256 repository, including a stash's untracked files and, for a range starting at the first commit, the _Commit Graph_'s scope file list and _Compose_
+- Fixes cloning a large repository from a GitLens link failing once it runs past the Git timeout (`gitlens.advanced.git.timeout`) &mdash; the clone now runs as long as it needs, and its progress notification can cancel it
+- Fixes branch-associated issues from self-managed Git hosts resolving through the wrong server when an older association has no host. These associations remain usable with a single configured host, and new Bitbucket Server issue associations retain their host ([#5883](https://github.com/gitkraken/vscode-gitlens/issues/5883))
+- Fixes Azure DevOps requests escaping the configured installation path with specially encoded remote names, and preserves names and branches containing spaces or reserved characters ([#5878](https://github.com/gitkraken/vscode-gitlens/issues/5878))
+- Fixes self-managed integrations dropping the installation path from API requests, including Azure DevOps Server virtual directories, while keeping existing connections usable ([#5871](https://github.com/gitkraken/vscode-gitlens/issues/5871))
+- Fixes _Start Work_ and _Launchpad_ reads covering only one host per supported self-managed provider ([#5873](https://github.com/gitkraken/vscode-gitlens/issues/5873)) &mdash; connected hosts are read independently, with open repository scopes kept on their matching host
+- Fixes _Launchpad_ mixing pins, snoozes, selections, and tree items between self-managed hosts whose pull requests share an identifier ([#5873](https://github.com/gitkraken/vscode-gitlens/issues/5873))
+- Fixes _Start Work_ and _Launchpad_ showing a raw `GraphqlResponseError` when GitHub's API rate limit is exhausted &mdash; they now report that the rate limit was reached and when to try again
+
+## [19.3.0] - 2026-10-01
+
+### Added
+
+- Adds starting a task or a pull request review in Kepler, right from where you are in GitLens ([#5760](https://github.com/gitkraken/vscode-gitlens/issues/5760))
+  - Adds _Start Task in Kepler_ to repositories, and _Start Review in Kepler_ to pull requests in GitLens views, _Launchpad_, and the _Commit Graph_ &mdash; each opens Kepler with the repository or pull request ready to go
+  - Adds _Open in Kepler_ to _Start Work_ and _Start PR Review_ for items Kepler supports, alongside opening in an agent or continuing manually &mdash; or choose `kepler` for `gitlens.ai.openInAgent` to go straight there
+  - Offers to get the Kepler application when it isn't installed, and stops showing the _Try Kepler_ banner once it is
 - Adds rebasing an entire stacked pull request chain in one action ([#5838](https://github.com/gitkraken/vscode-gitlens/issues/5838))
   - _Rebase Stack..._ cascades bottom to top, replaying each layer onto the one below it and the bottom layer onto the stack's trunk &mdash; and creates a local branch for any layer you haven't checked out, so no link in the chain is skipped
   - _Auto-Rebase Stack..._ resolves conflicts with AI the whole way up, pausing instead of unwinding when it needs your help &mdash; _Continue with Auto-Rebase_ then picks up the rest of the stack, not just the branch you fixed
   - Every message names where you are in the stack (_Branch 2 of 4_), and the cascade puts you back on the branch you started from
-  - Offers _Force Push Stack_ on completion, listing each rewritten branch pre-checked so you can hold any of them back &mdash; the offer also lives on the _Auto-Rebase Summary_ and as a _Git Force Push Pull Request Stack..._ command, so it survives the notification being dismissed, and retires itself once every branch is published
+  - Offers _Force Push Stack_ on completion, listing each rewritten branch pre-checked so you can hold any of them back &mdash; the offer also lives on the _Auto-Rebase Summary_ and as a _Git Force Push Stacked Pull Requests..._ command, so it survives the notification being dismissed, and retires itself once every branch is published
   - Offered only when the stack has drifted from its trunk &mdash; behind it, or conflicting with it &mdash; so an already-current stack isn't invited into a rebase that would do nothing
-  - Reachable from the _Commit Graph_'s pull request sheet and side bar stack rows, _Launchpad_, the rebase quick pick, and the _Git Rebase Pull Request Stack..._ and _Auto-Rebase Pull Request Stack..._ commands
+  - Reachable from the _Commit Graph_'s pull request sheet and side bar stack rows, _Launchpad_, the rebase quick pick, and the _Git Rebase Stacked Pull Requests..._ and _Auto-Rebase Stacked Pull Requests..._ commands
+- Adds start actions to the _Commit Graph_'s no-repository empty state &mdash; grouped ways to get going: open a folder, clone a repository, or start a new project (open a remote repository on the web), alongside _Start Work on an Issue_ and _Start Review on a PR_
+  - Adds _Start Work_ and _Start PR Review_ support when no repository is open &mdash; both now list your issues and pull requests across your connected integrations, and offer to locate the repository in a local folder before continuing, or to clone it when the integration supplies a repository URL (every pull request, and GitHub issues)
+  - _Start Work_ now tells you when a connected integration can't search issues account-wide, instead of letting it contribute nothing to a seemingly empty list &mdash; Bitbucket has no account-wide issue search, so it now says so and points you to open a repository
+- Adds task-specific context to the _Commit Graph_'s sign-in and upgrade screens when navigating to it from other areas of GitLens ([#5820](https://github.com/gitkraken/vscode-gitlens/issues/5820), [#5784](https://github.com/gitkraken/vscode-gitlens/issues/5784))
+  - Names the task that was interrupted &mdash; opening a commit, branch, tag, or stash, a file or folder's history, a comparison, your working changes, a branch focus, or an automatic rebase summary &mdash; and confirms it will open in the _Commit Graph_ once you have access
+  - Ctrl-clicking a commit hash in the terminal now names the commit and holds it until you're signed in, instead of landing on an unexplained sign-in screen
 
 ### Changed
 
@@ -7448,7 +7480,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Initial release but still heavily a work in progress.
 
-[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/v19.2.0...HEAD
+[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/v19.3.0...HEAD
+[19.3.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.2.0...gitkraken:v19.3.0
 [19.2.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.1.0...gitkraken:v19.2.0
 [19.1.0]: https://github.com/gitkraken/vscode-gitlens/compare/v19.0.1...gitkraken:v19.1.0
 [19.0.1]: https://github.com/gitkraken/vscode-gitlens/compare/v19.0.0...gitkraken:v19.0.1

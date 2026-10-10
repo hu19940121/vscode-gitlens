@@ -1,7 +1,9 @@
 import type { Cache } from '@gitlens/git/cache.js';
 import type { GitServiceContext } from '@gitlens/git/context.js';
+import { ReferenceUpdateError } from '@gitlens/git/errors.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitReference, GitRefTip, RefRecord } from '@gitlens/git/models/reference.js';
+import type { GitReflogEntry } from '@gitlens/git/models/reflog.js';
 import { deletedOrMissing } from '@gitlens/git/models/revision.js';
 import type { GitTag } from '@gitlens/git/models/tag.js';
 import type { GitRefsSubProvider } from '@gitlens/git/providers/refs.js';
@@ -19,8 +21,9 @@ import { iterateAsyncByDelimiter } from '@gitlens/utils/string.js';
 import type { Uri } from '@gitlens/utils/uri.js';
 import { toFsPath } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
-import type { Git } from '../exec/git.js';
-import { gitConfigsBranch } from '../exec/git.js';
+import type { Git, GitError } from '../exec/git.js';
+import { getGitCommandError, gitConfigsBranch, gitConfigsLog } from '../exec/git.js';
+import { getReflogEntryParser } from '../parsers/reflogParser.js';
 import { getRefParser } from '../parsers/refParser.js';
 
 export class RefsGitSubProvider implements GitRefsSubProvider {
@@ -342,13 +345,61 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 	}
 
 	@debug()
-	async getReference(repoPath: string, ref: string, cancellation?: AbortSignal): Promise<GitReference | undefined> {
+	async getReflogEntries(
+		repoPath: string,
+		ref: string,
+		options?: { grep?: string; priority?: GitCommandPriority },
+		cancellation?: AbortSignal,
+	): Promise<GitReflogEntry[]> {
+		// `show` so a branch named `delete`, `expire` or `exists` isn't read as that subcommand, and the trailing
+		// `--` so one named like a tracked file isn't rejected as ambiguous
+		const parser = getReflogEntryParser();
+		const args = ['reflog', 'show', ...parser.arguments];
+		if (options?.grep) {
+			args.push(`--grep-reflog=${options.grep}`);
+		}
+		args.push(ref, '--');
+
+		const result = await this.git.run(
+			{
+				cwd: repoPath,
+				errors: 'throw',
+				cancellation: cancellation,
+				// A user's `log.showSignature` would print gpg output into the records
+				configs: gitConfigsLog,
+				...(options?.priority != null ? { priority: options.priority } : undefined),
+			},
+			...args,
+		);
+
+		const entries: GitReflogEntry[] = [];
+		for (const entry of parser.parse(result.stdout)) {
+			entries.push({ sha: entry.sha, message: entry.subject });
+		}
+		return entries;
+	}
+
+	@debug()
+	async getReference(
+		repoPath: string,
+		ref: string,
+		options?: { force?: boolean },
+		cancellation?: AbortSignal,
+	): Promise<GitReference | undefined> {
 		if (!ref || ref === deletedOrMissing) return undefined;
 
-		if (!(await this.isValidReference(repoPath, ref, undefined, cancellation))) return undefined;
+		const valid = options?.force
+			? await this.validateReference(repoPath, ref, { force: true }, cancellation)
+			: await this.isValidReference(repoPath, ref, undefined, cancellation);
+		if (!valid) return undefined;
 
 		if (ref !== 'HEAD' && !isShaWithOptionalRevisionSuffix(ref)) {
-			const branch = await this.provider.branches.getBranch(repoPath, ref, cancellation);
+			const branch = await this.provider.branches.getBranch(
+				repoPath,
+				ref,
+				options?.force ? { force: true } : undefined,
+				cancellation,
+			);
 			if (branch != null) {
 				return createReference(branch.ref, repoPath, {
 					id: branch.id,
@@ -359,6 +410,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 				});
 			}
 
+			// Not forced: a tag that moves is rare enough that `force` is scoped to branches and validation.
 			const tag = await this.provider.tags.getTag(repoPath, ref, cancellation);
 			if (tag != null) {
 				return createReference(tag.ref, repoPath, {
@@ -434,19 +486,22 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 	): Promise<boolean> {
 		const path = pathOrUri != null ? toFsPath(pathOrUri) : undefined;
 		const relativePath = path ? this.provider.getRelativePath(path, repoPath) : undefined;
-		return Boolean((await this.validateReference(repoPath, ref, relativePath, cancellation))?.length);
+		return Boolean(
+			(await this.validateReference(repoPath, ref, { relativePath: relativePath }, cancellation))?.length,
+		);
 	}
 
 	@trace()
 	async validateReference(
 		repoPath: string,
 		ref: string,
-		relativePath?: string,
+		options?: { relativePath?: string; force?: boolean },
 		cancellation?: AbortSignal,
 	): Promise<string | undefined> {
 		if (!ref) return undefined;
 		if (ref === deletedOrMissing || isUncommitted(ref)) return ref;
 
+		const relativePath = options?.relativePath;
 		const supportsEndOfOptions = await this.git.supports('git:rev-parse:end-of-options');
 
 		// Why: a SHA-only validation (no path suffix) is effectively immutable — 5-min TTL is safe.
@@ -462,6 +517,7 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 				caching: {
 					cache: this.cache.gitResults,
 					options: { accessTTL: stable ? 5 * 60 * 1000 : 60 * 1000 },
+					force: options?.force,
 				},
 			},
 			'rev-parse',
@@ -473,14 +529,161 @@ export class RefsGitSubProvider implements GitRefsSubProvider {
 	}
 
 	@debug()
-	async updateReference(repoPath: string, ref: string, newRef: string, cancellation?: AbortSignal): Promise<void> {
+	async deleteReference(
+		repoPath: string,
+		ref: string,
+		options?: { expected?: string },
+		cancellation?: AbortSignal,
+	): Promise<void> {
 		const scope = getScopedLogger();
 
+		// `--no-deref`: without it git deletes what a symbolic ref points to rather than the ref itself, so
+		// deleting `refs/remotes/origin/HEAD` would take `origin/main` with it
+		const args = ['update-ref', '-d', '--no-deref', ref];
+		if (options?.expected != null) {
+			args.push(options.expected);
+		}
+
+		// `HEAD` is either the checked-out branch or, detached, the repository's own HEAD file — neither
+		// may be deleted
+		if (ref === 'HEAD') {
+			throw new ReferenceUpdateError({
+				reason: 'checkedOut',
+				action: 'delete',
+				ref: ref,
+				gitCommand: { repoPath: repoPath, args: args },
+			});
+		}
+
+		// `update-ref -d` has none of `git branch -d`'s guards or cleanup, so a local branch gets them here:
+		// deleting one checked out in a worktree would leave that worktree on a branch that no longer exists.
+		const branch = ref.startsWith('refs/heads/') ? ref.substring('refs/heads/'.length) : undefined;
+		if (branch != null) {
+			// Read git's worktree list directly rather than the cached one: that names a worktree's branch
+			// only when the separately cached branch list has it, so a worktree or branch made outside core
+			// since the last read would slip past this guard.
+			const result = await this.git.run(
+				{ cwd: repoPath, cancellation: cancellation, errors: 'throw' },
+				'worktree',
+				'list',
+				'--porcelain',
+			);
+			if (result.stdout.split('\n').some(l => l.trim() === `branch ${ref}`)) {
+				throw new ReferenceUpdateError({
+					reason: 'checkedOut',
+					action: 'delete',
+					ref: ref,
+					gitCommand: { repoPath: repoPath, args: args },
+				});
+			}
+		}
+
 		try {
-			await this.git.run({ cwd: repoPath, cancellation: cancellation }, 'update-ref', ref, newRef);
+			// `errors: 'throw'`: the default handler resolves a `GitWarnings` match (e.g. "not a git
+			// repository"), which would report a write that never happened as done
+			await this.git.run({ cwd: repoPath, cancellation: cancellation, errors: 'throw' }, ...args);
 		} catch (ex) {
 			scope?.error(ex);
 			if (isCancellationError(ex)) throw ex;
+
+			throw getGitCommandError(
+				'update-ref-delete',
+				ex as GitError,
+				reason =>
+					new ReferenceUpdateError(
+						{
+							reason: reason,
+							action: 'delete',
+							ref: ref,
+							gitCommand: { repoPath: repoPath, args: args },
+						},
+						ex as GitError,
+					),
+			);
 		}
+
+		if (branch != null) {
+			// What `git branch -d` removes itself (the upstream and other per-branch settings), then GitLens's own
+			await this.git.run({ cwd: repoPath, errors: 'ignore' }, 'config', '--remove-section', `branch.${branch}`);
+			await this.provider.branches.forgetDeletedBranch(repoPath, branch);
+			// A single combined reset/announce rather than this plus `fireReferenceChanged`'s own
+			// `'branches'`/`['heads']` — a branch delete only needs one of each.
+			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'config');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
+			return;
+		}
+
+		this.fireReferenceChanged(repoPath, ref);
+	}
+
+	@debug()
+	async updateReference(
+		repoPath: string,
+		ref: string,
+		sha: string,
+		options?: { expected?: string | 'absent' },
+		cancellation?: AbortSignal,
+	): Promise<void> {
+		const scope = getScopedLogger();
+
+		const args = ['update-ref', ref, sha];
+		if (options?.expected != null) {
+			// Git's own compare-and-swap old-value argument, which makes the update atomic against a
+			// concurrent writer. An EMPTY old value is how git spells "the ref must not exist yet"; the
+			// empty string has to reach argv intact, which it does because the executor drops only
+			// null/undefined.
+			args.push(options.expected === 'absent' ? '' : options.expected);
+		}
+
+		try {
+			await this.git.run({ cwd: repoPath, cancellation: cancellation, errors: 'throw' }, ...args);
+		} catch (ex) {
+			scope?.error(ex);
+			if (isCancellationError(ex)) throw ex;
+
+			throw getGitCommandError(
+				'update-ref',
+				ex as GitError,
+				reason =>
+					new ReferenceUpdateError(
+						{
+							reason: reason,
+							action: 'update',
+							ref: ref,
+							gitCommand: { repoPath: repoPath, args: args },
+						},
+						ex as GitError,
+					),
+			);
+		}
+
+		this.fireReferenceChanged(repoPath, ref);
+	}
+
+	/** Announces a ref mutation to the cache and repository hooks. */
+	private fireReferenceChanged(repoPath: string, ref: string): void {
+		if (ref === 'HEAD') {
+			// `update-ref HEAD` moves whatever HEAD resolves to — the checked-out branch, or a detached HEAD
+			// — which also changes what the index and working tree are compared against.
+			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads']);
+		} else if (ref.startsWith('refs/heads/')) {
+			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['heads']);
+		} else if (ref.startsWith('refs/tags/')) {
+			this.context.hooks?.cache?.onReset?.(repoPath, 'tags');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['tags']);
+		} else if (ref.startsWith('refs/remotes/')) {
+			// Remote-tracking branches are read through the branch and ref-tip caches, which `'branches'`
+			// clears; `'remotes'` covers only the configured remotes, which a ref write cannot change.
+			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['remotes']);
+		} else if (ref === 'refs/stash') {
+			this.context.hooks?.cache?.onReset?.(repoPath, 'stashes');
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['stash']);
+		}
+		// A ref outside those namespaces (a consumer's own bookkeeping under `refs/<tool>/`) is visible to
+		// nothing core caches, and announcing it as an unknown change would make a host refresh everything
+		// for a write it cannot observe.
 	}
 }

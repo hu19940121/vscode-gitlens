@@ -190,6 +190,7 @@ export {
 	GitCloudHostIntegrationId,
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
+	IssuesSelfManagedHostIntegrationId,
 	isIntegrationId,
 	isSupportedCloudIntegrationId,
 } from './constants.js';
@@ -204,11 +205,14 @@ export type {
 	ProviderResult,
 	ProviderSweepResult,
 	ProviderWarning,
+	ProviderWarningCause,
+	ProviderWarningCauseReason,
 	ProviderWarningKind,
 	ProviderWarningOmission,
 	ProviderWarningOmissionKind,
 	ProviderWarningOmissionRecovery,
 	ProviderWarningOmissionScope,
+	ProviderWarningScope,
 	ProviderOrganization,
 	ProviderRepositoryShape,
 	RepositoryIdentity,
@@ -223,9 +227,25 @@ export { IssueFilter, PullRequestFilter } from './providerFilters.js';
 export type { IssueSearchCapabilities, IssueSearchCriteria, IssueSearchRelationship } from './providerFilters.js';
 // Account-wide pull-request search criteria and the per-provider capability table.
 export type { PullRequestSearchCapabilities, PullRequestSearchCriteria } from './providerFilters.js';
-// The count-only issue probe's input and result shapes.
-export type { IssueCountResult, IssueCountScope } from './reads/counts.js';
-export type { TrackerIssueResult } from './reads/trackerIssue.js';
+// The count-only issue and pull-request probes' input and result shapes.
+export type {
+	IssueCountResult,
+	IssueCountScope,
+	PullRequestCountResult,
+	PullRequestCountScope,
+} from './reads/counts.js';
+export type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
+export type { PullRequestBatchResult, PullRequestBatchTarget } from './reads/pullRequestBatch.js';
+export type { IssueEtagInclude, PullRequestEtagInclude } from './models/integration.js';
+export type { PullRequestBranchResult, PullRequestBranchTarget } from './reads/pullRequestBranches.js';
+// The current-account read's result, and the account shape every identity-bearing read already returns.
+export type { CurrentAccountResult } from './reads/currentAccount.js';
+export type { Account } from '@gitlens/git/models/author.js';
 // Cross-provider PR/issue state filters (string unions in the git models).
 export type { PullRequestStateFilter } from '@gitlens/git/models/pullRequest.js';
 export type { IssueStateFilter } from '@gitlens/git/models/issue.js';
+// Which read produced a row, and which of its fields that read fetched.
+export type { PullRequestProjection } from '@gitlens/git/models/pullRequest.js';
+export type { IssueProjection } from '@gitlens/git/models/issue.js';
+export type { FieldPresence, IssueFieldGroup, PullRequestFieldGroup } from './fieldPresence.js';
+export { getIssueFieldPresence, getPullRequestFieldPresence } from './fieldPresence.js';

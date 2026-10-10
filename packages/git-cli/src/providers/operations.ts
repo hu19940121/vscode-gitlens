@@ -15,6 +15,7 @@ import {
 	SigningError,
 } from '@gitlens/git/errors.js';
 import type { GitBranchReference, GitReference } from '@gitlens/git/models/reference.js';
+import type { RepositoryChange } from '@gitlens/git/models/repository.js';
 import type { SigningFormat } from '@gitlens/git/models/signature.js';
 import type { GitConflictFile } from '@gitlens/git/models/staging.js';
 import type {
@@ -237,17 +238,37 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 	@debug()
 	async fetch(
 		repoPath: string,
-		options?: { all?: boolean; branch?: GitBranchReference; prune?: boolean; pull?: boolean; remote?: string },
+		options?:
+			| {
+					all?: boolean;
+					branch?: GitBranchReference;
+					prune?: boolean;
+					pull?: boolean;
+					remote?: string;
+					refspecs?: undefined;
+					preserveFetchHead?: boolean;
+			  }
+			| {
+					all?: undefined;
+					branch?: undefined;
+					prune?: boolean;
+					pull?: undefined;
+					remote: string;
+					refspecs: readonly string[];
+					preserveFetchHead?: boolean;
+			  },
 		runOptions?: GitOperationRunOptions,
 	): Promise<void> {
 		const scope = getScopedLogger();
 
 		const { branch, ...opts } = options ?? {};
+		let ran = false;
 		try {
 			if (isBranchReference(branch)) {
 				const [branchName, remoteName] = getBranchNameAndRemote(branch);
 				if (remoteName == null) return;
 
+				ran = true;
 				await this.fetchCore(
 					repoPath,
 					{
@@ -255,25 +276,78 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 						remote: remoteName,
 						upstream: getBranchTrackingWithoutRemote(branch)!,
 						pull: options?.pull,
+						preserveFetchHead: options?.preserveFetchHead,
 					},
 					runOptions,
 				);
 			} else {
+				ran = true;
 				await this.fetchCore(repoPath, opts, runOptions);
 			}
-
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'tags');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['remotes']);
 		} catch (ex) {
 			scope?.error(ex);
 			throw ex;
+		} finally {
+			// A rejected fetch may have stored some of its refs before it failed
+			if (ran) {
+				this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'tags');
+				this.context.hooks?.repository?.onChanged?.(repoPath, this.getFetchChanges(branch, options));
+			}
 		}
+	}
+
+	/** `remotes`, plus `heads`/`tags` for any local branch or tag the fetch writes — a `pull` fetch writes `<upstream>:<branch>` */
+	private getFetchChanges(
+		branch: GitBranchReference | undefined,
+		options: { pull?: boolean; refspecs?: readonly string[] } | undefined,
+	): RepositoryChange[] {
+		if (isBranchReference(branch)) {
+			return options?.pull ? ['heads', 'remotes'] : ['remotes'];
+		}
+		if (!options?.refspecs?.length) return ['remotes'];
+
+		const changes: RepositoryChange[] = ['remotes'];
+		for (const refspec of options.refspecs) {
+			const stripped = refspec.startsWith('+') ? refspec.slice(1) : refspec;
+			const colonIndex = stripped.indexOf(':');
+			if (colonIndex === -1) continue;
+
+			// Qualified as git's fetch does: an empty destination stores nothing, `heads/`/`tags/`/`remotes/`
+			// get `refs/`, and any other unqualified name is a local branch
+			let destination = stripped.slice(colonIndex + 1);
+			if (!destination) continue;
+
+			if (!destination.startsWith('refs/')) {
+				destination = /^(?:heads|tags|remotes)\//.test(destination)
+					? `refs/${destination}`
+					: `refs/heads/${destination}`;
+			}
+
+			if (destination.startsWith('refs/tags/')) {
+				if (!changes.includes('tags')) {
+					changes.push('tags');
+				}
+			} else if (destination.startsWith('refs/heads/')) {
+				if (!changes.includes('heads')) {
+					changes.push('heads');
+				}
+			}
+		}
+		return changes;
 	}
 
 	private async fetchCore(
 		repoPath: string,
 		options:
-			| { all?: boolean; branch?: undefined; prune?: boolean; pull?: boolean; remote?: string }
+			| {
+					all?: boolean;
+					branch?: undefined;
+					prune?: boolean;
+					pull?: boolean;
+					remote?: string;
+					refspecs?: undefined;
+					preserveFetchHead?: boolean;
+			  }
 			| {
 					all?: undefined;
 					branch: string;
@@ -281,6 +355,22 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					pull?: boolean;
 					remote: string;
 					upstream: string;
+					/**
+					 * `-u` (`--update-head-ok`, the default) lets a `pull` fetch move a branch even where it is
+					 * checked out; `false` keeps git's own refusal as a guard against a stale worktree lookup.
+					 */
+					updateHeadOk?: boolean;
+					refspecs?: undefined;
+					preserveFetchHead?: boolean;
+			  }
+			| {
+					all?: undefined;
+					branch?: undefined;
+					prune?: boolean;
+					pull?: undefined;
+					remote: string;
+					refspecs: readonly string[];
+					preserveFetchHead?: boolean;
 			  },
 		runOptions?: GitOperationRunOptions,
 	): Promise<void> {
@@ -290,12 +380,21 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			params.push('--prune');
 		}
 
+		if (options.preserveFetchHead && (await this.git.supports('git:fetch:no-write-fetch-head'))) {
+			params.push('--no-write-fetch-head');
+		}
+
 		if (options.branch && options.remote) {
 			if (options.upstream && options.pull) {
-				params.push('-u', options.remote, `${options.upstream}:${options.branch}`);
+				if (options.updateHeadOk !== false) {
+					params.push('-u');
+				}
+				params.push(options.remote, `${options.upstream}:${options.branch}`);
 			} else {
 				params.push(options.remote, options.upstream || options.branch);
 			}
+		} else if (options.refspecs?.length) {
+			params.push(options.remote, ...options.refspecs);
 		} else if (options.remote) {
 			params.push(options.remote);
 		} else if (options.all) {
@@ -383,11 +482,20 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 	@debug()
 	async pull(
 		repoPath: string,
-		options?: { branch?: GitBranchReference; rebase?: boolean; tags?: boolean; source?: unknown },
+		options?: {
+			branch?: GitBranchReference;
+			fastForward?: 'only';
+			rebase?: boolean;
+			tags?: boolean;
+			source?: unknown;
+		},
 		runOptions?: GitOperationRunOptions,
 	): Promise<void> {
 		const scope = getScopedLogger();
 
+		// Set once a git command is about to run, so a pull that fails partway (a merge or rebase stopping on a
+		// conflict, a fetch that stored some refs) announces what it changed the way a finished one does
+		let announce: (() => void) | undefined;
 		try {
 			if (isBranchReference(options?.branch)) {
 				const branch = options.branch;
@@ -400,11 +508,19 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					// Branch is checked out in a worktree — run git pull in that worktree's directory
 					// Any rebase state (e.g. from `pull.rebase=true`) appears under the worktree path
 					const worktreePath = normalizePath(worktree.uri.fsPath);
+					// Its HEAD, index and any paused merge or rebase belong to that worktree, not to `repoPath`
+					announce = () => {
+						this.announcePull(repoPath);
+						if (worktreePath !== normalizePath(repoPath)) {
+							this.announcePull(worktreePath);
+						}
+					};
 					this.context.hooks?.operations?.onRebaseCapableOperation?.(worktreePath, 'pull', 'started');
 					try {
 						await this.pullCore(
 							worktreePath,
 							{
+								fastForward: options?.fastForward,
 								rebase: options?.rebase,
 								tags: options?.tags,
 								source: options?.source,
@@ -414,9 +530,49 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					} finally {
 						this.context.hooks?.operations?.onRebaseCapableOperation?.(worktreePath, 'pull', 'ended');
 					}
+				} else if (options?.fastForward === 'only') {
+					// Not checked out anywhere, so there is no working tree to merge into — but a fast-forward
+					// needs none: fetching `<upstream>:<branch>` advances the local branch, and git refuses that
+					// non-forced refspec unless it fast-forwards. A plain fetch would leave the branch unmoved
+					// and report success.
+					// Fetched without `-u`: the worktree lookup above is cached and can miss a worktree added
+					// outside core, and then git's own refusal is what keeps a checked-out branch from moving.
+					const [branchName, remoteName] = getBranchNameAndRemote(branch);
+					const upstream = getBranchTrackingWithoutRemote(branch);
+					if (remoteName == null || upstream == null) {
+						throw new PullError({
+							reason: 'noUpstream',
+							gitCommand: { repoPath: repoPath, args: ['pull', '--ff-only', branch.name] },
+						});
+					}
 
-					this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status', 'tags');
-					this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'remotes', 'index']);
+					// A `pull` fetch writes `<upstream>:<branch>`, moving the local branch too — same
+					// hooks `fetch()` fires for a pull fetch with a branch reference.
+					announce = () => {
+						this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'tags');
+						this.context.hooks?.repository?.onChanged?.(repoPath, ['heads', 'remotes']);
+					};
+					try {
+						await this.fetchCore(
+							repoPath,
+							{
+								branch: branchName,
+								remote: remoteName,
+								upstream: upstream,
+								pull: true,
+								updateHeadOk: false,
+							},
+							runOptions,
+						);
+					} catch (ex) {
+						if (FetchError.is(ex, 'noFastForward')) {
+							throw new PullError(
+								{ reason: 'noFastForward', gitCommand: ex.details.gitCommand },
+								ex.original,
+							);
+						}
+						throw ex;
+					}
 				} else {
 					// Branch is not checked out anywhere — can only fetch (no working tree to merge into)
 					await this.fetch(repoPath, { branch: branch }, runOptions);
@@ -424,11 +580,13 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				return;
 			}
 
+			announce = () => this.announcePull(repoPath);
 			this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'pull', 'started');
 			try {
 				await this.pullCore(
 					repoPath,
 					{
+						fastForward: options?.fastForward,
 						rebase: options?.rebase,
 						tags: options?.tags,
 						source: options?.source,
@@ -438,18 +596,22 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			} finally {
 				this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'pull', 'ended');
 			}
-
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status', 'tags');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'remotes', 'index']);
 		} catch (ex) {
 			scope?.error(ex);
 			throw ex;
+		} finally {
+			announce?.();
 		}
+	}
+
+	private announcePull(repoPath: string): void {
+		this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status', 'tags');
+		this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'remotes', 'index']);
 	}
 
 	private async pullCore(
 		repoPath: string,
-		options: { rebase?: boolean; tags?: boolean; source?: unknown },
+		options: { fastForward?: 'only'; rebase?: boolean; tags?: boolean; source?: unknown },
 		runOptions?: GitOperationRunOptions,
 	): Promise<void> {
 		const params = ['pull'];
@@ -460,6 +622,10 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 
 		if (options.rebase) {
 			params.push('-r');
+		}
+
+		if (options.fastForward === 'only') {
+			params.push('--ff-only');
 		}
 
 		try {
@@ -574,15 +740,16 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					scope?.error(ex, 'Unable to set upstream tracking after publish');
 				}
 			}
-
+		} catch (ex) {
+			scope?.error(ex);
+			throw ex;
+		} finally {
+			// A rejected push may have updated some of its remote-tracking refs before it failed
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
 			this.context.hooks?.repository?.onChanged?.(
 				repoPath,
 				options?.publish != null ? ['config', 'heads', 'remotes'] : ['remotes'],
 			);
-		} catch (ex) {
-			scope?.error(ex);
-			throw ex;
 		}
 	}
 

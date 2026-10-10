@@ -1,5 +1,6 @@
 import type { UnifiedAsyncDisposable } from '@gitlens/utils/disposable.js';
 import type { Uri } from '@gitlens/utils/uri.js';
+import type { GitOperationRunOptions } from './operations.js';
 
 export interface DisposableTemporaryGitIndex extends UnifiedAsyncDisposable {
 	path: string;
@@ -33,4 +34,20 @@ export interface GitStagingSubProvider {
 	removeFiles(repoPath: string, pathsOrUris: (string | Uri)[], options?: { force?: boolean }): Promise<void>;
 	stageAll(repoPath: string): Promise<void>;
 	unstageAll(repoPath: string): Promise<void>;
+	/**
+	 * Removes untracked files from the working tree (`git clean`). `force` defaults to `true`, since git
+	 * refuses to clean without `-f` unless `clean.requireForce` is `false`. Pass
+	 * `directories: true` to also remove untracked directories, `ignored: true` to also remove files git
+	 * would otherwise skip (gitignored), and `paths` to restrict the clean to specific files/directories.
+	 */
+	clean(
+		repoPath: string,
+		options?: {
+			paths?: (string | Uri)[];
+			directories?: boolean;
+			force?: boolean;
+			ignored?: boolean;
+		},
+		runOptions?: GitOperationRunOptions,
+	): Promise<void>;
 }

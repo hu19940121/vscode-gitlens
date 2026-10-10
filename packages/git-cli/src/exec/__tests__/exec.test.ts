@@ -1,14 +1,15 @@
 import * as assert from 'assert';
-import { mkdtemp, rm } from 'fs/promises';
+import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { execPath } from 'process';
 import * as sinon from 'sinon';
+import { normalizePath } from '@gitlens/utils/path.js';
 import { CacheController } from '@gitlens/utils/promiseCache.js';
 import { CancelledRunError, RunError } from '../exec.errors.js';
 import { run, runSpawn } from '../exec.js';
 import type { GitResultCache } from '../exec.types.js';
-import { defaultExceptionHandler, Git } from '../git.js';
+import { defaultExceptionHandler, Git, GitError } from '../git.js';
 
 function nodeArgs(script: string): string[] {
 	return ['-e', script];
@@ -110,6 +111,19 @@ suite('Shell Test Suite', () => {
 			);
 
 			assert.strictEqual(result.stdout, 'HELLO FROM STDIN');
+		});
+
+		// An empty string is still stdin: the pipe has to close, or a process that reads to EOF (`hash-object
+		// --stdin`, `commit -F -`) waits until the command timeout kills it.
+		test('closes stdin when it is an empty string', async () => {
+			const result = await runSpawn<string>(
+				nodeExecutable,
+				nodeArgs(`process.stdin.on('end', () => process.stdout.write('eof'));process.stdin.resume();`),
+				'utf8',
+				{ stdin: '', timeout: 5000 },
+			);
+
+			assert.strictEqual(result.stdout, 'eof');
 		});
 
 		test('returns the exit code without rejecting when exitCodeOnly is set', async () => {
@@ -278,6 +292,7 @@ suite('Shell Test Suite', () => {
 					seenOptions = options;
 					return factory(cacheable, aggregate.signal);
 				},
+				delete: () => {},
 			};
 
 			const result = await git.run(
@@ -310,6 +325,75 @@ suite('Shell Test Suite', () => {
 				'queue-spliced bare abort never started a process',
 			);
 			assert.strictEqual(cacheable.invalidated, true, 'aborted result invalidated so it is never cached');
+		});
+
+		// `caching.force` has to drop the cached (or in-flight) entry BEFORE `getOrCreate` runs — otherwise a
+		// forced caller could still join a run that started before it, or return the value it deleted right
+		// before we asked for a fresh one.
+		test('caching.force deletes the cached entry before getOrCreate', async () => {
+			const git = new Git(async () => ({ path: '/nonexistent/git-binary', version: '2.40.0' }));
+
+			const calls: string[] = [];
+			const fakeCache: GitResultCache = {
+				delete: (repoPath, key) => {
+					calls.push(`delete:${repoPath}:${key}`);
+				},
+				getOrCreate: (repoPath, key, factory) => {
+					calls.push(`getOrCreate:${repoPath}:${key}`);
+					return factory(new CacheController());
+				},
+			};
+
+			await git.run({ cwd: '/repo', errors: 'ignore', caching: { cache: fakeCache, force: true } }, 'status');
+
+			assert.deepStrictEqual(calls, ['delete:/repo:git status', 'getOrCreate:/repo:git status']);
+		});
+
+		// Identical argv is not an identical command when the environment differs (`GIT_INDEX_FILE` for a
+		// temporary index, a credential helper, config injected through `GIT_CONFIG_*`).
+		test('concurrent runs with the same argv but a different per-call env are not shared', async () => {
+			const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+			const cwd = await mkdtemp(join(tmpdir(), 'gitlens-exec-test-'));
+
+			try {
+				const read = (value: string) =>
+					git.run(
+						{
+							cwd: cwd,
+							errors: 'throw',
+							env: {
+								GIT_CONFIG_COUNT: '1',
+								GIT_CONFIG_KEY_0: 'gitlens.probe',
+								GIT_CONFIG_VALUE_0: value,
+							},
+						},
+						'config',
+						'--get',
+						'gitlens.probe',
+					);
+				const [a, b] = await Promise.all([read('first'), read('second')]);
+
+				assert.strictEqual(a.stdout.trim(), 'first');
+				assert.strictEqual(b.stdout.trim(), 'second');
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		});
+
+		// The throwing form of the same queue refusal. A typed mutator catches a `GitError` as "git refused",
+		// so a cancellation that surfaced as one read as a failure of the operation itself.
+		test('a command the queue refuses for an aborted signal rejects as a CancellationError', async () => {
+			const git = new Git(async () => ({ path: '/nonexistent/git-binary', version: '2.40.0' }));
+
+			await assert.rejects(
+				git.run({ cwd: '/repo', cancellation: AbortSignal.abort() }, 'update-ref', 'refs/x', 'HEAD'),
+				(err: unknown) => err instanceof Error && err.name === 'CancellationError',
+			);
+			// Narrow on purpose: a command that failed to start with no abort in play is still a git failure.
+			await assert.rejects(
+				git.run({ cwd: '/repo' }, 'update-ref', 'refs/x', 'HEAD'),
+				(err: unknown) => err instanceof Error && err.name !== 'CancellationError',
+			);
 		});
 	});
 
@@ -383,6 +467,37 @@ suite('Shell Test Suite', () => {
 			assert.strictEqual(key, undefined, 'unclassified swallow — callers must treat it as not-an-answer');
 		});
 	});
+
+	suite('Git.run() expectedExitCodes', () => {
+		let cwd: string;
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+
+		suiteSetup(async () => {
+			cwd = await mkdtemp(join(tmpdir(), 'gitlens-exec-test-'));
+			await git.run({ cwd: cwd, errors: 'throw' }, 'init');
+			await writeFile(join(cwd, 'file.txt'), 'staged\n');
+			await git.run({ cwd: cwd, errors: 'throw' }, 'add', 'file.txt');
+			await writeFile(join(cwd, 'file.txt'), 'modified\n');
+		});
+
+		suiteTeardown(async () => {
+			await rm(cwd, { recursive: true, force: true });
+		});
+
+		test('a listed exit code resolves as an exited answer even under errors: throw', async () => {
+			const result = await git.run({ cwd: cwd, errors: 'throw', expectedExitCodes: [1] }, 'diff', '--quiet');
+
+			assert.strictEqual(result.exitCode, 1);
+			assert.strictEqual(result.completion.status, 'exited');
+		});
+
+		test('an unlisted non-zero exit still rejects as a GitError', async () => {
+			await assert.rejects(
+				git.run({ cwd: cwd, errors: 'throw' }, 'diff', '--quiet'),
+				(ex: unknown) => ex instanceof GitError,
+			);
+		});
+	});
 });
 
 suite('Git.ensureSupports', () => {
@@ -417,5 +532,293 @@ suite('Git.ensureSupports', () => {
 				return true;
 			},
 		);
+	});
+});
+
+suite('Git base environment', () => {
+	type TestableGit = {
+		getBaseEnv(): Record<string, string | undefined>;
+		buildEnv(perCallEnv: Record<string, string | undefined> | undefined): Record<string, string | undefined>;
+	};
+
+	function asTestable(git: Git): TestableGit {
+		return git as unknown as TestableGit;
+	}
+
+	// Repository-location keys a parent git process (a hook, `rebase -x`, an editor invoked as
+	// GIT_EDITOR) sets for ITSELF, and which must not leak into a command we run against a different cwd.
+	const droppedRepoLocationKeys = [
+		'GIT_DIR',
+		'GIT_WORK_TREE',
+		'GIT_INDEX_FILE',
+		'GIT_COMMON_DIR',
+		'GIT_OBJECT_DIRECTORY',
+		'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+		'GIT_NAMESPACE',
+	] as const;
+	// What git tells a child about the command it's running — not ours to inherit either.
+	const droppedGitCommandKeys = [
+		'GIT_CONFIG_PARAMETERS',
+		'GIT_EXEC_PATH',
+		'GIT_PREFIX',
+		'GIT_REFLOG_ACTION',
+	] as const;
+	// Deliberate user/tool config for every git process — must survive, unlike GIT_CONFIG_PARAMETERS.
+	const keptConfigKeys = ['GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'] as const;
+	// Dropped only when git launched the host (`GIT_EXEC_PATH` inherited).
+	const identityKeys = [
+		'GIT_AUTHOR_NAME',
+		'GIT_AUTHOR_EMAIL',
+		'GIT_AUTHOR_DATE',
+		'GIT_COMMITTER_NAME',
+		'GIT_COMMITTER_EMAIL',
+		'GIT_COMMITTER_DATE',
+	] as const;
+
+	const allTouchedKeys = [...droppedRepoLocationKeys, ...droppedGitCommandKeys, ...keptConfigKeys, ...identityKeys];
+	let originalValues: Record<string, string | undefined>;
+
+	setup(() => {
+		originalValues = {};
+		for (const key of allTouchedKeys) {
+			originalValues[key] = process.env[key];
+		}
+		for (const key of [...droppedRepoLocationKeys, ...droppedGitCommandKeys, ...identityKeys]) {
+			process.env[key] = `inherited-${key}`;
+		}
+		process.env.GIT_CONFIG_COUNT = '1';
+		process.env.GIT_CONFIG_KEY_0 = 'user.name';
+		process.env.GIT_CONFIG_VALUE_0 = 'Test';
+	});
+
+	teardown(() => {
+		for (const key of allTouchedKeys) {
+			if (originalValues[key] === undefined) {
+				Reflect.deleteProperty(process.env, key);
+			} else {
+				process.env[key] = originalValues[key];
+			}
+		}
+	});
+
+	test('drops the repository location and the launching command state inherited from process.env', () => {
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+		const env = asTestable(git).getBaseEnv();
+
+		for (const key of [...droppedRepoLocationKeys, ...droppedGitCommandKeys]) {
+			assert.strictEqual(env[key], undefined, `${key} should have been dropped`);
+		}
+
+		assert.strictEqual(env.GIT_CONFIG_COUNT, '1');
+		assert.strictEqual(env.GIT_CONFIG_KEY_0, 'user.name');
+		assert.strictEqual(env.GIT_CONFIG_VALUE_0, 'Test');
+	});
+
+	test('drops an inherited author and committer when git launched the host', () => {
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+		const env = asTestable(git).getBaseEnv();
+
+		for (const key of identityKeys) {
+			assert.strictEqual(env[key], undefined, `${key} should have been dropped`);
+		}
+	});
+
+	test('keeps a deliberately set author and committer when git did not launch the host', () => {
+		Reflect.deleteProperty(process.env, 'GIT_EXEC_PATH');
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+		const env = asTestable(git).getBaseEnv();
+
+		for (const key of identityKeys) {
+			assert.strictEqual(env[key], `inherited-${key}`, `${key} should have been kept`);
+		}
+		// The repository location is dropped either way: a host pointed at one repository can't serve the rest
+		assert.strictEqual(env.GIT_DIR, undefined);
+	});
+
+	test('static options.env can still set a dropped key', () => {
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }), {
+			env: { GIT_DIR: '/explicit/.git' },
+		});
+		const env = asTestable(git).getBaseEnv();
+
+		assert.strictEqual(env.GIT_DIR, '/explicit/.git');
+	});
+
+	test('a per-call env override can still set a dropped key', () => {
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+		const env = asTestable(git).buildEnv({ GIT_INDEX_FILE: '/tmp/index.tmp' });
+
+		assert.strictEqual(env.GIT_INDEX_FILE, '/tmp/index.tmp');
+	});
+});
+
+suite('Git.run notify', () => {
+	type Notified = { repoPaths: readonly string[]; changes: readonly string[] };
+
+	function newGitWithBinder(): { git: Git; notified: Notified[] } {
+		// A nonexistent binary makes every run fail fast (ENOENT) without ever spawning a real process —
+		// `notify` is applied once the run SETTLES regardless of outcome, so a failure exercises it exactly
+		// like a success would, and much faster than a real git invocation.
+		const git = new Git(async () => ({ path: '/nonexistent/git-binary', version: '2.40.0' }));
+		const notified: Notified[] = [];
+		git.bindChangeNotifier((repoPaths, changes) => notified.push({ repoPaths: repoPaths, changes: changes }));
+		return { git: git, notified: notified };
+	}
+
+	test("notify: 'infer' on a write calls the binder once with cwd and the verb's changes", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, 'commit', '-m', 'msg');
+
+		assert.deepStrictEqual(notified, [{ repoPaths: ['/repo'], changes: ['head', 'heads', 'index', 'pausedOp'] }]);
+	});
+
+	test("notify: 'infer' on a read-only command never calls the binder", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, 'status');
+
+		assert.deepStrictEqual(notified, []);
+	});
+
+	test("notify: 'infer' on a -C shared-state write announces the -C target and cwd in one call", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, '-C', '/other', 'branch', '-d', 'x');
+
+		assert.deepStrictEqual(notified, [
+			{ repoPaths: [normalizePath(resolve('/repo', '/other')), '/repo'], changes: ['heads', 'remotes', 'tags'] },
+		]);
+	});
+
+	test("notify: 'infer' on a -C branch-moving write announces the -C target, and only the branch move to cwd", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, '-C', '/other', 'commit', '-m', 'msg');
+
+		assert.deepStrictEqual(notified, [
+			{ repoPaths: [normalizePath(resolve('/repo', '/other'))], changes: ['head', 'heads', 'index', 'pausedOp'] },
+			{ repoPaths: ['/repo'], changes: ['heads'] },
+		]);
+	});
+
+	test("notify: 'infer' on a -C pull announces its worktree-local changes only to the -C target", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, '-C', '/other', 'pull');
+
+		assert.strictEqual(notified.length, 2);
+		assert.deepStrictEqual(notified[0].repoPaths, [normalizePath(resolve('/repo', '/other'))]);
+		assert.deepStrictEqual(notified[1], { repoPaths: ['/repo'], changes: ['heads', 'remotes', 'tags'] });
+	});
+
+	test("notify: 'infer' on a -C stash push announces only the stash to cwd", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, '-C', '/other', 'stash', 'push');
+
+		assert.deepStrictEqual(notified, [
+			{ repoPaths: [normalizePath(resolve('/repo', '/other'))], changes: ['stash', 'index'] },
+			{ repoPaths: ['/repo'], changes: ['stash'] },
+		]);
+	});
+
+	test("notify: 'infer' on a -C write it can't classify resets cwd too, since what it shares is unknown", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, '-C', '/other', 'reflog', 'expire', '--all');
+
+		assert.deepStrictEqual(notified, [
+			{ repoPaths: [normalizePath(resolve('/repo', '/other')), '/repo'], changes: [] },
+		]);
+	});
+
+	test("notify: 'infer' on a -C write that moves no branch announces only the -C target", async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, '-C', '/other', 'add', 'file.ts');
+
+		assert.deepStrictEqual(notified, [
+			{ repoPaths: [normalizePath(resolve('/repo', '/other'))], changes: ['index'] },
+		]);
+	});
+
+	test('an explicit notify array is announced exactly, regardless of the argv', async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore', notify: ['stash'] }, 'status');
+
+		assert.deepStrictEqual(notified, [{ repoPaths: ['/repo'], changes: ['stash'] }]);
+	});
+
+	test('a FAILED run is still notified', async () => {
+		const { git, notified } = newGitWithBinder();
+
+		const result = await git.run({ cwd: '/repo', errors: 'ignore', notify: 'infer' }, 'commit', '-m', 'msg');
+
+		assert.strictEqual(result.completion.status, 'failed');
+		assert.deepStrictEqual(notified, [{ repoPaths: ['/repo'], changes: ['head', 'heads', 'index', 'pausedOp'] }]);
+	});
+
+	test('an unset notify never calls the binder', async () => {
+		const { git, notified } = newGitWithBinder();
+
+		await git.run({ cwd: '/repo', errors: 'ignore' }, 'commit', '-m', 'msg');
+
+		assert.deepStrictEqual(notified, []);
+	});
+});
+
+suite('Git.clearPendingCommands', () => {
+	type PendingCommand = { cwd: string | undefined; promise: Promise<unknown> };
+
+	/** Seeds one in-flight run per cwd, keyed the way `runCore` keys them, and returns the map. */
+	function seedPending(git: Git, cwds: (string | undefined)[]): Map<string, PendingCommand> {
+		const pending = (git as unknown as { pendingCommands: Map<string, PendingCommand> }).pendingCommands;
+		for (const cwd of cwds) {
+			pending.set(`[${cwd}] git status`, { cwd: cwd, promise: new Promise(() => {}) });
+		}
+		return pending;
+	}
+
+	function newGit(): Git {
+		return new Git(async () => ({ path: '/nonexistent/git-binary', version: '2.40.0' }));
+	}
+
+	test("with no paths it drops every repository's pending runs", () => {
+		const git = newGit();
+		const pending = seedPending(git, ['/repo-a', '/repo-b', undefined]);
+
+		git.clearPendingCommands();
+
+		assert.strictEqual(pending.size, 0);
+	});
+
+	test('with paths it drops only runs in, or inside, one of them', () => {
+		const git = newGit();
+		const pending = seedPending(git, ['/repo-a', '/repo-a/sub', '/repo-a-wt', '/repo-ab', '/repo-b', undefined]);
+
+		git.clearPendingCommands(['/repo-a', '/repo-a-wt']);
+
+		assert.deepStrictEqual(
+			Array.from(pending.values(), p => p.cwd),
+			['/repo-ab', '/repo-b', undefined],
+			'a run in another repository — even one whose path merely starts the same — keeps being shared',
+		);
+	});
+});
+
+suite('Git.stream stdin', () => {
+	test('rejects, rather than crashing on EPIPE, when git exits before reading its input', async () => {
+		const git = new Git(async () => ({ path: 'git', version: '2.40.0' }));
+		// Far past any OS pipe buffer, so the write is still in flight when git refuses the option and exits
+		const stdin = Buffer.alloc(8 * 1024 * 1024, 'x');
+
+		await assert.rejects(async () => {
+			const out: string[] = [];
+			for await (const chunk of git.stream({ cwd: tmpdir(), stdin: stdin }, 'patch-id', '--no-such-option')) {
+				out.push(chunk);
+			}
+		});
 	});
 });
