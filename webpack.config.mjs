@@ -89,7 +89,7 @@ function getUtilsEnvAliases(target) {
 		'#env/platform.js': path.resolve(base, 'platform.ts'),
 	};
 }
-/** @typedef {{ analyzeBundle?: boolean; analyzeDeps?: boolean; quick?: boolean; stats?: boolean; trace?: boolean; webviews?: string }} GlEnv */
+/** @typedef {{ analyzeBundle?: boolean; analyzeDeps?: boolean; lowMemory?: boolean; quick?: boolean; stats?: boolean; trace?: boolean; webviews?: string }} GlEnv */
 /** @typedef {{ [key: string]: { entry: string; plus?: boolean; alias?: { [key: string]: string } } }} GlWebviews */
 
 /**
@@ -103,6 +103,7 @@ export default function (env, argv) {
 	env = {
 		analyzeBundle: false,
 		analyzeDeps: false,
+		lowMemory: false,
 		quick: false,
 		stats: false,
 		trace: false,
@@ -130,6 +131,9 @@ export default function (env, argv) {
 	const buildComplete = new BuildCompletePlugin();
 	for (const config of configs) {
 		(config.plugins ??= []).push(buildComplete);
+		if (env.lowMemory) {
+			config.parallelism = 1;
+		}
 	}
 
 	return configs;
@@ -342,7 +346,7 @@ function getExtensionConfig(target, mode, env) {
 				new TerserPlugin({
 					minify: TerserPlugin.swcMinify,
 					extractComments: false,
-					parallel: true,
+					parallel: !env.lowMemory,
 					terserOptions: {
 						compress: {
 							drop_debugger: true,
@@ -544,7 +548,13 @@ function getWebviewsCommonConfig(mode, env) {
 
 	if (!env.quick && mode !== 'production') {
 		// Only need to add the plugin for dev mode, as prod is handled by the minimization
-		plugins.push(new ImageMinimizerPlugin({ deleteOriginalAssets: true, generator: [imageGeneratorConfig] }));
+		plugins.push(
+			new ImageMinimizerPlugin({
+				deleteOriginalAssets: true,
+				generator: [imageGeneratorConfig],
+				concurrency: env.lowMemory ? 1 : undefined,
+			}),
+		);
 	}
 
 	return {
@@ -563,7 +573,13 @@ function getWebviewsCommonConfig(mode, env) {
 		optimization: {
 			minimizer:
 				mode === 'production'
-					? [new ImageMinimizerPlugin({ deleteOriginalAssets: true, generator: [imageGeneratorConfig] })]
+					? [
+							new ImageMinimizerPlugin({
+								deleteOriginalAssets: true,
+								generator: [imageGeneratorConfig],
+								concurrency: env.lowMemory ? 1 : undefined,
+							}),
+						]
 					: [],
 		},
 		plugins: plugins,
@@ -625,7 +641,13 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 
 	if (!env.quick && mode !== 'production') {
 		// Only need to add the plugin for dev mode, as prod is handled by the minimization
-		plugins.push(new ImageMinimizerPlugin({ deleteOriginalAssets: true, generator: [imageGeneratorConfig] }));
+		plugins.push(
+			new ImageMinimizerPlugin({
+				deleteOriginalAssets: true,
+				generator: [imageGeneratorConfig],
+				concurrency: env.lowMemory ? 1 : undefined,
+			}),
+		);
 	}
 
 	if (env.analyzeBundle) {
@@ -681,7 +703,7 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 							new TerserPlugin({
 								minify: TerserPlugin.swcMinify,
 								extractComments: false,
-								parallel: true,
+								parallel: !env.lowMemory,
 								terserOptions: {
 									compress: {
 										drop_debugger: true,
@@ -701,8 +723,13 @@ function getWebviewConfig(webviews, overrides, mode, env) {
 									},
 								},
 							}),
-							new ImageMinimizerPlugin({ deleteOriginalAssets: true, generator: [imageGeneratorConfig] }),
+							new ImageMinimizerPlugin({
+								deleteOriginalAssets: true,
+								generator: [imageGeneratorConfig],
+								concurrency: env.lowMemory ? 1 : undefined,
+							}),
 							new CssMinimizerPlugin({
+								parallel: !env.lowMemory,
 								// Shared with the css-template minifier loader so inline CSS and `*.css` minify alike
 								minimizerOptions: { preset: [cssnanoPresetPath, cssnanoPresetOptions] },
 							}),
