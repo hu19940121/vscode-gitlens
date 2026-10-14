@@ -95,6 +95,7 @@ import type { Container } from '../../../container.js';
 import { getPresentableErrorMessage } from '../../../errors.js';
 import { FeatureFlagKey, setFeatureFlagTelemetryGlobalAttributes } from '../../../featureFlags/featureFlagService.js';
 import type { FeaturePreview } from '../../../features.js';
+import { getFeaturePreviewStatus } from '../../../features.js';
 import { openCommitChanges, openCommitChangesWithWorking, undoCommit } from '../../../git/actions/commit.js';
 import { onDidChangeContinuingPausedOperation } from '../../../git/actions/pausedOperation.js';
 import * as RepoActions from '../../../git/actions/repository.js';
