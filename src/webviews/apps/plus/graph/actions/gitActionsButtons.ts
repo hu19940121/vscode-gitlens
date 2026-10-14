@@ -196,14 +196,18 @@ export class GitActionsButtons extends SignalWatcher(LitElement) {
 						></gl-publish-button>`
 					: nothing
 			}
-			<gl-fetch-button
-				.branchState=${this.branchState}
-				.fetchedText=${this.fetchedText}
-				.fetchedTextShort=${this.fetchedTextShort}
-				.state=${this.state}
-				.autoFetchMode=${this.state.config?.autoFetchMode ?? 'off'}
-				.autoFetchIntervalSeconds=${this.state.config?.autoFetchIntervalSeconds ?? 180}
-			></gl-fetch-button>
+			${
+				this.branchState?.hasRemotes === false
+					? nothing
+					: html`<gl-fetch-button
+							.branchState=${this.branchState}
+							.fetchedText=${this.fetchedText}
+							.fetchedTextShort=${this.fetchedTextShort}
+							.state=${this.state}
+							.autoFetchMode=${this.state.config?.autoFetchMode ?? 'off'}
+							.autoFetchIntervalSeconds=${this.state.config?.autoFetchIntervalSeconds ?? 180}
+						></gl-fetch-button>`
+			}
 			<gl-tooltip placement="bottom">
 				<a class="action-button wip-button" @click=${this.onJumpToWip}>
 					<code-icon class="action-button__icon" icon="gl-wip"></code-icon>
@@ -1545,6 +1549,30 @@ export class GlPublishButton extends LitElement {
 	override render() {
 		// Only when the current branch has no upstream (unpublished)
 		if (this.branchState == null || this.branchState.upstream != null) return nothing;
+
+		if (this.branchState.hasRemotes === false) {
+			return html`
+				<gl-tooltip placement="bottom">
+					<a
+						href=${this._webview.createCommandLink('gitlens.publishRepository:')}
+						class="action-button"
+						aria-label=${l10n.t('Publish Repository')}
+					>
+						<code-icon class="action-button__icon" icon="cloud-upload"></code-icon>
+						<span class="publish-button__text">${l10n.t('Publish Repository')}</span>
+					</a>
+					<span slot="content">
+						${
+							this.branchName
+								? localizedContent(l10n.t('Create a remote repository and publish {branch} to it'), {
+										branch: html`<strong>${this.branchName}</strong>`,
+									})
+								: l10n.t('Create a remote repository and publish this branch to it')
+						}
+					</span>
+				</gl-tooltip>
+			`;
+		}
 
 		return html`
 			<gl-tooltip placement="bottom">

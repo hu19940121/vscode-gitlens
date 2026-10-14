@@ -8,7 +8,9 @@
  *
  * Also covers the two cases that used to go wrong (#5967): a file renamed and modified on the checked-out branch
  * opens the working file at its first change, and a file that isn't in the working tree at all opens at the
- * compared revision instead of only warning.
+ * compared revision instead of only warning. A renamed file that isn't in the working tree under either name
+ * opens at the compared revision by its name there (#5975), rather than a picker for the other side's name —
+ * and so does a comparison row's inline "Open File at Revision", which shares the row's uri.
  */
 import * as process from 'node:process';
 import type { VSCodeInstance } from '../baseTest.js';
@@ -40,6 +42,11 @@ const test = base.extend({
 				// `only-other.txt` exists only on `other`, so it is never in the working tree
 				await git.checkout('other', true);
 				await git.commit('Add only-other', 'only-other.txt', lines(5));
+				// `renamed` carries it on under a new name, so comparing the two shows a rename whose names are both
+				// absent from the working tree
+				await git.checkout('renamed', true);
+				await git.move('only-other.txt', 'only-other-renamed.txt');
+				await git.commit('Rename only-other and change line 3', 'only-other-renamed.txt', lines(5, 3));
 				await git.checkout('main');
 
 				// The working tree stays on `feature`, so the working files carry the changes being opened
@@ -80,12 +87,18 @@ async function showComparison(vscode: VSCodeInstance, ref1: string, ref2: string
 	}
 }
 
-function treeItem(vscode: VSCodeInstance, name: RegExp) {
-	return vscode.gitlens.searchCompareViewTreeView.getByRole('treeitem', { name: name }).first();
+/** A row by accessible name, or — with `level` — by depth and visible text, to tell the files node under Ahead/Behind from the comparison's own */
+function treeItem(vscode: VSCodeInstance, name: RegExp, level?: number) {
+	const tree = vscode.gitlens.searchCompareViewTreeView;
+	return (
+		level == null
+			? tree.getByRole('treeitem', { name: name })
+			: tree.locator(`[role="treeitem"][aria-level="${level}"]`).filter({ hasText: name })
+	).first();
 }
 
-async function expandItem(vscode: VSCodeInstance, name: RegExp): Promise<void> {
-	const item = treeItem(vscode, name);
+async function expandItem(vscode: VSCodeInstance, name: RegExp, level?: number): Promise<void> {
+	const item = treeItem(vscode, name, level);
 	await expect(item).toBeVisible({ timeout: MaxTimeout });
 	if ((await item.getAttribute('aria-expanded')) !== 'true') {
 		await item.click();
@@ -94,9 +107,9 @@ async function expandItem(vscode: VSCodeInstance, name: RegExp): Promise<void> {
 	}
 }
 
-async function clickFile(vscode: VSCodeInstance, name: RegExp): Promise<void> {
+async function clickFile(vscode: VSCodeInstance, name: RegExp, level?: number): Promise<void> {
 	await vscode.gitlens.closeAllEditors();
-	const item = treeItem(vscode, name);
+	const item = treeItem(vscode, name, level);
 	await expect(item).toBeVisible({ timeout: MaxTimeout });
 	await item.click();
 }
@@ -115,7 +128,7 @@ test.describe('Search & Compare — open file on click', () => {
 
 		await expect
 			.poll(() => vscode.gitlens.getActiveEditorState(), { timeout: MaxTimeout })
-			.toEqual({ kind: 'diff', file: 'file1.txt' });
+			.toEqual({ kind: 'diff', file: 'file1.txt', original: 'file1.txt' });
 	});
 
 	test('with the setting off, the same row opens the working file at its first change without a refresh', async ({
@@ -198,4 +211,87 @@ test.describe('Search & Compare — open file on click', () => {
 			.poll(() => vscode.gitlens.getActiveEditorState(), { timeout: MaxTimeout })
 			.toEqual({ kind: 'text', file: 'only-other.txt', line: 0 });
 	});
+
+	// Neither name is in the working tree, so the click opens the compared revision — under the name the file has
+	// there, which is the side the diff runs to
+	for (const [ref1, ref2, file] of [
+		['other', 'renamed', 'only-other.txt'],
+		['renamed', 'other', 'only-other-renamed.txt'],
+	]) {
+		test(`with the setting off, a renamed file missing from the working tree compared ${ref1} with ${ref2} opens at the compared revision`, async ({
+			vscode,
+		}) => {
+			await vscode.gitlens.executeCommand('gitlens.views.searchAndCompare.clear');
+			await showComparison(vscode, ref1, ref2);
+			await expandItem(vscode, /^1 file changed/);
+			await clickFile(vscode, /^only-other(-renamed)?\.txt/);
+
+			await expect
+				.poll(() => vscode.gitlens.getActiveEditorState(), { timeout: MaxTimeout })
+				.toEqual({ kind: 'text', file: file, line: 2 });
+		});
+	}
+
+	test("with the setting off, a renamed file missing from the working tree in a commit's file list opens at that commit", async ({
+		vscode,
+	}) => {
+		// The comparison of `renamed` with `other` from the previous test stays up; the rename commit is its one behind
+		await expandItem(vscode, /^(Ahead|Behind) 1 commit/);
+		await expandItem(vscode, /Rename only-other and change line 3/);
+		await clickFile(vscode, /^only-other-renamed\.txt/);
+
+		await expect
+			.poll(() => vscode.gitlens.getActiveEditorState(), { timeout: MaxTimeout })
+			.toEqual({ kind: 'text', file: 'only-other-renamed.txt', line: 2 });
+	});
+
+	// The row names the file by the side the diff runs to, and its inline action must open that side — the other side
+	// has the file under its old name. Hover rather than click: a click is the open-on-click flow under test above
+	for (const [ref1, ref2, file] of [
+		['other', 'renamed', 'only-other.txt'],
+		['renamed', 'other', 'only-other-renamed.txt'],
+	]) {
+		test(`Open File at Revision on a renamed file compared ${ref1} with ${ref2} opens the revision that has it`, async ({
+			vscode,
+		}) => {
+			await vscode.gitlens.executeCommand('gitlens.views.searchAndCompare.clear');
+			await showComparison(vscode, ref1, ref2);
+			await expandItem(vscode, /^1 file changed/);
+			await vscode.gitlens.closeAllEditors();
+
+			const row = treeItem(vscode, /^only-other(-renamed)?\.txt/);
+			await expect(row).toBeVisible({ timeout: MaxTimeout });
+			await row.hover();
+			await row.getByRole('button', { name: /^Open File at Revision/ }).click();
+
+			await expect
+				.poll(() => vscode.gitlens.getActiveEditorState(), { timeout: MaxTimeout })
+				.toEqual({ kind: 'text', file: file, line: 0 });
+		});
+	}
+
+	// Back on the default: a rename row under the Ahead or Behind files node opens the rename diff, old name on the
+	// left, whichever way that node's diff runs
+	for (const [ref1, ref2, direction] of [
+		['feature', 'main', 'Ahead'],
+		['main', 'feature', 'Behind'],
+	]) {
+		test(`by default a renamed file under the ${direction} files node opens its rename diff`, async ({
+			vscode,
+		}) => {
+			// Explicitly `true`: an `undefined` doesn't survive the evaluator's serialized boundary, so it wouldn't reset.
+			// The view picks the change up asynchronously; rows built before that still open the working file
+			await vscode.gitlens.updateSetting(openDiffOnClick, true);
+			await vscode.page.waitForTimeout(DefaultTimeout);
+			await vscode.gitlens.executeCommand('gitlens.views.searchAndCompare.clear');
+			await showComparison(vscode, ref1, ref2);
+			await expandItem(vscode, new RegExp(`^${direction} 3 commits`));
+			await expandItem(vscode, /files changed/, 3);
+			await clickFile(vscode, /^file3-renamed\.txt/, 4);
+
+			await expect
+				.poll(() => vscode.gitlens.getActiveEditorState(), { timeout: MaxTimeout })
+				.toEqual({ kind: 'diff', file: 'file3-renamed.txt', original: 'file3.txt' });
+		});
+	}
 });

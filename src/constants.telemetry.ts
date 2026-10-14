@@ -479,6 +479,11 @@ export interface TelemetryEvents extends WebviewShowAbortedEvents, WebviewShownE
 	/** Sent when the Graph leaves Visualizations display mode (close button, sidebar rail, external search request, etc.) */
 	'graph/visualizations/closed': GraphVisualizationsClosedEvent;
 
+	/** Sent when the signed-out private-repo preview banner strip is shown (once per Graph instance) */
+	'graph/previewBanner/shown': GraphPreviewBannerEvent;
+	/** Sent when the user clicks Sign In on the preview banner strip */
+	'graph/previewBanner/signIn': GraphPreviewBannerEvent;
+
 	/** Sent when the Git Health banner strip is shown in the Commit Graph */
 	'graph/gitHealth/banner/shown': GraphGitHealthBannerEvent;
 	/** Sent when the user dismisses the Git Health banner strip */
@@ -2031,6 +2036,8 @@ export type GraphWipAction =
 	| 'pull'
 	| 'fetch'
 	| 'publishBranch'
+	| 'publishRepository'
+	| 'addRemote'
 	| 'switchBranch'
 	| 'createBranch'
 	| 'createPullRequest'
@@ -2194,6 +2201,7 @@ export type GraphSidebarOverviewActionName =
 	| 'push'
 	| 'fetch'
 	| 'publishBranch'
+	| 'publishRepository'
 	| 'switch'
 	| 'openWorktree'
 	| 'compareWithHead'
@@ -2635,6 +2643,11 @@ interface GraphGitHealthBannerEvent extends GraphContextEventData {
 	reason: 'slowness' | 'large';
 	/** Count of suggested optimizations advertised */
 	'findings.suggested': number;
+}
+
+interface GraphPreviewBannerEvent extends GraphContextEventData {
+	/** Whole days remaining in the preview window (ceiling; 0 = under a day) */
+	daysLeft: number;
 }
 
 interface GraphVisualizationsClosedEvent extends GraphContextEventData {

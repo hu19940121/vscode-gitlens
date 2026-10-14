@@ -32,7 +32,15 @@ export class ResultsFileNode extends ViewRefFileNode<'results-file', View, State
 		public readonly ref2: string,
 		private readonly direction: 'ahead' | 'behind' | undefined,
 	) {
-		super('results-file', GitUri.fromFile(file, repoPath, ref1 || ref2), view, parent, file);
+		// The diff runs from `ref1` to `ref2`, so `file.path` is the name on the `ref2` side (or on `ref1` for a deletion);
+		// pair the uri with that ref, otherwise a renamed or added file points at a revision that doesn't have it
+		super(
+			'results-file',
+			GitUri.fromFile(file, repoPath, file.status === 'D' ? ref1 : ref2 || ref1),
+			view,
+			parent,
+			file,
+		);
 
 		this.updateContext({ file: file });
 		if (this.context.storedComparisonId != null) {
@@ -127,16 +135,10 @@ export class ResultsFileNode extends ViewRefFileNode<'results-file', View, State
 		let lhsUri;
 		let rhsUri;
 		if (this.file.status === 'R' || this.file.status === 'C') {
-			if (this.direction === 'behind') {
-				lhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, true);
-				rhsUri = this.uri;
-			} else if (this.direction == null) {
-				lhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref1, true);
-				rhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, false);
-			} else {
-				lhsUri = this.uri;
-				rhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, true);
-			}
+			// `originalPath` is the name on the `ref1` side and `path` (this node's uri) the name on the `ref2` side,
+			// whichever direction the files node runs
+			lhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref1, true);
+			rhsUri = this.uri;
 		} else {
 			lhsUri = this.uri;
 			rhsUri = this.uri;

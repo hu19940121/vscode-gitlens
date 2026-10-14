@@ -35,7 +35,7 @@ import type { RecomposeFromCommitCommandArgs } from '../commands/recomposeFromCo
 import type { RunTaskOnWorktreeCommandArgs } from '../commands/runTaskOnWorktree.js';
 import type { StartAgentSessionCommandArgs } from '../commands/startAgentSession.js';
 import type { ViewShowBranchComparison } from '../config.js';
-import type { GlCommands } from '../constants.commands.js';
+import type { GlCommands, GlCommandsDeprecated } from '../constants.commands.js';
 import { GlyphChars } from '../constants.js';
 import type { Container } from '../container.js';
 import { browseAtRevision, executeGitCommand } from '../git/actions.js';
@@ -127,7 +127,7 @@ import type { WorktreeNode } from './nodes/worktreeNode.js';
 import type { WorktreesNode } from './nodes/worktreesNode.js';
 
 const { command, getCommands } = createCommandDecorator<
-	GlCommands,
+	GlCommands | GlCommandsDeprecated,
 	(...args: any[]) => unknown,
 	{
 		multiselect?: boolean | 'sequential';
@@ -942,6 +942,7 @@ export class ViewCommands implements Disposable {
 	}
 
 	@command('gitlens.views.publishRepository')
+	@command('gitlens.publishRepository:views')
 	@debug()
 	private publishRepository(node: BranchNode | BranchTrackingStatusNode) {
 		if (node.isAny('branch', 'tracking-status')) {
@@ -1817,8 +1818,7 @@ export class ViewCommands implements Disposable {
 			uri = GitUri.fromFile(node.file, node.commit.repoPath, node.commit.sha);
 			ref2 = node.commit.sha;
 		} else {
-			// Same uri the node's own working-file command uses, so the open command can follow renames
-			uri = GitUri.fromFile(node.file, node.uri.repoPath!, node.ref2 || node.ref1);
+			uri = node.uri;
 			ref1 = node.ref1 || undefined;
 			// An empty ref2 means the working tree
 			ref2 = node.ref2 || undefined;
@@ -1881,10 +1881,10 @@ export class ViewCommands implements Disposable {
 			return;
 		}
 
-		const revisionUri = this.container.git
-			.getRepositoryService(uri.repoPath!)
-			.getRevisionUri(node.file.status === 'D' ? node.ref1 : node.ref2 || node.ref1, node.file);
-		await CommitActions.openFileAtRevision(revisionUri, { ...showOptions, line: line });
+		await CommitActions.openFileAtRevision(this.container.git.getRevisionUriFromGitUri(node.uri), {
+			...showOptions,
+			line: line,
+		});
 	}
 
 	@command('gitlens.openFileHistoryInGraph:views')
@@ -2142,7 +2142,7 @@ export class ViewCommands implements Disposable {
 }
 
 export function registerViewCommand(
-	command: GlCommands,
+	command: GlCommands | GlCommandsDeprecated,
 	callback: (...args: any[]) => unknown,
 	thisArg?: any,
 	options?: {

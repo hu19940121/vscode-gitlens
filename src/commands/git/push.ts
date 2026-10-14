@@ -1,4 +1,4 @@
-import { l10n, ThemeIcon } from 'vscode';
+import { l10n, ThemeIcon, Uri } from 'vscode';
 import { undefinedOnGitWarning } from '@gitlens/git/errors.js';
 import type { GitBranch } from '@gitlens/git/models/branch.js';
 import type { GitBranchReference, GitReference } from '@gitlens/git/models/reference.js';
@@ -16,6 +16,7 @@ import { createQuickPickSeparator } from '../../quickpicks/items/common.js';
 import { createDirectiveQuickPickItem, Directive } from '../../quickpicks/items/directive.js';
 import type { FlagsQuickPickItem } from '../../quickpicks/items/flags.js';
 import { createFlagsQuickPickItem } from '../../quickpicks/items/flags.js';
+import { executeCoreGitCommand } from '../../system/-webview/command.js';
 import { configuration } from '../../system/-webview/configuration.js';
 import { supportedInVSCodeVersion } from '../../system/-webview/vscode.js';
 import type { ViewsWithRepositoryFolders } from '../../views/viewBase.js';
@@ -37,6 +38,7 @@ import {
 	pickRepositoryStep,
 } from '../quick-wizard/steps/repositories.js';
 import { StepsController } from '../quick-wizard/stepsController.js';
+import { getSteps } from '../quick-wizard/utils/quickWizard.utils.js';
 import {
 	appendReposToTitle,
 	assertStepState,
@@ -47,6 +49,7 @@ import {
 const Steps = {
 	PickRepos: 'push-pick-repos',
 	Confirm: 'push-confirm',
+	AddRemote: 'push-add-remote',
 } as const;
 type StepNames = (typeof Steps)[keyof typeof Steps];
 
@@ -503,7 +506,15 @@ export class PushGitCommand extends QuickCommand<State> {
 		this.initialState = { confirm: args?.confirm, ...args?.state };
 	}
 
-	private execute(state: StepState<State<GlRepository[]>>) {
+	private async execute(state: StepState<State<GlRepository[]>>) {
+		if (state.flags.includes('--publish-repository')) {
+			for (const repo of state.repos) {
+				await executeCoreGitCommand('git.publish', Uri.file(repo.path));
+			}
+
+			return;
+		}
+
 		const index = state.flags.indexOf('--set-upstream');
 		if (index !== -1) {
 			return this.container.git.pushAll(state.repos, {
@@ -611,6 +622,30 @@ export class PushGitCommand extends QuickCommand<State> {
 				state.flags = result;
 			}
 
+			if (state.flags.includes('--add-remote')) {
+				using addStep = steps.enterStep(Steps.AddRemote);
+
+				const addResult = yield* getSteps(
+					this.container,
+					{ command: 'remote', state: { subcommand: 'add', repo: state.repos[0], reveal: false } },
+					context,
+					this.startedFrom,
+				);
+				if (addResult === StepResultBreak) {
+					state.flags = state.flags.filter(f => f !== '--add-remote');
+					if (addStep.goBack() == null) break;
+					continue;
+				}
+
+				// The add wizard marks the shared navigation complete, but the remote is only the means to
+				// publish — clear that so the confirm re-runs and offers publishing to the new remote
+				steps.clearStepsComplete();
+				// Back from that confirm must not re-open the add wizard for a remote that now exists
+				addStep.skip();
+				state.flags = [];
+				continue;
+			}
+
 			steps.markStepsComplete();
 			void this.execute(state);
 		}
@@ -690,12 +725,24 @@ export class PushGitCommand extends QuickCommand<State> {
 						} else {
 							step = this.createConfirmStep(
 								appendReposToTitle(l10n.t('Publish'), state, context),
-								[],
+								[
+									createFlagsQuickPickItem<Flags>(state.flags, ['--publish-repository'], {
+										label: l10n.t('Publish Repository…'),
+										detail: l10n.t(
+											'Will create a new remote repository and publish {0} to it',
+											getReferenceLabel(branch),
+										),
+										picked: true,
+									}),
+									createFlagsQuickPickItem<Flags>(state.flags, ['--add-remote'], {
+										label: l10n.t('Add Remote…'),
+										detail: l10n.t(
+											'Will add a remote, then publish {0} to it',
+											getReferenceLabel(branch),
+										),
+									}),
+								],
 								l10n.t('Cannot publish; No remotes found'),
-								createDirectiveQuickPickItem(Directive.Cancel, true, {
-									label: l10n.t('OK'),
-									detail: l10n.t('No remotes found'),
-								}),
 							);
 						}
 					} else if (branch?.upstream?.state.behind) {
@@ -786,7 +833,10 @@ export class PushGitCommand extends QuickCommand<State> {
 					repoPath: repo.path,
 				};
 
-				if (status?.upstream?.state.ahead === 0) {
+				if (
+					status != null &&
+					(status.upstream == null || status.upstream.missing || status.upstream.state.ahead === 0)
+				) {
 					if (!isBranchReference(state.reference) && (status.upstream == null || status.upstream.missing)) {
 						const referenceName =
 							state.reference != null ? getReferenceLabel(state.reference, { label: false }) : undefined;
@@ -812,12 +862,24 @@ export class PushGitCommand extends QuickCommand<State> {
 					} else if (status.upstream == null || status.upstream.missing) {
 						step = this.createConfirmStep(
 							appendReposToTitle(l10n.t('Publish'), state, context),
-							[],
+							[
+								createFlagsQuickPickItem<Flags>(state.flags, ['--publish-repository'], {
+									label: l10n.t('Publish Repository…'),
+									detail: l10n.t(
+										'Will create a new remote repository and publish {0} to it',
+										getReferenceLabel(branch),
+									),
+									picked: true,
+								}),
+								createFlagsQuickPickItem<Flags>(state.flags, ['--add-remote'], {
+									label: l10n.t('Add Remote…'),
+									detail: l10n.t(
+										'Will add a remote, then publish {0} to it',
+										getReferenceLabel(branch),
+									),
+								}),
+							],
 							l10n.t('Cannot publish; No remotes found'),
-							createDirectiveQuickPickItem(Directive.Cancel, true, {
-								label: l10n.t('OK'),
-								detail: l10n.t('No remotes found'),
-							}),
 						);
 					} else {
 						step = this.createConfirmStep(

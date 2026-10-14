@@ -42,6 +42,7 @@ import type { Container } from '../../../container.js';
 import { getPresentableErrorMessage, ProviderNotSupportedError } from '../../../errors.js';
 import type { FeatureAccess, PlusFeatures } from '../../../features.js';
 import * as BranchActions from '../../../git/actions/branch.js';
+import * as RemoteActions from '../../../git/actions/remote.js';
 import * as RepoActions from '../../../git/actions/repository.js';
 import * as StashActions from '../../../git/actions/stash.js';
 import { GitUri } from '../../../git/gitUri.js';
@@ -58,7 +59,7 @@ import {
 import { countConflictMarkers } from '../../../git/utils/-webview/mergeConflicts.utils.js';
 import { getReferenceFromBranch } from '../../../git/utils/-webview/reference.utils.js';
 import { getReachableWorktrees } from '../../../git/utils/-webview/worktree.utils.js';
-import { executeCommand, executeCoreCommand } from '../../../system/-webview/command.js';
+import { executeCommand, executeCoreCommand, executeCoreGitCommand } from '../../../system/-webview/command.js';
 import { serialize } from '../../../system/serialize.js';
 import type { EventRegistration, EventVisibilityBuffer, SubscriptionTracker } from '../eventVisibilityBuffer.js';
 import { bufferEventHandler, toEventNotifier, trackRpcRegistration } from '../eventVisibilityBuffer.js';
@@ -1451,6 +1452,18 @@ export class RepositoryService {
 
 		const repo = this.container.git.getRepository(repoPath);
 		await RepoActions.push(repo ?? repoPath, undefined, getReferenceFromBranch(branch));
+	}
+
+	/**
+	 * Publish a repo with no remotes (VS Code's `git.publish` creates the hosted repo, adds `origin`, and pushes).
+	 */
+	async publishRepository(repoPath: string): Promise<void> {
+		await executeCoreGitCommand('git.publish', Uri.file(repoPath));
+	}
+
+	/** Runs the Add Remote wizard for the repo (the manual route when `git.publish` can't help, e.g. non-GitHub hosts). */
+	async addRemote(repoPath: string): Promise<void> {
+		await RemoteActions.add(repoPath);
 	}
 
 	/**

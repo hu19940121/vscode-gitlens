@@ -2524,7 +2524,7 @@ or
   'context.webview.type': string,
   // Where on the card the action was invoked
   'location': 'hover' | 'inline',
-  'name': 'compareWithHead' | 'compareWithPr' | 'compareWithWorking' | 'fetch' | 'openChanges' | 'openPrChanges' | 'openWorktree' | 'other' | 'publishBranch' | 'pull' | 'push' | 'switch',
+  'name': 'compareWithHead' | 'compareWithPr' | 'compareWithWorking' | 'fetch' | 'openChanges' | 'openPrChanges' | 'openWorktree' | 'other' | 'publishBranch' | 'publishRepository' | 'pull' | 'push' | 'switch',
   // Which surface the hover was anchored on (always `overview` for `location: 'inline'`)
   'surface': 'overview' | 'wip-bar'
 }
@@ -2653,6 +2653,46 @@ or
   'context.webview.type': string,
   // Active Recent timeframe threshold at the time of show
   'recentThreshold': 'OneDay' | 'OneMonth' | 'OneWeek'
+}
+```
+
+### graph/previewBanner/shown
+
+> Sent when the signed-out private-repo preview banner strip is shown (once per Graph instance)
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'editor' | 'panel' | 'view',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whole days remaining in the preview window (ceiling; 0 = under a day)
+  'daysLeft': number
+}
+```
+
+### graph/previewBanner/signIn
+
+> Sent when the user clicks Sign In on the preview banner strip
+
+```typescript
+{
+  'context.repository.closed': boolean,
+  'context.repository.folder.scheme': string,
+  'context.repository.id': string,
+  'context.repository.provider.id': string,
+  'context.repository.scheme': string,
+  'context.webview.host': 'editor' | 'panel' | 'view',
+  'context.webview.id': string,
+  'context.webview.instanceId': string,
+  'context.webview.type': string,
+  // Whole days remaining in the preview window (ceiling; 0 = under a day)
+  'daysLeft': number
 }
 ```
 
@@ -3716,7 +3756,7 @@ or
 ```typescript
 {
   // Which action was triggered
-  'action': 'applyStash' | 'copyPatch' | 'createBranch' | 'createPullRequest' | 'createPullRequestWithAI' | 'createWorktree' | 'fetch' | 'forcePush' | 'mergeMergeTarget' | 'publishBranch' | 'pull' | 'push' | 'rebaseOntoMergeTarget' | 'shareAsCloudPatch' | 'startReview' | 'startWork' | 'stashSave' | 'stashSaveFiles' | 'stashSaveStaged' | 'switchBranch',
+  'action': 'addRemote' | 'applyStash' | 'copyPatch' | 'createBranch' | 'createPullRequest' | 'createPullRequestWithAI' | 'createWorktree' | 'fetch' | 'forcePush' | 'mergeMergeTarget' | 'publishBranch' | 'publishRepository' | 'pull' | 'push' | 'rebaseOntoMergeTarget' | 'shareAsCloudPatch' | 'startReview' | 'startWork' | 'stashSave' | 'stashSaveFiles' | 'stashSaveStaged' | 'switchBranch',
   'context.repository.closed': boolean,
   'context.repository.folder.scheme': string,
   'context.repository.id': string,
