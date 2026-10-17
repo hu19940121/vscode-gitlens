@@ -28,7 +28,7 @@ const command = values.check
 		import v8 from 'node:v8';
 		const group = fs.readFileSync('/proc/self/cgroup', 'utf8').trim().split('::')[1];
 		const directory = '/sys/fs/cgroup' + group;
-		for (const [file, expected] of [['memory.max', '805306368'], ['memory.swap.max', '5368709120'], ['memory.oom.group', '1']]) {
+		for (const [file, expected] of [['memory.max', '805306368'], ['memory.swap.max', '8589934592'], ['memory.oom.group', '1']]) {
 			const actual = fs.readFileSync(directory + '/' + file, 'utf8').trim();
 			if (actual !== expected) throw new Error(file + ': expected ' + expected + ', got ' + actual);
 			console.log(file + '=' + actual);
@@ -37,13 +37,13 @@ const command = values.check
 		if (heapLimit < 2048 * 1024 * 1024) throw new Error('Node heap limit is too low to use the swap allowance.');
 		console.log('Node heap limit (MiB)=' + heapLimit / 1024 / 1024);
 		console.log('Resource limits verified; no build was started.');
-	`,
+	`
 		]
 	: values.package
 		? [path.join(rootPath, 'node_modules', '.bin', 'vsce'), 'package', '--no-dependencies']
 		: [process.execPath, path.join(rootPath, 'scripts', 'build.mjs'), '--mode', 'production', '--low-memory'];
 
-console.log(`[build] ${unit}.scope: RAM limit 768 MiB, swap limit 5 GiB`);
+console.log(`[build] ${unit}.scope: RAM limit 768 MiB, swap limit 8 GiB`);
 const child = spawn(
 	'systemd-run',
 	[
@@ -53,7 +53,7 @@ const child = spawn(
 		'--expand-environment=no',
 		`--unit=${unit}`,
 		'--property=MemoryMax=768M',
-		'--property=MemorySwapMax=5G',
+		'--property=MemorySwapMax=8G',
 		'--property=OOMPolicy=kill',
 		'--',
 		...command,
