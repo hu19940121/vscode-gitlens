@@ -3,7 +3,7 @@ import { l10n, ViewColumn } from 'vscode';
 import { GitCommit } from '@gitlens/git/models/commit.js';
 import { deletedOrMissing } from '@gitlens/git/models/revision.js';
 import type { DiffRange } from '@gitlens/git/providers/types.js';
-import { isShaWithParentSuffix, isUncommitted, shortenRevision } from '@gitlens/git/utils/revision.utils.js';
+import { isResolvedRevisionMissing, isUncommitted, shortenRevision } from '@gitlens/git/utils/revision.utils.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { basename } from '@gitlens/utils/path.js';
 import { getSettledValue } from '@gitlens/utils/promise.js';
@@ -63,9 +63,19 @@ export class DiffWithCommand extends GlCommandBase {
 			} else {
 				args = {
 					repoPath: commit.repoPath,
-					// Don't need to worry about verifying the previous sha, as the DiffWith command will
-					lhs: { sha: commit.unresolvedPreviousSha, uri: commit.file.originalUri ?? commit.file.uri },
-					rhs: { sha: commit.sha, uri: commit.file.uri },
+					// Added and untracked files have no previous revision; any other previous sha is verified by DiffWith
+					lhs: {
+						sha:
+							commit.file.status === 'A' || commit.file.status === '?'
+								? deletedOrMissing
+								: commit.unresolvedPreviousSha,
+						uri: commit.file.originalUri ?? commit.file.uri,
+					},
+					rhs: {
+						// Untracked files in a stash are stored in its third parent
+						sha: commit.file.status === '?' ? `${commit.sha}^3` : commit.sha,
+						uri: commit.file.uri,
+					},
 					range: range,
 					source: source,
 				};
@@ -121,12 +131,15 @@ export class DiffWithCommand extends GlCommandBase {
 				}
 			}
 
+			// Show an empty left side when the file doesn't exist there, e.g. it was deleted or moved away before being re-added
+			if (isResolvedRevisionMissing(lhsResolved, svc.getRelativePath(lhsUri, args.repoPath))) {
+				lhsResolved = { ...lhsResolved, sha: deletedOrMissing };
+			}
+
 			if (rhsResolved.status === 'D') {
-				rhsResolved.sha = deletedOrMissing;
+				rhsResolved = { ...rhsResolved, sha: deletedOrMissing };
 			} else if (rhsResolved.status === 'R' || rhsResolved.status === 'C') {
 				rhsUri = svc.getAbsoluteUri(rhsResolved.path!, args.repoPath);
-			} else if (rhsResolved.status === 'A' && isShaWithParentSuffix(lhsResolved.sha)) {
-				lhsResolved.sha = deletedOrMissing;
 			}
 
 			const [lhsResult, rhsResult] = await Promise.allSettled([
