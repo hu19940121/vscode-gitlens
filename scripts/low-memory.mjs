@@ -37,7 +37,7 @@ const command = values.check
 		if (heapLimit < 2048 * 1024 * 1024) throw new Error('Node heap limit is too low to use the swap allowance.');
 		console.log('Node heap limit (MiB)=' + heapLimit / 1024 / 1024);
 		console.log('Resource limits verified; no build was started.');
-	`
+	`,
 		]
 	: values.package
 		? [path.join(rootPath, 'node_modules', '.bin', 'vsce'), 'package', '--no-dependencies']
