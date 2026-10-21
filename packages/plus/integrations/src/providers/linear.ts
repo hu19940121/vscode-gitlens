@@ -11,7 +11,7 @@ import { Logger } from '@gitlens/utils/logger.js';
 import { mapSettledBounded } from '@gitlens/utils/promise.js';
 import { PromiseCache } from '@gitlens/utils/promiseCache.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
-import type { ProviderAuthenticationSession } from '../authentication/models.js';
+import type { ConnectionResource, ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
 import { IssuesCloudHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
@@ -55,6 +55,8 @@ const maxPagesPerRequest = 10;
  */
 const maxAccountWidePagesPerRequest = 50;
 const linearImplicitTeamsPageSize = 50;
+/** Long enough to span one tracker read, short enough that a profile change shows on the next. */
+const recentAccountTTL = 60 * 1000;
 /** A team key and issue number, as Linear writes an issue's identifier (`ENG-123`). */
 const linearIdentifier = /^([A-Za-z0-9]+)-(\d+)$/;
 
@@ -158,31 +160,61 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		return autolinks;
 	}
 
+	/** The workspace is the token's organization; kept only as a complete, trimmed pair. */
+	override async getProviderResourceForSession(
+		session: ProviderAuthenticationSession,
+	): Promise<ConnectionResource | undefined> {
+		const organization = await this.getOrganization(session, true);
+		const id = organization?.id.trim();
+		const name = organization?.name.trim();
+		return id && name ? { id: id, name: name } : undefined;
+	}
+
 	private _organizations: Map<string, LinearOrganizationDescriptor | undefined> | undefined;
+	/**
+	 * In flight by token. The request can't be aborted (provider-apis takes no signal), so a lookup that outlives its
+	 * caller's timeout is joined by the next one rather than piling another request on top of it.
+	 */
+	private readonly _organizationRequests = new Map<string, Promise<LinearOrganizationDescriptor | undefined>>();
 	private async getOrganization(
 		session: ProviderAuthenticationSession,
 		force: boolean = false,
 	): Promise<LinearOrganizationDescriptor | undefined> {
 		const { accessToken } = session;
-		this._organizations ??= new Map<string, LinearOrganizationDescriptor | undefined>();
+		// Held across the await: a re-sync drops `_organizations` meanwhile, and this read must still complete.
+		const organizations = (this._organizations ??= new Map<string, LinearOrganizationDescriptor | undefined>());
 
-		const cachedResources = this._organizations.get(accessToken);
+		const cachedResources = organizations.get(accessToken);
 
 		if (cachedResources == null || force) {
-			const api = await this.getProvidersApi();
-			const organization = await api.getLinearOrganization(toTokenWithInfo(this.id, session));
-			const descriptor: LinearOrganizationDescriptor | undefined = organization && {
+			let request = this._organizationRequests.get(accessToken);
+			if (request == null) {
+				request = this.fetchOrganization(session).finally(() => this._organizationRequests.delete(accessToken));
+				this._organizationRequests.set(accessToken, request);
+			}
+
+			const descriptor = await request;
+			if (descriptor) {
+				organizations.set(accessToken, descriptor);
+			}
+		}
+
+		return organizations.get(accessToken);
+	}
+
+	private async fetchOrganization(
+		session: ProviderAuthenticationSession,
+	): Promise<LinearOrganizationDescriptor | undefined> {
+		const api = await this.getProvidersApi();
+		const organization = await api.getLinearOrganization(toTokenWithInfo(this.id, session));
+		return (
+			organization && {
 				id: organization.id,
 				key: organization.key,
 				name: organization.name,
 				url: organization.url,
-			};
-			if (descriptor) {
-				this._organizations.set(accessToken, descriptor);
 			}
-		}
-
-		return this._organizations.get(accessToken);
+		);
 	}
 
 	/** Expires, and is dropped on a re-sync, so a team created or left mid-session is picked up (#5907). */
@@ -204,6 +236,19 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		if (cachedResources != null && !force) return { values: cachedResources };
 
 		const generation = this._teams.generation;
+		const read = await this.readTeams(session);
+		if (read?.metadata != null) return read;
+
+		if (read != null && this._teams.set(accessToken, read.values, { generation: generation })) {
+			// Built from the teams; a new set means new prefixes.
+			this._autolinks.delete(accessToken);
+		}
+		return read;
+	}
+
+	private async readTeams(
+		session: ProviderAuthenticationSession,
+	): Promise<ProviderApiCollectionResult<LinearTeamDescriptor> | undefined> {
 		const api = await this.getProvidersApi();
 		const teams = await api.getLinearTeamsForCurrentUser(toTokenWithInfo(this.id, session));
 		const descriptors: LinearTeamDescriptor[] | undefined = teams?.map(t => ({
@@ -222,10 +267,6 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 			return { values: descriptors, metadata: { completeness: 'unknown' } };
 		}
 
-		if (this._teams.set(accessToken, descriptors, { generation: generation })) {
-			// Built from the teams; a new set means new prefixes.
-			this._autolinks.delete(accessToken);
-		}
 		return { values: descriptors };
 	}
 
@@ -233,6 +274,13 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		session: ProviderAuthenticationSession,
 	): Promise<ResourceDescriptor[] | undefined> {
 		const organization = await this.getOrganization(session);
+		return organization != null ? [organization] : undefined;
+	}
+	protected override async getProviderUncachedResourcesForUser(
+		session: ProviderAuthenticationSession,
+	): Promise<ResourceDescriptor[] | undefined> {
+		// Joins none in flight, unlike `getOrganization`: one may have started before what the caller needs to see.
+		const organization = await this.fetchOrganization(session);
 		return organization != null ? [organization] : undefined;
 	}
 	protected override getProviderProjectsForResources(
@@ -245,20 +293,59 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		session: ProviderAuthenticationSession,
 		_resources: ResourceDescriptor[],
 	): Promise<ProviderApiCollectionResult<ResourceDescriptor>> {
-		return (await this.getTeamsWithMetadata(session)) ?? { values: [] };
+		return (await this.getTeamsWithMetadata(session)) ?? { values: [], metadata: { completeness: 'unknown' } };
+	}
+	protected override async getProviderUncachedProjectsForResourcesWithMetadata(
+		session: ProviderAuthenticationSession,
+		_resources: ResourceDescriptor[],
+	): Promise<ProviderApiCollectionResult<ResourceDescriptor>> {
+		return (await this.readTeams(session)) ?? { values: [], metadata: { completeness: 'unknown' } };
 	}
 
 	override invalidateDiscoveryCaches(): void {
 		this._organizations = undefined;
 		this._teams.clear();
 		this._autolinks.clear();
+		this._recentAccounts.clear();
 	}
 	readonly authProvider: IntegrationAuthenticationProviderDescriptor = authProvider;
+
+	/**
+	 * Always asks Linear: the host's current-account cache decides when this runs. The viewer query is account-wide,
+	 * so the answer is lent briefly to the per-resource lookup a tracker read makes right after it.
+	 */
+	protected override async getProviderCurrentAccount(
+		session: ProviderAuthenticationSession,
+	): Promise<Account | undefined> {
+		const account = await this.fetchAccount(session);
+		if (account != null) {
+			this._recentAccounts.set(session.accessToken, Promise.resolve(account));
+		}
+		return account;
+	}
+
+	protected override getProviderUncachedAccountForResource(
+		session: ProviderAuthenticationSession,
+		_resource: ResourceDescriptor,
+	): Promise<Account | undefined> {
+		return this.fetchAccount(session);
+	}
 
 	protected override async getProviderAccountForResource(
 		session: ProviderAuthenticationSession,
 		_resource: ResourceDescriptor,
 	): Promise<Account | undefined> {
+		return this._recentAccounts.getOrCreate(session.accessToken, () => this.fetchAccount(session), {
+			evictWhen: account => account == null,
+		});
+	}
+
+	private readonly _recentAccounts = new PromiseCache<string, Account | undefined>({
+		capacity: 10,
+		createTTL: recentAccountTTL,
+	});
+
+	private async fetchAccount(session: ProviderAuthenticationSession): Promise<Account | undefined> {
 		const api = await this.getProvidersApi();
 		// Linear's viewer isn't a ProviderAccount (no username/avatar), so build the Account manually
 		// (Trello-style) from the fields the viewer query returns.

@@ -1,5 +1,6 @@
 import { GitService } from '@gitlens/git/service.js';
 import type { FileWatchingProvider } from '@gitlens/git/watching/provider.js';
+import type { WatchPollingOptions } from '@gitlens/git/watching/watchService.js';
 import type { CliGitProviderOptions } from './cliGitProvider.js';
 import { CliGitProvider } from './cliGitProvider.js';
 import type { GitLocation } from './exec/locator.js';
@@ -36,6 +37,12 @@ export interface CliGitServiceOptions {
 	 * will watch repositories for changes (file creates, edits, deletes).
 	 */
 	watchingProvider?: FileWatchingProvider;
+
+	/**
+	 * Polls in place of (or beside) the watchers {@link watchingProvider} reports it can't trust. When omitted, no
+	 * watcher is asked.
+	 */
+	watchPolling?: WatchPollingOptions;
 }
 
 /**
@@ -58,7 +65,7 @@ export interface CliGitServiceOptions {
  * ```
  */
 export function createCliGitService(options: CliGitServiceOptions): GitService {
-	const service = GitService.createSingleton(options.watchingProvider);
+	const service = GitService.createSingleton(options.watchingProvider, { watchPolling: options.watchPolling });
 
 	const locator = options.locator ?? (() => findGitPath(options.gitPath ?? null));
 	const provider = new CliGitProvider({
@@ -77,6 +84,18 @@ export function createCliGitService(options: CliGitServiceOptions): GitService {
 	// models, so there are no force-fired `closed`/`lastFetched` bypassing the session for the global repo event to
 	// miss. Subscriptions are torn down with the service (its `watchService`'s emitters are disposed on dispose).
 	service.watchService?.onDidChangeWorkingTree(repoPath => provider.cache.onWorkingTreeChanged(repoPath));
-	service.watchService?.onDidChangeRepository(e => provider.cache.onRepositoryChanged(e.repoPath, e.changes));
+	// Announced kinds were evicted when core announced its write; evicting them again would discard what the host
+	// re-read since
+	service.watchService?.onDidChangeRepository(e => {
+		const changes = e.getUnannouncedChanges();
+		if (changes.length) {
+			provider.cache.onRepositoryChanged(e.repoPath, changes);
+		}
+	});
+	// FETCH_HEAD maps to no session change, and there's no `Repository` model here to force-fire `lastFetched` (as
+	// the VS Code host does), so bridge it straight to the cache or the last-fetched time is never re-read.
+	service.watchService?.onDidChangeFetchHead(repoPath =>
+		provider.cache.onRepositoryChanged(repoPath, ['lastFetched']),
+	);
 	return service;
 }

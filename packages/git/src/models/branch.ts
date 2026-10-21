@@ -16,6 +16,17 @@ import type { GitBranchReference } from './reference.js';
 
 export type BranchDisposition = 'starred' | 'archived';
 
+/** The `.git/gk/config` keys (`branch.<name>.<key>`) a branch's {@link BranchMetadata} is read from */
+export type BranchMetadataGkConfigKey =
+	| 'gk-last-accessed'
+	| 'gk-last-modified'
+	| 'gk-agent-last-activity'
+	| 'gk-disposition';
+
+/**
+ * A branch's `.git/gk/config` metadata. Unlike other cached values, the cache updates these objects in place when a
+ * key changes (see `Cache.patchBranchMetadata`), so every `GitBranch` holding one, old or new, reads the new value
+ */
 export interface BranchMetadata {
 	lastAccessedAt?: string;
 	lastModifiedAt?: string;
@@ -24,6 +35,31 @@ export interface BranchMetadata {
 }
 
 export type GitBranchShape = Shape<GitBranch>;
+
+/**
+ * Each metadata object's last parsed stamps. Not `@memoize`d on the branch: the cache updates `BranchMetadata` in
+ * place, so a parse is reused only while its stamp is unchanged — and shared by every branch holding the object.
+ */
+const stampDates = new WeakMap<BranchMetadata, Partial<Record<StampField, { stamp: string; date: Date }>>>();
+type StampField = 'lastAccessedAt' | 'lastModifiedAt';
+
+function getStampDate(metadata: BranchMetadata, field: StampField): Date | undefined {
+	const stamp = metadata[field];
+	if (!stamp) return undefined;
+
+	let parsed = stampDates.get(metadata);
+	if (parsed == null) {
+		parsed = {};
+		stampDates.set(metadata, parsed);
+	}
+
+	let entry = parsed[field];
+	if (entry?.stamp !== stamp) {
+		entry = { stamp: stamp, date: new Date(stamp) };
+		parsed[field] = entry;
+	}
+	return entry.date;
+}
 
 @loggable(i => i.id)
 @serializable
@@ -47,7 +83,10 @@ export class GitBranch implements GitBranchReference {
 		public readonly refName: string,
 		public readonly current: boolean,
 		public readonly date: Date | undefined,
-		/** GK config metadata (dates, disposition) */
+		/**
+		 * GK config metadata (dates, disposition), shared with the cache and updated in place: comparing an old and a
+		 * new branch can't detect a changed stamp (no change event fires for one either)
+		 */
 		public readonly metadata: BranchMetadata | undefined,
 		public readonly sha?: string,
 		public readonly upstream?: GitTrackingUpstream,
@@ -105,14 +144,13 @@ export class GitBranch implements GitBranchReference {
 		return maxTime != null ? new Date(maxTime) : undefined;
 	}
 
-	@memoize()
 	get lastAccessedDate(): Date | undefined {
-		return this.metadata?.lastAccessedAt ? new Date(this.metadata.lastAccessedAt) : undefined;
+		return this.metadata != null ? getStampDate(this.metadata, 'lastAccessedAt') : undefined;
 	}
 
-	@memoize()
+	/** When a checkout's working tree or index last changed while on this branch (`gk-last-modified`), not only commits */
 	get lastModifiedDate(): Date | undefined {
-		return this.metadata?.lastModifiedAt ? new Date(this.metadata.lastModifiedAt) : undefined;
+		return this.metadata != null ? getStampDate(this.metadata, 'lastModifiedAt') : undefined;
 	}
 
 	@memoize()
@@ -127,7 +165,8 @@ export class GitBranch implements GitBranchReference {
 	@memoize()
 	get remoteName(): string | undefined {
 		if (this.remote) return getRemoteNameFromBranchName(this.name);
-		if (this.upstream != null) return getRemoteNameFromBranchName(this.upstream.name);
+		if (this.upstream?.local) return undefined;
+		if (this.upstream != null) return this.upstream.remote ?? getRemoteNameFromBranchName(this.upstream.name);
 
 		return undefined;
 	}
@@ -214,6 +253,18 @@ export interface GitTrackingState {
 
 export interface GitTrackingUpstream {
 	readonly name: string;
+	/**
+	 * The remote the upstream is on (`branch.<name>.remote`) as git reports it, so a remote whose own name contains a
+	 * `/` stays whole. `undefined` when git is too old to report it (before 2.23 here) or the upstream is a local branch
+	 */
+	readonly remote?: string;
+	/**
+	 * The branch's name on its {@link remote} (`branch.<name>.merge` without `refs/heads/`), so a custom fetch refspec
+	 * can't misname it. `undefined` when git is too old to report it or the upstream is a local branch
+	 */
+	readonly remoteBranch?: string;
+	/** The upstream is a branch in this repository (`branch.<name>.remote = .`), so it has no remote */
+	readonly local?: boolean;
 	readonly missing: boolean;
 	readonly state: GitTrackingState;
 }

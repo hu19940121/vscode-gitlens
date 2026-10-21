@@ -23,7 +23,6 @@ import type {
 	GitOperationRunOptions,
 	GitOperationsSubProvider,
 } from '@gitlens/git/providers/operations.js';
-import { getBranchNameAndRemote, getBranchTrackingWithoutRemote } from '@gitlens/git/utils/branch.utils.js';
 import { isBranchReference } from '@gitlens/git/utils/reference.utils.js';
 import { debug } from '@gitlens/utils/decorators/log.js';
 import { sequentialize } from '@gitlens/utils/decorators/sequentialize.js';
@@ -32,6 +31,7 @@ import { Logger } from '@gitlens/utils/logger.js';
 import { getScopedLogger } from '@gitlens/utils/logger.scoped.js';
 import { normalizePath, splitPath } from '@gitlens/utils/path.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
+import { mayWriteTracking } from '../exec/commandClassifier.js';
 import type { Git, PushForceOptions } from '../exec/git.js';
 import {
 	classifySigningError,
@@ -39,10 +39,19 @@ import {
 	gitConfigsPull,
 	GitErrors,
 	inferSigningFormatFromError,
+	isRunHookFailure,
 	maxGitCliLength,
 } from '../exec/git.js';
+import { resolveBranchRemote } from './branchRemote.js';
+import { parseGitBoolean } from './config.js';
+
+/** The remotes a fetch read with their configured refspecs: one named remote, all of them, or a bare fetch's default */
+type FetchedRemotes = { remote: string } | 'all' | 'default';
 
 export class OperationsGitSubProvider implements GitOperationsSubProvider {
+	/** The `commonPath\0remote` pairs {@link followRemoteHeads} has handled */
+	private readonly followedRemoteHeads = new Set<string>();
+
 	constructor(
 		private readonly context: GitServiceContext,
 		private readonly git: Git,
@@ -76,10 +85,10 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				// Evict the cached base only — see `createBranch` on why the persisted keys stay.
 				this.cache.deleteBaseBranchName(repoPath, options.createBranch);
 			}
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			throw getGitCommandError(
 				'checkout',
 				ex,
@@ -88,6 +97,11 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 						{ reason: reason ?? 'other', ref: ref, gitCommand: { repoPath: repoPath, args: params } },
 						ex,
 					),
+			);
+		} finally {
+			this.announceHeadChanged(
+				repoPath,
+				Boolean(options?.createBranch) && mayWriteTracking(ref, options?.noTracking),
 			);
 		}
 	}
@@ -133,12 +147,16 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		args.push(...revs);
 
 		try {
-			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...args);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			try {
+				await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...args);
+			} finally {
+				this.announceHeadChanged(repoPath);
+			}
 			return { conflicted: false };
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			await this.throwIfSigningError(repoPath, args, ex, options?.source);
 			const mapped = getGitCommandError(
 				'cherry-pick',
@@ -204,12 +222,15 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		params.push('-F', '-');
 
 		try {
-			await this.git.run(
-				{ cwd: repoPath, stdin: message, stdinEncoding: 'utf8', errors: 'throw', ...runOptions },
-				...params,
-			);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			try {
+				await this.git.run(
+					{ cwd: repoPath, stdin: message, stdinEncoding: 'utf8', errors: 'throw', ...runOptions },
+					...params,
+				);
+			} finally {
+				// A commit refused by a hook can still have restaged files
+				this.announceHeadChanged(repoPath);
+			}
 			if (sign) {
 				// `-S` was passed and the commit succeeded, so signing is confirmed — fire the
 				// explicit-sign hook (same contract as the patch provider's `commit-tree -S` path).
@@ -221,6 +242,8 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			}
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			await this.throwIfSigningError(repoPath, params, ex, options?.source);
 			throw getGitCommandError(
 				'commit',
@@ -263,18 +286,19 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 
 		const { branch, ...opts } = options ?? {};
 		let ran = false;
+		let fetched: FetchedRemotes | undefined;
 		try {
 			if (isBranchReference(branch)) {
-				const [branchName, remoteName] = getBranchNameAndRemote(branch);
-				if (remoteName == null) return;
+				const resolved = await resolveBranchRemote(this.provider, repoPath, branch, runOptions?.cancellation);
+				if (resolved.remote == null) return;
 
 				ran = true;
 				await this.fetchCore(
 					repoPath,
 					{
-						branch: branchName,
-						remote: remoteName,
-						upstream: getBranchTrackingWithoutRemote(branch)!,
+						branch: resolved.name,
+						remote: resolved.remote,
+						upstream: resolved.upstream!,
 						pull: options?.pull,
 						preserveFetchHead: options?.preserveFetchHead,
 					},
@@ -283,6 +307,9 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			} else {
 				ran = true;
 				await this.fetchCore(repoPath, opts, runOptions);
+				if (!opts.refspecs?.length) {
+					fetched = opts.remote != null ? { remote: opts.remote } : opts.all ? 'all' : 'default';
+				}
 			}
 		} catch (ex) {
 			scope?.error(ex);
@@ -293,7 +320,78 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'tags');
 				this.context.hooks?.repository?.onChanged?.(repoPath, this.getFetchChanges(branch, options));
 			}
+			if (fetched != null) {
+				void this.followRemoteHeads(repoPath, fetched);
+			}
 		}
+	}
+
+	/**
+	 * Writes the missing `refs/remotes/<remote>/HEAD` (the default branch the base reads) of each remote a fetch just
+	 * read with its configured refspecs, once per remote, on git < 2.48 — newer git's fetch creates it itself. A bare
+	 * fetch/pull reads every remote when `fetch.all` is set (git 2.44+), else its default remote. Right after the
+	 * fetch, so the credentials it used are still cached. Never awaited; never rejects, failures not retried.
+	 */
+	private async followRemoteHeads(repoPath: string, fetched: FetchedRemotes): Promise<void> {
+		try {
+			if (await this.git.supports('git:fetch:follow-remote-head')) return;
+
+			const commonPath = this.cache.getCommonPath(repoPath);
+			const pending = (names: string[]): string[] =>
+				names.filter(r => !this.followedRemoteHeads.has(`${commonPath}\0${r}`));
+
+			// One cached read for everything that picks the remotes
+			const config = await this.provider.config.getConfigRegex(
+				repoPath,
+				'^(fetch\\.all|remote\\..+\\.skipfetchall|branch\\..+\\.remote)$',
+			);
+
+			if (
+				fetched === 'default' &&
+				parseGitBoolean(config.get('fetch.all')) &&
+				(await this.git.supports('git:fetch:all-config'))
+			) {
+				fetched = 'all';
+			}
+
+			let remotes: string[];
+			if (fetched === 'all') {
+				// `fetch --all` skips the remotes marked `skipFetchAll`
+				remotes = pending(
+					(await this.provider.remotes.getRemotes(repoPath))
+						.map(r => r.name)
+						.filter(r => !parseGitBoolean(config.get(`remote.${r}.skipfetchall`))),
+				);
+			} else if (fetched === 'default') {
+				const remote = await this.getDefaultFetchRemote(repoPath, config);
+				remotes = pending(remote != null ? [remote] : []);
+			} else {
+				remotes = pending([fetched.remote]);
+			}
+			if (!remotes.length) return;
+
+			for (const remote of remotes) {
+				this.followedRemoteHeads.add(`${commonPath}\0${remote}`);
+			}
+			for (const remote of remotes) {
+				try {
+					await this.provider.branches.setRemoteHeadIfMissing(repoPath, remote);
+				} catch {}
+			}
+		} catch {}
+	}
+
+	/**
+	 * The remote a bare `fetch`/`pull` reads: the current branch's `branch.<name>.remote` (none for `.`, the local
+	 * repository), else the sole remote, else `origin`
+	 */
+	private async getDefaultFetchRemote(repoPath: string, config: Map<string, string>): Promise<string | undefined> {
+		const current = await this.provider.branches.getBranch(repoPath);
+		const configured = current != null ? config.get(`branch.${current.name}.remote`) : undefined;
+		if (configured) return configured === '.' ? undefined : configured;
+
+		const remotes = await this.provider.remotes.getRemotes(repoPath);
+		return remotes.length === 1 ? remotes[0].name : 'origin';
 	}
 
 	/** `remotes`, plus `heads`/`tags` for any local branch or tag the fetch writes — a `pull` fetch writes `<upstream>:<branch>` */
@@ -404,6 +502,8 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		try {
 			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
+			if (isRunHookFailure(ex)) throw ex;
+
 			throw getGitCommandError(
 				'fetch',
 				ex,
@@ -450,17 +550,20 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		args.push(ref);
 
 		try {
-			await this.git.run(
-				// Avoid a timeout since merges can take a long time (set to 0 to disable)
-				{ cwd: repoPath, errors: 'throw', timeout: 0, ...runOptions },
-				...args,
-			);
-
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			try {
+				await this.git.run(
+					// Avoid a timeout since merges can take a long time (set to 0 to disable)
+					{ cwd: repoPath, errors: 'throw', timeout: 0, ...runOptions },
+					...args,
+				);
+			} finally {
+				this.announceHeadChanged(repoPath);
+			}
 			return { conflicted: false };
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			await this.throwIfSigningError(repoPath, args, ex, options?.source);
 			const mapped = getGitCommandError(
 				'merge',
@@ -496,6 +599,8 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		// Set once a git command is about to run, so a pull that fails partway (a merge or rebase stopping on a
 		// conflict, a fetch that stored some refs) announces what it changed the way a finished one does
 		let announce: (() => void) | undefined;
+		// A `pull` with no arguments fetches the branch's remote with its configured refspecs
+		let fetched: { repoPath: string; remotes: FetchedRemotes } | undefined;
 		try {
 			if (isBranchReference(options?.branch)) {
 				const branch = options.branch;
@@ -527,6 +632,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 							},
 							runOptions,
 						);
+						fetched = { repoPath: worktreePath, remotes: 'default' };
 					} finally {
 						this.context.hooks?.operations?.onRebaseCapableOperation?.(worktreePath, 'pull', 'ended');
 					}
@@ -537,8 +643,11 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					// and report success.
 					// Fetched without `-u`: the worktree lookup above is cached and can miss a worktree added
 					// outside core, and then git's own refusal is what keeps a checked-out branch from moving.
-					const [branchName, remoteName] = getBranchNameAndRemote(branch);
-					const upstream = getBranchTrackingWithoutRemote(branch);
+					const {
+						name: branchName,
+						remote: remoteName,
+						upstream,
+					} = await resolveBranchRemote(this.provider, repoPath, branch, runOptions?.cancellation);
 					if (remoteName == null || upstream == null) {
 						throw new PullError({
 							reason: 'noUpstream',
@@ -593,6 +702,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					},
 					runOptions,
 				);
+				fetched = { repoPath: repoPath, remotes: 'default' };
 			} finally {
 				this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'pull', 'ended');
 			}
@@ -601,6 +711,9 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			throw ex;
 		} finally {
 			announce?.();
+			if (fetched != null) {
+				void this.followRemoteHeads(fetched.repoPath, fetched.remotes);
+			}
 		}
 	}
 
@@ -631,6 +744,8 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		try {
 			await this.git.run({ cwd: repoPath, configs: gitConfigsPull, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
+			if (isRunHookFailure(ex)) throw ex;
+
 			await this.throwIfSigningError(repoPath, params, ex, options.source);
 			throw getGitCommandError(
 				'pull',
@@ -653,6 +768,9 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		let branchName: string;
 		let remoteName: string | undefined;
 		let upstreamName: string | undefined;
+		// Whether the push itself writes `branch.<n>.remote/merge` (`-u`): only when it establishes tracking,
+		// never to rewrite what a branch with a live upstream already has
+		let trackUpstream = options?.publish != null;
 		let setUpstream:
 			| {
 					branch: string;
@@ -662,43 +780,57 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			| undefined;
 
 		if (isBranchReference(options?.reference)) {
+			const resolved = await resolveBranchRemote(
+				this.provider,
+				repoPath,
+				options.reference,
+				runOptions?.cancellation,
+			);
 			if (options.publish != null) {
 				branchName = options.reference.name;
 				remoteName = options.publish.remote;
 			} else {
-				[branchName, remoteName] = getBranchNameAndRemote(options.reference);
+				branchName = resolved.name;
+				remoteName = resolved.remote;
 			}
-			upstreamName = getBranchTrackingWithoutRemote(options.reference);
+			// A local upstream names a branch in this repository, never a branch on the remote being published to
+			upstreamName = options.publish != null && resolved.local ? undefined : resolved.upstream;
+			trackUpstream ||= options.reference.upstream?.missing === true;
+
+			// Without a remote, a bare `git push` would follow `push.default` somewhere the caller didn't pick
+			if (options.publish == null && remoteName == null) {
+				throw new PushError({ reason: 'noUpstream', branch: options.reference.name });
+			}
 		} else {
 			const branch = await this.provider.branches.getBranch(repoPath);
 			if (branch == null) return;
 
+			const resolved = await resolveBranchRemote(this.provider, repoPath, branch, runOptions?.cancellation);
 			if (options?.reference != null) {
+				// Onto the upstream's remote-side name, which a custom fetch refspec or a renamed upstream can make differ
 				branchName = `${options.reference.ref}:${
-					options?.publish != null ? 'refs/heads/' : ''
-				}${branch.nameWithoutRemote}`;
+					options?.publish != null ? `refs/heads/${resolved.name}` : (resolved.upstream ?? resolved.name)
+				}`;
 			} else {
-				const tracking = options?.publish == null ? branch.trackingWithoutRemote : undefined;
+				const tracking = options?.publish == null ? resolved.upstream : undefined;
 				branchName =
-					tracking != null && tracking !== branch.nameWithoutRemote
-						? `${branch.name}:${tracking}`
-						: branch.name;
+					tracking != null && tracking !== resolved.name ? `${branch.name}:${tracking}` : branch.name;
 			}
-			remoteName = branch.remoteName ?? options?.publish?.remote;
+			remoteName = resolved.remote ?? options?.publish?.remote;
+			if (options?.publish == null && remoteName == null) {
+				throw new PushError({ reason: 'noUpstream', branch: branch.name });
+			}
+
 			upstreamName = options?.reference == null && options?.publish != null ? branch.name : undefined;
 
 			// Git can't setup upstream tracking when publishing a new branch to a specific commit, so we'll need to do it after the push
 			if (options?.publish?.remote != null && options?.reference != null) {
 				setUpstream = {
-					branch: branch.nameWithoutRemote,
+					branch: resolved.name,
 					remote: remoteName!,
-					remoteBranch: branch.nameWithoutRemote,
+					remoteBranch: resolved.name,
 				};
 			}
-		}
-
-		if (options?.publish == null && remoteName == null && upstreamName == null) {
-			throw new PushError({ reason: 'other' });
 		}
 
 		let forceOpts: PushForceOptions | undefined;
@@ -719,7 +851,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					remote: remoteName,
 					upstream: upstreamName,
 					force: forceOpts,
-					publish: options?.publish != null,
+					setUpstream: trackUpstream,
 				},
 				runOptions,
 			);
@@ -746,10 +878,15 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		} finally {
 			// A rejected push may have updated some of its remote-tracking refs before it failed
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
-			this.context.hooks?.repository?.onChanged?.(
-				repoPath,
-				options?.publish != null ? ['config', 'heads', 'remotes'] : ['remotes'],
-			);
+			const changes: RepositoryChange[] = [];
+			if (trackUpstream || setUpstream != null) {
+				changes.push('config');
+			}
+			if (options?.publish != null) {
+				changes.push('heads');
+			}
+			changes.push('remotes');
+			this.context.hooks?.repository?.onChanged?.(repoPath, changes);
 		}
 	}
 
@@ -758,7 +895,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		options: {
 			branch?: string;
 			force?: PushForceOptions;
-			publish?: boolean;
+			setUpstream?: boolean;
 			remote?: string;
 			upstream?: string;
 			delete?: { remote: string; branch: string };
@@ -780,10 +917,14 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			}
 		}
 
+		// `push` refuses a branch without a remote before reaching here, as this would drop the branch
 		if (options.branch && options.remote) {
 			if (options.upstream) {
-				params.push('-u', options.remote, `${options.branch}:${options.upstream}`);
-			} else if (options.publish) {
+				if (options.setUpstream) {
+					params.push('-u');
+				}
+				params.push(options.remote, `${options.branch}:${options.upstream}`);
+			} else if (options.setUpstream) {
 				params.push('--set-upstream', options.remote, options.branch);
 			} else {
 				params.push(options.remote, options.branch);
@@ -797,6 +938,8 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		try {
 			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
+			if (isRunHookFailure(ex)) throw ex;
+
 			const error = getGitCommandError(
 				'push',
 				ex,
@@ -937,16 +1080,20 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		// so the result can't be used to detect that a rebase started
 		this.context.hooks?.operations?.onRebaseCapableOperation?.(repoPath, 'rebase', 'started');
 		try {
-			await this.git.run(
-				// Avoid a timeout since rebases can take a long time (set to 0 to disable)
-				{ cwd: repoPath, errors: 'throw', configs: configs, timeout: 0, ...runOptions, env: env },
-				...args,
-			);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			try {
+				await this.git.run(
+					// Avoid a timeout since rebases can take a long time (set to 0 to disable)
+					{ cwd: repoPath, errors: 'throw', configs: configs, timeout: 0, ...runOptions, env: env },
+					...args,
+				);
+			} finally {
+				this.announceHeadChanged(repoPath);
+			}
 			return { conflicted: false };
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			await this.throwIfSigningError(repoPath, args, ex, options?.source);
 			const mapped = getGitCommandError(
 				'rebase',
@@ -982,11 +1129,11 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 
 		try {
 			await this.resetCore(repoPath, rev, options?.mode, runOptions);
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
 		} catch (ex) {
 			scope?.error(ex);
 			throw ex;
+		} finally {
+			this.announceHeadChanged(repoPath);
 		}
 	}
 
@@ -1005,6 +1152,8 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		try {
 			await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...params);
 		} catch (ex) {
+			if (isRunHookFailure(ex)) throw ex;
+
 			throw getGitCommandError(
 				'reset',
 				ex,
@@ -1037,6 +1186,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		const selector = options?.side != null ? `--${options.side}` : options?.ref || undefined;
 		const prefix = selector != null ? ['checkout', selector, '--'] : ['checkout', '--'];
 
+		let ran = false;
 		try {
 			if (await this.git.supports('git:checkout:pathspec-from-file')) {
 				// Git ≥ 2.26: stream all pathspecs via stdin (NUL-separated) in a single invocation —
@@ -1047,6 +1197,7 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 					args.push(selector);
 				}
 				args.push('--pathspec-from-file=-', '--pathspec-file-nul');
+				ran = true;
 				await this.git.run(
 					{ cwd: repoPath, errors: 'throw', ...runOptions, stdin: normalized.join('\0') },
 					...args,
@@ -1059,13 +1210,14 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 				const perArgOverhead = 3;
 				const prefixLength = prefix.reduce((sum, arg) => sum + arg.length + perArgOverhead, 0);
 				for (const batch of chunkByStringLength(normalized, maxGitCliLength - prefixLength, perArgOverhead)) {
+					ran = true;
 					await this.git.run({ cwd: repoPath, errors: 'throw', ...runOptions }, ...prefix, ...batch);
 				}
 			}
-			this.context.hooks?.cache?.onReset?.(repoPath, 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['index']);
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			throw getGitCommandError(
 				'checkout',
 				ex,
@@ -1079,6 +1231,11 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 						ex,
 					),
 			);
+		} finally {
+			if (ran) {
+				this.context.hooks?.cache?.onReset?.(repoPath, 'status');
+				this.context.hooks?.repository?.onChanged?.(repoPath, ['index']);
+			}
 		}
 	}
 
@@ -1103,17 +1260,20 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		args.push(...refs);
 
 		try {
-			await this.git.run(
-				// Avoid a timeout since reverts can take a long time (set to 0 to disable)
-				{ cwd: repoPath, errors: 'throw', timeout: 0, ...runOptions },
-				...args,
-			);
-
-			this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-			this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
+			try {
+				await this.git.run(
+					// Avoid a timeout since reverts can take a long time (set to 0 to disable)
+					{ cwd: repoPath, errors: 'throw', timeout: 0, ...runOptions },
+					...args,
+				);
+			} finally {
+				this.announceHeadChanged(repoPath);
+			}
 			return { conflicted: false };
 		} catch (ex) {
 			scope?.error(ex);
+			if (isRunHookFailure(ex)) throw ex;
+
 			await this.throwIfSigningError(repoPath, args, ex, options?.source);
 
 			const mapped = getGitCommandError(
@@ -1166,6 +1326,16 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 		);
 	}
 
+	/** Called once git has run, success or not — a rejected write can still have moved HEAD or left state behind */
+	private announceHeadChanged(repoPath: string, wroteTracking?: boolean): void {
+		this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
+		this.context.hooks?.repository?.onChanged?.(
+			repoPath,
+			wroteTracking ? ['config', 'head', 'heads', 'index'] : ['head', 'heads', 'index'],
+		);
+	}
+
+	/** The caller has already announced the change — the conflict is what the failed run left behind */
 	private async createConflictResult(repoPath: string, command: GitConflictCommand): Promise<GitOperationResult> {
 		let conflicts: GitConflictFile[] | undefined;
 		try {
@@ -1174,10 +1344,6 @@ export class OperationsGitSubProvider implements GitOperationsSubProvider {
 			// Don't let a secondary status-read failure mask the original conflict signal
 			Logger.warn(`Unable to read conflicting files after ${command}: ${ex}`);
 		}
-		// A conflicted op mutates the working tree, index, and paused-op state — invalidate caches
-		// and fire repository-change the same way the success path does, so downstream views refresh.
-		this.context.hooks?.cache?.onReset?.(repoPath, 'branches', 'status');
-		this.context.hooks?.repository?.onChanged?.(repoPath, ['head', 'heads', 'index']);
 		this.context.hooks?.operations?.onConflicted?.(command, conflicts);
 		return { conflicted: true, conflicts: conflicts };
 	}

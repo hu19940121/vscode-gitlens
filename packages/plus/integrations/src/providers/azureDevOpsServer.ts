@@ -3,9 +3,10 @@ import type { Account } from '@gitlens/git/models/author.js';
 import type { IssueSearchCriteria } from '@gitlens/git/models/issue.js';
 import type { PullRequest, PullRequestSearchCriteria, PullRequestSorting } from '@gitlens/git/models/pullRequest.js';
 import { defaultPullRequestSort } from '@gitlens/git/models/pullRequest.js';
-import { CancellationError } from '@gitlens/utils/cancellation.js';
+import { CancellationError, raceWithSignal } from '@gitlens/utils/cancellation.js';
 import { uuid } from '@gitlens/utils/crypto.js';
 import type { Emitter } from '@gitlens/utils/event.js';
+import { Logger } from '@gitlens/utils/logger.js';
 import { mapBounded } from '@gitlens/utils/promise.js';
 import { PromiseCache } from '@gitlens/utils/promiseCache.js';
 import type { IntegrationAuthenticationProviderDescriptor } from '../authentication/integrationAuthenticationProvider.js';
@@ -15,7 +16,7 @@ import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
 import { GitSelfManagedHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
-import { IntegrationReadUnavailableError, RequestNotFoundError } from '../errors.js';
+import { AuthenticationError, IntegrationReadUnavailableError, RequestNotFoundError } from '../errors.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
 import type {
 	IntegrationKey,
@@ -24,7 +25,7 @@ import type {
 	ProviderPullRequestSearchPage,
 	ProviderSearchCount,
 } from '../models/integration.js';
-import type { AzureOrganizationDescriptor, AzureProjectDescriptor } from './azure/models.js';
+import type { AzureOrganizationDescriptor, AzureProjectDescriptor, AzureRepositoryDescriptor } from './azure/models.js';
 import type { AzurePullRequestSearchPosition } from './azure/search.js';
 import {
 	compareAzurePullRequestSearchPositions,
@@ -36,12 +37,16 @@ import {
 	toAzurePullRequestSearchPosition,
 	toAzureSearchPageSize,
 } from './azure/search.js';
-import type { AzureReviewerRead } from './azureDevOps.js';
+import type { AzureRepositoryTarget, AzureReviewerRead } from './azureDevOps.js';
 import {
 	AzureDevOpsIntegrationBase,
+	findAzureRepositoryApiBaseUrl,
 	getAzureRepositoryApiBaseUrl,
 	getAzureRepositoryIdentity,
+	getAzureScopeVirtualDirectory,
+	isAzureProjectlessCandidate,
 	markMyGroupReviews,
+	resolveAzureProjectlessRepository,
 	sameAzureName,
 	toAzureReviewerReads,
 	uniqueAzureNames,
@@ -62,6 +67,7 @@ import {
 	toProviderPullRequestStates,
 } from './models.js';
 import type { ProvidersApi } from './providersApi.js';
+import { discoveryCacheTtl } from './utils/discoveryCache.js';
 
 /**
  * Whether `value` can stand as one route segment. Encoding keeps `.` and `..` as they are, and a URL resolves them
@@ -249,6 +255,155 @@ export class AzureDevOpsServerIntegration extends AzureDevOpsIntegrationBase<Git
 	}
 
 	/**
+	 * The collection names per credential and installation, `undefined` when they couldn't be read. Only a
+	 * tie-breaker for {@link getRepositoryTarget}, so a failed read is kept (for {@link discoveryCacheTtl}) rather than
+	 * retried on every repository read; a successful one comes from the organizations, which are kept for the session.
+	 */
+	private readonly _collectionNames = new PromiseCache<string, string[] | undefined>({
+		capacity: 10,
+		createTTL: discoveryCacheTtl,
+	});
+
+	/**
+	 * Settles which segment of a remote's path is the collection before reading the repository. Behind a virtual
+	 * directory a repository named after its project is also served as `{vdir}/{collection}/_git/{repo}`, which the
+	 * remote parser reads as collection `{vdir}` and project `{collection}`; the discovered collections tell the two
+	 * apart (see {@link resolveAzureProjectlessRepository}). Only a path that reading could address below the connection
+	 * is settled ({@link isAzureProjectlessCandidate}); any other reads as parsed, without discovery. A connection
+	 * addressed at a collection discovers only that collection.
+	 */
+	protected override async getRepositoryTarget<
+		T extends Pick<AzureRepositoryDescriptor, 'owner' | 'name' | 'project' | 'virtualDirectory'>,
+	>(session: ProviderAuthenticationSession, repo: T, cancellation?: AbortSignal): Promise<AzureRepositoryTarget<T>> {
+		const { repo: settled, baseUrl, unsettled } = await this.settleRepository(session, repo, cancellation);
+		// Throws for a virtual directory the connection doesn't serve, or an invalid one.
+		return {
+			repo: settled,
+			baseUrl: baseUrl ?? getAzureRepositoryApiBaseUrl(this.apiBaseUrlFor(session), settled),
+			unsettled: unsettled,
+		};
+	}
+
+	/**
+	 * The repository {@link getRepositoryTarget} reads `repo` as, and the base it reads it below: `undefined` when the
+	 * connection doesn't serve its virtual directory (another installation's) or that directory isn't a valid one.
+	 */
+	private async settleRepository<
+		T extends Pick<AzureRepositoryDescriptor, 'owner' | 'name' | 'project' | 'virtualDirectory'>,
+	>(
+		session: ProviderAuthenticationSession,
+		repo: T,
+		cancellation?: AbortSignal,
+	): Promise<{ repo: T; baseUrl: string | undefined; unsettled: boolean }> {
+		const baseUrl = this.apiBaseUrlFor(session);
+		let unsettled = false;
+		if (isAzureProjectlessCandidate(baseUrl, repo)) {
+			// The discovery is shared, so it takes no signal: one caller's abort must neither cancel it for the others
+			// nor be kept as its result.
+			const names = this._collectionNames.getOrCreate(this.discoveryKey(session), () =>
+				this.getCollectionNames(session),
+			);
+			const collections = await (cancellation != null ? raceWithSignal(names, cancellation) : names);
+			if (collections != null) {
+				repo = resolveAzureProjectlessRepository(repo, collections);
+			} else {
+				unsettled = true;
+			}
+		}
+
+		return { repo: repo, baseUrl: findAzureRepositoryApiBaseUrl(baseUrl, repo), unsettled: unsettled };
+	}
+
+	/**
+	 * Settles each coordinate as {@link getRepositoryTarget} settles a remote's descriptor: a consumer that parses a
+	 * remote itself splits a project-less path behind a virtual directory the same way. Its owner is placed in the path
+	 * the connection addresses ({@link getAzureScopeVirtualDirectory}), since a coordinate carries no virtual directory.
+	 * Only the coordinate is settled, and only to a repository the connection serves: each read places it below the
+	 * connection itself, so one settling elsewhere reads as given and fails its own read rather than every coordinate's.
+	 */
+	protected override async resolveRepositoryCoordinates<T extends { owner: string; repo: string; project?: string }>(
+		session: ProviderAuthenticationSession,
+		coordinates: readonly T[],
+		cancellation?: AbortSignal,
+	): Promise<{ coordinates: readonly T[]; unsettled?: readonly boolean[] }> {
+		const baseUrl = this.apiBaseUrlFor(session);
+		const targets = await Promise.all(
+			coordinates.map(async c => {
+				const virtualDirectory =
+					c.project != null ? getAzureScopeVirtualDirectory(baseUrl, c.owner) : undefined;
+				if (virtualDirectory == null) return { coordinate: c, unsettled: false };
+
+				const {
+					repo,
+					baseUrl: repoBaseUrl,
+					unsettled,
+				} = await this.settleRepository(
+					session,
+					{
+						owner: c.owner,
+						name: `${c.project}/_git/${c.repo}`,
+						project: c.project,
+						virtualDirectory: virtualDirectory || undefined,
+					},
+					cancellation,
+				);
+				// A repository this connection doesn't serve is another installation's: read the scope as given.
+				const settled = repo.owner !== c.owner && repoBaseUrl != null;
+				return {
+					coordinate: settled ? { ...c, owner: repo.owner, project: repo.project } : c,
+					unsettled: unsettled,
+				};
+			}),
+		);
+		return { coordinates: targets.map(t => t.coordinate), unsettled: targets.map(t => t.unsettled) };
+	}
+
+	/**
+	 * The searches and counts take only `repos`: they re-read the collections and refuse a scope whose collection
+	 * isn't one of them ({@link getSearchCollections}), and a scope read as parsed below a listed collection is what
+	 * settling it would read ({@link resolveAzureProjectlessRepository}), so a miss there is not `unsettled`.
+	 */
+	protected override async resolveRepositoryInputs(
+		session: ProviderAuthenticationSession,
+		repos: readonly ProviderRepoInput[],
+		cancellation?: AbortSignal,
+	): Promise<{ repos: ProviderRepoInput[]; unsettled?: readonly boolean[] }> {
+		const { coordinates, unsettled } = await this.resolveRepositoryCoordinates(
+			session,
+			repos.map(r => ({ ...r, owner: r.namespace, repo: r.name })),
+			cancellation,
+		);
+		return {
+			repos: coordinates.map(({ owner, repo, ...r }) => ({ ...r, namespace: owner, name: repo })),
+			unsettled: unsettled,
+		};
+	}
+
+	/**
+	 * Never rejects. A credential refused the list leaves every path as parsed, as before discovery was asked; any other
+	 * failure is `undefined`, so a read of a path it could have settled keeps a miss out of the caches (see
+	 * `readRepository`).
+	 */
+	private async getCollectionNames(session: ProviderAuthenticationSession): Promise<string[] | undefined> {
+		try {
+			return (await this.getProviderResourcesForUser(session))?.map(r => r.name);
+		} catch (ex) {
+			if (ex instanceof AuthenticationError) return [];
+
+			Logger.debug(
+				`${this.name}: collections at ${this.apiBaseUrlFor(session)} couldn't be read to place a repository path`,
+				ex,
+			);
+			return undefined;
+		}
+	}
+
+	override invalidateDiscoveryCaches(): void {
+		super.invalidateDiscoveryCaches();
+		this._collectionNames.clear();
+	}
+
+	/**
 	 * Only the server level lists the collections: below one, Azure DevOps Server answers `projectCollections` with a
 	 * 404 page. On that 404 an address that names a collection reads the collection's own connection data, whose
 	 * `webApplicationRelativeDirectory` spells it, and reports it as the one collection visible there.
@@ -293,12 +448,13 @@ export class AzureDevOpsServerIntegration extends AzureDevOpsIntegrationBase<Git
 		if (azure == null) return undefined;
 
 		this.assertSearchDates(options.criteria);
+		const repos = options.repos && (await this.resolveRepositoryInputs(session, options.repos, cancellation)).repos;
 		// A first page re-reads the collection's projects, so a project created since discovery is known before its
 		// work items can turn up in a collection-wide query; a continuation keeps the set its first page resolved.
 		// The facade's page-1 marker (`broadenIssues` retries a failed first page with it) is a first page too.
 		const scope = await this.resolveWorkItemSearchScope(
 			session,
-			options.repos,
+			repos,
 			options.org,
 			isAzureWorkItemSearchFirstPage(options.cursor),
 		);
@@ -338,7 +494,8 @@ export class AzureDevOpsServerIntegration extends AzureDevOpsIntegrationBase<Git
 				this.assertSearchDates(s.criteria);
 				// Re-reads the projects like a first search page does, so a count and the page it previews resolve
 				// the same project set — a newer project can't be counted by one and refused or missed by the other.
-				const scope = await this.resolveWorkItemSearchScope(session, s.repos, s.org, true);
+				const repos = s.repos && (await this.resolveRepositoryInputs(session, s.repos, cancellation)).repos;
+				const scope = await this.resolveWorkItemSearchScope(session, repos, s.org, true);
 				return azure.countWorkItems(
 					this,
 					tokenWithInfo,
@@ -600,7 +757,9 @@ export class AzureDevOpsServerIntegration extends AzureDevOpsIntegrationBase<Git
 
 		// A drain runs for a first page (or once its predecessor expired), so it re-reads the projects it fans out
 		// over: an org search trusting the connection-long discovery cache would silently skip a newer project.
-		const facets = await this.resolvePullRequestSearchFacets(session, options.repos, options.org);
+		// Settled here rather than before the query is keyed, so a cursor stays the caller's whatever discovery answers.
+		const repos = options.repos && (await this.resolveRepositoryInputs(session, options.repos, cancellation)).repos;
+		const facets = await this.resolvePullRequestSearchFacets(session, repos, options.org);
 
 		// The current user's id is resolved PER COLLECTION: Azure DevOps Server gives one person a different
 		// identity id in each collection than at the server level, and a creator/reviewer filter only matches the
@@ -978,6 +1137,7 @@ export class AzureDevOpsServerIntegration extends AzureDevOpsIntegrationBase<Git
 		this._pullRequestSearches.clear();
 		this._latestPullRequestSearches.clear();
 		this._collectionUserIds.clear();
+		this._collectionNames.clear();
 	}
 
 	protected override async _requestForCurrentUser(

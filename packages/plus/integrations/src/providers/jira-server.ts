@@ -10,7 +10,7 @@ import type { IntegrationAuthenticationProviderDescriptor } from '../authenticat
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
-import { toCollectionScopeFailure } from '../collectionMetadata.js';
+import { isIncompleteCollection, toCollectionScopeFailure } from '../collectionMetadata.js';
 import { IssuesSelfManagedHostIntegrationId } from '../constants.js';
 import type { IntegrationServiceContext } from '../context.js';
 import type { IntegrationConnectionChangeEvent } from '../integrationService.js';
@@ -22,10 +22,11 @@ import type {
 	ProjectIssuesRequest,
 	SearchMyIssuesOptions,
 } from '../models/issueReads.js';
-import { groupProjectIssuesSearches, IssuesIntegration } from '../models/issuesIntegration.js';
+import { groupProjectIssuesSearches, IssuesIntegration, toProjectsCollection } from '../models/issuesIntegration.js';
 import { areDomainsOnSameHost, baseUrlFromDomain } from '../utils/domain.utils.js';
+import type { ProviderApiCollectionResult } from './models.js';
 import { providersMetadata, toAccount, toIssueShape, toProviderIssueStates } from './models.js';
-import { isJiraMissingProjectError } from './providerErrors.js';
+import { isJiraServerMissingProjectError } from './providerErrors.js';
 import type { ProvidersApi } from './providersApi.js';
 import { DiscoveryCache } from './utils/discoveryCache.js';
 import type { JiraDrainOptions, JiraIssuePageFetcher } from './utils/jiraIssueDrains.js';
@@ -33,7 +34,9 @@ import {
 	drainJiraIssues,
 	readUserScopedJiraIssues,
 	searchJiraProjectIssues,
+	summarizePageMetadata,
 	toUniqueJiraIssueShapes,
+	withFailureScope,
 } from './utils/jiraIssueDrains.js';
 import { mergeCollectionMetadata } from './utils/providerPaging.js';
 
@@ -136,12 +139,9 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 		return { id: this.domain, key: this.domain, name: this.domain, url: this.apiBaseUrlFor(session) };
 	}
 
-	// No `autolinks()` override, unlike Jira Cloud: an autolink prefix has to be the Jira project KEY, which
-	// is what a commit message or branch name carries (`PROJ-123`). `/rest/api/2/project` reports no key — see
-	// `getProviderProjectsForResources`, which falls back to the name because JQL accepts it — so the only
-	// prefix this class could build is the display name, which matches nothing and yields a `/browse/` URL that
-	// is not an issue. Registering that would be worse than registering none. Restore the override once the SDK
-	// surfaces the project key (GKDEV-3629's sibling gap).
+	// No `autolinks()` override yet, unlike Jira Cloud: an autolink prefix has to be the Jira project KEY, which
+	// is what a commit message or branch name carries (`PROJ-123`). The project descriptors carry it now (see
+	// `getProviderProjectsForResources`), so the override can follow Cloud's; until then none is registered.
 
 	protected override async getProviderAccountForResource(
 		session: ProviderAuthenticationSession,
@@ -178,6 +178,26 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 		if (cached != null && !force) return cached;
 
 		const generation = this._projects.generation;
+		const descriptors = await this.readProjects(session);
+		if (descriptors == null) return undefined;
+
+		this._projects.set(cacheKey, descriptors, { generation: generation });
+
+		return descriptors;
+	}
+
+	protected override async getProviderUncachedProjectsForResourcesWithMetadata(
+		session: ProviderAuthenticationSession,
+		resources: JiraServerResourceDescriptor[],
+	): Promise<ProviderApiCollectionResult<JiraServerProjectDescriptor>> {
+		if (resources.length === 0) return { values: [] };
+
+		return toProjectsCollection(await this.readProjects(session));
+	}
+
+	private async readProjects(
+		session: ProviderAuthenticationSession,
+	): Promise<JiraServerProjectDescriptor[] | undefined> {
 		const api = await this.getProvidersApi();
 		const projects = await api.getJiraServerProjects(
 			toTokenWithInfo(this.id, session),
@@ -186,21 +206,16 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 		if (projects == null) return undefined;
 
 		const resourceId = this.resourceFor(session).id;
-		const descriptors = projects.map<JiraServerProjectDescriptor>(p => ({
+		return projects.map<JiraServerProjectDescriptor>(p => ({
 			id: p.id,
-			// The display name, NOT what the reads address the project by. `/rest/api/2/project` reports no
-			// project key (GKDEV-3629's sibling gap) and the SDK's `JiraServerProject` carries only `id` and
-			// `name`, so there is no key to put here; the reads below use `id` instead, because JQL resolves a
-			// `project = "<value>"` clause against key before name, and a display name that collides with
-			// ANOTHER project's key would silently return that project's issues.
-			key: p.name,
+			// The project key, which selects the project (`listProjects`' `name`) and is what an issue key starts
+			// with. The SDK does not validate it, so a missing or blank one falls back to the numeric id, never to the
+			// display name, which can equal another project's key. The reads below still address the project by
+			// `id`, which no other project can share.
+			key: p.key?.trim() || p.id,
 			name: p.name,
 			resourceId: resourceId,
 		}));
-
-		this._projects.set(cacheKey, descriptors, { generation: generation });
-
-		return descriptors;
 	}
 
 	protected override async getProviderIssuesForProject(
@@ -235,13 +250,14 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 			});
 		const drainOptions: JiraDrainOptions = {
 			maxPages: maxPagesPerRequest,
-			failureScope: { providerId: this.id, resourceId: project.resourceId, projectId: project.id },
+			// Scoped by key, as on Jira Cloud: the id addresses the read, the key is how a consumer names the project.
+			failureScope: { providerId: this.id, resourceId: project.resourceId, projectId: project.key },
 			providerName: 'Jira Server',
 			// A project this connection can no longer see (deleted, or its browse permission removed) holds
 			// no issues for it, and the project list that named it is stale: drop that list so the next read
 			// re-reads it, instead of failing the whole provider on every read until a restart (#5907).
 			isEmptyFailure: ex => {
-				if (!isJiraMissingProjectError(ex)) return false;
+				if (!isJiraServerMissingProjectError(ex)) return false;
 
 				Logger.warn(`Jira Server project '${project.name}' (${project.id}) no longer exists or is not visible`);
 				this._projects.delete(this.projectsCacheKey(session));
@@ -257,25 +273,20 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 				drainOptions,
 			);
 			const values = toUniqueJiraIssueShapes(read.issues, this);
+			const drain = { values: values, metadata: read.metadata, scope: drainOptions.failureScope };
 			// `recovery: 'none'` for the whole set: the filter branches merge here, so even a pure backstop in one
 			// branch is not fixable by narrowing this read's scope.
-			return read.truncated
-				? { values: values, truncated: true, recovery: 'none', metadata: read.metadata }
-				: { values: values, truncated: false, metadata: read.metadata };
+			return read.truncated ? { ...drain, truncated: true, recovery: 'none' } : { ...drain, truncated: false };
 		}
 
 		const unscoped = await drainJiraIssues(fetchPage, {}, drainOptions);
 		const values = unscoped.issues
 			.map(issue => toIssueShape(issue, this, { projection: 'project' }))
 			.filter((result): result is IssueShape => result !== undefined);
+		const drain = { values: values, metadata: unscoped.metadata, scope: drainOptions.failureScope };
 		return unscoped.status !== 'complete'
-			? {
-					values: values,
-					truncated: true,
-					recovery: unscoped.status === 'backstop' ? 'narrow-scope' : 'none',
-					metadata: unscoped.metadata,
-				}
-			: { values: values, truncated: false, metadata: unscoped.metadata };
+			? { ...drain, truncated: true, recovery: unscoped.status === 'backstop' ? 'narrow-scope' : 'none' }
+			: { ...drain, truncated: false };
 	}
 
 	/**
@@ -305,6 +316,9 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 		// Every request of a search shares its user scope (see `getProjectIssuesSearches`).
 		const { options } = requests[0];
 		if (options.user == null) return undefined;
+		// One project's search is its own read, by the same numeric id, so it costs no more to read it as one. And it
+		// reports what the search can't: a dropped issue's failure, which a search can only answer by being read again.
+		if (requests.length === 1) return undefined;
 
 		const tokenWithInfo = toTokenWithInfo(this.id, session);
 		const api = await this.getProvidersApi();
@@ -369,6 +383,7 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 		let cursor: string | undefined;
 		let truncated = false;
 		let metadata: CollectionMetadata | undefined;
+		const pages: CollectionMetadata[] = [];
 
 		const stopIncomplete = (reason: string) => {
 			truncated = true;
@@ -399,6 +414,13 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 					.map(issue => toIssueShape(issue, this, { projection: 'account' }))
 					.filter((r): r is IssueShape => r != null),
 			);
+			// An issue the page dropped because it could not be read arrives here, not as a missing row; recorded under
+			// the same scope as this read's other failures.
+			if (page.metadata != null) {
+				// Truncated too, as Jira Cloud's read is through `getPagedResult`: the account is missing that issue.
+				truncated ||= isIncompleteCollection(page.metadata);
+				pages.push(withFailureScope(page.metadata, accountScope));
+			}
 
 			if (!page.hasMore) break;
 
@@ -418,7 +440,11 @@ export class JiraServerIntegration extends IssuesIntegration<IssuesSelfManagedHo
 			}
 		}
 
-		return { values: results, truncated: truncated, metadata: metadata };
+		return {
+			values: results,
+			truncated: truncated,
+			metadata: mergeCollectionMetadata(summarizePageMetadata(pages), metadata),
+		};
 	}
 
 	protected override async getProviderLinkedIssueOrPullRequest(

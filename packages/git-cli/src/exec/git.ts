@@ -36,6 +36,7 @@ import type { GitRunCancellation } from '@gitlens/git/run.types.js';
 import { CancellationError, getAbortSignalId, isCancellationError } from '@gitlens/utils/cancellation.js';
 import { getScopedCounter } from '@gitlens/utils/counter.js';
 import { getDurationMilliseconds, hrtime } from '@gitlens/utils/hrtime.js';
+import { chunkByStringLength } from '@gitlens/utils/iterable.js';
 import type { LogChannel } from '@gitlens/utils/logger.js';
 import { Logger } from '@gitlens/utils/logger.js';
 import { formatLoggableScopeBlock } from '@gitlens/utils/logger.scoped.js';
@@ -53,6 +54,14 @@ import type { FilteredGitFeatures, GitFeatureOrPrefix, GitFeatures } from './fea
 import { gitFeaturesByVersion } from './features.js';
 import type { GitQueueConfig } from './gitQueue.js';
 import { getPrimaryGitCommand, GitQueue, inferGitCommandPriority } from './gitQueue.js';
+import {
+	isConfigCommand,
+	isIndexWriteCommand,
+	KeyedSequencer,
+	retryWhileConfigLocked,
+	retryWhileIndexLocked,
+	toExitCode,
+} from './indexLock.js';
 import type { GitLocation } from './locator.js';
 
 export const slowCallWarningThreshold = 2000;
@@ -62,6 +71,32 @@ const queueWaitAnnotationThreshold = 100;
 /** Below this, a measured event-loop stall isn't worth annotating — see {@link EventLoopMonitor}. */
 const eventLoopDelayAnnotationThreshold = 500;
 export const maxGitCliLength = 30000;
+
+/** Rejections from a host's `beforeIndexLockRetry` — typed writes rethrow these as thrown instead of mapping them to their own error. */
+const runHookFailures = new WeakSet<object>();
+
+export function isRunHookFailure(ex: unknown): boolean {
+	return typeof ex === 'object' && ex != null && runHookFailures.has(ex);
+}
+
+/**
+ * Splits `paths` into `:(literal)` pathspec batches that each fit the command-line length limit after `prefix`, so a
+ * folder named like a glob (`[id]/`) doesn't match its siblings.
+ */
+export function batchLiteralPathspecs(
+	paths: readonly string[],
+	prefix: readonly string[],
+): Iterable<readonly string[]> {
+	// Reserve the prefix and a per-arg overhead (separator + possible quoting), so neither a run of long paths nor
+	// many short ones can push a batch past the OS limit
+	const perArgOverhead = 3;
+	const prefixLength = [...prefix, '--'].reduce((sum, arg) => sum + arg.length + perArgOverhead, 0);
+	return chunkByStringLength(
+		paths.map(p => `:(literal)${p}`),
+		maxGitCliLength - prefixLength,
+		perArgOverhead,
+	);
+}
 
 export const gitConfigsBranch = ['-c', 'color.branch=false'] as const;
 export const gitConfigsDiff = ['-c', 'color.diff=false', '-c', 'diff.mnemonicPrefix=false'] as const;
@@ -582,7 +617,7 @@ export interface GitOptions {
 	env?: Record<string, string | undefined>;
 	/** Dynamic environment provider called for each command (e.g., host-discovered SCM credentials) */
 	getEnvironment?: () => Record<string, string | undefined> | undefined;
-	/** Git command timeout in milliseconds. Defaults to 60000. Set to 0 to disable. */
+	/** Git command timeout in milliseconds, for runs that don't set their own. Defaults to 60000. Set to 0 to disable. */
 	gitTimeout?: number;
 	/** Returns whether the workspace is currently trusted. Defaults to true when not provided. Called on every exec/stream. */
 	isTrusted?: () => boolean;
@@ -694,6 +729,10 @@ export class Git {
 	>();
 	/** Queue for throttling background git operations */
 	private readonly _queue: GitQueue;
+	/** Orders the index-writing runs of each checkout, so they don't race for its `index.lock` */
+	private readonly _indexWrites = new KeyedSequencer();
+	/** The spawn behind every non-streaming run — a field only so tests can substitute it */
+	private readonly _runSpawn: typeof runSpawn = runSpawn;
 	/** Detects event-loop stalls while at least one git command is in flight */
 	private readonly _eventLoopMonitor = new EventLoopMonitor();
 	/** Count of git commands currently in flight, across both the exec and streaming paths */
@@ -707,7 +746,13 @@ export class Git {
 	private _lastDynamicEnv: Record<string, string | undefined> | undefined | null;
 
 	/** Bound via {@link bindChangeNotifier}; announces a `notify`-flagged run's changes. No-op until bound. */
-	private _changeNotifier: ((repoPaths: readonly string[], changes: readonly RepositoryChange[]) => void) | undefined;
+	private _changeNotifier:
+		| ((
+				repoPaths: readonly string[],
+				changes: readonly RepositoryChange[],
+				sharedPaths?: readonly string[],
+		  ) => void)
+		| undefined;
 
 	constructor(
 		private readonly _locator: () => Promise<GitLocation>,
@@ -721,9 +766,17 @@ export class Git {
 	 * to its own `notifyChanged` from its constructor — including when it's handed a pre-built `Git` via
 	 * `options.git`, so a host-supplied instance gets bound too. With nothing bound, `notify` is a no-op.
 	 * `repoPaths` holds more than one path only for a `-C`-scoped shared-state verb: the `-C` target, then the
-	 * caller's own `cwd`.
+	 * caller's own `cwd`. `sharedPaths` names the paths that were not run in but share the repository, which
+	 * hear only the part of `changes` every worktree sees (the caller's `cwd`, when the verb also changed
+	 * something local to the `-C` target).
 	 */
-	bindChangeNotifier(fn: (repoPaths: readonly string[], changes: readonly RepositoryChange[]) => void): void {
+	bindChangeNotifier(
+		fn: (
+			repoPaths: readonly string[],
+			changes: readonly RepositoryChange[],
+			sharedPaths?: readonly string[],
+		) => void,
+	): void {
 		this._changeNotifier = fn;
 	}
 
@@ -985,8 +1038,7 @@ export class Git {
 			if (command.sharedChanges.length === command.changes.length) {
 				this._changeNotifier([ranIn, cwd], command.changes);
 			} else {
-				this._changeNotifier([ranIn], command.changes);
-				this._changeNotifier([cwd], command.sharedChanges);
+				this._changeNotifier([ranIn], command.changes, [cwd]);
 			}
 			return;
 		}
@@ -1008,6 +1060,7 @@ export class Git {
 
 		gitCommand = `[${options.cwd}] ${gitCommand}`;
 		const {
+			beforeIndexLockRetry,
 			cancellation,
 			configs,
 			correlationKey,
@@ -1020,10 +1073,11 @@ export class Git {
 			...opts
 		} = options;
 
-		const defaultTimeout = this.options.gitTimeout ?? 60000;
+		// A run's own timeout holds even when the default is disabled (0), so an unrequested background run stays capped
+		const runTimeout = opts.timeout ?? this.options.gitTimeout ?? 60000;
 		const runOpts: Mutable<RunOptions> = {
 			...opts,
-			timeout: opts.timeout === 0 || defaultTimeout === 0 ? undefined : (opts.timeout ?? defaultTimeout),
+			timeout: runTimeout === 0 ? undefined : runTimeout,
 			encoding: (encoding ?? 'utf8') === 'utf8' ? 'utf8' : 'buffer',
 			decode: this.options.decode,
 			env: this.buildEnv(options.env),
@@ -1031,8 +1085,12 @@ export class Git {
 		};
 
 		// A run fed its own stdin or per-call env is never shared: the same argv can answer differently for
-		// each (a temporary index through `GIT_INDEX_FILE`, config injected through `GIT_CONFIG_*`).
-		const unshared = options?.stdin != null || (options?.env != null && Object.keys(options.env).length > 0);
+		// each (a temporary index through `GIT_INDEX_FILE`, config injected through `GIT_CONFIG_*`). Nor is one
+		// carrying a retry hook, since the check it makes is that caller's own.
+		const unshared =
+			options?.stdin != null ||
+			(options?.env != null && Object.keys(options.env).length > 0) ||
+			beforeIndexLockRetry != null;
 		const cacheKey = `${correlationKey !== undefined ? `${correlationKey}:` : ''}${
 			unshared ? `${unsharedRunCounter.next()}:` : ''
 		}${cancellation != null ? `${getAbortSignalId(cancellation)}:` : ''}${gitCommand}`;
@@ -1040,6 +1098,9 @@ export class Git {
 		// When the subprocess actually started — `start` includes GitQueue wait, which is congestion rather
 		// than anything the repository did. Stays undefined for a dedup rider or a command aborted while queued.
 		let execStart: ReturnType<typeof hrtime> | undefined;
+		// What the caller's retry hook threw. It is the caller's own failure, so it must reach them as thrown
+		// rather than be classified like a git failure below.
+		let hookFailure: { error: unknown } | undefined;
 		let waiting;
 		let promise = this.pendingCommands.get(cacheKey)?.promise;
 		if (promise == null) {
@@ -1050,6 +1111,15 @@ export class Git {
 			const deferred = defer<RunResult<string | Buffer>>();
 			promise = deferred.promise;
 			this.pendingCommands.set(cacheKey, { cwd: options.cwd, promise: promise });
+
+			// A write to the index takes `index.lock` and fails at once if another process holds it, so these
+			// runs queue behind one another per checkout and retry briefly when something outside still beats
+			// them to it. A temporary index (`GIT_INDEX_FILE`) has a lock of its own, so it never joins the order.
+			const writesIndex = isIndexWriteCommand(args);
+			const checkoutKey =
+				writesIndex && options.cwd != null && runOpts.env?.GIT_INDEX_FILE == null
+					? this.resolveNotifyPath(options.cwd, leadingCommand(args).pathOverride)
+					: undefined;
 
 			// Fixes https://github.com/gitkraken/vscode-gitlens/issues/73 & https://github.com/gitkraken/vscode-gitlens/issues/161
 			// See https://stackoverflow.com/questions/4144417/how-to-handle-asian-characters-in-file-names-in-git-on-os-x
@@ -1071,15 +1141,44 @@ export class Git {
 
 			// Execute through the queue (interactive/normal run immediately, background is throttled)
 			const gitPath = await this.path();
-			void this._queue
-				.run(
+			const spawnQueued = () =>
+				this._queue.run(
 					priority,
 					() => {
 						execStart = hrtime();
-						return runSpawn<T>(gitPath, args, encoding ?? 'utf8', runOpts);
+						return this._runSpawn<T>(gitPath, args, encoding ?? 'utf8', runOpts);
 					},
 					cancellation,
-				)
+				);
+			// The retry wraps the spawn itself, before any `errors` mode turns a failure into a result or a
+			// throw, because only the raw `RunError` carries the stderr that says the lock was held. It re-queues
+			// each attempt, so waiting between them doesn't hold a queue slot.
+			// A config write likewise fails at once on a held `<file>.lock`. Reads never produce that failure, so
+			// the retry costs them nothing, and one wrap covers both `errors` modes.
+			const beforeRetry =
+				beforeIndexLockRetry != null
+					? async (lockError: Error) => {
+							try {
+								await beforeIndexLockRetry(lockError);
+							} catch (ex) {
+								// The lock error thrown back only declines the retry, leaving the lock failure as the result
+								if (ex !== lockError) {
+									hookFailure = { error: ex };
+								}
+								throw ex;
+							}
+						}
+					: undefined;
+			const spawnWithRetry = writesIndex
+				? () => retryWhileIndexLocked(spawnQueued, cancellation, beforeRetry)
+				: isConfigCommand(args)
+					? () => retryWhileConfigLocked(spawnQueued, cancellation)
+					: spawnQueued;
+			void (
+				checkoutKey != null
+					? this._indexWrites.run(checkoutKey, cancellation, spawnWithRetry)
+					: spawnWithRetry()
+			)
 				.then(deferred.fulfill, (e: unknown) => deferred.cancel(e instanceof Error ? e : new Error(String(e))))
 				.finally(() => {
 					// A clear may have dropped this run and a later identical call registered its own under the key
@@ -1141,6 +1240,16 @@ export class Git {
 				completion: { status: 'exited', code: result.exitCode },
 			};
 		} catch (ex) {
+			if (hookFailure != null) {
+				exception =
+					hookFailure.error instanceof Error ? hookFailure.error : new Error(String(hookFailure.error));
+				if (typeof hookFailure.error === 'object' && hookFailure.error != null) {
+					runHookFailures.add(hookFailure.error);
+				}
+
+				throw hookFailure.error;
+			}
+
 			if (expectedExitCodes?.length && ex instanceof RunError && !(ex instanceof CancelledRunError)) {
 				const code = toExitCode(ex.code);
 				if (code != null && expectedExitCodes.includes(code)) {
@@ -1448,8 +1557,22 @@ export class Git {
 		return void cleanup();
 	}
 
+	/**
+	 * Resolves the git dir (and common dir, for a linked worktree) of `cwd`.
+	 *
+	 * Resolves `undefined` when `cwd` is not in a repository: git reported so, or `cwd` doesn't exist. Any
+	 * other failure (unsafe ownership, a timeout or cancellation, a missing git binary) rejects.
+	 */
 	async rev_parse__git_dir(cwd: string): Promise<{ path: string; commonPath?: string } | undefined> {
-		const result = await this.run({ cwd: cwd, errors: 'ignore' }, 'rev-parse', '--git-dir', '--git-common-dir');
+		let result;
+		try {
+			result = await this.run({ cwd: cwd, errors: 'throw' }, 'rev-parse', '--git-dir', '--git-common-dir');
+		} catch (ex) {
+			if (ex instanceof GitError && GitWarnings.notARepository.test(ex.stderr ?? '')) return undefined;
+			// A missing `cwd` fails the spawn itself (ENOENT) before git can say anything about it
+			if (!(await fsExists(cwd))) return undefined;
+			throw ex;
+		}
 		if (!result.stdout) return undefined;
 
 		// Keep trailing spaces which are part of the directory name
@@ -1522,7 +1645,7 @@ export class Git {
 			if (inDotGit && this.options.isTrusted?.() !== false) {
 				result = await this.run({ cwd: cwd, errors: 'ignore' }, 'rev-parse', '--is-bare-repository');
 				if (result.stdout.trim() === 'true') {
-					const result = await this.rev_parse__git_dir(cwd);
+					const result = await this.rev_parse__git_dir(cwd).catch(() => undefined);
 					const repoPath = result?.commonPath ?? result?.path;
 					if (repoPath?.length) return [true, repoPath];
 				}
@@ -1653,15 +1776,6 @@ export class Git {
 			this.options.logger?.info(`${logMessage} \u2022 completed`);
 		}
 	}
-}
-
-/**
- * The exit code in a run error's `code`, or `undefined` when the process never exited normally: a numeric string
- * is a real exit code, but an errno (`'ENOENT'`) means the spawn itself failed, and `undefined` means it was killed.
- */
-function toExitCode(code: number | string | undefined): number | undefined {
-	const exitCode = typeof code === 'number' ? code : code != null ? parseInt(code, 10) : NaN;
-	return Number.isInteger(exitCode) ? exitCode : undefined;
 }
 
 /**

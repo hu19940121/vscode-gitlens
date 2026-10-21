@@ -30,10 +30,12 @@ import {
 	throwIfCallerContractError,
 	toCollectionFailureError,
 	toCollectionScopeFailure,
+	toUnsettledScopeFailure,
+	unsettledMissMessage,
 } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
-import { toError } from '../errors.js';
+import { RequestNotFoundError, toError } from '../errors.js';
 import type {
 	GetIssuesOptions,
 	GetPullRequestsOptions,
@@ -50,6 +52,7 @@ import type {
 	ProviderRepository,
 } from '../providers/models.js';
 import {
+	isRepoIdsInput,
 	IssueFilter,
 	PagingMode,
 	PullRequestFilter,
@@ -119,6 +122,40 @@ type MyPullRequestsForReposOptions = {
 	summary?: boolean;
 };
 
+/** A repository as the batch and branch reads name it. */
+type RepositoryCoordinate = { owner: string; repo: string; project?: string };
+
+/**
+ * Rejects each slot that read nothing (`isMiss`) for a coordinate whose repository couldn't be settled (see
+ * {@link GitHostIntegration.resolveRepositoryCoordinates}): it may have addressed another repository, so its miss is
+ * not a proven absence a caller may cache.
+ */
+function rejectUnsettledMisses<T>(
+	slots: PromiseSettledResult<T>[],
+	unsettled: readonly boolean[] | undefined,
+	isMiss: (value: T) => boolean,
+): PromiseSettledResult<T>[] {
+	if (!unsettled?.some(Boolean)) return slots;
+
+	return slots.map((slot, i) =>
+		unsettled[i] && slot.status === 'fulfilled' && isMiss(slot.value)
+			? { status: 'rejected', reason: new Error(unsettledMissMessage) }
+			: slot,
+	);
+}
+
+/**
+ * The keys of the scopes {@link GitHostIntegration.resolveRepositoryInputs} couldn't settle, for a list read to record
+ * a miss for one as a failure ({@link toUnsettledScopeFailure}) rather than as an empty scope.
+ */
+function toUnsettledScopeKeys(
+	repos: readonly ProviderRepoInput[],
+	unsettled: readonly boolean[] | undefined,
+	key: (repo: ProviderRepoInput) => string,
+): ReadonlySet<string> {
+	return new Set(unsettled?.some(Boolean) ? repos.filter((_, i) => unsettled[i]).map(key) : []);
+}
+
 /**
  * Rejects a read the provider can't serve as asked: logs the reason and returns it as the `{ error }` half of an
  * {@link IntegrationResult}, timed from `start`.
@@ -173,6 +210,76 @@ export abstract class GitHostIntegration<
 			default:
 				return baseUrl;
 		}
+	}
+
+	/**
+	 * The repositories the repo-scoped, batch and branch reads address, given the coordinates their caller named, in
+	 * order: those, unless the host names a caller's repository differently than the caller parsed it (see the Azure
+	 * DevOps Server override). `unsettled` flags a coordinate the host couldn't place, read as given; a batch or
+	 * branch slot that then reads nothing is rejected rather than reported as absent ({@link rejectUnsettledMisses}).
+	 */
+	protected resolveRepositoryCoordinates<T extends RepositoryCoordinate>(
+		_session: ProviderAuthenticationSession,
+		coordinates: readonly T[],
+		_cancellation?: AbortSignal,
+	): Promise<{ coordinates: readonly T[]; unsettled?: readonly boolean[] }> {
+		return Promise.resolve({ coordinates: coordinates });
+	}
+
+	/**
+	 * {@link resolveRepositoryCoordinates} for the repository descriptors the list and search reads take: those, unless
+	 * the host overrides both. A scope flagged `unsettled` that then reads nothing is reported as a failure of the read
+	 * ({@link toUnsettledScopeFailure}) rather than as an empty scope.
+	 */
+	protected resolveRepositoryInputs(
+		_session: ProviderAuthenticationSession,
+		repos: readonly ProviderRepoInput[],
+		_cancellation?: AbortSignal,
+	): Promise<{ repos: ProviderRepoInput[]; unsettled?: readonly boolean[] }> {
+		return Promise.resolve({ repos: [...repos] });
+	}
+
+	/**
+	 * The repositories a repo-scoped read of `repos` addresses ({@link resolveRepositoryInputs}), for a caller that
+	 * shapes the read by them before making it. Resolves the session as that read does, and fails as it would: a
+	 * session that can't be resolved is the read's own failure (refreshing a refused token is claimed here), so the
+	 * caller reports it rather than making the read. Settling that fails leaves `repos` as given, for the read to
+	 * settle or report.
+	 */
+	async resolveRepositoryScopes(
+		repos: ProviderReposInput,
+		connectionId?: string,
+	): Promise<IntegrationResult<ProviderReposInput>> {
+		if (isRepoIdsInput(repos)) return { value: repos };
+
+		const session = await this.resolveReadSession(connectionId, undefined);
+		if (session == null || isReadSessionFailure(session)) return session && { error: session.error };
+
+		try {
+			return { value: (await this.resolveRepositoryInputs(session, repos)).repos };
+		} catch {
+			return { value: repos };
+		}
+	}
+
+	/**
+	 * A batch or branch read's slots, settled against the repositories {@link resolveRepositoryCoordinates} settled
+	 * its coordinates to: a miss for one it couldn't settle is rejected ({@link rejectUnsettledMisses}), and a refusal
+	 * is recorded against the repository the host read rather than the caller's parse of it.
+	 */
+	private settleResolvedSlots<T>(
+		session: ProviderAuthenticationSession,
+		resolved: { coordinates: readonly RepositoryCoordinate[]; unsettled?: readonly boolean[] },
+		slots: PromiseSettledResult<T>[],
+		isMiss: (value: T) => boolean,
+		options?: { keepOtherFailures?: boolean },
+	): Promise<BatchSlot<T>[]> {
+		return this.settleBatchRefusals(
+			session,
+			resolved.coordinates,
+			rejectUnsettledMisses(slots, resolved.unsettled, isMiss),
+			options,
+		);
 	}
 
 	/** The base the repository-list reads hand the provider client for a self-managed host. */
@@ -275,13 +382,23 @@ export abstract class GitHostIntegration<
 		const defaultBranch = this.ctx.cache.getRepositoryDefaultBranch(
 			repo,
 			this,
-			() => ({
+			cacheable => ({
 				value: (async () => {
 					try {
 						const result = await this.getProviderDefaultBranch(this._session!, repo, options?.cancellation);
+						// A canceled read may come back with nothing, which isn't an answer to keep
+						if (result == null && options?.cancellation?.aborted) {
+							cacheable.invalidate();
+							return undefined;
+						}
+
 						this.resetRequestExceptionCount('getDefaultBranch');
 						return result;
 					} catch (ex) {
+						// A failed lookup is not an answer, and this bucket never expires one; a missing repository is.
+						if (!(ex instanceof RequestNotFoundError)) {
+							cacheable.invalidate();
+						}
 						this.handleProviderException('getDefaultBranch', ex, { scope: scope });
 						return undefined;
 					}
@@ -301,9 +418,10 @@ export abstract class GitHostIntegration<
 
 	/**
 	 * Settles what one repository's refusal of the credential means, as a batch read settles a refused target (see
-	 * `IntegrationBase.settleBatchRefusals`): the scope failure it is recorded as, against that repository (and, on
-	 * Azure DevOps, its project), with its cause named once the credential checks out. A refused credential throws
-	 * its own error, which the caller reports for the connection instead of the repository's refusal.
+	 * `IntegrationBase.settleBatchRefusals`): the scope failure it is recorded as, against that repository as the host
+	 * names it (and, on Azure DevOps, its project), with its cause named once the credential checks out. `name` names
+	 * the repository alone, as a batch target does. A refused credential throws its own error, which the caller reports
+	 * for the connection instead of the repository's refusal.
 	 */
 	async settleRepositoryRefusal(
 		repo: { owner: string; name: string; project?: string; connectionId?: string },
@@ -312,11 +430,11 @@ export abstract class GitHostIntegration<
 		const session = await this.resolveReadSessionOrThrow(repo.connectionId, undefined);
 		if (session == null) return undefined;
 
-		const [slot] = await this.settleBatchRefusals(
-			session,
-			[{ owner: repo.owner, repo: repo.name, project: repo.project }],
-			[{ status: 'rejected', reason: refusal }],
-		);
+		// Against the repository the host read, which a caller's parsed path may name differently.
+		const { coordinates } = await this.resolveRepositoryCoordinates(session, [
+			{ owner: repo.owner, repo: repo.name, project: repo.project },
+		]);
+		const [slot] = await this.settleBatchRefusals(session, coordinates, [{ status: 'rejected', reason: refusal }]);
 		return slot?.status === 'rejected' ? slot.failure : undefined;
 	}
 
@@ -356,7 +474,7 @@ export abstract class GitHostIntegration<
 		const metadata = this.ctx.cache.getRepositoryMetadata(
 			repo,
 			this,
-			() => ({
+			cacheable => ({
 				value: (async () => {
 					try {
 						const result = await this.getProviderRepositoryMetadata(
@@ -364,9 +482,19 @@ export abstract class GitHostIntegration<
 							repo,
 							options?.cancellation,
 						);
+						// A canceled read may come back with nothing, which isn't an answer to keep
+						if (result == null && options?.cancellation?.aborted) {
+							cacheable.invalidate();
+							return undefined;
+						}
+
 						this.resetRequestExceptionCount('getRepositoryMetadata');
 						return result;
 					} catch (ex) {
+						// A failed lookup is not an answer, and this bucket never expires one; a missing repository is.
+						if (!(ex instanceof RequestNotFoundError)) {
+							cacheable.invalidate();
+						}
 						this.handleProviderException('getRepositoryMetadata', ex, { scope: scope });
 						return undefined;
 					}
@@ -823,7 +951,7 @@ export abstract class GitHostIntegration<
 	 * rather than swallowing them to `undefined`.
 	 */
 	async getMyIssuesForReposResult(
-		reposOrRepoIds: ProviderReposInput,
+		repos: ProviderReposInput,
 		options?: MyIssuesForReposOptions,
 		connectionId?: string,
 	): Promise<IntegrationResult<(PagedResult<ProviderIssue> & { metadata?: CollectionMetadata }) | undefined>> {
@@ -836,19 +964,28 @@ export abstract class GitHostIntegration<
 		if (session == null || isReadSessionFailure(session)) return session && { error: session.error };
 
 		const start = performance.now();
+		let resolvedRepos: ProviderReposInput;
+		let unsettled: readonly boolean[] | undefined;
 		let customUrl: string | undefined;
 		let api: ProvidersApi;
 		try {
+			if (isRepoIdsInput(repos)) {
+				resolvedRepos = repos;
+			} else {
+				({ repos: resolvedRepos, unsettled } = await this.resolveRepositoryInputs(session, repos));
+			}
 			customUrl =
 				options?.customUrl ??
 				(isGitSelfManagedHostIntegrationId(providerId)
-					? this.getRepositoriesApiBaseUrl(session, reposOrRepoIds)
+					? this.getRepositoriesApiBaseUrl(session, resolvedRepos)
 					: undefined);
 			api = await this.getProvidersApi();
 		} catch (ex) {
 			this.handleProviderException('getIssuesForRepos', ex, { scope: scope, connectionId: connectionId });
 			return { error: toError(ex), duration: performance.now() - start };
 		}
+		// A const, so the narrowing below holds inside callbacks.
+		const reposOrRepoIds = resolvedRepos;
 		const repoIdsInput = api.isRepoIdsInput(reposOrRepoIds);
 		if (
 			providerId !== GitCloudHostIntegrationId.GitLab &&
@@ -924,6 +1061,11 @@ export abstract class GitHostIntegration<
 				};
 			}
 
+			const unsettledProjects = toUnsettledScopeKeys(
+				reposOrRepoIds as ProviderRepoInput[],
+				unsettled,
+				r => `${r.namespace}\0${r.project}`,
+			);
 			const cursorInfo = this.parseCursorInfo<PagedProjectInput>(options?.cursor);
 			const cursors: PagedProjectInput[] = cursorInfo.cursors ?? [];
 			let projectInputs: PagedProjectInput[] = Array.from(projects.values(), project => ({
@@ -995,6 +1137,30 @@ export abstract class GitHostIntegration<
 
 					const { projectInput: _projectInput, results } = outcome.value;
 					data.push(...results.values);
+					// A project read can answer with rows and still be incomplete (a failed states read, say).
+					if (results.paging?.truncated) {
+						truncated = true;
+					}
+					metadata = mergeCollectionMetadata(metadata, results.metadata);
+					// A project that couldn't be settled may have been read in another collection, so reading
+					// nothing there doesn't prove it empty. A continuation already read rows from it.
+					if (
+						projectInput.cursor == null &&
+						results.values.length === 0 &&
+						unsettledProjects.has(`${projectInput.namespace}\0${projectInput.project}`)
+					) {
+						truncated = true;
+						metadata = mergeCollectionMetadata(metadata, {
+							completeness: 'partial',
+							failures: [
+								toUnsettledScopeFailure({
+									providerId: providerId,
+									resourceId: projectInput.namespace,
+									projectId: projectInput.project,
+								}),
+							],
+						});
+					}
 					if (results.paging?.more) {
 						hasMore = true;
 						cursor.cursors.push({
@@ -1261,7 +1427,7 @@ export abstract class GitHostIntegration<
 	 * rather than swallowing them to `undefined`.
 	 */
 	async getMyPullRequestsForReposResult(
-		reposOrRepoIds: ProviderReposInput,
+		repos: ProviderReposInput,
 		options?: MyPullRequestsForReposOptions,
 		connectionId?: string,
 	): Promise<IntegrationResult<ProviderApiPagedResult<ProviderPullRequest> | undefined>> {
@@ -1274,13 +1440,20 @@ export abstract class GitHostIntegration<
 		if (session == null || isReadSessionFailure(session)) return session && { error: session.error };
 
 		const start = performance.now();
+		let resolvedRepos: ProviderReposInput;
+		let unsettled: readonly boolean[] | undefined;
 		let customUrl: string | undefined;
 		let api: ProvidersApi;
 		try {
+			if (isRepoIdsInput(repos)) {
+				resolvedRepos = repos;
+			} else {
+				({ repos: resolvedRepos, unsettled } = await this.resolveRepositoryInputs(session, repos));
+			}
 			customUrl =
 				options?.customUrl ??
 				(isGitSelfManagedHostIntegrationId(providerId)
-					? this.getRepositoriesApiBaseUrl(session, reposOrRepoIds)
+					? this.getRepositoriesApiBaseUrl(session, resolvedRepos)
 					: undefined);
 			api = await this.getProvidersApi();
 		} catch (ex) {
@@ -1290,6 +1463,8 @@ export abstract class GitHostIntegration<
 			});
 			return { error: toError(ex), duration: performance.now() - start };
 		}
+		// A const, so the narrowing below holds inside callbacks.
+		const reposOrRepoIds = resolvedRepos;
 		if (
 			providerId !== GitCloudHostIntegrationId.GitLab &&
 			(api.isRepoIdsInput(reposOrRepoIds) ||
@@ -1420,6 +1595,8 @@ export abstract class GitHostIntegration<
 			api.getProviderPullRequestsPagingMode(providerId) === PagingMode.Repo &&
 			!api.isRepoIdsInput(reposOrRepoIds)
 		) {
+			const toRepoInputKey = (r: ProviderRepoInput) => `${r.namespace}\0${r.project ?? ''}\0${r.name}`;
+			const unsettledRepos = toUnsettledScopeKeys(reposOrRepoIds, unsettled, toRepoInputKey);
 			const cursorInfo = this.parseCursorInfo<PagedRepoInput>(options?.cursor);
 			const cursors: PagedRepoInput[] = cursorInfo.cursors ?? [];
 			let repoInputs: PagedRepoInput[] = reposOrRepoIds.map(repo => ({ repo: repo, cursor: undefined }));
@@ -1485,6 +1662,19 @@ export abstract class GitHostIntegration<
 					// Fan-out across repos: preserve each repo's SDK completeness/failures and its terminal
 					// truncation so a single failed/incomplete repo isn't lost when merged with its siblings.
 					metadata = mergeCollectionMetadata(metadata, results.metadata);
+					// See the project fan-out in `getMyIssuesForReposResult`.
+					if (
+						repoInput.cursor == null &&
+						results.values.length === 0 &&
+						unsettledRepos.has(toRepoInputKey(repoInput.repo))
+					) {
+						failures.push(
+							toUnsettledScopeFailure({
+								providerId: providerId,
+								repositoryId: `${repoInput.repo.namespace}/${repoInput.repo.name}`,
+							}),
+						);
+					}
 					if (results.paging?.truncated) {
 						truncated = true;
 					}
@@ -1927,16 +2117,17 @@ export abstract class GitHostIntegration<
 		const start = performance.now();
 		let slots: PromiseSettledResult<IssueShape | undefined>[] | undefined;
 		try {
-			slots = await this.getProviderIssuesBatch?.(session, coordinates, cancellation);
+			const targets = await this.resolveRepositoryCoordinates(session, coordinates, cancellation);
+			slots = await this.getProviderIssuesBatch?.(session, targets.coordinates, cancellation);
 			if (slots == null) {
 				this.resetRequestExceptionCount('getIssuesBatch');
 				return { value: undefined, duration: performance.now() - start };
 			}
 
-			const settled = await this.settleBatchRefusals(session, coordinates, slots);
+			const settled = await this.settleResolvedSlots(session, targets, slots, issue => issue == null);
 
 			this.resetRequestExceptionCount('getIssuesBatch');
-			this.reportDeferredRequestFailures(slots, false);
+			this.reportDeferredRequestFailures(settled, false);
 			return { value: settled, duration: performance.now() - start };
 		} catch (ex) {
 			const struck = this.handleProviderException('getIssuesBatch', ex, {
@@ -1994,16 +2185,17 @@ export abstract class GitHostIntegration<
 		const start = performance.now();
 		let slots: PromiseSettledResult<PullRequestShape | undefined>[] | undefined;
 		try {
-			slots = await this.getProviderPullRequestsBatch?.(session, coordinates, options, cancellation);
+			const targets = await this.resolveRepositoryCoordinates(session, coordinates, cancellation);
+			slots = await this.getProviderPullRequestsBatch?.(session, targets.coordinates, options, cancellation);
 			if (slots == null) {
 				this.resetRequestExceptionCount('getPullRequestsBatch');
 				return { value: undefined, duration: performance.now() - start };
 			}
 
-			const settled = await this.settleBatchRefusals(session, coordinates, slots);
+			const settled = await this.settleResolvedSlots(session, targets, slots, pr => pr == null);
 
 			this.resetRequestExceptionCount('getPullRequestsBatch');
-			this.reportDeferredRequestFailures(slots, false);
+			this.reportDeferredRequestFailures(settled, false);
 			return { value: settled, duration: performance.now() - start };
 		} catch (ex) {
 			const struck = this.handleProviderException('getPullRequestsBatch', ex, {
@@ -2059,12 +2251,15 @@ export abstract class GitHostIntegration<
 
 		const start = performance.now();
 		try {
-			const slots = await this.getProviderIssuesEtagFields?.(session, coordinates, options, cancellation);
-			if (slots == null) return { value: undefined, duration: performance.now() - start };
+			const targets = await this.resolveRepositoryCoordinates(session, coordinates, cancellation);
+			const read = await this.getProviderIssuesEtagFields?.(session, targets.coordinates, options, cancellation);
+			if (read == null) return { value: undefined, duration: performance.now() - start };
 
-			const settled = await this.settleBatchRefusals(session, coordinates, slots, { keepOtherFailures: true });
+			const settled = await this.settleResolvedSlots(session, targets, read, fields => fields == null, {
+				keepOtherFailures: true,
+			});
 
-			if (slots.some(slot => slot.status === 'fulfilled')) {
+			if (settled.some(slot => slot.status === 'fulfilled')) {
 				this.resetRequestExceptionCount('getIssuesEtagFields');
 			}
 			return { value: settled, duration: performance.now() - start };
@@ -2109,12 +2304,20 @@ export abstract class GitHostIntegration<
 
 		const start = performance.now();
 		try {
-			const slots = await this.getProviderPullRequestsEtagFields?.(session, coordinates, options, cancellation);
-			if (slots == null) return { value: undefined, duration: performance.now() - start };
+			const targets = await this.resolveRepositoryCoordinates(session, coordinates, cancellation);
+			const read = await this.getProviderPullRequestsEtagFields?.(
+				session,
+				targets.coordinates,
+				options,
+				cancellation,
+			);
+			if (read == null) return { value: undefined, duration: performance.now() - start };
 
-			const settled = await this.settleBatchRefusals(session, coordinates, slots, { keepOtherFailures: true });
+			const settled = await this.settleResolvedSlots(session, targets, read, fields => fields == null, {
+				keepOtherFailures: true,
+			});
 
-			if (slots.some(slot => slot.status === 'fulfilled')) {
+			if (settled.some(slot => slot.status === 'fulfilled')) {
 				this.resetRequestExceptionCount('getPullRequestsEtagFields');
 			}
 			return { value: settled, duration: performance.now() - start };
@@ -2170,16 +2373,27 @@ export abstract class GitHostIntegration<
 		const start = performance.now();
 		let slots: PromiseSettledResult<{ pullRequests: PullRequestShape[]; truncated: boolean }>[] | undefined;
 		try {
-			slots = await this.getProviderPullRequestsForBranches?.(session, targets, options, cancellation);
+			const resolved = await this.resolveRepositoryCoordinates(session, targets, cancellation);
+			slots = await this.getProviderPullRequestsForBranches?.(
+				session,
+				resolved.coordinates,
+				options,
+				cancellation,
+			);
 			if (slots == null) {
 				this.resetRequestExceptionCount('getPullRequestsForBranches');
 				return { value: undefined, duration: performance.now() - start };
 			}
 
-			const settled = await this.settleBatchRefusals(session, targets, slots);
+			const settled = await this.settleResolvedSlots(
+				session,
+				resolved,
+				slots,
+				found => found.pullRequests.length === 0 && !found.truncated,
+			);
 
 			this.resetRequestExceptionCount('getPullRequestsForBranches');
-			this.reportDeferredRequestFailures(slots, false);
+			this.reportDeferredRequestFailures(settled, false);
 			return { value: settled, duration: performance.now() - start };
 		} catch (ex) {
 			const struck = this.handleProviderException('getPullRequestsForBranches', ex, {

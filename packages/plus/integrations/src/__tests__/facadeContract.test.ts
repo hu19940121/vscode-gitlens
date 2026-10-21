@@ -304,14 +304,43 @@ suite('facade contract regressions', () => {
 		);
 		stubApi(azure, {});
 
-		// Azure's repo lookup is project-scoped; a remote carrying no project can't address a repo at all, so
-		// reporting it as `unauthorized` would drive a pointless reconnect.
+		// Azure's repo lookup is project-scoped; a remote whose project can't be told (here, more segments than an
+		// org and a project before `_git`) can't address a repo at all, so reporting it as `unauthorized` would
+		// drive a pointless reconnect. (`dev.azure.com/{org}/_git/{repo}` does carry one: the repo's own name.)
+		const result = await manager.resolveRepository({
+			providerId: GitCloudHostIntegrationId.AzureDevOps,
+			remoteUrl: 'https://dev.azure.com/org/group/project/_git/repo',
+		});
+
+		assert.equal(result.resolution.status, 'invalid-remote-url');
+
+		manager.dispose();
+	});
+
+	test('an Azure remote without the project segment addresses the project named after its repository', async () => {
+		const runtime = createFakeRuntime();
+		const manager = createIntegrationManager(runtime);
+		const azure = await manager.get(GitCloudHostIntegrationId.AzureDevOps);
+		(azure as unknown as { _session: ProviderAuthenticationSession })._session = primarySession(
+			't',
+			'dev.azure.com',
+		);
+		const calls: unknown[][] = [];
+		stubApi(azure, {
+			getRepo: (_token: unknown, owner: string, name: string, project: string) => {
+				calls.push([owner, name, project]);
+				return Promise.resolve({ id: 'r1', namespace: owner, name: name, project: project });
+			},
+		});
+
 		const result = await manager.resolveRepository({
 			providerId: GitCloudHostIntegrationId.AzureDevOps,
 			remoteUrl: 'https://dev.azure.com/org/_git/repo',
 		});
 
-		assert.notEqual(result.resolution.status, 'unauthorized');
+		assert.deepEqual(calls, [['org', 'repo', 'repo']]);
+		assert.equal(result.resolution.status, 'resolved');
+		assert.equal(result.resolution.identity?.project, 'repo');
 
 		manager.dispose();
 	});

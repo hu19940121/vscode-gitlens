@@ -18,7 +18,9 @@ import {
 	createIntegrationManager,
 	type ConfigChangeEvent,
 	GitCloudHostIntegrationId,
+	GitSelfManagedHostIntegrationId,
 	hostFromDomain,
+	IssuesCloudHostIntegrationId,
 	type IntegrationsRemoteConfig,
 	type IntegrationManagerCacheProvider,
 	type IntegrationManagerContext,
@@ -153,7 +155,19 @@ async function main(): Promise<void> {
 		assert.equal(typeof manager.listPullRequestsPage, 'function');
 		assert.equal(typeof manager.resolveRepository, 'function');
 		assert.equal(typeof manager.dispose, 'function');
+		assert.equal(manager.getSupportedFilters(GitCloudHostIntegrationId.AzureDevOps).issueStates, true);
+		assert.equal(manager.getSupportedFilters(GitSelfManagedHostIntegrationId.AzureDevOpsServer).issueStates, true);
 		if (false) {
+			void manager.listIssuesPage({
+				providerId: GitCloudHostIntegrationId.AzureDevOps,
+				project: 'Project',
+				state: 'closed',
+			});
+			void manager.listIssuesPage({
+				providerId: GitSelfManagedHostIntegrationId.AzureDevOpsServer,
+				domain: 'server.test',
+				state: 'all',
+			});
 			// @ts-expect-error A scoped hierarchy selector is ambiguous without its provider.
 			void manager.listOrgs({ connectionId: 'secondary' });
 			// @ts-expect-error A self-managed hierarchy selector is ambiguous without its provider.
@@ -166,6 +180,58 @@ async function main(): Promise<void> {
 		const manager = createIntegrationManager(buildRuntime());
 		assert.deepEqual(manager.getConfigured(), []);
 		manager.dispose();
+	});
+
+	await check('consumer reads the Linear workspace from each connection without hierarchy reads', async () => {
+		const runtime = buildRuntime();
+		runtime.account.getAccount = async () => ({ id: 'me' });
+		const linearConnection = (tokenId: string) => ({
+			tokenId: tokenId,
+			provider: 'linear',
+			type: 'oauth',
+			domain: 'linear.app',
+			accountName: 'person',
+		});
+		runtime.account.fetchGkApi = async path =>
+			new Response(
+				JSON.stringify({
+					data:
+						path === 'v1/provider-tokens'
+							? [{ ...linearConnection('one'), secondaries: [linearConnection('two')] }]
+							: {
+									tokenId: path.split('/').pop(),
+									accessToken: `token-${path.split('/').pop()}`,
+									expiresIn: 3600,
+									type: 'oauth',
+									scopes: 'read',
+								},
+				}),
+				{ status: 200 },
+			);
+		const authorizations: (string | null)[] = [];
+		runtime.http.fetch = async (_url, init) => {
+			const authorization = new Headers(init?.headers).get('authorization');
+			authorizations.push(authorization);
+			const organization =
+				authorization === 'token-two' ? { id: 'org-two', name: 'Second' } : { id: 'org-one', name: 'First' };
+			return new Response(JSON.stringify({ data: { organization: organization } }), {
+				status: 200,
+				headers: { 'Content-Type': 'application/json' },
+			});
+		};
+		const manager = createIntegrationManager(runtime);
+		try {
+			await manager.refreshConnections();
+			assert.deepEqual(authorizations.sort(), ['token-one', 'token-two'], 'one lookup per connection token');
+			const connections = new Map(manager.getConfigured(IssuesCloudHostIntegrationId.Linear).map(c => [c.id, c]));
+			assert.equal(connections.get('one')?.resourceName, 'First');
+			assert.equal(connections.get('one')?.resourceId, 'org-one');
+			assert.equal(connections.get('two')?.resourceName, 'Second');
+			assert.equal(connections.get('two')?.resourceId, 'org-two');
+			assert.equal(connections.get('two')?.accountName, 'person');
+		} finally {
+			manager.dispose();
+		}
 	});
 
 	await check('facade exports the domain normalizer used for connection selection', () => {

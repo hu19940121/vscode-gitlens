@@ -3,12 +3,14 @@ import * as sinon from 'sinon';
 import { createDisposable } from '@gitlens/utils/disposable.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import { fileUri } from '@gitlens/utils/uri.js';
+import type { BranchMetadataChange, MergeTargetsChangeEvent } from '../cache.js';
 import { Cache, shouldEvictBlameCacheEntry } from '../cache.js';
 import type { GitBlame, ProgressiveGitBlame } from '../models/blame.js';
-import type { GitBranch } from '../models/branch.js';
+import type { BranchMetadata } from '../models/branch.js';
+import { GitBranch } from '../models/branch.js';
 import type { GitCommitLine } from '../models/commit.js';
 import type { GitTag } from '../models/tag.js';
-import type { GitWorktree } from '../models/worktree.js';
+import { GitWorktree } from '../models/worktree.js';
 
 function createCompletedBlame(lineCount: number): ProgressiveGitBlame {
 	const blame: GitBlame = {
@@ -630,6 +632,33 @@ suite('Cache — tag-scoped invalidation', () => {
 		await cache.logShas.getOrCreate(repoPath, 'feat', factory);
 		assert.strictEqual(factoryCount, 2, 'a list excluding tags must not survive a tag create or delete');
 	});
+
+	test('leftRightCommitCount and mergeBase are cleared when tags change', async () => {
+		let countReads = 0;
+		let mergeBaseReads = 0;
+		const countFactory = () => {
+			countReads++;
+			return Promise.resolve({ left: 0, right: 1 });
+		};
+		const mergeBaseFactory = () => {
+			mergeBaseReads++;
+			return Promise.resolve('abc123');
+		};
+
+		await cache.leftRightCommitCount.getOrCreate(repoPath, 'v1.0.0...HEAD', countFactory);
+		await cache.mergeBase.getOrCreate(repoPath, 'v1.0.0:HEAD', mergeBaseFactory);
+		await cache.leftRightCommitCount.getOrCreate(repoPath, 'v1.0.0...HEAD', countFactory);
+		await cache.mergeBase.getOrCreate(repoPath, 'v1.0.0:HEAD', mergeBaseFactory);
+		assert.strictEqual(countReads, 1);
+		assert.strictEqual(mergeBaseReads, 1);
+
+		cache.clearCaches(repoPath, 'tags');
+
+		await cache.leftRightCommitCount.getOrCreate(repoPath, 'v1.0.0...HEAD', countFactory);
+		await cache.mergeBase.getOrCreate(repoPath, 'v1.0.0:HEAD', mergeBaseFactory);
+		assert.strictEqual(countReads, 2, 'a force-moved tag must not serve the count taken against its old commit');
+		assert.strictEqual(mergeBaseReads, 2, 'a force-moved tag must not serve its old fork point');
+	});
 });
 
 suite('Cache — gkConfig watcher reconciliation', () => {
@@ -689,7 +718,7 @@ suite('Cache — gkConfig watcher reconciliation', () => {
 				]),
 		);
 		cache.onRepositoryChanged(repoPath, ['gkConfig']);
-		assert.strictEqual(await result(), false, 'no merge-relevant key changed');
+		assert.strictEqual(await result(), true, 'the activity stamp changed the branches, not a merge-relevant key');
 
 		await cache.getBaseBranchName(repoPath, 'main', baseFactory);
 		assert.strictEqual(baseFactoryCount, 1, 'a gk-last-accessed-only change must not re-derive the base branch');
@@ -841,6 +870,687 @@ suite('Cache — gkConfig watcher reconciliation', () => {
 			true,
 			'the baseline must still be the pre-change value, or the change diffs against itself',
 		);
+	});
+
+	suite('branch metadata', () => {
+		let metadataFactoryCount: number;
+		let events: MergeTargetsChangeEvent[];
+		let deleteBranchMetadata: sinon.SinonSpy<[repoPath: string], void>;
+		let patchBranchMetadata: sinon.SinonSpy<[repoPath: string, changes: readonly BranchMetadataChange[]], void>;
+
+		const initial: [string, string][] = [
+			['branch.main.gk-merge-target', 'origin/main'],
+			['branch.main.gk-last-accessed', '2026-10-01T00:00:00.000Z'],
+		];
+
+		/** Seeds the reconcile baseline and a cached branch metadata map, as a warm branch read leaves them */
+		async function seedBranchMetadata(): Promise<BranchMetadata> {
+			await cache.getGkConfigMap(repoPath, () => Promise.resolve(new Map(initial)));
+			const metadata = (await readBranchMetadata()).get('main');
+			assert.strictEqual(metadataFactoryCount, 1);
+			assert.ok(metadata);
+			return metadata;
+		}
+
+		/** Mirrors the CLI factory: one fresh object per branch with any metadata (here only `main`) */
+		function readBranchMetadata(): Promise<Map<string, BranchMetadata>> {
+			return cache.getBranchMetadataMap(repoPath, () => {
+				metadataFactoryCount++;
+				return new Map([['main', { lastAccessedAt: '2026-10-01T00:00:00.000Z' }]]);
+			});
+		}
+
+		setup(() => {
+			metadataFactoryCount = 0;
+			events = [];
+			cache.onDidChangeMergeTargets(e => events.push(e));
+			deleteBranchMetadata = sinon.spy(cache, 'deleteBranchMetadata');
+			patchBranchMetadata = sinon.spy(cache, 'patchBranchMetadata');
+		});
+
+		teardown(() => {
+			sinon.restore();
+		});
+
+		test('a patch updates the cached metadata object in place and evicts nothing', async () => {
+			const metadata = await seedBranchMetadata();
+
+			cache.patchBranchMetadata(repoPath, [
+				{ branch: 'main', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+				{ branch: 'main', key: 'gk-last-modified', value: '2026-10-05T00:00:00.000Z' },
+			]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			const reread = (await readBranchMetadata()).get('main');
+			assert.strictEqual(metadataFactoryCount, 1, 'served from the cache');
+			assert.strictEqual(reread, metadata, 'the same object every cached branch holds');
+			assert.deepStrictEqual(metadata, {
+				lastAccessedAt: '2026-10-05T00:00:00.000Z',
+				lastModifiedAt: '2026-10-05T00:00:00.000Z',
+			});
+		});
+
+		test('a patch stores a value as a fresh read would', async () => {
+			const metadata = await seedBranchMetadata();
+
+			cache.patchBranchMetadata(repoPath, [{ branch: 'main', key: 'gk-disposition', value: 'starred' }]);
+			assert.strictEqual(metadata.disposition, 'starred');
+
+			cache.patchBranchMetadata(repoPath, [{ branch: 'main', key: 'gk-disposition', value: 'bogus' }]);
+			assert.ok(!('disposition' in metadata), 'a fresh read ignores an unknown disposition');
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+		});
+
+		test('a removal deletes the field', async () => {
+			const metadata = await seedBranchMetadata();
+
+			cache.patchBranchMetadata(repoPath, [{ branch: 'main', key: 'gk-last-accessed', value: undefined }]);
+
+			assert.ok(!('lastAccessedAt' in metadata));
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+		});
+
+		test('a patch with nothing cached does nothing', async () => {
+			cache.patchBranchMetadata(repoPath, [
+				{ branch: 'main', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+			]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 1);
+		});
+
+		test('a patch while the map is still being read evicts it', async () => {
+			let resolveRead!: (map: Map<string, BranchMetadata>) => void;
+			const inFlight = cache.getBranchMetadataMap(repoPath, () => {
+				metadataFactoryCount++;
+				return new Promise<Map<string, BranchMetadata>>(resolve => {
+					resolveRead = resolve;
+				});
+			});
+
+			cache.patchBranchMetadata(repoPath, [
+				{ branch: 'main', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+			]);
+			assert.strictEqual(deleteBranchMetadata.callCount, 1, 'the read may predate the write');
+
+			resolveRead(new Map([['main', { lastAccessedAt: '2026-10-01T00:00:00.000Z' }]]));
+			await inFlight;
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 2, 'the next read is not joined to the one in flight');
+		});
+
+		test("a branch's first stamp evicts once, since its cached branches hold no metadata to share", async () => {
+			await seedBranchMetadata();
+
+			cache.patchBranchMetadata(repoPath, [
+				{ branch: 'main', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+				{ branch: 'feature', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+				{ branch: 'other', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+			]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 1);
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 2);
+		});
+
+		function createBranch(path: string, metadata: BranchMetadata | undefined): GitBranch {
+			return new GitBranch(path, 'refs/heads/main', true, undefined, metadata, 'abc123');
+		}
+
+		/** Caches `branches` as the branch list, mapped to each path as is */
+		function readBranches(branches: () => GitBranch[]): Promise<PagedResult<GitBranch>> {
+			return cache.getBranches(
+				repoPath,
+				() => ({ values: branches() }),
+				result => result,
+			);
+		}
+
+		/** Re-reads the map after a typed `'branches'` reset, which evicts it but no worktree's list */
+		async function rereadBranchMetadataAfterReset(stale: BranchMetadata): Promise<BranchMetadata> {
+			cache.clearCaches(repoPath, 'branches');
+			const metadata = (await readBranchMetadata()).get('main');
+			assert.ok(metadata);
+			assert.notStrictEqual(metadata, stale);
+			return metadata;
+		}
+
+		const stamp: BranchMetadataChange = {
+			branch: 'main',
+			key: 'gk-last-accessed',
+			value: '2026-10-05T00:00:00.000Z',
+		};
+
+		test("a sibling worktree's current branch built from an earlier map is patched too", async () => {
+			const worktree = '/test/repo-wt';
+			cache.registerRepoPath(fileUri(repoPath), { uri: fileUri(`${repoPath}/.git`) });
+			cache.registerRepoPath(fileUri(worktree), {
+				uri: fileUri(`${repoPath}/.git/worktrees/wt`),
+				commonUri: fileUri(`${repoPath}/.git`),
+			});
+
+			const stale = await seedBranchMetadata();
+			const current = await cache.branch.getOrCreate(worktree, () =>
+				Promise.resolve(createBranch(worktree, stale)),
+			);
+			const metadata = await rereadBranchMetadataAfterReset(stale);
+
+			cache.patchBranchMetadata(repoPath, [stamp]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.strictEqual(metadata.lastAccessedAt, stamp.value);
+			assert.strictEqual(current?.metadata?.lastAccessedAt, stamp.value, "the sibling's current branch");
+			assert.strictEqual(await cache.branch.get(worktree), current, 'still cached');
+		});
+
+		test("a cached worktree list's branch is patched, and an eviction drops the list", async () => {
+			const stale = await seedBranchMetadata();
+			let worktreesFactoryCount = 0;
+			const readWorktrees = () =>
+				cache.getWorktrees(repoPath, commonPath => {
+					worktreesFactoryCount++;
+					return [
+						new GitWorktree(
+							true,
+							'branch',
+							commonPath,
+							fileUri(commonPath),
+							false,
+							false,
+							'abc123',
+							createBranch(commonPath, stale),
+						),
+					];
+				});
+			const [worktree] = await readWorktrees();
+			const metadata = await rereadBranchMetadataAfterReset(stale);
+
+			cache.patchBranchMetadata(repoPath, [stamp]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.strictEqual(metadata.lastAccessedAt, stamp.value);
+			assert.strictEqual(worktree.branch?.metadata?.lastAccessedAt, stamp.value);
+
+			cache.deleteBranchMetadata(repoPath);
+			await readWorktrees();
+			assert.strictEqual(worktreesFactoryCount, 2, 'the worktrees hold the branches');
+		});
+
+		test('with no map cached, a cached branch list is still patched', async () => {
+			const metadata: BranchMetadata = { lastAccessedAt: '2026-10-01T00:00:00.000Z' };
+			let branchesFactoryCount = 0;
+			const read = () =>
+				readBranches(() => {
+					branchesFactoryCount++;
+					return [createBranch(repoPath, metadata)];
+				});
+			await read();
+
+			cache.patchBranchMetadata(repoPath, [stamp]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.strictEqual(metadata.lastAccessedAt, stamp.value);
+			await read();
+			assert.strictEqual(branchesFactoryCount, 1, 'served from the cache');
+		});
+
+		test('a cached branch of a changed name with no metadata to patch evicts once', async () => {
+			let branchesFactoryCount = 0;
+			const read = () =>
+				readBranches(() => {
+					branchesFactoryCount++;
+					return [createBranch(repoPath, undefined)];
+				});
+			await read();
+
+			cache.patchBranchMetadata(repoPath, [stamp, { ...stamp, key: 'gk-last-modified' }]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 1);
+			await read();
+			assert.strictEqual(branchesFactoryCount, 2);
+		});
+
+		test('a current branch still being read evicts', async () => {
+			let release!: (branch: GitBranch) => void;
+			const inFlight = cache.branch.getOrCreate(
+				repoPath,
+				() => new Promise<GitBranch>(resolve => (release = resolve)),
+			);
+
+			cache.patchBranchMetadata(repoPath, [stamp]);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 1, 'the read may predate the write');
+			assert.strictEqual(cache.branch.has(repoPath), false);
+			release(createBranch(repoPath, { lastAccessedAt: '2026-10-01T00:00:00.000Z' }));
+			await inFlight;
+		});
+
+		test("another process's stamps are patched in one call, without a merge-targets event", async () => {
+			const metadata = await seedBranchMetadata();
+
+			const result = registerTestReconciler(
+				() =>
+					new Map([
+						['branch.main.gk-merge-target', 'origin/main'],
+						['branch.main.gk-last-accessed', '2026-10-05T00:00:00.000Z'],
+						['branch.main.gk-agent-last-activity', '2026-10-05T00:00:00.000Z'],
+					]),
+			);
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), true, 'a follow-up event lets consumers re-read the branches');
+
+			assert.strictEqual(patchBranchMetadata.callCount, 1, 'two changed stamps patch once');
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.deepStrictEqual(events, [], 'activity stamps are not merge targets');
+			assert.deepStrictEqual(metadata, {
+				lastAccessedAt: '2026-10-05T00:00:00.000Z',
+				agentLastActivityAt: '2026-10-05T00:00:00.000Z',
+			});
+			assert.strictEqual((await readBranchMetadata()).get('main'), metadata);
+			assert.strictEqual(metadataFactoryCount, 1);
+		});
+
+		test("another process's first stamp on a branch evicts the branches once", async () => {
+			await seedBranchMetadata();
+
+			const result = registerTestReconciler(
+				() =>
+					new Map([
+						...initial,
+						['branch.feature.gk-last-accessed', '2026-10-05T00:00:00.000Z'],
+						['branch.feature.gk-agent-last-activity', '2026-10-05T00:00:00.000Z'],
+					]),
+			);
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), true);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 1, 'two changed stamps still evict only once');
+			assert.deepStrictEqual(events, []);
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 2, 'the branches re-read the new stamps');
+		});
+
+		test("another process's removed stamp is removed from the cached metadata", async () => {
+			const metadata = await seedBranchMetadata();
+
+			const result = registerTestReconciler(() => new Map([['branch.main.gk-merge-target', 'origin/main']]));
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), true);
+
+			assert.ok(!('lastAccessedAt' in metadata));
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+		});
+
+		test("another process's disposition change is patched", async () => {
+			const metadata = await seedBranchMetadata();
+
+			const result = registerTestReconciler(
+				() => new Map([...initial, ['branch.main.gk-disposition', 'starred']]),
+			);
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), true);
+
+			assert.strictEqual(metadata.disposition, 'starred');
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.deepStrictEqual(events, []);
+		});
+
+		test('a merge-key-only change leaves the branches cached', async () => {
+			await seedBranchMetadata();
+
+			const result = registerTestReconciler(
+				() =>
+					new Map([
+						['branch.main.gk-merge-target', 'origin/develop'],
+						['branch.main.gk-last-accessed', '2026-10-01T00:00:00.000Z'],
+					]),
+			);
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), true);
+
+			assert.strictEqual(patchBranchMetadata.callCount, 0);
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.strictEqual(events.length, 1);
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 1, 'branch metadata does not depend on merge keys');
+		});
+
+		test("core's own recorded stamp is not patched again by the watcher's report of it", async () => {
+			const metadata = await seedBranchMetadata();
+
+			// What `recordBranchActivity` does: write (recorded by `setGkConfig`), then patch the branches itself
+			cache.recordGkConfigWrite(repoPath, 'branch.main.gk-last-accessed', '2026-10-05T00:00:00.000Z');
+			assert.deepStrictEqual(events, [], 'recording an activity stamp never fires the merge-targets event');
+			cache.patchBranchMetadata(repoPath, [
+				{ branch: 'main', key: 'gk-last-accessed', value: '2026-10-05T00:00:00.000Z' },
+			]);
+
+			const result = registerTestReconciler(
+				() =>
+					new Map([
+						['branch.main.gk-merge-target', 'origin/main'],
+						['branch.main.gk-last-accessed', '2026-10-05T00:00:00.000Z'],
+					]),
+			);
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), false, 'the write is already reflected in the snapshot');
+
+			assert.strictEqual(patchBranchMetadata.callCount, 1, "only core's own patch");
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+			assert.strictEqual(metadata.lastAccessedAt, '2026-10-05T00:00:00.000Z');
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 1);
+		});
+
+		test("core's own section rename is not evicted again by the watcher's report of it", async () => {
+			await seedBranchMetadata();
+
+			cache.recordGkConfigSectionWrite(repoPath, 'main', 'renamed');
+			const result = registerTestReconciler(
+				() =>
+					new Map([
+						['branch.renamed.gk-merge-target', 'origin/main'],
+						['branch.renamed.gk-last-accessed', '2026-10-01T00:00:00.000Z'],
+					]),
+			);
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			assert.strictEqual(await result(), false);
+
+			assert.strictEqual(patchBranchMetadata.callCount, 0);
+			assert.strictEqual(deleteBranchMetadata.callCount, 0);
+		});
+
+		test('the coarse fallback evicts the branches (no reconciler)', async () => {
+			await seedBranchMetadata();
+
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 1);
+			await readBranchMetadata();
+			assert.strictEqual(metadataFactoryCount, 2);
+		});
+
+		test('the coarse fallback evicts the branches (a failed reconcile)', async () => {
+			await seedBranchMetadata();
+
+			let outcome: Promise<'failed'> = Promise.resolve('failed');
+			cache.setGkConfigReconciler(() => (outcome = Promise.resolve('failed')));
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			await outcome;
+			await Promise.resolve();
+
+			assert.strictEqual(deleteBranchMetadata.callCount, 1);
+		});
+	});
+});
+
+suite('Cache.onDidChangeMergeTargets', () => {
+	const repoPath = '/test/repo';
+	let cache: Cache;
+	let events: MergeTargetsChangeEvent[];
+
+	setup(() => {
+		cache = new Cache();
+		events = [];
+		cache.onDidChangeMergeTargets(e => events.push(e));
+	});
+
+	teardown(() => {
+		cache.dispose();
+	});
+
+	/** Seeds the reconcile baseline, then registers a reconciler that re-reads `next` (see the suite above) */
+	async function seedThenReconcileTo(
+		initial: [string, string][],
+		next: [string, string][],
+	): Promise<() => Promise<void>> {
+		await cache.getGkConfigMap(repoPath, () => Promise.resolve(new Map(initial)));
+		let pending: Promise<unknown> = Promise.resolve();
+		cache.setGkConfigReconciler((rp, priorSnapshot) => {
+			pending = cache
+				.getGkConfigMap(rp, () => new Map(next))
+				.then(freshMap => cache.reconcileGkConfigMap(rp, priorSnapshot, freshMap));
+			return pending.then(() => 'reconciled' as const);
+		});
+		return async () => {
+			await pending;
+		};
+	}
+
+	test('stays silent for a rewrite that only touches activity timestamps', async () => {
+		const settled = await seedThenReconcileTo(
+			[
+				['branch.main.gk-merge-target', 'origin/main'],
+				['branch.main.gk-last-accessed', '2026-10-01T00:00:00.000Z'],
+			],
+			[
+				['branch.main.gk-merge-target', 'origin/main'],
+				['branch.main.gk-last-accessed', '2026-10-05T00:00:00.000Z'],
+			],
+		);
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.deepStrictEqual(events, []);
+	});
+
+	test('names the branches whose merge keys changed', async () => {
+		const settled = await seedThenReconcileTo(
+			[
+				['branch.main.gk-merge-target', 'origin/main'],
+				['branch.feature.gk-merge-base', 'main'],
+				['branch.other.gk-merge-base', 'main'],
+			],
+			[
+				['branch.main.gk-merge-target', 'origin/main'],
+				['branch.feature.gk-merge-base', 'develop'],
+				['branch.other.gk-merge-base', 'main'],
+				['branch.fresh.gk-merge-target-user', 'origin/release'],
+			],
+		);
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.strictEqual(events.length, 1);
+		assert.strictEqual(events[0].repoPath, repoPath);
+		assert.deepStrictEqual([...(events[0].refs ?? [])].sort(), ['feature', 'fresh']);
+	});
+
+	test("fires once, naming the branch, for core's own key write, and not again for the watcher's report", async () => {
+		const settled = await seedThenReconcileTo(
+			[['branch.main.gk-merge-target', 'origin/main']],
+			[['branch.main.gk-merge-target', 'origin/develop']],
+		);
+		// What `setGkConfig` records right after writing, before the watcher reports the file change
+		cache.recordGkConfigWrite(repoPath, 'branch.main.gk-merge-target', 'origin/develop');
+		assert.strictEqual(events.length, 1);
+		assert.deepStrictEqual([...(events[0].refs ?? [])], ['main']);
+
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.strictEqual(events.length, 1);
+	});
+
+	suite("a reconcile overlapping core's own key write", () => {
+		const written: [string, string] = ['branch.main.gk-merge-target', 'origin/develop'];
+		let file: Map<string, string>;
+		let release: () => void;
+		let gate: Promise<void>;
+
+		/** Registers a reconciler whose re-read waits for `gate`, reading the file through `read` */
+		function registerGatedReconciler(read: () => Promise<Map<string, string>>): () => Promise<void> {
+			let pending: Promise<unknown> = Promise.resolve();
+			cache.setGkConfigReconciler((rp, priorSnapshot) => {
+				pending = cache
+					.getGkConfigMap(rp, read)
+					.then(freshMap => cache.reconcileGkConfigMap(rp, priorSnapshot, freshMap));
+				return pending.then(() => 'reconciled' as const);
+			});
+			return async () => {
+				await pending;
+			};
+		}
+
+		/** Core writes and records a merge key while the reconcile is reading */
+		function writeOwnKey(): void {
+			file = new Map([...file, written]);
+			cache.recordGkConfigWrite(repoPath, ...written);
+			assert.strictEqual(events.length, 1);
+			assert.deepStrictEqual([...(events[0].refs ?? [])], ['main']);
+		}
+
+		setup(async () => {
+			file = new Map([
+				['branch.main.gk-merge-target', 'origin/main'],
+				['branch.feature.gk-merge-base', 'main'],
+			]);
+			await cache.getGkConfigMap(repoPath, () => Promise.resolve(new Map(file)));
+			gate = new Promise<void>(resolve => (release = resolve));
+		});
+
+		test('a read that predates the write fires nothing for it, nor does the watcher report of it', async () => {
+			const settled = registerGatedReconciler(() => {
+				const content = file;
+				return gate.then(() => new Map(content));
+			});
+			// Another process's change starts a reconcile whose read sees the file as it was before core's write
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			writeOwnKey();
+			release();
+			await settled();
+			assert.strictEqual(events.length, 1);
+			assert.strictEqual(cache.getGkConfigSnapshot(repoPath)?.get(written[0]), written[1], 'the write is kept');
+
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			await settled();
+			assert.strictEqual(events.length, 1);
+		});
+
+		test('a read that follows the write fires nothing for it', async () => {
+			const settled = registerGatedReconciler(() => gate.then(() => new Map(file)));
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			writeOwnKey();
+			release();
+			await settled();
+
+			assert.strictEqual(events.length, 1);
+		});
+
+		test("still reports another process's change to a different merge key", async () => {
+			const settled = registerGatedReconciler(() => gate.then(() => new Map(file)));
+			cache.onRepositoryChanged(repoPath, ['gkConfig']);
+			file = new Map([...file, ['branch.feature.gk-merge-base', 'develop']]);
+			writeOwnKey();
+			release();
+			await settled();
+
+			assert.strictEqual(events.length, 2);
+			assert.deepStrictEqual([...(events[1].refs ?? [])], ['feature']);
+		});
+	});
+
+	test("records core's internal self-write in the snapshot without firing", async () => {
+		const settled = await seedThenReconcileTo(
+			[['branch.main.gk-merge-target', 'origin/main']],
+			[['branch.main.gk-merge-target', 'origin/develop']],
+		);
+		cache.recordGkConfigWrite(repoPath, 'branch.main.gk-merge-target', 'origin/develop', { announce: false });
+		assert.deepStrictEqual(events, []);
+
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.deepStrictEqual(events, [], "the watcher's reconcile of the recorded value fires nothing");
+	});
+
+	test("stays silent for core's own write of an unchanged value", async () => {
+		const settled = await seedThenReconcileTo(
+			[['branch.main.gk-merge-target', 'origin/main']],
+			[['branch.main.gk-merge-target', 'origin/main']],
+		);
+		cache.recordGkConfigWrite(repoPath, 'branch.main.gk-merge-target', 'origin/main');
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.deepStrictEqual(events, []);
+	});
+
+	test("stays silent for core's own section remove and rename (a branch delete or rename)", async () => {
+		const settled = await seedThenReconcileTo(
+			[
+				['branch.gone.gk-merge-base', 'main'],
+				['branch.old.gk-merge-target', 'origin/main'],
+				['branch.old.gk-last-accessed', '2026-10-01T00:00:00.000Z'],
+			],
+			[
+				['branch.new.gk-merge-target', 'origin/main'],
+				['branch.new.gk-last-accessed', '2026-10-01T00:00:00.000Z'],
+			],
+		);
+		cache.recordGkConfigSectionWrite(repoPath, 'gone');
+		cache.recordGkConfigSectionWrite(repoPath, 'new');
+		cache.recordGkConfigSectionWrite(repoPath, 'old', 'new');
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.deepStrictEqual(events, []);
+	});
+
+	test('leaves a dotted sibling branch alone when recording a section remove or rename', async () => {
+		// `--remove-section branch.feature` and `--rename-section branch.old` leave `[branch "feature.x"]` and
+		// `[branch "old.y"]` in place, so the recorded snapshot must too
+		const settled = await seedThenReconcileTo(
+			[
+				['branch.feature.gk-merge-base', 'main'],
+				['branch.feature.x.gk-merge-base', 'main'],
+				['branch.old.gk-merge-target', 'origin/main'],
+				['branch.old.y.gk-merge-target', 'origin/develop'],
+			],
+			[
+				['branch.feature.x.gk-merge-base', 'main'],
+				['branch.new.gk-merge-target', 'origin/main'],
+				['branch.old.y.gk-merge-target', 'origin/develop'],
+			],
+		);
+		cache.recordGkConfigSectionWrite(repoPath, 'feature');
+		cache.recordGkConfigSectionWrite(repoPath, 'new');
+		cache.recordGkConfigSectionWrite(repoPath, 'old', 'new');
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await settled();
+
+		assert.deepStrictEqual(events, []);
+	});
+
+	test('reports every branch as possibly changed when there is no reconciler (the coarse fallback)', () => {
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+
+		assert.deepStrictEqual(events, [{ repoPath: repoPath, refs: undefined }]);
+	});
+
+	test('reports every branch as possibly changed when the reconcile fails', async () => {
+		let outcome: Promise<'failed'> = Promise.resolve('failed');
+		cache.setGkConfigReconciler(() => (outcome = Promise.resolve('failed')));
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await outcome;
+		await Promise.resolve();
+
+		assert.deepStrictEqual(events, [{ repoPath: repoPath, refs: undefined }]);
+	});
+
+	test('reports every branch as possibly changed with no earlier snapshot to diff against', async () => {
+		let pending: Promise<unknown> = Promise.resolve();
+		cache.setGkConfigReconciler((rp, priorSnapshot) => {
+			pending = cache
+				.getGkConfigMap(rp, () => new Map([['branch.main.gk-merge-target', 'origin/main']]))
+				.then(freshMap => cache.reconcileGkConfigMap(rp, priorSnapshot, freshMap));
+			return pending.then(() => 'reconciled' as const);
+		});
+		cache.onRepositoryChanged(repoPath, ['gkConfig']);
+		await pending;
+
+		assert.deepStrictEqual(events, [{ repoPath: repoPath, refs: undefined }]);
 	});
 });
 

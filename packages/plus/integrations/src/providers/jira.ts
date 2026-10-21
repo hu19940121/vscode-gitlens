@@ -35,6 +35,7 @@ import {
 	drainJiraIssues,
 	readUserScopedJiraIssues,
 	searchJiraProjectIssues,
+	summarizePageMetadata,
 	toUniqueJiraIssueShapes,
 } from './utils/jiraIssueDrains.js';
 import { collectProviderPagedResult, mergeCollectionMetadata } from './utils/providerPaging.js';
@@ -199,6 +200,14 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		return toAccount(user, this);
 	}
 
+	/** Atlassian's account id is the same on every site, so the first site answers for all of them. */
+	protected override async getProviderCurrentAccount(
+		session: ProviderAuthenticationSession,
+	): Promise<Account | undefined> {
+		const resource = (await this.getProviderResourcesForUser(session))?.[0];
+		return resource != null ? this.getProviderAccountForResource(session, resource) : undefined;
+	}
+
 	/** The site-list request the resource cache would otherwise answer; see `IntegrationBase.validateCredential`. */
 	protected override async validateCredential(session: ProviderAuthenticationSession): Promise<void> {
 		const api = await this.getProvidersApi();
@@ -235,9 +244,7 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		if (cachedResources != null && !force) return cachedResources;
 
 		const generation = this._organizations.generation;
-		const api = await this.getProvidersApi();
-		const resources = await api.getJiraResourcesForCurrentUser(toTokenWithInfo(this.id, session));
-		const organizations = resources?.map(r => ({ ...r, key: r.id }));
+		const organizations = await this.readOrganizations(session);
 		if (organizations == null) {
 			this._organizations.delete(accessToken);
 			return undefined;
@@ -245,6 +252,20 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 
 		this._organizations.set(accessToken, organizations, { generation: generation });
 		return organizations;
+	}
+
+	protected override getProviderUncachedResourcesForUser(
+		session: ProviderAuthenticationSession,
+	): Promise<JiraOrganizationDescriptor[] | undefined> {
+		return this.readOrganizations(session);
+	}
+
+	private async readOrganizations(
+		session: ProviderAuthenticationSession,
+	): Promise<JiraOrganizationDescriptor[] | undefined> {
+		const api = await this.getProvidersApi();
+		const resources = await api.getJiraResourcesForCurrentUser(toTokenWithInfo(this.id, session));
+		return resources?.map(r => ({ ...r, key: r.id }));
 	}
 
 	protected override async getProviderProjectsForResources(
@@ -264,95 +285,113 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		const projectsCache = this._projects;
 		const generation = projectsCache.generation;
 
-		let resourcesWithoutProjects = [];
-		if (force) {
-			resourcesWithoutProjects = resources;
-		} else {
-			for (const resource of resources) {
-				const resourceKey = `${accessToken}:${resource.id}`;
-				const cachedProjects = projectsCache.get(resourceKey);
-				if (cachedProjects == null) {
-					resourcesWithoutProjects.push(resource);
-				}
+		// Taken before the read, so a clear while it is in flight can't empty what was cached when it started. A forced
+		// read reads every resource, and still keeps a cached list for one it can't read completely.
+		const cachedProjects = new Map<string, JiraProjectDescriptor[]>();
+		for (const resource of resources) {
+			const projects = projectsCache.get(`${accessToken}:${resource.id}`);
+			if (projects != null) {
+				cachedProjects.set(resource.id, projects);
 			}
 		}
+		const resourcesWithoutProjects = force
+			? resources
+			: resources.filter(resource => !cachedProjects.has(resource.id));
 
-		let metadata: CollectionMetadata | undefined;
-		const partialProjects: JiraProjectDescriptor[] = [];
-		if (resourcesWithoutProjects.length > 0) {
-			const api = await this.getProvidersApi();
-			const tokenWithInfo = toTokenWithInfo(this.id, session);
-			const drains = await Promise.allSettled(
-				resourcesWithoutProjects.map(async resource => ({
-					resource: resource,
-					result: await collectProviderPagedResult(
-						cursor => api.getJiraProjectsForResource(tokenWithInfo, resource.id, { cursor: cursor }),
-						maxPagesPerRequest,
-						{ providerId: this.id, resourceId: resource.id },
-					),
-				})),
-			);
-
-			drains.forEach((drain, index) => {
-				if (drain.status === 'rejected') {
-					const resource = resourcesWithoutProjects[index];
-					if (resource == null) return;
-
-					metadata = mergeCollectionMetadata(metadata, {
-						completeness: 'partial',
-						failures: [
-							toCollectionScopeFailure({ providerId: this.id, resourceId: resource.id }, drain.reason),
-						],
-					});
-					return;
-				}
-
-				const { resource, result } = drain.value;
-				metadata = mergeCollectionMetadata(metadata, result.metadata);
-				const projects = result.values
-					.filter(project => project.resourceId === resource.id)
-					.map(project => ({ ...project }));
-				const incomplete =
-					result.truncated === true ||
-					(result.metadata != null && result.metadata.completeness !== 'complete');
-				if (incomplete) {
-					partialProjects.push(...projects);
-					if (
-						result.truncated === true &&
-						(result.metadata == null || result.metadata.completeness === 'complete')
-					) {
-						metadata = mergeCollectionMetadata(metadata, { completeness: 'partial' });
-					}
-					return;
-				}
-
-				// Not stored when the cache was dropped while this read was in flight, but still returned below: it
-				// is what this read found, only no longer trusted for the next one.
-				if (!projectsCache.set(`${accessToken}:${resource.id}`, projects, { generation: generation })) {
-					partialProjects.push(...projects);
-					return;
-				}
-
+		const read = await this.readProjects(session, resourcesWithoutProjects);
+		const values = [...read.partial];
+		for (const [resourceId, projects] of read.complete) {
+			// Returned either way; not stored when the cache was dropped while this read was in flight: it is what this
+			// read found, only no longer trusted for the next one.
+			if (projectsCache.set(`${accessToken}:${resourceId}`, projects, { generation: generation })) {
 				this._autolinks.delete(accessToken);
-			});
+			}
 		}
-
-		const values = resources.reduce<JiraProjectDescriptor[]>((projects, resource) => {
-			const resourceProjects = projectsCache.get(`${accessToken}:${resource.id}`);
+		for (const resource of resources) {
+			const resourceProjects = read.complete.get(resource.id) ?? cachedProjects.get(resource.id);
 			if (resourceProjects != null) {
-				projects.push(...resourceProjects);
-			}
-			return projects;
-		}, partialProjects);
-
-		const projectsByIdentity = new Map<string, JiraProjectDescriptor>();
-		for (const project of values) {
-			const identity = `${project.resourceId}:${project.id}`;
-			if (!projectsByIdentity.has(identity)) {
-				projectsByIdentity.set(identity, project);
+				values.push(...resourceProjects);
 			}
 		}
-		return { values: [...projectsByIdentity.values()], metadata: metadata };
+		return { values: uniqueProjects(values), metadata: read.metadata };
+	}
+
+	protected override async getProviderUncachedProjectsForResourcesWithMetadata(
+		session: ProviderAuthenticationSession,
+		resources: JiraOrganizationDescriptor[],
+	): Promise<ProviderApiCollectionResult<JiraProjectDescriptor>> {
+		const read = await this.readProjects(session, resources);
+		return {
+			values: uniqueProjects([...read.partial, ...[...read.complete.values()].flat()]),
+			metadata: read.metadata,
+		};
+	}
+
+	/**
+	 * Reads the projects of each resource from the provider, apart by whether a resource's list came back complete:
+	 * only a complete one may be cached as the resource's project set.
+	 */
+	private async readProjects(
+		session: ProviderAuthenticationSession,
+		resources: JiraOrganizationDescriptor[],
+	): Promise<{
+		complete: Map<string, JiraProjectDescriptor[]>;
+		partial: JiraProjectDescriptor[];
+		metadata: CollectionMetadata | undefined;
+	}> {
+		const complete = new Map<string, JiraProjectDescriptor[]>();
+		const partial: JiraProjectDescriptor[] = [];
+		let metadata: CollectionMetadata | undefined;
+		if (resources.length === 0) return { complete: complete, partial: partial, metadata: metadata };
+
+		const api = await this.getProvidersApi();
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
+		const drains = await Promise.allSettled(
+			resources.map(async resource => ({
+				resource: resource,
+				result: await collectProviderPagedResult(
+					cursor => api.getJiraProjectsForResource(tokenWithInfo, resource.id, { cursor: cursor }),
+					maxPagesPerRequest,
+					{ providerId: this.id, resourceId: resource.id },
+				),
+			})),
+		);
+
+		drains.forEach((drain, index) => {
+			if (drain.status === 'rejected') {
+				const resource = resources[index];
+				if (resource == null) return;
+
+				metadata = mergeCollectionMetadata(metadata, {
+					completeness: 'partial',
+					failures: [
+						toCollectionScopeFailure({ providerId: this.id, resourceId: resource.id }, drain.reason),
+					],
+				});
+				return;
+			}
+
+			const { resource, result } = drain.value;
+			metadata = mergeCollectionMetadata(metadata, result.metadata);
+			const projects = result.values
+				.filter(project => project.resourceId === resource.id)
+				.map(project => ({ ...project }));
+			const incomplete =
+				result.truncated === true || (result.metadata != null && result.metadata.completeness !== 'complete');
+			if (incomplete) {
+				partial.push(...projects);
+				if (
+					result.truncated === true &&
+					(result.metadata == null || result.metadata.completeness === 'complete')
+				) {
+					metadata = mergeCollectionMetadata(metadata, { completeness: 'partial' });
+				}
+				return;
+			}
+
+			complete.set(resource.id, projects);
+		});
+		return { complete: complete, partial: partial, metadata: metadata };
 	}
 
 	protected override async getProviderIssuesForProject(
@@ -373,8 +412,10 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		const api = await this.getProvidersApi();
 
 		const states = toProviderIssueStates(options?.state);
+		// By key, not name, as the multi-project search: JQL's `project = "<value>"` also accepts a name or id, so a
+		// display name equal to another project's key would address that project. The key is the only unambiguous one.
 		const fetchPage: JiraIssuePageFetcher = (scope, cursor) =>
-			api.getIssuesForProjectPaged(tokenWithInfo, project.name, project.resourceId, {
+			api.getIssuesForProjectPaged(tokenWithInfo, project.key, project.resourceId, {
 				...scope,
 				cursor: cursor,
 				states: states,
@@ -382,7 +423,7 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 			});
 		const drainOptions: JiraDrainOptions = {
 			maxPages: maxPagesPerRequest,
-			failureScope: { providerId: this.id, resourceId: project.resourceId, projectId: project.name },
+			failureScope: { providerId: this.id, resourceId: project.resourceId, projectId: project.key },
 			providerName: 'Jira',
 			// A project this token can no longer see (deleted, or its browse permission removed) holds no issues
 			// for it, and the site's project list that named it is stale: drop that list so the next read
@@ -405,23 +446,18 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 				drainOptions,
 			);
 			const values = toUniqueJiraIssueShapes(read.issues, this);
-			return read.truncated
-				? { values: values, truncated: true, recovery: 'none', metadata: read.metadata }
-				: { values: values, truncated: false, metadata: read.metadata };
+			const drain = { values: values, metadata: read.metadata, scope: drainOptions.failureScope };
+			return read.truncated ? { ...drain, truncated: true, recovery: 'none' } : { ...drain, truncated: false };
 		}
 
 		const unscoped = await drainJiraIssues(fetchPage, {}, drainOptions);
 		const values = unscoped.issues
 			.map(issue => toIssueShape(issue, this, { projection: 'project' }))
 			.filter((result): result is IssueShape => result !== undefined);
+		const drain = { values: values, metadata: unscoped.metadata, scope: drainOptions.failureScope };
 		return unscoped.status !== 'complete'
-			? {
-					values: values,
-					truncated: true,
-					recovery: unscoped.status === 'backstop' ? 'narrow-scope' : 'none',
-					metadata: unscoped.metadata,
-				}
-			: { values: values, truncated: false, metadata: unscoped.metadata };
+			? { ...drain, truncated: true, recovery: unscoped.status === 'backstop' ? 'narrow-scope' : 'none' }
+			: { ...drain, truncated: false };
 	}
 
 	/**
@@ -459,6 +495,9 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		// Every request of a search shares its site and user scope (see `getProjectIssuesSearches`).
 		const { project, options } = requests[0];
 		if (options.user == null) return undefined;
+		// One project's search is its own read, by the same key and user clauses, so it costs no more to read it as one;
+		// and that read attributes a failure to the project and drops a project list that no longer has it.
+		if (requests.length === 1) return undefined;
 
 		const tokenWithInfo = toTokenWithInfo(this.id, session);
 		const api = await this.getProvidersApi();
@@ -492,12 +531,22 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		resources?: JiraOrganizationDescriptor[],
 		cancellation?: AbortSignal,
 	): Promise<IssueShape[] | undefined> {
-		return (await this.searchProviderMyIssuesWithTruncation(session, resources, cancellation))?.values;
+		const result = await this.searchProviderMyIssuesWithTruncation(session, resources, cancellation);
+		// This read can only return values, so what the account-wide read reports as missing is at least logged.
+		for (const failure of result?.metadata?.failures ?? []) {
+			Logger.warn(
+				`searchProviderMyIssues: Jira site '${failure.scope?.resourceId ?? '?'}' was not fully read: ${failure.message ?? failure.kind}`,
+			);
+		}
+		return result?.values;
 	}
 
 	/**
-	 * Overridden so `state` reaches the per-site read, which the default drops. Still reports `truncated: false`,
-	 * as the default did: the per-site loop has no way to say it stopped early.
+	 * Overridden so `state` reaches the per-site read, which the default drops. Each site is drained on its own, so a
+	 * site that fails keeps what it read and is recorded as that site's failure instead of discarding the sites that
+	 * answered; so is an issue a page dropped because it could not be read. A page backstop or a stalled continuation
+	 * makes the read `truncated`. A refused site therefore goes through `confirmScopedAuthFailures`, which publishes it
+	 * as that site's auth warning or, if the credential itself is refused, as the connection's.
 	 */
 	protected override async searchProviderMyIssuesWithTruncation(
 		session: ProviderAuthenticationSession,
@@ -510,44 +559,51 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		if (!myResources) return undefined;
 
 		const api = await this.getProvidersApi();
+		const tokenWithInfo = toTokenWithInfo(this.id, session);
 
 		const results: IssueShape[] = [];
+		let truncated = false;
+		let metadata: CollectionMetadata | undefined;
+		// What each page reported failing, summarized at the end so a site whose many pages dropped issues reports
+		// it once (see `summarizePageMetadata`); the pages keep the rest of their metadata, so `truncated` holds.
+		const pages: CollectionMetadata[] = [];
+		const readPage = async (resourceId: string, cursor: string | undefined) => {
+			const page = await api.getIssuesForResourceForCurrentUser(tokenWithInfo, resourceId, {
+				cursor: cursor,
+				states: states,
+			});
+			if (!page.metadata?.failures?.length) return page;
+
+			const { failures: _failures, ...rest } = page.metadata;
+			pages.push(page.metadata);
+			return { ...page, metadata: rest };
+		};
 		for (const resource of myResources) {
 			if (cancellation?.aborted) break;
 
-			try {
-				let cursor = undefined;
-				let hasMore = false;
-				let requestCount = 0;
-				do {
-					if (cancellation?.aborted) break;
-
-					const resourceIssues = await api.getIssuesForResourceForCurrentUser(
-						toTokenWithInfo(this.id, session),
-						resource.id,
-						{
-							cursor: cursor,
-							states: states,
-						},
-					);
-					requestCount += 1;
-					hasMore = resourceIssues.paging?.more ?? false;
-					cursor = resourceIssues.paging?.cursor;
-					const formattedIssues = resourceIssues.values
-						.map(issue => toIssueShape(issue, this, { projection: 'account' }))
-						.filter((result): result is IssueShape => result != null);
-					if (formattedIssues.length > 0) {
-						results.push(...formattedIssues);
-					}
-				} while (requestCount < maxPagesPerRequest && hasMore);
-			} catch (ex) {
-				// TODO: We need a better way to message the failure to the user here.
-				// This is a stopgap to prevent one bag org from throwing and preventing any issues from being returned.
-				Logger.error(ex, 'searchProviderMyIssues');
-			}
+			const site = await collectProviderPagedResult(
+				cursor =>
+					// Cancellation is not truncation: the caller asked for the stop, so the site ends where it is.
+					cancellation?.aborted
+						? Promise.resolve({ values: [], paging: { cursor: '{}', more: false } })
+						: readPage(resource.id, cursor),
+				maxPagesPerRequest,
+				{ providerId: this.id, resourceId: resource.id },
+			);
+			results.push(
+				...site.values
+					.map(issue => toIssueShape(issue, this, { projection: 'account' }))
+					.filter((result): result is IssueShape => result != null),
+			);
+			truncated ||= site.truncated === true;
+			metadata = mergeCollectionMetadata(metadata, site.metadata);
 		}
 
-		return { values: results, truncated: false };
+		return {
+			values: results,
+			truncated: truncated,
+			metadata: mergeCollectionMetadata(summarizePageMetadata(pages), metadata),
+		};
 	}
 
 	protected override async getProviderLinkedIssueOrPullRequest(
@@ -589,10 +645,7 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 
 		const api = await this.getProvidersApi();
 		const apiResult = await api.getJiraIssueByKey(toTokenWithInfo(this.id, session), resourceId, resourceUrl, id);
-		const issue =
-			apiResult != null
-				? toIssueShape(apiResult, this, { reliableStateCategory: true, projection: 'batch' })
-				: undefined;
+		const issue = apiResult != null ? toIssueShape(apiResult, this, { projection: 'batch' }) : undefined;
 		return issue != null ? { ...issue, type: 'issue' } : undefined;
 	}
 
@@ -800,4 +853,16 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		this._projects.clear();
 		this._autolinks.clear();
 	}
+}
+
+/** The projects once each, by site and id. */
+function uniqueProjects(projects: JiraProjectDescriptor[]): JiraProjectDescriptor[] {
+	const projectsByIdentity = new Map<string, JiraProjectDescriptor>();
+	for (const project of projects) {
+		const identity = `${project.resourceId}:${project.id}`;
+		if (!projectsByIdentity.has(identity)) {
+			projectsByIdentity.set(identity, project);
+		}
+	}
+	return [...projectsByIdentity.values()];
 }

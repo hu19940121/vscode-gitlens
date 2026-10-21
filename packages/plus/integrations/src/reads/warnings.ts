@@ -1,4 +1,5 @@
 import type { IntegrationIds } from '../constants.js';
+import type { ProjectIssuesRecovery } from '../models/issueReads.js';
 import type {
 	IssueFilter,
 	IssueSearchCapabilities,
@@ -8,7 +9,12 @@ import type {
 	PullRequestSorting,
 } from '../providerFilters.js';
 import { providersMetadata } from '../providers/models.js';
-import type { ProviderWarning, ProviderWarningOmissionRecovery } from '../results.js';
+import type {
+	ProviderWarning,
+	ProviderWarningOmissionRecovery,
+	ProviderWarningOmissionScope,
+	ProviderWarningSelector,
+} from '../results.js';
 import type { IssueSearchCriteriaRejection, PullRequestSearchCriteriaRejection } from './filters.js';
 import type { UnmergeableIssueSort, UnsupportedIssueSortRejection } from './ordering.js';
 
@@ -31,8 +37,8 @@ import type { UnmergeableIssueSort, UnsupportedIssueSortRejection } from './orde
  * `collectionMetadata.ts` builds those from the structured failure/omission it is given.
  *
  * The kinds that carry a programmatic remedy — `auth`, `rate-limit`, `not-found`, `no-connection` — are derived
- * from the caught error's type instead and never come from here; see `ProviderWarningKind` and
- * {@link noConnectionWarning}.
+ * from the caught error's type or built by their own builders ({@link noConnectionWarning},
+ * {@link unmatchedSelectorWarning}), never by this one; see `ProviderWarningKind`.
  */
 export function otherWarning(
 	id: IntegrationIds,
@@ -100,6 +106,32 @@ export function noConnectionWarning(
 	};
 }
 
+/**
+ * Builds the `not-found` warning for an issue-tracker project read whose `org` or `project` selector matched
+ * nothing a complete discovery returned; see {@link ProviderWarning.selector}. A `project` miss under an `org` names
+ * the project, since the org matched.
+ */
+export function unmatchedSelectorWarning(
+	id: IntegrationIds,
+	domain: string | undefined,
+	connectionId: string | undefined,
+	selector: ProviderWarningSelector,
+	org?: string,
+): ProviderWarning {
+	return {
+		providerId: id,
+		domain: domain,
+		connectionId: connectionId,
+		message:
+			selector.kind === 'org'
+				? `No organization matches '${selector.value}' for '${id}'; it was removed or this connection can no longer see it.`
+				: `No project matches '${selector.value}'${org != null ? ` in '${org}'` : ''} for '${id}'; it was removed, renamed or this connection can no longer see it.`,
+		kind: 'not-found',
+		isAuth: false,
+		selector: selector,
+	};
+}
+
 /** Warning for an issue-tracker provider asked for a surface only a git host serves (repos, PRs, sweeps). */
 export function gitHostOnlySurfaceWarning(
 	id: IntegrationIds,
@@ -156,8 +188,8 @@ function recoveryForIncompleteReadCause(cause: IncompleteReadCause): ProviderWar
  * is the same shape `assessCollectionMetadata` derives from SDK metadata, so a consumer never has to care
  * which layer noticed the gap.
  *
- * No `scope`: this applies to the whole read, not to one repository or project the way an SDK-attributed
- * omission can, so a consumer acting on `recovery` re-runs the read itself.
+ * `scope` names the one project (or repository) the gap is confined to, as an SDK-attributed omission does; without it
+ * the warning applies to the whole read, so a consumer acting on `recovery` re-runs the read itself.
  */
 export function incompleteReadWarning(
 	id: IntegrationIds,
@@ -165,6 +197,7 @@ export function incompleteReadWarning(
 	connectionId: string | undefined,
 	message: string,
 	cause: IncompleteReadCause,
+	scope?: ProviderWarningOmissionScope,
 ): ProviderWarning {
 	const warning = otherWarning(id, domain, connectionId, message);
 	if (cause === 'interrupted') return warning;
@@ -174,8 +207,35 @@ export function incompleteReadWarning(
 		omission: {
 			kind: 'pagination-incomplete',
 			recovery: recoveryForIncompleteReadCause(cause),
+			...(scope != null ? { scope: { ...scope } } : {}),
 		},
 	};
+}
+
+/**
+ * {@link incompleteReadWarning} for one project of a tracker read that stopped short with nothing in its metadata to say
+ * why: a drain cut by its page backstop (`narrow-scope`) or otherwise left incomplete (`none`). Confined to `scope`,
+ * which names the project the way the provider's own failures do.
+ */
+export function projectCutWarning(
+	id: IntegrationIds,
+	domain: string | undefined,
+	connectionId: string | undefined,
+	project: string,
+	recovery: ProjectIssuesRecovery,
+	scope: ProviderWarningOmissionScope,
+): ProviderWarning {
+	const [message, cause]: [string, IncompleteReadCause] =
+		recovery === 'narrow-scope'
+			? [
+					`Project '${project}' holds more issues than one read can return; narrow the scope to read the rest.`,
+					'scope-too-large',
+				]
+			: [
+					`Some issues of project '${project}' were omitted; the provider returned an incomplete result.`,
+					'exhausted',
+				];
+	return incompleteReadWarning(id, domain, connectionId, message, cause, scope);
 }
 
 /**

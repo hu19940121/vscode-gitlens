@@ -2,10 +2,17 @@ import type { CollectionMetadata, CollectionScopeFailure } from '@gitkraken/prov
 import type { IssueShape } from '@gitlens/git/models/issue.js';
 import type { ProviderReference } from '@gitlens/git/models/remoteProvider.js';
 import { Logger } from '@gitlens/utils/logger.js';
-import { throwIfCallerContractError, toCollectionScopeFailure } from '../../collectionMetadata.js';
+import type { ProviderScopeFailure } from '../../collectionMetadata.js';
+import {
+	isIncompleteCollection,
+	throwIfCallerContractError,
+	toCollectionScopeFailure,
+} from '../../collectionMetadata.js';
 import { splitProjectIssuesSearch } from '../../models/issuesIntegration.js';
 import { IssueFilter } from '../../providerFilters.js';
-import type { ProviderIssue } from '../models.js';
+import type { ProviderWarningUnreadableItems } from '../../results.js';
+import { collectionScopeKey, mergeUnreadableItems } from '../../results.js';
+import type { JiraIssuePage, ProviderIssue } from '../models.js';
 import { toIssueShape } from '../models.js';
 import { mergeCollectionMetadata } from './providerPaging.js';
 
@@ -17,13 +24,11 @@ import { mergeCollectionMetadata } from './providerPaging.js';
 
 export type JiraUserScope = { authorLogin?: string; assigneeLogins?: string[]; mentionLogin?: string };
 
-/** One page of a Jira issue search, whether it names one project or several. */
-export type JiraIssuePage = { data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined;
 export type JiraIssuePageFetcher = (scope: JiraUserScope, cursor: string | undefined) => Promise<JiraIssuePage>;
 
 /**
- * Three states rather than a boolean: the backstop is recoverable by narrowing the scope, a page error or a stalled
- * cursor is not, and `ProjectIssuesDrain` makes the caller say which.
+ * Three states rather than a boolean: the backstop is recoverable by narrowing the scope, a page error, a stalled
+ * cursor or a page that dropped issues is not, and `ProjectIssuesDrain` makes the caller say which.
  */
 export type JiraIssuesDrain = {
 	issues: ProviderIssue[];
@@ -35,7 +40,7 @@ export type JiraUserScopedRead = { issues: ProviderIssue[]; truncated: boolean; 
 
 export type JiraDrainOptions = {
 	maxPages: number;
-	/** Where a failure that stops the drain is recorded. */
+	/** Where a failure that stops the drain, or that a page reported, is recorded. */
 	failureScope: CollectionScopeFailure['scope'];
 	/** Names the provider in the failures this drain synthesizes. */
 	providerName: string;
@@ -47,9 +52,127 @@ export type JiraDrainOptions = {
 };
 
 /**
+ * A search page's metadata with its failures recorded under `scope`. provider-apis scopes a page failure to what it
+ * searched (a Cloud site, or nothing below the provider on Data Center, which would publish it as a failure of the
+ * whole connection); the caller knows what it read, e.g. one project. Omissions keep their own scope.
+ */
+export function withFailureScope(
+	metadata: CollectionMetadata,
+	scope: CollectionScopeFailure['scope'],
+): CollectionMetadata {
+	if (metadata.failures == null) return metadata;
+
+	return { ...metadata, failures: metadata.failures.map(failure => ({ ...failure, scope: scope })) };
+}
+
+/**
+ * Folds what a drain's pages reported into one metadata, with one failure per scope and kind however many pages
+ * reported one. provider-apis reports the issues a page dropped per page, naming that page's keys, so the failures
+ * of a drain over many unreadable pages never dedupe and would publish one warning per page. The first page's
+ * failure is kept, naming its keys, and says how many more pages dropped issues too.
+ *
+ * A failure that names the issues a page dropped because it could not read them (GKDEV-3652) is marked as such, with
+ * the keys every page of its group named (see {@link parseSkippedJiraIssues}), and is published as an
+ * `'unreadable-items'` warning rather than a failed read. `pages` holds only what the SDK's search pages reported, never
+ * a failure synthesized here: only those can carry that form.
+ */
+export function summarizePageMetadata(pages: readonly CollectionMetadata[]): CollectionMetadata | undefined {
+	let summary: CollectionMetadata | undefined;
+	const failures = new Map<
+		string,
+		{ failure: CollectionScopeFailure; pages: number; unreadableItems: ProviderWarningUnreadableItems | undefined }
+	>();
+	for (const { failures: pageFailures, ...page } of pages) {
+		summary = mergeCollectionMetadata(summary, page);
+		for (const failure of pageFailures ?? []) {
+			const unreadableItems = parseSkippedJiraIssues(failure.message);
+			const key = `${collectionScopeKey(failure.scope)}\0${failure.kind}\0${unreadableItems != null}`;
+			const group = failures.get(key);
+			if (group == null) {
+				failures.set(key, { failure: failure, pages: 1, unreadableItems: unreadableItems });
+			} else {
+				group.pages++;
+				group.unreadableItems = mergeUnreadableItems(group.unreadableItems, unreadableItems);
+			}
+		}
+	}
+	if (failures.size === 0) return summary;
+
+	return mergeCollectionMetadata(summary, {
+		completeness: 'partial',
+		failures: Array.from(failures.values(), ({ failure, pages: count, unreadableItems }): ProviderScopeFailure => ({
+			...failure,
+			...(count === 1
+				? {}
+				: {
+						message: `${failure.message != null ? `${failure.message} ` : ''}Issues on ${count - 1} more ${count === 2 ? 'page' : 'pages'} could not be read either.`,
+					}),
+			...(unreadableItems != null ? { unreadableItems: unreadableItems } : {}),
+		})),
+	});
+}
+
+const skippedJiraIssuesPrefix = 'Skipped Jira issues that could not be read: ';
+/** Where provider-apis names a skipped issue: its key, or its position, opening its entry at the start or after `, `. */
+const skippedJiraIssueEntry = /(?:^|, )(result \d+|[^\s(),]+) \(/g;
+const moreSkippedJiraIssues = / and \d+ more\.$/;
+/** An entry with no name: provider-apis names one by its key or position, so this one can't be accounted for. */
+const unnamedSkippedJiraIssue = /(?:^|, ) \(/;
+
+/**
+ * The keys of the issues a Jira search page dropped, read from the message of the failure that reports them, since
+ * provider-apis names them nowhere else: `Skipped Jira issues that could not be read: KEY-1 (reason), KEY-2 (reason)
+ * and N more.`, with at most ten named and a position (`result 3`) in place of a key the issue lacked.
+ *
+ * A reason is the error's own text, so the entries can't be told apart by their parentheses: every place an entry can
+ * open is taken as one instead. That can name a key that only appeared in a reason, never miss a skipped one, which is
+ * the safe side: a consumer relies only on an issue being absent from `keys`.
+ *
+ * Undefined for a message that doesn't open that way, which is then no report of dropped issues: a failure of another
+ * kind must not pass for one, since a consumer takes the rest of its scope as read. Never throws. A list that names
+ * only some of its issues, doesn't open with a named entry, holds an unnamed one or lacks its closing period is
+ * reported incomplete. A change of separator can't be told from a reason that holds one, so the test reading a page
+ * through the real SDK is what pins the form.
+ */
+export function parseSkippedJiraIssues(message: string | undefined): ProviderWarningUnreadableItems | undefined {
+	if (!message?.startsWith(skippedJiraIssuesPrefix)) return undefined;
+
+	const list = message.slice(skippedJiraIssuesPrefix.length);
+	const entries = [...list.matchAll(skippedJiraIssueEntry)];
+	let complete =
+		entries[0]?.index === 0 &&
+		!list.startsWith(', ') &&
+		!unnamedSkippedJiraIssue.test(list) &&
+		list.endsWith('.') &&
+		!moreSkippedJiraIssues.test(list);
+	const keys: string[] = [];
+	for (const [, name] of entries) {
+		if (name.startsWith('result ')) {
+			complete = false;
+		} else if (!keys.includes(name)) {
+			keys.push(name);
+		}
+	}
+	return { keys: keys, complete: complete };
+}
+
+/**
+ * Says a drain of `scope` stopped at its page backstop with pages left: an omission, not a failure, since every request
+ * answered, so it retracts no other omission of the read. A clean drain leaves it to its caller (`'backstop'`), which
+ * knows whether a narrower scope would avoid it.
+ */
+function backstopOmission(scope: CollectionScopeFailure['scope']): CollectionMetadata {
+	return { completeness: 'partial', omissions: [{ kind: 'pagination-incomplete', scope: scope }] };
+}
+
+/**
  * Follows a search's cursor up to `maxPages`. A page failure after the first page leaves the already-drained prefix
  * intact and records the failure instead of re-throwing and discarding the prefix; if nothing was fetched yet, the
  * throw propagates so the caller sees a hard error rather than an empty partial success.
+ *
+ * A page that dropped issues it could not read (its metadata says so) makes the drain `incomplete` without stopping
+ * it: the issues it did read and the pages after it are kept, and its failures are recorded under `failureScope`,
+ * which names what this drain reads (e.g. one project) more narrowly than the site the SDK searched.
  */
 export async function drainJiraIssues(
 	fetchPage: JiraIssuePageFetcher,
@@ -60,6 +183,13 @@ export async function drainJiraIssues(
 	let cursor: string | undefined;
 	let status: JiraIssuesDrain['status'] = 'complete';
 	let metadata: CollectionMetadata | undefined;
+	const pages: CollectionMetadata[] = [];
+	const recordPage = (pageMetadata: CollectionMetadata | undefined): void => {
+		if (pageMetadata == null || (!isIncompleteCollection(pageMetadata) && !pageMetadata.failures?.length)) return;
+
+		status = 'incomplete';
+		pages.push(withFailureScope(pageMetadata, options.failureScope));
+	};
 	const stopIncomplete = (ex: unknown): void => {
 		status = 'incomplete';
 		metadata = mergeCollectionMetadata(metadata, {
@@ -72,11 +202,16 @@ export async function drainJiraIssues(
 		try {
 			result = await fetchPage(scope, cursor);
 		} catch (ex) {
-			if (issues.length === 0) {
+			// A page that read no issue but reported dropping some (every issue on it was unreadable) is not
+			// "nothing fetched": its failure is kept rather than lost to the throw or to an empty success.
+			const nothingRead = issues.length === 0 && pages.length === 0;
+			if (nothingRead) {
 				if (options.isEmptyFailure?.(ex)) return { issues: [], status: 'complete' };
 
 				throw ex;
 			}
+			// The project is gone, so it has nothing more to report; what its pages dropped already is.
+			if (issues.length === 0 && options.isEmptyFailure?.(ex)) break;
 
 			stopIncomplete(ex);
 			break;
@@ -89,6 +224,7 @@ export async function drainJiraIssues(
 		}
 
 		issues.push(...result.data);
+		recordPage(result.metadata);
 		if (!result.hasMore) break;
 
 		// The provider claims more pages but gave no advancing cursor: we can't continue, so the drain
@@ -100,12 +236,21 @@ export async function drainJiraIssues(
 
 		cursor = result.nextCursor;
 		// Pages remain but this was the last allowed iteration: the backstop stopped the drain, which a
-		// narrower scope would avoid.
+		// narrower scope would avoid. A drain already incomplete stays so (narrowing can't recover a dropped
+		// issue), so its metadata says the backstop also stopped it rather than only naming the dropped issues.
 		if (i === options.maxPages - 1) {
-			status = 'backstop';
+			if (status === 'complete') {
+				status = 'backstop';
+			} else {
+				metadata = mergeCollectionMetadata(metadata, backstopOmission(options.failureScope));
+			}
 		}
 	}
-	return { issues: issues, status: status, metadata: metadata };
+	return {
+		issues: issues,
+		status: status,
+		metadata: mergeCollectionMetadata(summarizePageMetadata(pages), metadata),
+	};
 }
 
 /**
@@ -191,6 +336,11 @@ export async function readUserScopedJiraIssues(
 		if (outcome.value.status !== 'complete') {
 			truncated = true;
 		}
+		// A backstop leaves nothing in the drain's metadata, so merged with a sibling's failure it would be told only by
+		// `truncated`, which that failure sets too: a skipped issue would then stand for a read that also stopped short.
+		if (outcome.value.status === 'backstop') {
+			metadata = mergeCollectionMetadata(metadata, backstopOmission(options.failureScope));
+		}
 		if (outcome.value.metadata != null) {
 			metadata = mergeCollectionMetadata(metadata, outcome.value.metadata);
 		}
@@ -216,11 +366,12 @@ export function toUniqueJiraIssueShapes(issues: readonly ProviderIssue[], provid
 
 /**
  * Reads the current user's issues of several projects with one search per relationship, split back to the projects
- * in `projectIds` order by each issue's `project.id`. Undefined when the search did not complete or an issue belongs
- * to no requested project, so the caller reads them one by one: a search's pages are global to its project set, and
- * an incomplete one says nothing about which of its projects it covered. Its failures are therefore never
- * published, and the waste is bounded by one project's page budget, paid only by a search that needed more than
- * that or failed partway.
+ * in `projectIds` order by each issue's `project.id`. Undefined when the search did not complete (including a page
+ * that dropped an issue it could not read) or an issue belongs to no requested project, so the caller reads them one
+ * by one: a search's pages are global to its project set, and an incomplete one says nothing about which of its
+ * projects it covered. Its failures are therefore never published, and the waste is bounded by one project's page
+ * budget, paid by a search that needed more than that or did not read cleanly. An issue that stays unreadable makes
+ * every such search pay it, as Linear's does for an incomplete search.
  */
 export async function searchJiraProjectIssues(
 	fetchPage: JiraIssuePageFetcher,

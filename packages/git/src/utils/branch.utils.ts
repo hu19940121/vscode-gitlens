@@ -1,6 +1,6 @@
 import { getRemoteNameSlashIndex } from '@gitlens/utils/gitRefs.js';
 import type { PageableResult } from '@gitlens/utils/paging.js';
-import type { GitBranch, GitTrackingUpstream } from '../models/branch.js';
+import type { BranchMetadata, BranchMetadataGkConfigKey, GitBranch, GitTrackingUpstream } from '../models/branch.js';
 import type { GitBranchReference, GitReference } from '../models/reference.js';
 import { shortenRevision } from './revision.utils.js';
 
@@ -29,6 +29,9 @@ export function getBranchNameAndRemote(ref: GitBranchReference): [name: string, 
 		return [ref.name.substring(index + 1), ref.name.substring(0, index)];
 	}
 
+	if (ref.upstream?.local) return [ref.name, undefined];
+	if (ref.upstream?.remote) return [ref.name, ref.upstream.remote];
+
 	if (ref.upstream?.name != null) {
 		const index = getRemoteNameSlashIndex(ref.upstream.name);
 		if (index === -1) return [ref.name, undefined];
@@ -39,8 +42,54 @@ export function getBranchNameAndRemote(ref: GitBranchReference): [name: string, 
 	return [ref.name, undefined];
 }
 
+/**
+ * The upstream's branch name on its remote. The name git reports (`branch.<name>.merge`) wins over stripping the local
+ * remote-tracking name, which a custom fetch refspec makes differ (`origin` fetching into `refs/remotes/mirror/*`)
+ */
 export function getBranchTrackingWithoutRemote(ref: GitBranchReference): string | undefined {
-	return ref.upstream?.name.substring(getRemoteNameSlashIndex(ref.upstream.name) + 1);
+	if (ref.upstream == null) return undefined;
+
+	const { name, remote, remoteBranch, local } = ref.upstream;
+	if (local) return name;
+	if (remoteBranch) return remoteBranch;
+	if (remote && name.startsWith(`${remote}/`)) return name.substring(remote.length + 1);
+
+	return name.substring(getRemoteNameSlashIndex(name) + 1);
+}
+
+/**
+ * Splits `name` at the longest of `remoteNames` that prefixes it, so a remote whose own name contains a `/` resolves
+ * whole. A leading `remotes/` is stripped only when no remote matches the name as given
+ */
+export function splitRemoteBranchName(
+	name: string,
+	remoteNames: Iterable<string>,
+): [remote: string, branch: string] | undefined {
+	const names = Array.isArray(remoteNames) ? remoteNames : [...remoteNames];
+
+	const split = splitAtLongestRemote(name, names);
+	if (split != null || !name.startsWith('remotes/')) return split;
+
+	return splitAtLongestRemote(name.substring(8), names);
+}
+
+function splitAtLongestRemote(
+	name: string,
+	remoteNames: Iterable<string>,
+): [remote: string, branch: string] | undefined {
+	let match: string | undefined;
+	for (const remote of remoteNames) {
+		if (
+			name.length > remote.length + 1 &&
+			name.charCodeAt(remote.length) === 47 /* '/' */ &&
+			name.startsWith(remote) &&
+			(match == null || remote.length > match.length)
+		) {
+			match = remote;
+		}
+	}
+
+	return match != null ? [match, name.substring(match.length + 1)] : undefined;
 }
 
 export function isDetachedHead(name: string): boolean {
@@ -129,14 +178,31 @@ export async function getLocalBranchUpstreamNames(branches: PageableResult<GitBr
 
 const trackingStateRegex = /(?:\[(?:ahead ([0-9]+))?[,\s]*(?:behind ([0-9]+))?]|\[(gone)])/;
 
-export function parseUpstream(upstream: string, tracking: string): GitTrackingUpstream | undefined {
+/**
+ * @param remote - `%(upstream:remotename)`; `.` is a local upstream, and empty means git reported none. A reported
+ * remote always wins, even when a custom fetch refspec puts its branches under `refs/heads/`; only when none was
+ * reported (git < 2.23) is an upstream under `refs/heads/` taken as local
+ * @param remoteRef - `%(upstream:remoteref)`; the upstream's ref on `remote`, read as its branch name
+ */
+export function parseUpstream(
+	upstream: string,
+	tracking: string,
+	remote?: string,
+	remoteRef?: string,
+): GitTrackingUpstream | undefined {
 	if (!upstream) return undefined;
 
 	const { name } = parseRefName(upstream);
+	const local = remote ? remote === '.' : upstream.startsWith('refs/heads/');
+	const localProp = local ? { local: true } : undefined;
+	const remoteProp =
+		remote && remote !== '.'
+			? { remote: remote, ...(remoteRef ? { remoteBranch: remoteRef.replace(/^refs\/heads\//, '') } : undefined) }
+			: undefined;
 
 	const match = trackingStateRegex.exec(tracking);
 	if (match == null) {
-		return { name: name, missing: false, state: { ahead: 0, behind: 0 } };
+		return { name: name, missing: false, state: { ahead: 0, behind: 0 }, ...remoteProp, ...localProp };
 	}
 
 	const ahead = match[1] == null ? 0 : Number(match[1]);
@@ -146,5 +212,58 @@ export function parseUpstream(upstream: string, tracking: string): GitTrackingUp
 		name: name,
 		missing: match[3] != null,
 		state: { ahead: isNaN(ahead) ? 0 : ahead, behind: isNaN(behind) ? 0 : behind },
+		...remoteProp,
+		...localProp,
 	};
+}
+
+const branchMetadataGkConfigKeyRegex =
+	/^branch\.(.+)\.(gk-(?:last-accessed|last-modified|agent-last-activity|disposition))$/;
+
+/** Splits a `branch.<name>.<key>` gk config key that a branch's {@link BranchMetadata} is read from, or `undefined` for any other key */
+export function parseBranchMetadataGkConfigKey(
+	key: string,
+): { branch: string; key: BranchMetadataGkConfigKey } | undefined {
+	const match = branchMetadataGkConfigKeyRegex.exec(key);
+	if (match == null) return undefined;
+
+	return { branch: match[1], key: match[2] as BranchMetadataGkConfigKey };
+}
+
+/** Sets the field `key` is read into to `value`, or removes it for `undefined`, exactly as a fresh read of the key would */
+export function setBranchMetadataValue(
+	metadata: BranchMetadata,
+	key: BranchMetadataGkConfigKey,
+	value: string | undefined,
+): void {
+	switch (key) {
+		case 'gk-last-accessed':
+			if (value != null) {
+				metadata.lastAccessedAt = value;
+			} else {
+				delete metadata.lastAccessedAt;
+			}
+			break;
+		case 'gk-last-modified':
+			if (value != null) {
+				metadata.lastModifiedAt = value;
+			} else {
+				delete metadata.lastModifiedAt;
+			}
+			break;
+		case 'gk-agent-last-activity':
+			if (value != null) {
+				metadata.agentLastActivityAt = value;
+			} else {
+				delete metadata.agentLastActivityAt;
+			}
+			break;
+		case 'gk-disposition':
+			if (value === 'starred' || value === 'archived') {
+				metadata.disposition = value;
+			} else {
+				delete metadata.disposition;
+			}
+			break;
+	}
 }

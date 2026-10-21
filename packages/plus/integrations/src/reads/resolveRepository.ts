@@ -237,7 +237,9 @@ export async function resolveRepository(
 			domain: domain,
 			owner: canonicalOwner,
 			name: canonicalName,
-			project: project,
+			// Azure's own project for the repository: an Azure DevOps Server remote's path may name the collection where
+			// the parser read the project (see `AzureDevOpsServerIntegration.getRepositoryTarget`).
+			project: project != null ? repo.project || project : undefined,
 			remoteUrl: options.remoteUrl,
 			renamed: renamed,
 		};
@@ -254,7 +256,12 @@ export async function resolveRepository(
 			let warning = toProviderWarning(id, domain, connectionId, ex);
 			try {
 				const failure = await integration.settleRepositoryRefusal(
-					{ owner: owner, name: name, project: project, connectionId: connectionId },
+					{
+						owner: owner,
+						name: project != null ? getAzureRepositoryName(name) : name,
+						project: project,
+						connectionId: connectionId,
+					},
 					ex,
 				);
 				if (failure != null) {
@@ -279,6 +286,17 @@ export async function resolveRepository(
 		}
 		return { resolution: resolution };
 	}
+}
+
+/** The repository an Azure remote's `{project}/_git/{repo}` name addresses, as a batch target names it. */
+function getAzureRepositoryName(name: string): string {
+	return /\/_git\/([^/]+)$/i.exec(name)?.[1] ?? name;
+}
+
+/** Whether `path` is `{x}/_git/{repo}`, the Azure repository path the remote parser reads without a project segment. */
+function isProjectlessAzurePath(path: string | undefined): boolean {
+	const segments = path?.split('/');
+	return segments?.length === 3 && decodePathSegment(segments[1]).toLowerCase() === '_git';
 }
 
 /**
@@ -394,8 +412,10 @@ function matchInstallation(
 	}
 
 	// An Azure DevOps Server address may name the collection as well as the virtual directory; the parser expects
-	// the collection in the path, so re-base on the address's parent when no project was found.
-	if (basePath && provider?.providerDesc?.repoDomain == null) {
+	// the collection in the path, so re-base on the address's parent when no project was found. A relative
+	// `{x}/_git/{repo}` re-bases too: `x` is a collection only if the address is the installation rather than a
+	// collection, which the path can't tell, so the integration settles it against the collections it discovers.
+	if (basePath && (provider?.providerDesc?.repoDomain == null || isProjectlessAzurePath(relativeTo(basePath)))) {
 		basePath = basePath.slice(0, basePath.lastIndexOf('/'));
 		provider = rematch(basePath);
 	}

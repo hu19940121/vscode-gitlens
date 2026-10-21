@@ -3,7 +3,10 @@ export type GitFeatures =
 	| 'git:checkout:pathspec-from-file'
 	| 'git:commit-graph'
 	| 'git:commit-graph:changed-paths'
+	| 'git:fetch:all-config'
+	| 'git:fetch:follow-remote-head'
 	| 'git:fetch:no-write-fetch-head'
+	| 'git:for-each-ref:ahead-behind'
 	| 'git:for-each-ref:worktreePath'
 	| 'git:fsmonitor'
 	| 'git:fsmonitor:linux'
@@ -28,8 +31,10 @@ export type GitFeatures =
 	| 'git:stash:push:staged'
 	| 'git:stash:push:stdin'
 	| 'git:status:find-renames'
+	| 'git:status:ignored-matching'
 	| 'git:status:porcelain-v2'
 	| 'git:untrackedCache'
+	| 'git:worktree:list:lock-reason'
 	| 'git:worktrees';
 
 type ExtractPrefix<T> = T extends `${infer Prefix}:${infer Rest}`
@@ -52,7 +57,14 @@ export const gitFeaturesByVersion = new Map<GitFeatures, string>([
 	// Changed-path Bloom filters (`--changed-paths`), the v2 filter format — pre-2.31 shipped Bloom filters
 	// with real correctness bugs (bad results for merge commits), so 2.31 is the safe floor to write them.
 	['git:commit-graph:changed-paths', '2.31'],
+	// A bare `fetch` reads every remote when `fetch.all` is set
+	['git:fetch:all-config', '2.44'],
+	// A fetch using a remote's configured refspecs creates its missing `refs/remotes/<remote>/HEAD`
+	// (`remote.<name>.followRemoteHEAD`, default `create`)
+	['git:fetch:follow-remote-head', '2.48'],
 	['git:fetch:no-write-fetch-head', '2.29'],
+	// `%(ahead-behind:<commit>)` in for-each-ref formats
+	['git:for-each-ref:ahead-behind', '2.41'],
 	['git:for-each-ref:worktreePath', '2.23'],
 	// `core.fsmonitor=true` selects the built-in FSMonitor daemon (accepting a bool rather than only a
 	// hook path). This 2.37 floor is the Windows + macOS one.
@@ -100,8 +112,12 @@ export const gitFeaturesByVersion = new Map<GitFeatures, string>([
 	['git:stash:push:staged', '2.35.0'],
 	['git:stash:push:stdin', '2.30.0'],
 	['git:status:find-renames', '2.18'],
+	// `status --ignored=matching`: an ignored folder is one entry, without a walk of what is inside it
+	['git:status:ignored-matching', '2.16'],
 	['git:status:porcelain-v2', '2.11'],
 	// `core.untrackedCache=true` (repo-local cache of untracked-file scans — the auto-tier config lever).
 	['git:untrackedCache', '2.8'],
+	// `worktree list --porcelain` prints a lock's reason (`locked <reason>`); older ones print a bare `locked`
+	['git:worktree:list:lock-reason', '2.31'],
 	['git:worktrees', '2.17.0'],
 ]);

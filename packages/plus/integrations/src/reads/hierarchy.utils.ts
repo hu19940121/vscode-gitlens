@@ -3,6 +3,7 @@ import { IssuesCloudHostIntegrationId } from '../constants.js';
 import type { IntegrationIds } from '../constants.js';
 import type { ProviderOrganization, ProviderResult, ProviderWarning } from '../results.js';
 import { appendDedupedWarning } from '../results.js';
+import { isJiraIntegrationId } from '../utils/integration.utils.js';
 
 /**
  * Mapping of a provider's own hierarchy vocabulary onto the single {@link ProviderOrganization} shape the facade
@@ -32,6 +33,16 @@ export function resourceMatchesOrg(resource: ResourceDescriptor, org: string): b
 }
 
 /**
+ * Whether a caller's `org`/`project` selector addresses this resource or project, for the reads that act on a
+ * remembered selection. Jira's only by its canonical key (a site's id, a project's key): a site or project that was
+ * removed must select nothing, not resolve through its old name or id to another one that happens to carry it as a
+ * name, id or key. Every other provider by any identifier, as {@link resourceMatchesOrg}.
+ */
+export function selectorMatches(providerId: IntegrationIds, resource: ResourceDescriptor, selector: string): boolean {
+	return isJiraIntegrationId(providerId) ? resource.key === selector : resourceMatchesOrg(resource, selector);
+}
+
+/**
  * The id of the RESOURCE a project belongs to, used to look up which account (and therefore which user) that
  * project's issues should be scoped to. Falls back through the project's own identifiers because some providers
  * (and test doubles) return project descriptors without naming their parent.
@@ -43,12 +54,13 @@ export function resourceIdForProject(project: ResourceDescriptor): string | unde
 
 /**
  * A stable identity for one project across facade pages, for the retry/completed bookkeeping an issue-tracker
- * cursor carries. All three identifiers are included rather than one preferred value: two trackers can reuse the
- * same project id, so keying on a single field would collapse them into one entry.
+ * cursor carries. The resource is included because two resources can reuse the same project id. The key is left
+ * out because it can be renamed between pages (a Jira project key), which would re-read a completed project and
+ * drop a retrying one; it stands in only for a descriptor with no id.
  */
 export function projectKey(project: ResourceDescriptor): string {
 	const typed = project as IssueResourceDescriptor & { resourceId?: string };
-	return JSON.stringify([typed.resourceId ?? '', typed.id ?? '', project.key]);
+	return JSON.stringify([typed.resourceId ?? '', typed.id || project.key]);
 }
 
 /**
@@ -69,6 +81,24 @@ export function resourceToOrg(
 		...(org != null ? { org: org } : {}),
 		url: typed.url ?? '',
 	};
+}
+
+/**
+ * Maps an issue-tracker project descriptor to the unified org shape, as {@link resourceToOrg} does with its parent's
+ * label as `org`. A Jira project is published by what its reads take: `name` is its key (its display name can collide
+ * with another project's key), and `orgId` its site's id, since the label in `org` can't address the site.
+ */
+export function projectToOrg(
+	providerId: IntegrationIds,
+	project: ResourceDescriptor,
+	resources: ResourceDescriptor[],
+): ProviderOrganization {
+	const item = resourceToOrg(providerId, project, orgForProject(providerId, project, resources));
+	if (!isJiraIntegrationId(providerId)) return item;
+
+	// The descriptor's own parent id only: `resourceIdForProject` would fall back to the project's id or key.
+	const { resourceId } = project;
+	return { ...item, name: project.key, ...(typeof resourceId === 'string' ? { orgId: resourceId } : {}) };
 }
 
 /**

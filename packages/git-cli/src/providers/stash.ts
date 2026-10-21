@@ -23,7 +23,7 @@ import { fileUri, joinUriPath, toFsPath } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
 import { gitFeaturesByVersion } from '../exec/features.js';
 import type { Git } from '../exec/git.js';
-import { getGitCommandError, GitError, GitErrors, maxGitCliLength } from '../exec/git.js';
+import { getGitCommandError, GitError, GitErrors, isRunHookFailure, maxGitCliLength } from '../exec/git.js';
 import type { ParsedStash, ParsedStashWithFiles } from '../parsers/logParser.js';
 import { getStashFilesOnlyLogParser, getStashLogParser } from '../parsers/logParser.js';
 import { createCommitFileset } from './commitFilesetUtils.js';
@@ -64,7 +64,7 @@ export class StashGitSubProvider implements GitStashSubProvider {
 			await this.git.run({ cwd: repoPath, ...runOptions }, ...args);
 			return { conflicted: false };
 		} catch (ex) {
-			if (isCancellationError(ex)) throw ex;
+			if (isCancellationError(ex) || isRunHookFailure(ex)) throw ex;
 
 			if (ex instanceof Error) {
 				const msg: string = ex.message ?? '';
@@ -286,31 +286,48 @@ export class StashGitSubProvider implements GitStashSubProvider {
 
 	@debug()
 	async deleteStash(repoPath: string, stashName: string, sha?: string): Promise<void> {
-		await this.deleteStashCore(repoPath, stashName, sha);
-		this.context.hooks?.repository?.onChanged?.(repoPath, ['stash']);
-		this.context.hooks?.cache?.onReset?.(repoPath, 'stashes');
+		await this.deleteStashCore(repoPath, stashName, sha, { announce: true });
 	}
 
-	@gate()
-	private async deleteStashCore(repoPath: string, stashName: string, sha?: string): Promise<string | undefined> {
+	// Keyed without `options`, so a delete and a rename of the same stash share one drop: a second drop would take
+	// the stash that moved up into its place
+	@gate((rp, name, sha) => `${rp}\0${name}\0${sha ?? ''}`)
+	private async deleteStashCore(
+		repoPath: string,
+		stashName: string,
+		sha: string | undefined,
+		options: { announce: boolean; verified?: boolean },
+	): Promise<string | undefined> {
 		if (!stashName) return undefined;
 
-		let result;
-		if (sha) {
-			result = await this.git.run(
-				{ cwd: repoPath, errors: 'ignore' },
-				'show',
-				'--format=%H',
-				'--no-patch',
-				stashName,
-			);
-			if (result.stdout.trim() !== sha) {
-				throw new Error(l10n.t('Unable to delete stash; mismatch with stash number'));
-			}
+		if (!options.verified) {
+			await this.verifyStashSha(repoPath, stashName, sha);
 		}
 
-		result = await this.git.run({ cwd: repoPath }, 'stash', 'drop', stashName);
+		let result;
+		try {
+			result = await this.git.run({ cwd: repoPath }, 'stash', 'drop', stashName);
+		} finally {
+			if (options.announce) {
+				this.announceStashChanged(repoPath);
+			}
+		}
 		return result.stdout;
+	}
+
+	private async verifyStashSha(repoPath: string, stashName: string, sha: string | undefined): Promise<void> {
+		if (!sha) return;
+
+		const result = await this.git.run(
+			{ cwd: repoPath, errors: 'ignore' },
+			'show',
+			'--format=%H',
+			'--no-patch',
+			stashName,
+		);
+		if (result.stdout.trim() !== sha) {
+			throw new Error(l10n.t('Unable to delete stash; mismatch with stash number'));
+		}
 	}
 
 	@debug()
@@ -321,18 +338,24 @@ export class StashGitSubProvider implements GitStashSubProvider {
 		message: string,
 		stashOnRef?: string,
 	): Promise<void> {
-		await this.deleteStashCore(repoPath, stashName, sha);
-		await this.git.run(
-			{ cwd: repoPath },
-			'stash',
-			'store',
-			'-m',
-			stashOnRef ? `On ${stashOnRef}: ${message}` : message,
-			sha,
-		);
+		if (stashName) {
+			await this.verifyStashSha(repoPath, stashName, sha);
+		}
 
-		this.context.hooks?.repository?.onChanged?.(repoPath, ['stash']);
-		this.context.hooks?.cache?.onReset?.(repoPath, 'stashes');
+		// The drop and the store announce once, after both ran, even if the store fails
+		try {
+			await this.deleteStashCore(repoPath, stashName, sha, { announce: false, verified: true });
+			await this.git.run(
+				{ cwd: repoPath },
+				'stash',
+				'store',
+				'-m',
+				stashOnRef ? `On ${stashOnRef}: ${message}` : message,
+				sha,
+			);
+		} finally {
+			this.announceStashChanged(repoPath);
+		}
 	}
 
 	@debug({ args: (repoPath, message, paths) => ({ repoPath: repoPath, message: message, paths: paths?.length }) })
@@ -469,7 +492,7 @@ export class StashGitSubProvider implements GitStashSubProvider {
 				});
 			}
 		} catch (ex) {
-			if (ex instanceof StashPushError || isCancellationError(ex)) throw ex;
+			if (ex instanceof StashPushError || isCancellationError(ex) || isRunHookFailure(ex)) throw ex;
 
 			throw getGitCommandError(
 				'stash-push',
@@ -500,10 +523,16 @@ export class StashGitSubProvider implements GitStashSubProvider {
 		if (message) {
 			args.push('-m', message);
 		}
-		await this.git.run({ cwd: repoPath }, 'stash', 'store', ...args, id);
+		try {
+			await this.git.run({ cwd: repoPath }, 'stash', 'store', ...args, id);
+		} finally {
+			this.announceStashChanged(repoPath);
+		}
+	}
 
-		this.context.hooks?.repository?.onChanged?.(repoPath, ['stash']);
+	private announceStashChanged(repoPath: string): void {
 		this.context.hooks?.cache?.onReset?.(repoPath, 'stashes');
+		this.context.hooks?.repository?.onChanged?.(repoPath, ['stash']);
 	}
 }
 

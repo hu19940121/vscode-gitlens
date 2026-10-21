@@ -3,11 +3,13 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as sinon from 'sinon';
 import type { SigningErrorReason } from '@gitlens/git/errors.js';
-import { CommitError, FetchError, MergeError, PullError, SigningError } from '@gitlens/git/errors.js';
+import { CommitError, FetchError, MergeError, PullError, PushError, SigningError } from '@gitlens/git/errors.js';
 import type { GitBranchReference } from '@gitlens/git/models/reference.js';
 import type { SigningFormat } from '@gitlens/git/models/signature.js';
 import { createReference } from '@gitlens/git/utils/reference.utils.js';
+import type { TestRepo } from './helpers.js';
 import {
 	addCommit,
 	checkout,
@@ -17,6 +19,7 @@ import {
 	createTrackingBranch,
 	createWorktree,
 	getHeadSha,
+	getRefTips,
 	revParse,
 } from './helpers.js';
 
@@ -407,6 +410,505 @@ suite('OperationsGitSubProvider.push', () => {
 			r.cleanup();
 		}
 	});
+
+	suite('upstream tracking writes', () => {
+		function watch() {
+			const changes: string[][] = [];
+			return {
+				changes: changes,
+				hooks: { repository: { onChanged: (_rp: string, c: readonly string[]) => changes.push([...c]) } },
+			};
+		}
+
+		function setup(hooks?: ReturnType<typeof watch>['hooks']) {
+			const origin = createTestRepo();
+			const bare = createBareRemoteFrom(origin.path);
+			const local = cloneTestRepo(bare.path, { hooks: hooks });
+			return {
+				origin: origin,
+				bare: bare,
+				local: local,
+				cleanup: () => {
+					local.cleanup();
+					bare.cleanup();
+					origin.cleanup();
+				},
+			};
+		}
+
+		function branchRef(repoPath: string, name: string, upstream?: { name: string; missing: boolean }) {
+			return createReference(name, repoPath, {
+				refType: 'branch',
+				name: name,
+				remote: false,
+				upstream: upstream,
+			});
+		}
+
+		function config(repoPath: string, key: string): string {
+			try {
+				return execFileSync('git', ['config', '--get-all', key], { cwd: repoPath, encoding: 'utf-8' }).trim();
+			} catch {
+				return '';
+			}
+		}
+
+		test('a branch tracking a live upstream pushes without -u', async () => {
+			const watched = watch();
+			const r = setup(watched.hooks);
+			try {
+				addCommit(r.local.path, 'a.txt', 'a', 'Local commit');
+				const localSha = getHeadSha(r.local.path);
+				const configPath = join(r.local.path, '.git', 'config');
+				const before = readFileSync(configPath, 'utf-8');
+
+				await r.local.provider.ops.push(r.local.path, {
+					reference: branchRef(r.local.path, 'main', { name: 'origin/main', missing: false }),
+				});
+
+				assert.strictEqual(readFileSync(configPath, 'utf-8'), before, '.git/config must not be rewritten');
+				assert.strictEqual(
+					execFileSync('git', ['ls-remote', r.bare.path, 'refs/heads/main'], { encoding: 'utf-8' }).split(
+						'\t',
+					)[0],
+					localSha,
+				);
+				assert.ok(watched.changes.every(c => !c.includes('config')));
+			} finally {
+				r.cleanup();
+			}
+		});
+
+		test('a reference whose upstream is missing sets tracking and announces config', async () => {
+			const watched = watch();
+			const r = setup(watched.hooks);
+			try {
+				createBranch(r.local.path, 'topic', { checkout: true });
+				addCommit(r.local.path, 'topic.txt', 't', 'Topic commit');
+				assert.strictEqual(config(r.local.path, 'branch.topic.remote'), '', 'sanity');
+
+				await r.local.provider.ops.push(r.local.path, {
+					reference: branchRef(r.local.path, 'topic', { name: 'origin/topic', missing: true }),
+				});
+
+				assert.strictEqual(config(r.local.path, 'branch.topic.remote'), 'origin');
+				assert.strictEqual(config(r.local.path, 'branch.topic.merge'), 'refs/heads/topic');
+				assert.ok(watched.changes.some(c => c.includes('config')));
+			} finally {
+				r.cleanup();
+			}
+		});
+
+		suite('a remote whose fetch refspec stores its branches under another name', () => {
+			function setupMirror() {
+				const r = setup();
+				execFileSync('git', ['config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/mirror/pfx/*'], {
+					cwd: r.local.path,
+					stdio: 'pipe',
+				});
+				execFileSync('git', ['fetch', 'origin'], { cwd: r.local.path, stdio: 'pipe' });
+				execFileSync('git', ['push', 'origin', 'main:x'], { cwd: r.local.path, stdio: 'pipe' });
+				execFileSync('git', ['fetch', 'origin'], { cwd: r.local.path, stdio: 'pipe' });
+				createTrackingBranch(r.local.path, 'x', 'mirror/pfx/x');
+				checkout(r.local.path, 'x');
+				return r;
+			}
+
+			function bareRefs(bare: string): string {
+				return execFileSync('git', ['for-each-ref', '--format=%(refname) %(objectname)', 'refs/heads'], {
+					cwd: bare,
+					encoding: 'utf-8',
+				});
+			}
+
+			test('a branch read from the repository reports its branch on the remote', async () => {
+				const r = setupMirror();
+				try {
+					const x = await r.local.provider.branches.getBranch(r.local.path, 'x');
+					assert.strictEqual(x?.upstream?.name, 'mirror/pfx/x');
+					assert.strictEqual(x.upstream.remote, 'origin');
+					assert.strictEqual(x.upstream.remoteBranch, 'x');
+
+					const all = await r.local.provider.branches.getBranches(r.local.path);
+					assert.strictEqual(all.values.find(b => b.name === 'x')?.upstream?.remoteBranch, 'x');
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a force push of a branch reference lands on the upstream name on the remote', async () => {
+				const r = setupMirror();
+				try {
+					addCommit(r.local.path, 'x.txt', 'x', 'X commit');
+					const localSha = getHeadSha(r.local.path);
+					const before = bareRefs(r.bare.path);
+
+					const branch = await r.local.provider.branches.getBranch(r.local.path, 'x');
+					assert.ok(branch != null);
+					await r.local.provider.ops.push(r.local.path, { reference: branch, force: true });
+
+					const after = bareRefs(r.bare.path);
+					assert.notStrictEqual(after, before);
+					assert.strictEqual(revParse(r.bare.path, 'refs/heads/x'), localSha);
+					assert.deepStrictEqual(
+						after.split('\n').map(l => l.split(' ')[0]),
+						before.split('\n').map(l => l.split(' ')[0]),
+						'no other branch is created',
+					);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a commit pushed onto the current branch lands on its upstream name on the remote', async () => {
+				const r = setupMirror();
+				try {
+					createTrackingBranch(r.local.path, 'lx', 'mirror/pfx/x');
+					checkout(r.local.path, 'lx');
+					addCommit(r.local.path, 'lx.txt', 'lx', 'LX commit');
+					const localSha = getHeadSha(r.local.path);
+					const before = bareRefs(r.bare.path);
+
+					await r.local.provider.ops.push(r.local.path, {
+						reference: createReference(localSha, r.local.path, { refType: 'revision' }),
+					});
+
+					const after = bareRefs(r.bare.path);
+					assert.strictEqual(revParse(r.bare.path, 'refs/heads/x'), localSha);
+					assert.deepStrictEqual(
+						after.split('\n').map(l => l.split(' ')[0]),
+						before.split('\n').map(l => l.split(' ')[0]),
+						'no branch named after the local branch is created',
+					);
+				} finally {
+					r.cleanup();
+				}
+			});
+		});
+
+		suite('a reference push without a remote to push to', () => {
+			test('a branch tracking a local branch rejects with noUpstream and pushes nothing', async () => {
+				const r = setup();
+				try {
+					createBranch(r.local.path, 'feature', { checkout: true });
+					execFileSync('git', ['branch', '--set-upstream-to=main', 'feature'], {
+						cwd: r.local.path,
+						stdio: 'pipe',
+					});
+					addCommit(r.local.path, 'f.txt', 'f', 'Feature commit');
+					const before = getRefTips(r.bare.path);
+
+					const branch = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+					assert.ok(branch?.upstream != null);
+					await assert.rejects(
+						r.local.provider.ops.push(r.local.path, { reference: branch, force: true }),
+						(ex: unknown) => PushError.is(ex, 'noUpstream'),
+					);
+
+					assert.deepStrictEqual(getRefTips(r.bare.path), before);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test("publishing a branch tracking a local branch creates it on the remote, leaving the local upstream's name alone", async () => {
+				const r = setup();
+				try {
+					createBranch(r.local.path, 'feature', { checkout: true });
+					execFileSync('git', ['branch', '--set-upstream-to=main', 'feature'], {
+						cwd: r.local.path,
+						stdio: 'pipe',
+					});
+					addCommit(r.local.path, 'f.txt', 'f', 'Feature commit');
+					const localSha = getHeadSha(r.local.path);
+					const mainBefore = revParse(r.bare.path, 'refs/heads/main');
+
+					const branch = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+					assert.ok(branch?.upstream?.local);
+					await r.local.provider.ops.push(r.local.path, { reference: branch, publish: { remote: 'origin' } });
+
+					assert.strictEqual(revParse(r.bare.path, 'refs/heads/feature'), localSha);
+					assert.strictEqual(revParse(r.bare.path, 'refs/heads/main'), mainBefore);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a branch tracking a local branch with a slash in its name rejects with noUpstream', async () => {
+				const r = setup();
+				try {
+					createBranch(r.local.path, 'release/2.0');
+					createBranch(r.local.path, 'feature', { checkout: true });
+					execFileSync('git', ['branch', '--set-upstream-to=release/2.0', 'feature'], {
+						cwd: r.local.path,
+						stdio: 'pipe',
+					});
+					addCommit(r.local.path, 'f.txt', 'f', 'Feature commit');
+					const before = getRefTips(r.bare.path);
+
+					const branch = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+					assert.strictEqual(branch?.upstream?.name, 'release/2.0');
+					await assert.rejects(
+						r.local.provider.ops.push(r.local.path, { reference: branch, force: true }),
+						(ex: unknown) => PushError.is(ex, 'noUpstream'),
+					);
+
+					assert.deepStrictEqual(getRefTips(r.bare.path), before);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			suite('a branch tracking a local branch with a slash in its name', () => {
+				function setupUnchecked() {
+					const r = setup();
+					createBranch(r.local.path, 'release/2.0');
+					createBranch(r.local.path, 'feature');
+					execFileSync('git', ['branch', '--set-upstream-to=release/2.0', 'feature'], {
+						cwd: r.local.path,
+						stdio: 'pipe',
+					});
+					return r;
+				}
+
+				test('fetch of the branch runs no fetch and changes no refs', async () => {
+					const r = setupUnchecked();
+					try {
+						const before = getRefTips(r.local.path);
+
+						const branch = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+						assert.strictEqual(branch?.upstream?.name, 'release/2.0');
+						await r.local.provider.ops.fetch(r.local.path, { branch: branch });
+
+						assert.deepStrictEqual(getRefTips(r.local.path), before);
+					} finally {
+						r.cleanup();
+					}
+				});
+
+				test('a fast-forward-only pull rejects with noUpstream', async () => {
+					const r = setupUnchecked();
+					try {
+						const branch = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+						assert.strictEqual(branch?.upstream?.name, 'release/2.0');
+						await assert.rejects(
+							r.local.provider.ops.pull(r.local.path, { branch: branch, fastForward: 'only' }),
+							(ex: unknown) => PullError.is(ex, 'noUpstream'),
+						);
+					} finally {
+						r.cleanup();
+					}
+				});
+			});
+
+			test('pushing the current branch with no upstream rejects with noUpstream', async () => {
+				const r = setup();
+				try {
+					createBranch(r.local.path, 'feature', { checkout: true });
+					const before = getRefTips(r.bare.path);
+
+					await assert.rejects(r.local.provider.ops.push(r.local.path), (ex: unknown) =>
+						PushError.is(ex, 'noUpstream'),
+					);
+
+					assert.deepStrictEqual(getRefTips(r.bare.path), before);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a commit reference with no remote for the current branch rejects with noUpstream', async () => {
+				const r = setup();
+				try {
+					createBranch(r.local.path, 'feature', { checkout: true });
+					execFileSync('git', ['branch', '--set-upstream-to=main', 'feature'], {
+						cwd: r.local.path,
+						stdio: 'pipe',
+					});
+					const before = getRefTips(r.bare.path);
+
+					await assert.rejects(
+						r.local.provider.ops.push(r.local.path, {
+							reference: createReference(getHeadSha(r.local.path), r.local.path, { refType: 'revision' }),
+						}),
+						(ex: unknown) => PushError.is(ex, 'noUpstream'),
+					);
+
+					assert.deepStrictEqual(getRefTips(r.bare.path), before);
+				} finally {
+					r.cleanup();
+				}
+			});
+		});
+
+		suite('a remote whose own name contains a slash', () => {
+			function setupSlashRemote() {
+				const r = setup();
+				const fork = createBareRemoteFrom(r.origin.path);
+				execFileSync('git', ['remote', 'add', 'team/fork', fork.path], { cwd: r.local.path, stdio: 'pipe' });
+				execFileSync('git', ['push', 'team/fork', 'main:feature'], { cwd: r.local.path, stdio: 'pipe' });
+				execFileSync('git', ['fetch', 'team/fork'], { cwd: r.local.path, stdio: 'pipe' });
+				createTrackingBranch(r.local.path, 'feature', 'team/fork/feature');
+				checkout(r.local.path, 'feature');
+				const ref = branchRef(r.local.path, 'feature', { name: 'team/fork/feature', missing: false });
+				return {
+					...r,
+					fork: fork,
+					ref: ref,
+					cleanup: () => {
+						fork.cleanup();
+						r.cleanup();
+					},
+				};
+			}
+
+			function forkFeature(path: string): string {
+				return execFileSync('git', ['rev-parse', 'refs/heads/feature'], {
+					cwd: path,
+					encoding: 'utf-8',
+				}).trim();
+			}
+
+			test('a force push of a branch reference lands on that remote, not on its first segment', async () => {
+				const r = setupSlashRemote();
+				try {
+					addCommit(r.local.path, 'feature.txt', 'f', 'Feature commit');
+					const localSha = getHeadSha(r.local.path);
+
+					await r.local.provider.ops.push(r.local.path, { reference: r.ref, force: true });
+
+					assert.strictEqual(forkFeature(r.fork.path), localSha);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a push of the current branch lands on that remote', async () => {
+				const r = setupSlashRemote();
+				try {
+					addCommit(r.local.path, 'feature.txt', 'f', 'Feature commit');
+					const localSha = getHeadSha(r.local.path);
+
+					await r.local.provider.ops.push(r.local.path);
+
+					assert.strictEqual(forkFeature(r.fork.path), localSha);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a branch read from the repository reports its upstream remote exactly', async () => {
+				const r = setupSlashRemote();
+				try {
+					execFileSync('git', ['branch', '--track', 'tracks-local', 'main'], {
+						cwd: r.local.path,
+						stdio: 'pipe',
+					});
+
+					const feature = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+					assert.strictEqual(feature?.upstream?.remote, 'team/fork');
+					assert.strictEqual(feature.remoteName, 'team/fork');
+					assert.strictEqual(feature.trackingWithoutRemote, 'feature');
+
+					const all = await r.local.provider.branches.getBranches(r.local.path);
+					const listedFeature = all.values.find(b => b.name === 'feature');
+					assert.strictEqual(listedFeature?.upstream?.remote, 'team/fork');
+
+					const local = all.values.find(b => b.name === 'tracks-local');
+					assert.strictEqual(local?.upstream?.name, 'main');
+					assert.strictEqual(local.upstream.remote, undefined);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a push of a branch read from the repository lands on that remote', async () => {
+				const r = setupSlashRemote();
+				try {
+					addCommit(r.local.path, 'feature.txt', 'f', 'Feature commit');
+					const localSha = getHeadSha(r.local.path);
+
+					const branch = await r.local.provider.branches.getBranch(r.local.path, 'feature');
+					assert.ok(branch != null);
+					await r.local.provider.ops.push(r.local.path, { reference: branch });
+
+					assert.strictEqual(forkFeature(r.fork.path), localSha);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a fetch of a branch reference updates the remote-tracking branch', async () => {
+				const r = setupSlashRemote();
+				try {
+					const other = cloneTestRepo(r.fork.path);
+					let advanced: string;
+					try {
+						checkout(other.path, 'feature');
+						addCommit(other.path, 'other.txt', 'o', 'Other advances');
+						advanced = getHeadSha(other.path);
+						execFileSync('git', ['push', 'origin', 'feature'], { cwd: other.path, stdio: 'pipe' });
+					} finally {
+						other.cleanup();
+					}
+
+					await r.local.provider.ops.fetch(r.local.path, { branch: r.ref });
+
+					assert.strictEqual(revParse(r.local.path, 'refs/remotes/team/fork/feature'), advanced);
+				} finally {
+					r.cleanup();
+				}
+			});
+
+			test('a fast-forward-only pull of a branch reference advances it from that remote', async () => {
+				const r = setupSlashRemote();
+				try {
+					checkout(r.local.path, 'main');
+					const other = cloneTestRepo(r.fork.path);
+					let advanced: string;
+					try {
+						checkout(other.path, 'feature');
+						addCommit(other.path, 'other.txt', 'o', 'Other advances');
+						advanced = getHeadSha(other.path);
+						execFileSync('git', ['push', 'origin', 'feature'], { cwd: other.path, stdio: 'pipe' });
+					} finally {
+						other.cleanup();
+					}
+
+					await r.local.provider.ops.pull(r.local.path, { branch: r.ref, fastForward: 'only' });
+
+					assert.strictEqual(revParse(r.local.path, 'refs/heads/feature'), advanced);
+				} finally {
+					r.cleanup();
+				}
+			});
+		});
+
+		test('a force push whose lease is stale rejects with rejectedWithLease', async () => {
+			const r = setup();
+			try {
+				// Another clone advances the remote after this one last fetched
+				const other = cloneTestRepo(r.bare.path);
+				try {
+					addCommit(other.path, 'other.txt', 'o', 'Other advances');
+					execFileSync('git', ['push', 'origin', 'main'], { cwd: other.path, stdio: 'pipe' });
+				} finally {
+					other.cleanup();
+				}
+				addCommit(r.local.path, 'mine.txt', 'm', 'Mine diverges');
+
+				await assert.rejects(
+					r.local.provider.ops.push(r.local.path, {
+						reference: branchRef(r.local.path, 'main', { name: 'origin/main', missing: false }),
+						force: true,
+					}),
+					(ex: unknown) => PushError.is(ex, 'rejectedWithLease'),
+				);
+			} finally {
+				r.cleanup();
+			}
+		});
+	});
 });
 
 suite('OperationsSubProvider — branch-creating checkout', () => {
@@ -667,6 +1169,315 @@ suite('OperationsGitSubProvider.fetch — explicit refspecs', () => {
 	});
 });
 
+suite('OperationsGitSubProvider.fetch — remote HEAD symref', () => {
+	let origin: TestRepo;
+	let clone: TestRepo;
+
+	function readRemoteHead(repoPath: string): string | undefined {
+		try {
+			return execFileSync('git', ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], {
+				cwd: repoPath,
+				encoding: 'utf-8',
+				stdio: 'pipe',
+			}).trim();
+		} catch {
+			return undefined;
+		}
+	}
+
+	function deleteRemoteHead(repoPath: string): void {
+		execFileSync('git', ['remote', 'set-head', 'origin', '-d'], { cwd: repoPath, stdio: 'pipe' });
+	}
+
+	/** Takes the git < 2.48 path, and keeps the installed git's own fetch from creating the symref */
+	function simulateOldGit(repo: TestRepo): void {
+		execFileSync('git', ['config', 'remote.origin.followRemoteHEAD', 'never'], { cwd: repo.path, stdio: 'pipe' });
+		// A user's global `fetch.all` would turn every bare fetch into a fetch of all remotes
+		execFileSync('git', ['config', 'fetch.all', 'false'], { cwd: repo.path, stdio: 'pipe' });
+		const git = repo.provider.git;
+		const supports = git.supports;
+		git.supports = feature => (feature === 'git:fetch:follow-remote-head' ? false : supports.call(git, feature));
+	}
+
+	/** The `setRemoteHeadIfMissing` calls the fetch started, once they settle; the fetch doesn't await them */
+	async function settledSetHeads(spy: sinon.SinonSpy, count: number): Promise<void> {
+		const deadline = Date.now() + 5000;
+		while (spy.callCount < count && Date.now() < deadline) {
+			await new Promise(resolve => setTimeout(resolve, 10));
+		}
+		await Promise.allSettled(spy.returnValues);
+	}
+
+	function setHeadRuns(spy: sinon.SinonSpy): number {
+		return spy.getCalls().filter(c => c.args.includes('set-head')).length;
+	}
+
+	setup(() => {
+		origin = createTestRepo();
+		createBranch(origin.path, 'develop', { checkout: true });
+		addCommit(origin.path, 'develop-only.txt', 'develop', 'develop only');
+		// The clone's `origin/HEAD`, and what `remote set-head -a` reads back
+		clone = cloneTestRepo(origin.path);
+		deleteRemoteHead(clone.path);
+	});
+
+	teardown(() => {
+		sinon.restore();
+		clone.cleanup();
+		origin.cleanup();
+	});
+
+	test('git 2.48+: the fetch writes the missing symref itself; core runs no set-head', async function () {
+		if (!(await clone.provider.git.supports('git:fetch:follow-remote-head'))) {
+			this.skip();
+		}
+
+		const runs = sinon.spy(clone.provider.git, 'run');
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path, { remote: 'origin' });
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.strictEqual(readRemoteHead(clone.path), 'origin/develop');
+		assert.strictEqual(setHeads.callCount, 0);
+		assert.strictEqual(setHeadRuns(runs), 0);
+	});
+
+	test('git < 2.48: writes the missing symref after a fetch, so the base reads it', async () => {
+		simulateOldGit(clone);
+		// From a detached HEAD, so the branch's reflog names no branch it was created from and the base is the default
+		checkout(clone.path, 'origin/develop');
+		createBranch(clone.path, 'feature', { checkout: true });
+		addCommit(clone.path, 'branch-only.txt', 'feature', 'branch only');
+
+		const before = await clone.provider.branches.getAheadOfBase(clone.path, 'feature');
+		// Without the symref the base is a guess at the remote's usual default
+		assert.strictEqual(before.base?.ref, 'origin/main');
+
+		const runs = sinon.spy(clone.provider.git, 'run');
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path, { remote: 'origin' });
+		await settledSetHeads(setHeads, 1);
+
+		assert.strictEqual(readRemoteHead(clone.path), 'origin/develop');
+		assert.strictEqual(setHeadRuns(runs), 1);
+
+		const after = await clone.provider.branches.getAheadOfBase(clone.path, 'feature');
+		assert.strictEqual(after.base?.ref, 'origin/develop');
+		assert.strictEqual(after.base?.ahead, 1);
+		assert.strictEqual(after.base?.tier, 'default');
+	});
+
+	test('git < 2.48: runs set-head once per remote, not on every fetch', async () => {
+		simulateOldGit(clone);
+		const runs = sinon.spy(clone.provider.git, 'run');
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path, { remote: 'origin' });
+		await settledSetHeads(setHeads, 1);
+		assert.strictEqual(setHeadRuns(runs), 1);
+
+		deleteRemoteHead(clone.path);
+		await clone.provider.ops.fetch(clone.path, { all: true });
+		await clone.provider.ops.fetch(clone.path);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.strictEqual(setHeads.callCount, 1);
+		assert.strictEqual(setHeadRuns(runs), 1);
+		assert.strictEqual(readRemoteHead(clone.path), undefined);
+	});
+
+	test('git < 2.48: runs no set-head when the symref exists', async () => {
+		simulateOldGit(clone);
+		execFileSync('git', ['remote', 'set-head', 'origin', 'main'], { cwd: clone.path, stdio: 'pipe' });
+		const runs = sinon.spy(clone.provider.git, 'run');
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path, { remote: 'origin' });
+		await settledSetHeads(setHeads, 1);
+
+		assert.strictEqual(setHeadRuns(runs), 0);
+		assert.strictEqual(readRemoteHead(clone.path), 'origin/main');
+	});
+
+	test("git < 2.48: a pull writes the symref of the branch's remote", async () => {
+		simulateOldGit(clone);
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.pull(clone.path);
+		await settledSetHeads(setHeads, 1);
+
+		assert.deepStrictEqual(
+			setHeads.getCalls().map(c => c.args[1]),
+			['origin'],
+		);
+		assert.strictEqual(readRemoteHead(clone.path), 'origin/develop');
+	});
+
+	/** Adds a remote that points at the origin repo, with `config` set on the clone */
+	function addSecondRemote(name: string, config: Record<string, string> = {}): void {
+		execFileSync('git', ['remote', 'add', name, origin.path], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', `remote.${name}.followRemoteHEAD`, 'never'], { cwd: clone.path, stdio: 'pipe' });
+		for (const [key, value] of Object.entries(config)) {
+			execFileSync('git', ['config', key, value], { cwd: clone.path, stdio: 'pipe' });
+		}
+	}
+
+	function setHeadRemotes(spy: sinon.SinonSpy): string[] {
+		return spy
+			.getCalls()
+			.map(c => c.args[1] as string)
+			.sort();
+	}
+
+	test('git < 2.48: fetch --all skips a remote marked skipFetchAll', async () => {
+		simulateOldGit(clone);
+		addSecondRemote('skipped', { 'remote.skipped.skipFetchAll': 'true' });
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path, { all: true });
+		await settledSetHeads(setHeads, 1);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.deepStrictEqual(setHeadRemotes(setHeads), ['origin']);
+	});
+
+	test("git < 2.48: a bare fetch uses the branch's remote, even when its name contains a slash", async () => {
+		simulateOldGit(clone);
+		addSecondRemote('team/fork');
+		execFileSync('git', ['fetch', 'team/fork'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', 'branch.main.remote', 'team/fork'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', 'branch.main.merge', 'refs/heads/main'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['checkout', '-B', 'main'], { cwd: clone.path, stdio: 'pipe' });
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path);
+		await settledSetHeads(setHeads, 1);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.deepStrictEqual(setHeadRemotes(setHeads), ['team/fork']);
+	});
+
+	test('git < 2.48: a bare fetch with fetch.all handles every remote but skipFetchAll ones', async () => {
+		simulateOldGit(clone);
+		addSecondRemote('other');
+		addSecondRemote('skipped', { 'remote.skipped.skipFetchAll': 'true' });
+		execFileSync('git', ['config', 'fetch.all', 'true'], { cwd: clone.path, stdio: 'pipe' });
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path);
+		await settledSetHeads(setHeads, 2);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.deepStrictEqual(setHeadRemotes(setHeads), ['origin', 'other']);
+	});
+
+	test('git < 2.48: a bare fetch of the only remote handles it even when it is not origin', async () => {
+		simulateOldGit(clone);
+		execFileSync('git', ['remote', 'rename', 'origin', 'upstream'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', 'remote.upstream.followRemoteHEAD', 'never'], {
+			cwd: clone.path,
+			stdio: 'pipe',
+		});
+		const current = execFileSync('git', ['branch', '--show-current'], {
+			cwd: clone.path,
+			encoding: 'utf-8',
+		}).trim();
+		execFileSync('git', ['config', '--remove-section', `branch.${current}`], { cwd: clone.path, stdio: 'pipe' });
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path);
+		await settledSetHeads(setHeads, 1);
+
+		assert.deepStrictEqual(setHeadRemotes(setHeads), ['upstream']);
+	});
+
+	test('git < 2.48: a bare fetch of a branch whose remote is the local repository runs no set-head', async () => {
+		simulateOldGit(clone);
+		const current = execFileSync('git', ['branch', '--show-current'], {
+			cwd: clone.path,
+			encoding: 'utf-8',
+		}).trim();
+		execFileSync('git', ['config', `branch.${current}.remote`, '.'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', `branch.${current}.merge`, `refs/heads/${current}`], {
+			cwd: clone.path,
+			stdio: 'pipe',
+		});
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.strictEqual(setHeads.callCount, 0);
+	});
+
+	test('git < 2.48: a bare fetch ignores fetch.all when git has no fetch.all config', async () => {
+		simulateOldGit(clone);
+		addSecondRemote('other');
+		execFileSync('git', ['config', 'fetch.all', 'true'], { cwd: clone.path, stdio: 'pipe' });
+		const git = clone.provider.git;
+		const supports = git.supports;
+		git.supports = feature => (feature === 'git:fetch:all-config' ? false : supports.call(git, feature));
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path);
+		await settledSetHeads(setHeads, 1);
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.deepStrictEqual(setHeadRemotes(setHeads), ['origin']);
+	});
+
+	test('git < 2.48: a pull in a worktree honors fetch.all', async function () {
+		if (!(await clone.provider.git.supports('git:fetch:all-config'))) {
+			this.skip();
+		}
+
+		simulateOldGit(clone);
+		addSecondRemote('other');
+		execFileSync('git', ['config', 'fetch.all', 'true'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['branch', 'wt', 'origin/develop'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', 'branch.wt.remote', 'origin'], { cwd: clone.path, stdio: 'pipe' });
+		execFileSync('git', ['config', 'branch.wt.merge', 'refs/heads/develop'], { cwd: clone.path, stdio: 'pipe' });
+		const wtPath = `${clone.path}-wt`;
+		execFileSync('git', ['worktree', 'add', wtPath, 'wt'], { cwd: clone.path, stdio: 'pipe' });
+		try {
+			const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+			await clone.provider.ops.pull(clone.path, {
+				branch: createReference('wt', clone.path, {
+					refType: 'branch',
+					name: 'wt',
+					remote: false,
+					upstream: { name: 'origin/develop', missing: false },
+				}),
+			});
+			await settledSetHeads(setHeads, 2);
+			await new Promise(resolve => setTimeout(resolve, 100));
+
+			assert.deepStrictEqual(setHeadRemotes(setHeads), ['origin', 'other']);
+			// Run for the worktree the pull ran in, not the path it was asked for
+			assert.ok(setHeads.getCalls().every(c => c.args[0] !== clone.path));
+		} finally {
+			execFileSync('git', ['worktree', 'remove', '--force', wtPath], { cwd: clone.path, stdio: 'pipe' });
+		}
+	});
+
+	test('git < 2.48: a fetch of explicit refspecs writes no symref', async () => {
+		simulateOldGit(clone);
+		const setHeads = sinon.spy(clone.provider.branches, 'setRemoteHeadIfMissing');
+
+		await clone.provider.ops.fetch(clone.path, {
+			remote: 'origin',
+			refspecs: ['+refs/heads/develop:refs/remotes/origin/develop'],
+		});
+		await new Promise(resolve => setTimeout(resolve, 100));
+
+		assert.strictEqual(setHeads.callCount, 0);
+		assert.strictEqual(readRemoteHead(clone.path), undefined);
+	});
+});
+
 suite('OperationsGitSubProvider.fetch — preserveFetchHead', () => {
 	function fetchHeadPath(repoPath: string): string {
 		return join(repoPath, '.git', 'FETCH_HEAD');
@@ -896,6 +1707,127 @@ suite('OperationsGitSubProvider — announcing a write that failed', () => {
 			worktree?.cleanup();
 			local?.cleanup();
 			origin.cleanup();
+		}
+	});
+});
+
+suite('OperationsGitSubProvider — failed writes still announce', () => {
+	test('commit refused by a pre-commit hook announces head, heads and index', async () => {
+		const onChanged = sinon.spy();
+		const r = createTestRepo({ hooks: { repository: { onChanged: onChanged } } });
+		try {
+			const hook = join(r.path, '.git', 'hooks', 'pre-commit');
+			writeFileSync(hook, '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+
+			writeFileSync(join(r.path, 'new.txt'), 'x\n');
+			execFileSync('git', ['add', 'new.txt'], { cwd: r.path, stdio: 'pipe' });
+			onChanged.resetHistory();
+
+			// An ambient `core.hooksPath` injected through `GIT_CONFIG_*` would otherwise bypass the repo's own hooks
+			const runOptions = { env: { GIT_CONFIG_COUNT: '0' } };
+			await assert.rejects(
+				r.provider.ops.commit(r.path, 'Refused', undefined, runOptions),
+				(ex: unknown) => ex instanceof CommitError,
+			);
+
+			assert.strictEqual(onChanged.callCount, 1);
+			assert.deepStrictEqual(onChanged.lastCall.args, [r.path, ['head', 'heads', 'index']]);
+		} finally {
+			r.cleanup();
+		}
+	});
+});
+
+suite('OperationsGitSubProvider — beforeIndexLockRetry rejection', () => {
+	test('commit rethrows the hook rejection instead of mapping it to a CommitError', async () => {
+		const r = createTestRepo();
+		const lock = join(r.path, '.git', 'index.lock');
+		try {
+			writeFileSync(join(r.path, 'new.txt'), 'x\n');
+			execFileSync('git', ['add', 'new.txt'], { cwd: r.path, stdio: 'pipe' });
+			writeFileSync(lock, '');
+
+			const hostError = new Error('host refused');
+			let hookCalls = 0;
+			let caught: unknown;
+			try {
+				await r.provider.ops.commit(r.path, 'msg', undefined, {
+					beforeIndexLockRetry: () => {
+						hookCalls++;
+						return Promise.reject(hostError);
+					},
+				});
+			} catch (ex) {
+				caught = ex;
+			}
+
+			assert.strictEqual(caught, hostError);
+			assert.strictEqual(hookCalls, 1);
+		} finally {
+			rmSync(lock, { force: true });
+			r.cleanup();
+		}
+	});
+
+	test('reset rethrows the hook rejection instead of mapping it to a ResetError', async () => {
+		const r = createTestRepo();
+		const lock = join(r.path, '.git', 'index.lock');
+		try {
+			writeFileSync(lock, '');
+
+			const hostError = new Error('host refused');
+			let hookCalls = 0;
+			let caught: unknown;
+			try {
+				await r.provider.ops.reset(
+					r.path,
+					'HEAD',
+					{ mode: 'mixed' },
+					{
+						beforeIndexLockRetry: () => {
+							hookCalls++;
+							return Promise.reject(hostError);
+						},
+					},
+				);
+			} catch (ex) {
+				caught = ex;
+			}
+
+			assert.strictEqual(caught, hostError);
+			assert.strictEqual(hookCalls, 1);
+		} finally {
+			rmSync(lock, { force: true });
+			r.cleanup();
+		}
+	});
+
+	test('restore rethrows the hook rejection instead of mapping it to a CheckoutError', async () => {
+		const r = createTestRepo();
+		const lock = join(r.path, '.git', 'index.lock');
+		try {
+			writeFileSync(join(r.path, 'README.md'), 'changed\n');
+			writeFileSync(lock, '');
+
+			const hostError = new Error('host refused');
+			let hookCalls = 0;
+			let caught: unknown;
+			try {
+				await r.provider.ops.restore(r.path, 'README.md', undefined, {
+					beforeIndexLockRetry: () => {
+						hookCalls++;
+						return Promise.reject(hostError);
+					},
+				});
+			} catch (ex) {
+				caught = ex;
+			}
+
+			assert.strictEqual(caught, hostError);
+			assert.strictEqual(hookCalls, 1);
+		} finally {
+			rmSync(lock, { force: true });
+			r.cleanup();
 		}
 	});
 });

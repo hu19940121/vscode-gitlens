@@ -1,5 +1,6 @@
 import * as assert from 'node:assert/strict';
 import { suite, test } from 'mocha';
+import { createRemoteProviderMatcher } from '@gitlens/git/remotes/matcher.js';
 import { createFakeRuntime } from '../../../__tests__/fakeRuntime.js';
 import { primarySession } from '../../../__tests__/sweepHelpers.js';
 import { GitCloudHostIntegrationId } from '../../../constants.js';
@@ -9,6 +10,7 @@ import type { ApiClients } from '../../apiClients.js';
 import type { ProviderApiConfig } from '../../apiConfig.js';
 import { AzureDevOpsApi } from '../azure.js';
 import type { AzurePullRequest, AzureRepositoryUrls } from '../models.js';
+import { AzureWorkItemStatesCache } from '../workItemStateCategories.js';
 import { azureProvider, azureToken, createAzureForkSource, createAzurePullRequest } from './fixtures.js';
 
 function pullRequest(): AzurePullRequest {
@@ -115,6 +117,42 @@ suite('AzureDevOpsApi pull requests', () => {
 			/Invalid Azure repository descriptor/,
 		);
 		assert.deepEqual(requests, []);
+	});
+
+	test('reads pull requests for legacy and short visualstudio.com / dev.azure.com remotes (#5999)', async () => {
+		const matcher = createRemoteProviderMatcher();
+		for (const { remoteUrl, route } of [
+			{
+				remoteUrl: 'https://myorg.visualstudio.com/DefaultCollection/Project/_git/Repo',
+				route: 'Project/_apis/git/repositories/Repo',
+			},
+			{
+				remoteUrl: 'https://myorg.visualstudio.com/defaultcollection/Project/_git/Repo',
+				route: 'Project/_apis/git/repositories/Repo',
+			},
+			{
+				remoteUrl: 'https://myorg.visualstudio.com/DefaultCollection/_git/Repo',
+				route: 'Repo/_apis/git/repositories/Repo',
+			},
+			{ remoteUrl: 'https://myorg.visualstudio.com/_git/Repo', route: 'Repo/_apis/git/repositories/Repo' },
+			{ remoteUrl: 'https://dev.azure.com/myorg/_git/Repo', route: 'Repo/_apis/git/repositories/Repo' },
+		]) {
+			const { hostname, pathname } = new URL(remoteUrl);
+			const remote = matcher(remoteUrl, hostname, pathname.substring(1), 'https');
+			assert.ok(remote?.owner != null && remote.repoName != null, remoteUrl);
+
+			const { config, requests } = configForPullRequest(pullRequest());
+			const api = new AzureDevOpsApi(config);
+			await api.getPullRequestForBranch(azureProvider, azureToken, remote.owner, remote.repoName, 'feature', {
+				baseUrl: 'https://dev.azure.com',
+			});
+
+			assert.deepEqual(
+				requests.map(r => r.split('?')[0]),
+				[`https://dev.azure.com/myorg/${route}/pullRequests`],
+				remoteUrl,
+			);
+		}
 	});
 
 	test('resolves a fork repository once and reuses it', async () => {
@@ -505,6 +543,7 @@ suite('AzureDevOpsIntegration.getPullRequest', () => {
 			wrapForForcedInsecureSSL: (_ignore, fn) => Promise.resolve(fn()),
 		});
 		const apis: ApiClients = {
+			azureWorkItemStates: new AzureWorkItemStatesCache(),
 			github: Promise.resolve(undefined),
 			gitlab: Promise.resolve(undefined),
 			bitbucket: Promise.resolve(undefined),

@@ -73,6 +73,7 @@ import {
 } from '@gitlens/git/models/pullRequest.js';
 import type { Provider, ProviderReference } from '@gitlens/git/models/remoteProvider.js';
 import type { ProviderScope } from '@gitlens/git/models/resourceDescriptor.js';
+import { isTerminalIssueStateCategory } from '@gitlens/git/utils/issue.utils.js';
 import { gitSuffixRegex } from '@gitlens/git/utils/remote.utils.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
 import { equalsIgnoreCase } from '@gitlens/utils/string.js';
@@ -105,6 +106,7 @@ export type {
 	PullRequestSorting,
 } from '../providerFilters.js';
 import type { ProviderRepositoryShape } from '../results.js';
+import { isJiraIntegrationId } from '../utils/integration.utils.js';
 
 export type { ProviderOrganization, ProviderRepositoryShape } from '../results.js';
 import { fromProviderAccount, toProviderAccount } from './accounts.js';
@@ -726,6 +728,15 @@ export type GetBitbucketServerPullRequestsForCurrentUserFn = (
 	};
 	data: GitPullRequest[];
 }>;
+/**
+ * One page of a Jira issue search; `nextCursor` is the raw provider cursor, fed back verbatim. `metadata` is the
+ * SDK's: a page that dropped an issue it could not read reports it there as `partial` with a `provider` failure
+ * (GKDEV-3652).
+ */
+export type JiraIssuePage =
+	| { data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined; metadata?: CollectionMetadata }
+	| undefined;
+
 export type GetIssuesForProjectFn = Jira['getIssuesForProject'];
 // Jira Server's own reads, derived from its client rather than shared with Cloud's: every one of them is
 // addressed by the instance's `baseUrl`/`resourceUrl` instead of Cloud's `resourceId`, and its project read is
@@ -881,8 +892,7 @@ export interface ProviderMetadata {
 	 */
 	supportedAccountWideIssueSorts?: IssueSorting[];
 	/**
-	 * Whether an issue tracker's reads (the project-scoped read, which is `listIssueTrackerIssuesPage`, and its
-	 * account-wide read) can be asked for a `state` other than open, and honor it server-side.
+	 * Whether issue list reads (including Azure project/repository and account-wide reads) can be asked for a `state` other than open, and honor it server-side.
 	 *
 	 * A tracker read is open-only unless asked otherwise, so absent does not mean the read returns every state: it
 	 * means only `'open'` is expressible, and `'closed'`/`'all'` are refused rather than served as the open list.
@@ -1207,6 +1217,7 @@ export const providersMetadata: ProvidersMetadata = {
 		scopes: ['Project (Read)', 'Repository (Write)'],
 	},
 	[GitCloudHostIntegrationId.AzureDevOps]: {
+		supportsIssueStates: true,
 		domain: 'dev.azure.com',
 		id: GitCloudHostIntegrationId.AzureDevOps,
 		name: 'Azure DevOps',
@@ -1238,6 +1249,7 @@ export const providersMetadata: ProvidersMetadata = {
 		scopes: ['vso.code', 'vso.identity', 'vso.project', 'vso.profile', 'vso.work'],
 	},
 	[GitSelfManagedHostIntegrationId.AzureDevOpsServer]: {
+		supportsIssueStates: true,
 		domain: '',
 		id: GitSelfManagedHostIntegrationId.AzureDevOpsServer,
 		name: 'Azure DevOps Server',
@@ -1281,6 +1293,7 @@ export const providersMetadata: ProvidersMetadata = {
 		scopes: [
 			'read:status:jira',
 			'read:application-role:jira',
+			'read:attachment:jira',
 			'write:attachment:jira',
 			'read:comment:jira',
 			'read:project-category:jira',
@@ -1351,8 +1364,8 @@ export const providersMetadata: ProvidersMetadata = {
 		// Both directions, and one table for both reads: they are the same root `issues` query taking the same
 		// `sort` argument, so there is no account-wide narrowing to declare.
 		supportedIssueSorts: linearIssueSorts,
-		// A workflow-state type clause on both reads (`completed`/`canceled` are closed), the same types the SDK
-		// normalizes to the `DONE` category.
+		// A workflow-state type clause on both reads (`completed`/`canceled`/`duplicate` are closed), the same types
+		// the SDK normalizes to a terminal category (`DONE`, or `CANCELED` for the last two).
 		supportsIssueStates: true,
 	},
 	[IssuesCloudHostIntegrationId.Trello]: {
@@ -1397,24 +1410,34 @@ function toIssueIdentifier(value: string | number): string {
 	return String(value);
 }
 
-function toIssueProviderState(
-	state: ProviderIssue['state'],
-	reliableStateCategory = true,
-): IssueProviderState | undefined {
+function toIssueProviderState(state: ProviderIssue['state']): IssueProviderState | undefined {
 	return state == null
 		? undefined
 		: {
 				id: state.id,
 				name: state.name,
 				color: state.color ?? undefined,
-				category: reliableStateCategory ? state.category : undefined,
+				category: state.category,
 			};
+}
+
+function isProviderIssueClosed(issue: ProviderIssue, providerId: ProviderReference['id']): boolean {
+	const category = issue.state?.category;
+	if (
+		(providerId === GitCloudHostIntegrationId.AzureDevOps ||
+			providerId === GitSelfManagedHostIntegrationId.AzureDevOpsServer) &&
+		category != null
+	) {
+		return isTerminalIssueStateCategory(category);
+	}
+
+	return issue.closedDate != null || isTerminalIssueStateCategory(category);
 }
 
 export function toIssueShape(
 	issue: ProviderIssue,
 	provider: ProviderReference,
-	options?: { reliableStateCategory?: boolean; projection?: IssueProjection },
+	options?: { projection?: IssueProjection },
 ): IssueShape | undefined {
 	// TODO: Add some protections/baselines rather than killing the transformation here
 	// `author` is intentionally not required: some providers have no per-item creator (e.g. Trello cards,
@@ -1422,16 +1445,7 @@ export function toIssueShape(
 	// Fall back to an empty author instead so these issues still surface.
 	if (issue.updatedDate == null || issue.url == null) return undefined;
 
-	// Jira SDK results derive this category from a localized display name and default unknown names to DONE.
-	// Only the direct point read opts in because it maps Jira's stable status-category key itself. The whole
-	// Jira family shares that mapper (`jiraHelpers` serves Cloud and Server alike), so the gate is keyed on the
-	// family rather than the cloud id — a self-hosted instance in any non-English locale would otherwise report
-	// every open issue as closed.
-	const isJira =
-		provider.id === IssuesCloudHostIntegrationId.Jira ||
-		provider.id === IssuesSelfManagedHostIntegrationId.JiraServer;
-	const reliableStateCategory = !isJira || options?.reliableStateCategory === true;
-	const closed = issue.closedDate != null || (issue.state?.category === 'DONE' && reliableStateCategory);
+	const closed = isProviderIssueClosed(issue, provider.id);
 
 	return {
 		type: 'issue',
@@ -1453,7 +1467,7 @@ export function toIssueShape(
 		closedDate: issue.closedDate ?? undefined,
 		closed: closed,
 		state: closed ? 'closed' : 'opened',
-		providerState: toIssueProviderState(issue.state, reliableStateCategory),
+		providerState: toIssueProviderState(issue.state),
 		author: {
 			id: issue.author?.id ?? '',
 			// An absent name stays absent, matching {@link fromProviderAccount}; see `IssueMember.name`.
@@ -1491,7 +1505,7 @@ export function toIssueShape(
 		thumbsUpCount: issue.upvoteCount ?? undefined,
 		body: issue.description ?? undefined,
 		// Both Jira flavors return `/rest/api/2` wiki markup for the description.
-		bodyFormat: isJira ? 'jira-wiki' : undefined,
+		bodyFormat: isJiraIntegrationId(provider.id) ? 'jira-wiki' : undefined,
 		issueType: issue.type ?? undefined,
 		iterations: toIssueIterations(issue),
 		// Only when tagged, so an untagged row keeps exactly the keys it always had.
@@ -1989,7 +2003,7 @@ export function fromProviderIssue(
 	options?: { project?: IssueProject; projection?: IssueProjection },
 ): Issue {
 	const identifier = toIssueIdentifier(issue.number);
-	const closed = issue.closedDate != null || issue.state?.category === 'DONE';
+	const closed = isProviderIssueClosed(issue, integration.id);
 	return new Issue(
 		integration,
 		identifier,
@@ -2032,7 +2046,7 @@ export function fromProviderIssue(
 				: undefined,
 		identifier,
 		issue.type ?? undefined,
-		toIssueProviderState(issue.state, integration.id !== IssuesCloudHostIntegrationId.Jira),
+		toIssueProviderState(issue.state),
 		integration.id === IssuesCloudHostIntegrationId.Jira ? 'jira-wiki' : undefined,
 		toIssueIterations(issue),
 		options?.projection,

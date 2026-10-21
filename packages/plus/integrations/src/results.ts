@@ -25,8 +25,37 @@ export interface ConnectionStateChangeEvent {
  * provider, scope or request may. NOT unsupported (these stay `'other'`): malformed or contradictory caller
  * input the caller fixes in the request itself (a duplicate batch key, invalid target numbers, an empty owner,
  * an unusable scope), incompleteness or omission warnings, and unclassified errors.
+ *
+ * `'unreadable-items'`: the provider returned items this read could not read (a Jira issue whose fields the SDK cannot
+ * parse), so it left them out and read everything else in the warning's {@link ProviderWarning.scope}. It still fails
+ * the read (`fetchFailed`), since those items are missing, but retrying returns the same gap. On the reads that publish
+ * it (an issue tracker's project reads) it never hides a read that was cut short: a cut always comes with a warning of
+ * another kind. {@link ProviderWarning.unreadableItems} names the items left out.
  */
-export type ProviderWarningKind = 'auth' | 'rate-limit' | 'not-found' | 'no-connection' | 'unsupported' | 'other';
+export type ProviderWarningKind =
+	| 'auth'
+	| 'rate-limit'
+	| 'not-found'
+	| 'no-connection'
+	| 'unsupported'
+	| 'unreadable-items'
+	| 'other';
+
+/** The items an `'unreadable-items'` warning left out: see {@link ProviderWarning.unreadableItems}. */
+export interface ProviderWarningUnreadableItems {
+	/**
+	 * The provider's identifiers of the items left out (a Jira issue's key), without duplicates, in reported order. Read
+	 * from the provider's prose, it may also hold an identifier that only appeared in an item's error text, never lack
+	 * one it named: rely on an identifier's absence, not on its presence.
+	 */
+	keys: string[];
+	/**
+	 * Whether {@link keys} names every item left out. `false` when the provider named only some of them (Jira names at
+	 * most ten per page), named one by position rather than by key, or reported them in a form this layer could not
+	 * read, so an identifier absent from `keys` may still be one of them.
+	 */
+	complete: boolean;
+}
 
 /**
  * Why a read that SUCCEEDED still withheld results:
@@ -60,11 +89,24 @@ export interface ProviderWarningScope {
 	/**
 	 * The resource as the read addressed it: its id on most reads, its name on the few that address it by name
 	 * (Azure DevOps' repo-scoped reads, Bitbucket's workspace reads). Match it against both
-	 * `ProviderOrganization.id` and `name`.
+	 * `ProviderOrganization.id` and `name`, and a project's `orgId` where it has one.
 	 */
 	resourceId?: string;
+	/**
+	 * The project as the read addressed it. For a Jira project read, the key, on Jira Cloud and Jira Data Center alike
+	 * (the project's `name` in `listProjects`).
+	 */
 	projectId?: string;
 	repositoryId?: string;
+}
+
+/**
+ * The selector of an issue-tracker project read that matched nothing: see {@link ProviderWarning.selector}. `kind`
+ * names which one missed, and `value` is that selector exactly as the caller passed it.
+ */
+export interface ProviderWarningSelector {
+	kind: 'org' | 'project';
+	value: string;
 }
 
 /**
@@ -212,6 +254,44 @@ export interface ProviderWarning {
 	 * out, so treat a bare `kind: 'other'` warning as unclassified rather than as a proven failure.
 	 */
 	omission?: ProviderWarningOmission;
+	/**
+	 * Present exactly when {@link kind} is `'unreadable-items'`: which items the read left out because it could not read
+	 * them. A consumer deciding whether an identifier is absent from the provider, rather than merely unread, must find
+	 * it in no warning's `keys` and see `complete` on every one.
+	 */
+	unreadableItems?: ProviderWarningUnreadableItems;
+	/**
+	 * Present when an issue-tracker project read's `org` or `project` selector matched nothing the connection
+	 * discovered: the selection was removed, renamed, or is no longer visible to this connection. `kind` is
+	 * `'not-found'`, the page is empty and not `fetchFailed`, and it carries no cursor, since a retry finds the same.
+	 *
+	 * Set only when discovery was complete. A read whose discovery failed or was truncated cannot tell a missing
+	 * selection from one it did not reach, so it keeps reporting that failure instead, without this field. A miss is
+	 * confirmed against the connection's lists as the provider holds them now, read without the cache, since a cached
+	 * one predates what was created since. A cached project list can still name a project deleted since: the tracker
+	 * refuses it (Jira's "does not exist for the field 'project'"), it reads as empty, and the refusal drops that list,
+	 * so the next read reports the miss. Jira Data Center's refusal counts only when it names the user it
+	 * authenticated: it answers a rejected token the same way, as the anonymous user. The miss waits on an account
+	 * lookup on a resource those lists name, which confirms the
+	 * connection's credential, and a failed lookup is reported as the read's failure instead; an account that lists no
+	 * resource at all has none to look up, and is judged on its lists alone.
+	 *
+	 * It is the discriminant: a `not-found` without it is a request that failed with a 404, 410 or 422.
+	 */
+	selector?: ProviderWarningSelector;
+	/**
+	 * The keys of the batch targets this warning concerns: the target a per-target failure was refused or failed
+	 * for, or every target of an integration call that failed as a whole. So a caller that sends several callers'
+	 * targets in one call can hand a failure only to the targets it belongs to.
+	 *
+	 * Its ABSENCE means the whole call. It is absent on every read that is not a batch read, and on a batch read's
+	 * refusal of the whole call before any target is read (a duplicate key, an invalid target, an unknown etag
+	 * include, no resolvable connection, the wrong surface), which concerns every target alike.
+	 *
+	 * It is not part of a warning's identity: two warnings that differ only here are one warning, for the union of
+	 * their targets (see {@link appendDedupedWarning}).
+	 */
+	targetKeys?: string[];
 }
 
 export interface ProviderPageInfo {
@@ -388,13 +468,19 @@ export function providerWarningMessage(ex: unknown): string {
 
 /**
  * Normalized org/workspace/group shape returned by the provider facade.
- * `name` is the provider identifier to pass to follow-up reads, while `org` is an optional display label.
+ * `name` is the provider identifier to pass to follow-up reads (a Jira project's key), while `org` is an optional
+ * display label of the parent. Where that label can't address the parent, `orgId` is the parent's stable id to pass
+ * as `org` instead (a Jira site's id, or a Data Center instance's domain).
+ *
+ * Jira site rows (`listOrgs`) are the exception: their `name` is the site's label, and a Jira read selects a site only
+ * by its `id` (or a project row's `orgId`).
  */
 export interface ProviderOrganization {
 	id: string;
 	providerId: IntegrationIds;
 	name: string;
 	org?: string;
+	orgId?: string;
 	url: string;
 }
 
@@ -536,17 +622,65 @@ function providerWarningKey(warning: ProviderWarning): string {
 		collectionScopeKey(warning.scope),
 		warning.cause?.reason ?? '',
 		providerWarningOmissionKey(warning.omission),
+		warning.selector != null ? JSON.stringify([warning.selector.kind, warning.selector.value]) : '',
 		warning.message,
 	].join(' ');
 }
 
 /**
  * Appends `warning` to `into` only when an equal warning (by provider/connection/domain/kind/message, plus the
- * structured scope, cause and omission when present) is absent.
+ * structured scope, cause, omission and selector when present) is absent. An equal warning already there merges its
+ * {@link ProviderWarning.targetKeys} with the new one's instead: the union of both, or none when either concerns
+ * the whole call. Its {@link ProviderWarning.unreadableItems} merge too (see {@link mergeUnreadableItems}): two reads
+ * can report the same text for different items. The existing warning is replaced, never mutated, since it may be
+ * shared.
  */
 export function appendDedupedWarning(into: ProviderWarning[], warning: ProviderWarning): void {
 	const key = providerWarningKey(warning);
-	if (into.some(existing => providerWarningKey(existing) === key)) return;
+	const index = into.findIndex(existing => providerWarningKey(existing) === key);
+	if (index === -1) {
+		into.push(warning);
+		return;
+	}
 
-	into.push(warning);
+	const existing = into[index];
+	const targetKeys = mergeTargetKeys(existing.targetKeys, warning.targetKeys);
+	const unreadableItems = mergeUnreadableItems(existing.unreadableItems, warning.unreadableItems);
+	if (targetKeys === existing.targetKeys && unreadableItems === existing.unreadableItems) return;
+
+	const { targetKeys: _, ...rest } = existing;
+	into[index] = {
+		...rest,
+		...(targetKeys != null ? { targetKeys: targetKeys } : {}),
+		...(unreadableItems != null ? { unreadableItems: unreadableItems } : {}),
+	};
+}
+
+/** The union of two warnings' target keys, or none when either concerns the whole call. `existing` when unchanged. */
+function mergeTargetKeys(existing: string[] | undefined, next: string[] | undefined): string[] | undefined {
+	// Either concerns the whole call.
+	if (existing == null || next == null) return undefined;
+
+	const added = next.filter(k => !existing.includes(k));
+	if (!added.length) return existing;
+
+	return [...existing, ...new Set(added)];
+}
+
+/**
+ * The items two reports of unreadable items left out together: the union of their keys, complete only when both are.
+ * `existing` when `next` adds nothing to it.
+ */
+export function mergeUnreadableItems(
+	existing: ProviderWarningUnreadableItems | undefined,
+	next: ProviderWarningUnreadableItems | undefined,
+): ProviderWarningUnreadableItems | undefined {
+	if (existing == null) return next;
+	if (next == null) return existing;
+
+	const added = next.keys.filter(k => !existing.keys.includes(k));
+	const complete = existing.complete && next.complete;
+	if (!added.length && complete === existing.complete) return existing;
+
+	return { keys: [...existing.keys, ...new Set(added)], complete: complete };
 }

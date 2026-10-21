@@ -1,35 +1,50 @@
-import ProviderApis from '@gitkraken/provider-apis';
+import ProviderApis, { GitIssueState } from '@gitkraken/provider-apis';
 import type {
+	AzureWorkItemTypeStates,
 	CollectionMetadata,
-	GitIssueState,
 	GitPullRequestState,
 	GraphQLError,
 	GraphQLErrors,
 	TrelloBoard,
 	TrelloList,
 } from '@gitkraken/provider-apis';
+import type { IssueProviderState } from '@gitlens/git/models/issue.js';
 import type { PullRequest, PullRequestMergeMethod } from '@gitlens/git/models/pullRequest.js';
 import { base64 } from '@gitlens/utils/base64.js';
 import type { PagedResult } from '@gitlens/utils/paging.js';
+import { mapSettledBounded } from '@gitlens/utils/promise.js';
 import type { IntegrationAuthenticationService } from '../authentication/integrationAuthenticationService.js';
 import type { TokenOptInfo, TokenWithInfo } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
-import { isIncompleteCollection } from '../collectionMetadata.js';
+import { isIncompleteCollection, toCollectionScopeFailure } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import {
 	GitCloudHostIntegrationId,
 	GitSelfManagedHostIntegrationId,
 	IssuesCloudHostIntegrationId,
 	IssuesSelfManagedHostIntegrationId,
+	providerFanOutConcurrency,
 } from '../constants.js';
-import { RequestNotFoundError, toError } from '../errors.js';
+import { getAuthenticatedUser, RequestNotFoundError, toError } from '../errors.js';
 import type { ProviderPullRequestCount, ProviderPullRequestSearchPage } from '../models/pullRequestReads.js';
-import type { AzurePullRequest, AzureWorkItemResponse } from './azure/models.js';
+import type {
+	AzurePullRequest,
+	AzureWorkItemEtagRead,
+	AzureWorkItemResponse,
+	AzureWorkItemStateCategory,
+} from './azure/models.js';
 import {
+	azureIssueStateCategory,
 	azureWorkItemEtagFieldNames,
 	encodeAzurePathSegment,
 	fromAzureWorkItemToProviderIssue,
 } from './azure/models.js';
+import type { AzureWorkItemStatesScope } from './azure/workItemStateCategories.js';
+import {
+	AzureWorkItemStatesCache,
+	getAzureWorkItemTypeStatesUrl,
+	getAzureWorkItemTypesUrl,
+} from './azure/workItemStateCategories.js';
 import { requestBitbucketServerProjects, requestBitbucketServerRepositories } from './bitbucket-server/discovery.js';
 import {
 	countBitbucketServerPullRequests,
@@ -50,6 +65,7 @@ import type {
 	GetReposOptions,
 	IssueFilter,
 	IssueSorting,
+	JiraIssuePage,
 	PageInfo,
 	PagingInput,
 	PagingMode,
@@ -82,6 +98,7 @@ import type {
 } from './models.js';
 import { isRepoIdsInput, providersMetadata } from './models.js';
 import {
+	AnonymousResponseError,
 	getProviderResponseBodyMessage,
 	isAzureProviderId,
 	isProviderIssueNotFoundError,
@@ -185,6 +202,7 @@ function azureAuthorization(token: string, isPAT: boolean | undefined): string {
 }
 
 const azureDevOpsBaseUrl = 'https://dev.azure.com';
+
 /** The most group descriptors one identity batch read resolves. */
 const azureIdentityBatchSize = 100;
 /** Azure DevOps Services serves the identity APIs from its own host, below the organization like the main one. */
@@ -274,11 +292,45 @@ function fromTrelloCard(
 	};
 }
 
+/**
+ * One Jira search page as the drains read it: `nextCursor` is the raw provider cursor (Jira offset / nextPageToken)
+ * fed back verbatim as `options.cursor`, and `metadata` is the SDK's, kept only when it reported something.
+ */
+function toJiraIssuePage(
+	result:
+		| {
+				data: ProviderIssue[];
+				pageInfo?: { hasNextPage: boolean; endCursor?: string | null };
+				metadata?: CollectionMetadata;
+		  }
+		| undefined,
+): JiraIssuePage {
+	if (result == null) return undefined;
+
+	return {
+		data: result.data,
+		hasMore: result.pageInfo?.hasNextPage ?? false,
+		nextCursor: result.pageInfo?.endCursor ?? undefined,
+		...(result.metadata != null ? { metadata: result.metadata } : {}),
+	};
+}
+
+/**
+ * An Azure DevOps work item as {@link ProvidersApi.classifyAzureIssueStates} reads and classifies it: its type and
+ * its state, whose `category` the classification replaces.
+ */
+interface AzureClassifiableIssue {
+	readonly type?: string | null;
+	state?: { readonly name: string; readonly category?: IssueProviderState['category'] } | null;
+}
+
 export class ProvidersApi {
 	private readonly providers: Providers;
 	private readonly request: ProviderRequestFunction;
-
-	constructor(private readonly authenticationService: IntegrationAuthenticationService) {
+	constructor(
+		private readonly authenticationService: IntegrationAuthenticationService,
+		private readonly azureWorkItemTypeStates = new AzureWorkItemStatesCache(),
+	) {
 		const http = authenticationService.ctx.http;
 		const userAgent = http.userAgent;
 		const customFetch: ProviderRequestFunction = async <T>({
@@ -293,7 +345,7 @@ export class ProvidersApi {
 				},
 			});
 
-			return parseFetchResponseForApi<T>(response);
+			return parseFetchResponseForApi<T>(response, () => hasAuthorization(options.headers));
 		};
 		this.request = customFetch;
 		const providerApis = createProviderApis({ request: customFetch });
@@ -1045,6 +1097,9 @@ export class ProvidersApi {
 			throw new Error(`Azure DevOps work item ${id} is in project '${project}', not '${scope.project}'`);
 		}
 
+		// Outside the not-found handling above: a states read that 404s says nothing about the work item, so it fails
+		// the read rather than reading as an absent work item.
+		await this.classifyAzureIssueStates([issue], tokenWithInfo, scope.namespace, scope.project, options);
 		return issue;
 	}
 
@@ -1053,15 +1108,16 @@ export class ProvidersApi {
 	 * request, where {@link getAzureWorkItem} reads one work item per request, selecting only
 	 * `azureWorkItemEtagFieldNames`. Asked with `errorPolicy=omit`, without which one missing id fails the whole
 	 * request; Azure then leaves out every id it can't return, for whatever reason, so a caller matches the work items
-	 * to its ids by `id`, never by position, and reads an omission as unknown rather than absent. Every failure throws,
-	 * classified as {@link getAzureWorkItem} classifies it.
+	 * to its ids by `id`, never by position, and reads an omission as unknown rather than absent. Each work item comes
+	 * with the workflow category its state classifies to, as {@link getAzureWorkItem} classifies it. Every failure
+	 * throws, classified as {@link getAzureWorkItem} classifies it, the states reads' included.
 	 */
 	async getAzureWorkItemsEtagFields(
 		tokenOptInfo: TokenOptInfo,
 		scope: { namespace: string; project: string },
 		ids: readonly number[],
 		options: { isPAT?: boolean; baseUrl?: string },
-	): Promise<AzureWorkItemResponse[]> {
+	): Promise<AzureWorkItemEtagRead[]> {
 		const { tokenWithInfo } = await this.ensureProviderToken(tokenOptInfo);
 		const token = tokenWithInfo.accessToken;
 
@@ -1080,9 +1136,20 @@ export class ProvidersApi {
 			if (!Array.isArray(workItems)) throw new Error('Azure DevOps returned no work items');
 
 			// Documented to answer an omitted id with `null` in its place; it has been seen to drop it instead.
-			return workItems.filter(w => w != null);
+			const readable = workItems.filter(w => w != null);
+			// Built as `fromAzureWorkItemToProviderIssue` builds the full read's state and type, so both classify alike.
+			const issues = readable.map((w): AzureClassifiableIssue => {
+				const state = w.fields?.['System.State'];
+				const type = w.fields?.['System.WorkItemType'];
+				return {
+					type: typeof type === 'string' ? type : undefined,
+					state: typeof state === 'string' && state ? { name: state } : undefined,
+				};
+			});
+			await this.classifyAzureIssueStates(issues, tokenWithInfo, scope.namespace, scope.project, options);
+			return readable.map((w, i) => ({ workItem: w, category: issues[i].state?.category }));
 		} catch (e) {
-			return this.handleProviderError<AzureWorkItemResponse[]>(tokenWithInfo, e);
+			return this.handleProviderError<AzureWorkItemEtagRead[]>(tokenWithInfo, e);
 		}
 	}
 
@@ -2028,20 +2095,175 @@ export class ProvidersApi {
 		namespace: string,
 		project: string,
 		options?: GetIssuesOptions & { isPAT?: boolean; baseUrl?: string },
-	): Promise<PagedResult<ProviderIssue>> {
+	): Promise<ProviderApiPagedResult<ProviderIssue>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getIssuesForAzureProjectFn',
 		);
 
-		return this.getPagedResult<ProviderIssue>(
-			{ namespace: namespace, project: project, ...options },
+		const allStates =
+			options?.states?.includes(GitIssueState.Open) && options.states.includes(GitIssueState.Closed);
+		const workItemTypeStates = allStates
+			? undefined
+			: await this.getAzureProjectWorkItemStates(tokenWithInfo, namespace, project, options);
+		const page = await this.getPagedResult<ProviderIssue>(
+			{ namespace: namespace, project: project, ...options, workItemTypeStates: workItemTypeStates },
 			provider.getIssuesForAzureProjectFn,
 			tokenWithInfo,
 			options?.cursor,
 			options?.isPAT,
 			options?.baseUrl,
 		);
+
+		const result =
+			workItemTypeStates?.metadata == null
+				? page
+				: {
+						...page,
+						metadata: mergeCollectionMetadata(page.metadata, workItemTypeStates.metadata),
+						paging: { ...(page.paging ?? { cursor: '{}', more: false }), truncated: true },
+					};
+
+		try {
+			await this.classifyAzureIssueStates(
+				result.values,
+				tokenWithInfo,
+				namespace,
+				project,
+				options,
+				workItemTypeStates,
+			);
+		} catch (ex) {
+			// The rows are read; only some lack the category a failed states read would have given them. Keep them, as
+			// a partial collection that names the project, rather than failing the page.
+			return {
+				...result,
+				values: result.values,
+				paging: { ...(result.paging ?? { cursor: '{}', more: false }), truncated: true },
+				metadata: mergeCollectionMetadata(result.metadata, {
+					completeness: 'partial',
+					failures: [
+						toCollectionScopeFailure(
+							{ providerId: tokenWithInfo.providerId, resourceId: namespace, projectId: project },
+							ex,
+						),
+					],
+				}),
+			};
+		}
+
+		return result;
+	}
+
+	private azureStatesScope(
+		token: TokenWithInfo,
+		namespace: string,
+		project: string,
+		options?: { baseUrl?: string; isPAT?: boolean },
+	): AzureWorkItemStatesScope {
+		return {
+			baseUrl: options?.baseUrl ?? azureDevOpsBaseUrl,
+			namespace: namespace,
+			project: project,
+			token: token.accessToken,
+			isPAT: options?.isPAT === true,
+		};
+	}
+
+	private async readAzureStatesMetadata(token: TokenWithInfo, url: string, isPAT: boolean): Promise<unknown> {
+		try {
+			return (
+				await this.request<unknown>({
+					url: url,
+					headers: { Authorization: azureAuthorization(token.accessToken, isPAT) },
+				})
+			).body;
+		} catch (ex) {
+			return this.handleProviderError(token, ex);
+		}
+	}
+
+	private getAzureTypeStates(token: TokenWithInfo, scope: AzureWorkItemStatesScope, type: string) {
+		return this.azureWorkItemTypeStates.getStates(scope, type, () =>
+			this.readAzureStatesMetadata(
+				token,
+				getAzureWorkItemTypeStatesUrl(scope.baseUrl, scope.namespace, scope.project, type),
+				scope.isPAT,
+			),
+		);
+	}
+
+	private async getAzureProjectWorkItemStates(
+		token: TokenWithInfo,
+		namespace: string,
+		project: string,
+		options?: { baseUrl?: string; isPAT?: boolean },
+	): Promise<AzureWorkItemTypeStates> {
+		const scope = this.azureStatesScope(token, namespace, project, options);
+		const failureScope = { providerId: token.providerId, resourceId: namespace, projectId: project };
+		let types: string[];
+		try {
+			types = await this.azureWorkItemTypeStates.getTypes(scope, () =>
+				this.readAzureStatesMetadata(
+					token,
+					getAzureWorkItemTypesUrl(scope.baseUrl, namespace, project),
+					scope.isPAT,
+				),
+			);
+		} catch (ex) {
+			return {
+				types: [],
+				metadata: { completeness: 'partial', failures: [toCollectionScopeFailure(failureScope, ex)] },
+			};
+		}
+		const results = await mapSettledBounded(types, providerFanOutConcurrency, async type => ({
+			name: type,
+			states: await this.getAzureTypeStates(token, scope, type),
+		}));
+		const failures = results.flatMap(r =>
+			r.status === 'rejected' ? [toCollectionScopeFailure(failureScope, r.reason)] : [],
+		);
+		return {
+			types: results.map((r, i) => (r.status === 'fulfilled' ? r.value : { name: types[i] })),
+			...(failures.length ? { metadata: { completeness: 'partial', failures: failures } } : {}),
+		};
+	}
+
+	private async classifyAzureIssueStates(
+		issues: readonly AzureClassifiableIssue[],
+		tokenWithInfo: TokenWithInfo,
+		namespace: string,
+		project: string,
+		options: { isPAT?: boolean; baseUrl?: string } | undefined,
+		snapshot?: AzureWorkItemTypeStates,
+	): Promise<void> {
+		const scope = this.azureStatesScope(tokenWithInfo, namespace, project, options);
+		const snapshotTypes = new Map(snapshot?.types.map(type => [type.name, type.states]));
+		const types = [
+			...new Set(issues.flatMap(i => (i.state?.name && i.type && !snapshotTypes.has(i.type) ? [i.type] : []))),
+		];
+		const results = await mapSettledBounded(
+			types,
+			providerFanOutConcurrency,
+			async type => [type, await this.getAzureTypeStates(tokenWithInfo, scope, type)] as const,
+		);
+		const statesByType = new Map([
+			...snapshotTypes,
+			...results.flatMap(r => (r.status === 'fulfilled' ? [r.value] : [])),
+		]);
+		for (const issue of issues) {
+			const states = issue.type ? statesByType.get(issue.type) : undefined;
+			if (states == null || issue.state == null) continue;
+
+			issue.state = {
+				...issue.state,
+				category: azureIssueStateCategory(
+					states.find(s => s.name === issue.state?.name)?.category as AzureWorkItemStateCategory | undefined,
+				),
+			};
+		}
+		const failure = results.find(r => r.status === 'rejected');
+		if (failure?.status === 'rejected') throw failure.reason;
 	}
 
 	async getIssuesForProject(
@@ -2083,7 +2305,7 @@ export class ProvidersApi {
 		project: string,
 		resourceId: string,
 		options?: GetIssuesOptions,
-	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+	): Promise<JiraIssuePage> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getIssuesForProjectFn',
@@ -2100,12 +2322,7 @@ export class ProvidersApi {
 				},
 				{ token: token },
 			);
-			if (result == null) return undefined;
-			return {
-				data: result.data,
-				hasMore: result.pageInfo?.hasNextPage ?? false,
-				nextCursor: result.pageInfo?.endCursor ?? undefined,
-			};
+			return toJiraIssuePage(result);
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -2167,7 +2384,7 @@ export class ProvidersApi {
 		baseUrl: string,
 		projectKey: string,
 		options?: GetIssuesOptions,
-	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+	): Promise<JiraIssuePage> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getJiraServerIssuesForProjectFn',
@@ -2178,13 +2395,7 @@ export class ProvidersApi {
 				{ projectKey: projectKey, ...options, includeTransitions: jiraListIncludeTransitions },
 				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
 			);
-			if (result == null) return undefined;
-
-			return {
-				data: result.data,
-				hasMore: result.pageInfo?.hasNextPage ?? false,
-				nextCursor: result.pageInfo?.endCursor ?? undefined,
-			};
+			return toJiraIssuePage(result);
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -2200,7 +2411,7 @@ export class ProvidersApi {
 		baseUrl: string,
 		projectKeys: string[],
 		options?: GetIssuesOptions,
-	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+	): Promise<JiraIssuePage> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getJiraServerIssuesForProjectsFn',
@@ -2211,13 +2422,7 @@ export class ProvidersApi {
 				{ projectKeys: projectKeys, ...options, includeTransitions: jiraListIncludeTransitions },
 				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
 			);
-			if (result == null) return undefined;
-
-			return {
-				data: result.data,
-				hasMore: result.pageInfo?.hasNextPage ?? false,
-				nextCursor: result.pageInfo?.endCursor ?? undefined,
-			};
+			return toJiraIssuePage(result);
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -2255,7 +2460,7 @@ export class ProvidersApi {
 		tokenOptInfo: TokenWithInfo<IssuesSelfManagedHostIntegrationId.JiraServer>,
 		baseUrl: string,
 		options?: { cursor?: string; states?: GitIssueState[]; sort?: IssueSorting },
-	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+	): Promise<JiraIssuePage> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getJiraServerIssuesForCurrentUserFn',
@@ -2271,13 +2476,7 @@ export class ProvidersApi {
 				},
 				{ token: tokenWithInfo.accessToken, baseUrl: baseUrl },
 			);
-			if (result == null) return undefined;
-
-			return {
-				data: result.data,
-				hasMore: result.pageInfo?.hasNextPage ?? false,
-				nextCursor: result.pageInfo?.endCursor ?? undefined,
-			};
+			return toJiraIssuePage(result);
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -2293,7 +2492,7 @@ export class ProvidersApi {
 		projectKeys: string[],
 		resourceId: string,
 		options?: GetIssuesOptions,
-	): Promise<{ data: ProviderIssue[]; hasMore: boolean; nextCursor: string | undefined } | undefined> {
+	): Promise<JiraIssuePage> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getIssuesForProjectsFn',
@@ -2310,12 +2509,7 @@ export class ProvidersApi {
 				},
 				{ token: token },
 			);
-			if (result == null) return undefined;
-			return {
-				data: result.data,
-				hasMore: result.pageInfo?.hasNextPage ?? false,
-				nextCursor: result.pageInfo?.endCursor ?? undefined,
-			};
+			return toJiraIssuePage(result);
 		} catch (e) {
 			return this.handleProviderError(tokenWithInfo, e);
 		}
@@ -2453,7 +2647,7 @@ export class ProvidersApi {
 			isPAT?: boolean;
 			baseUrl?: string;
 		},
-	): Promise<PagedResult<ProviderIssue>> {
+	): Promise<ProviderApiPagedResult<ProviderIssue>> {
 		const { provider, tokenWithInfo } = await this.ensureProviderTokenAndFunction(
 			tokenOptInfo,
 			'getIssuesForResourceForCurrentUserFn',
@@ -2537,10 +2731,33 @@ export class ProvidersApi {
 // This is copied over from the shared provider library because the current version is not respecting the "forceIsFetch: true"
 // option in the config and our custom fetch function isn't being wrapped by the necessary fetch wrapper. Remove this once the library
 // properly wraps our custom fetch and use `forceIsFetch: true` in the config.
-export async function parseFetchResponseForApi<T>(response: Response): Promise<ProviderRequestResponse<T>> {
+export async function parseFetchResponseForApi<T>(
+	response: Response,
+	sentCredential?: () => boolean,
+): Promise<ProviderRequestResponse<T>> {
 	// Media types are case-insensitive (RFC 9110 §8.3.1) and `fetch` hands the header back exactly as the server
 	// wrote it, so match on a lowercased copy rather than the raw value.
 	const contentType = (response.headers.get('content-type') || '').toLowerCase();
+
+	// A credential the server served as the anonymous user was rejected, whatever the body says; reading it as data
+	// reports an account with nothing in it (see `AnonymousResponseError`). Checked before the body is parsed, which
+	// may itself fail. A 401 already fails as the credential's rejection, with its body, and a throttle or a server
+	// failure keeps its own error: neither proves anything about the credential.
+	if (
+		response.status !== 401 &&
+		response.status !== 429 &&
+		response.status < 500 &&
+		getAuthenticatedUser(response.headers) === 'anonymous' &&
+		sentCredential?.() === true
+	) {
+		// Released rather than left for the collector: an unread body holds its connection.
+		void response.body?.cancel().catch(() => undefined);
+		throw new AnonymousResponseError(response.status, {
+			headers: Object.fromEntries(response.headers.entries()),
+			status: response.status,
+		});
+	}
+
 	let body;
 	let servedHtml = false;
 
@@ -2589,4 +2806,10 @@ export async function parseFetchResponseForApi<T>(response: Response): Promise<P
 	}
 
 	return result;
+}
+
+function hasAuthorization(headers: ProviderRequestOptions['headers']): boolean {
+	if (headers == null) return false;
+
+	return Object.entries(headers).some(([name, value]) => name.toLowerCase() === 'authorization' && Boolean(value));
 }

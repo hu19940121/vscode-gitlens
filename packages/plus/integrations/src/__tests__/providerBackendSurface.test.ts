@@ -23,6 +23,8 @@ import type {
 	ProviderRepository,
 } from '../providers/models.js';
 import { IssueFilter, PagingMode, PullRequestFilter } from '../providers/models.js';
+import { parseIssueTrackerPageCursor } from '../reads/cursors.js';
+import { projectKey } from '../reads/hierarchy.utils.js';
 import { createFakeRuntime } from './fakeRuntime.js';
 import { readProjectsOneByOne } from './projectReads.js';
 
@@ -2650,7 +2652,8 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			{
 				id: 'p1',
 				providerId: IssuesCloudHostIntegrationId.Jira,
-				name: 'Project One',
+				// The key, which is what a Jira project read takes; no `orgId`, since this descriptor names no parent.
+				name: 'proj',
 				org: 'Org Two',
 				url: '',
 			},
@@ -2691,8 +2694,9 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			{
 				id: 'proj-1',
 				providerId: IssuesCloudHostIntegrationId.Jira,
-				name: 'Project One',
+				name: 'proj-1',
 				org: 'Beta Site',
+				orgId: 'site-2',
 				url: '',
 			},
 		]);
@@ -2805,7 +2809,7 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			projects.items.some(
 				item =>
 					item.providerId === IssuesCloudHostIntegrationId.Jira &&
-					item.name === 'Platform' &&
+					item.name === 'proj' &&
 					item.org === 'Jira Site',
 			),
 			'aggregated Jira project items retain the parent org',
@@ -3557,8 +3561,8 @@ suite('ProviderBackend surface facade (#5438)', () => {
 				completedProjects?: string[];
 			};
 			assert.deepEqual(firstCursor.retryPages, [1], 'the origin window survives a terminal retry');
-			assert.deepEqual(firstCursor.retryProjects, [JSON.stringify(['', 'p2', 'p2'])]);
-			assert.deepEqual(firstCursor.completedProjects, [JSON.stringify(['', 'p1', 'p1'])]);
+			assert.deepEqual(firstCursor.retryProjects, [JSON.stringify(['', 'p2'])]);
+			assert.deepEqual(firstCursor.completedProjects, [JSON.stringify(['', 'p1'])]);
 
 			reads.length = 0;
 			const partialRetry = await manager.listIssueTrackerIssuesPage({
@@ -3580,8 +3584,8 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			};
 			assert.deepEqual(partialCursor.retryPages, [1]);
 			assert.deepEqual(partialCursor.completedProjects?.sort(), [
-				JSON.stringify(['', 'p1', 'p1']),
-				JSON.stringify(['', 'p2', 'p2']),
+				JSON.stringify(['', 'p1']),
+				JSON.stringify(['', 'p2']),
 			]);
 
 			reads.length = 0;
@@ -3598,6 +3602,123 @@ suite('ProviderBackend surface facade (#5438)', () => {
 			manager.dispose();
 		});
 	}
+
+	test('listIssueTrackerIssuesPage resumes a retry by project id after the project keys were renamed', async () => {
+		const runtime = createFakeRuntime();
+		const manager = createIntegrationManager(runtime);
+		const jira = await manager.get(IssuesCloudHostIntegrationId.Jira);
+
+		(
+			jira as unknown as { getResourcesForUserResult: () => Promise<{ value: ResourceDescriptor[] }> }
+		).getResourcesForUserResult = () => Promise.resolve({ value: [{ key: 'one', id: 'org-1' }] });
+
+		let keys = { p1: 'ALPHA', p2: 'BETA' };
+		(
+			jira as unknown as {
+				getProjectsForResourcesWithMetadataResult: () => Promise<{ value: { values: ResourceDescriptor[] } }>;
+			}
+		).getProjectsForResourcesWithMetadataResult = () =>
+			Promise.resolve({
+				value: {
+					values: [
+						{ key: keys.p1, id: 'p1', resourceId: 'org-1' },
+						{ key: keys.p2, id: 'p2', resourceId: 'org-1' },
+					] as ResourceDescriptor[],
+				},
+			});
+
+		const reads: string[] = [];
+		let p2Calls = 0;
+		readProjectsOneByOne(jira);
+		(
+			jira as unknown as {
+				getIssuesForProjectWithTruncationResult: (project: {
+					id: string;
+					key: string;
+				}) => Promise<{ error: Error } | { value: { values: IssueShape[]; truncated: boolean } }>;
+			}
+		).getIssuesForProjectWithTruncationResult = project => {
+			reads.push(project.key);
+			if (project.id === 'p2' && p2Calls++ === 0) {
+				return Promise.resolve({ error: new Error('temporary project failure') });
+			}
+			return Promise.resolve({
+				value: { values: [{ id: `${project.id}-issue` } as unknown as IssueShape], truncated: false },
+			});
+		};
+
+		const first = await manager.listIssueTrackerIssuesPage({
+			providerId: IssuesCloudHostIntegrationId.Jira,
+			includeAllAssignees: true,
+			itemsPerPage: 2,
+		});
+		assert.deepEqual(reads, ['ALPHA', 'BETA']);
+		assert.deepEqual(
+			first.items.map(issue => issue.id),
+			['p1-issue'],
+		);
+		assert.ok(first.cursor != null);
+
+		keys = { p1: 'ALPHA2', p2: 'BETA2' };
+		reads.length = 0;
+		const resumed = await manager.listIssueTrackerIssuesPage({
+			providerId: IssuesCloudHostIntegrationId.Jira,
+			includeAllAssignees: true,
+			itemsPerPage: 2,
+			cursor: first.cursor,
+		});
+		assert.deepEqual(reads, ['BETA2'], 'the completed project is not re-read and the retrying one is not dropped');
+		assert.deepEqual(
+			resumed.items.map(issue => issue.id),
+			['p2-issue'],
+		);
+		assert.equal(resumed.fetchFailed, undefined);
+		assert.equal(resumed.hasMore, false);
+		assert.equal(resumed.cursor, undefined);
+
+		// A cursor minted when the bookkeeping also carried the project key resumes the same way.
+		const cursor = JSON.parse(first.cursor) as { retryProjects?: string[]; completedProjects?: string[] };
+		assert.deepEqual(cursor.retryProjects, [JSON.stringify(['org-1', 'p2'])]);
+		assert.deepEqual(cursor.completedProjects, [JSON.stringify(['org-1', 'p1'])]);
+		const legacyCursor = JSON.stringify({
+			...cursor,
+			retryProjects: [JSON.stringify(['org-1', 'p2', 'BETA'])],
+			completedProjects: [JSON.stringify(['org-1', 'p1', 'ALPHA'])],
+		});
+		reads.length = 0;
+		const legacy = await manager.listIssueTrackerIssuesPage({
+			providerId: IssuesCloudHostIntegrationId.Jira,
+			includeAllAssignees: true,
+			itemsPerPage: 2,
+			cursor: legacyCursor,
+		});
+		assert.deepEqual(reads, ['BETA2']);
+		assert.deepEqual(
+			legacy.items.map(issue => issue.id),
+			['p2-issue'],
+		);
+		assert.equal(legacy.fetchFailed, undefined);
+		assert.equal(legacy.hasMore, false);
+		assert.equal(legacy.cursor, undefined);
+
+		manager.dispose();
+	});
+
+	test('issue-tracker cursor bookkeeping keys a project with no id by its key, from a legacy cursor too', () => {
+		assert.equal(projectKey({ key: 'KEY', resourceId: 'org-1' }), JSON.stringify(['org-1', 'KEY']));
+		assert.equal(projectKey({ key: 'KEY', id: 'p1', resourceId: 'org-1' }), JSON.stringify(['org-1', 'p1']));
+
+		const parsed = parseIssueTrackerPageCursor(
+			JSON.stringify({
+				type: 'issue-tracker-page',
+				currentPage: 2,
+				retryProjects: [JSON.stringify(['org-1', '', 'KEY']), JSON.stringify(['org-1', 'KEY'])],
+				completedProjects: [JSON.stringify(['org-1', 'p1', 'ALPHA'])],
+			}),
+		);
+		assert.deepEqual(parsed?.retryProjects, [JSON.stringify(['org-1', 'KEY'])]);
+		assert.deepEqual(parsed?.completedProjects, [JSON.stringify(['org-1', 'p1'])]);
+	});
 
 	test('listIssueTrackerIssuesPage keeps total discovery failure retry-only', async () => {
 		const runtime = createFakeRuntime();
@@ -3629,6 +3750,127 @@ suite('ProviderBackend surface facade (#5438)', () => {
 
 		manager.dispose();
 	});
+
+	for (const providerId of [
+		IssuesCloudHostIntegrationId.Jira,
+		IssuesCloudHostIntegrationId.Linear,
+		IssuesCloudHostIntegrationId.Trello,
+	]) {
+		test(`a ${providerId} resource discovery with no data is incomplete, not an empty account`, async () => {
+			const runtime = createFakeRuntime();
+			const manager = createIntegrationManager(runtime);
+			const tracker = await manager.get(providerId);
+			(tracker as unknown as { _session: ProviderAuthenticationSession })._session = primarySession('t');
+			let calls = 0;
+			(
+				tracker as unknown as { getProviderResourcesForUser: () => Promise<undefined> }
+			).getProviderResourcesForUser = () => {
+				calls += 1;
+				return Promise.resolve(undefined);
+			};
+
+			const selected = await manager.listIssueTrackerIssuesPage({
+				providerId: providerId,
+				org: 'site',
+				project: 'OPS',
+				itemsPerPage: 2,
+			});
+			assert.equal(selected.page.truncated, true);
+			assert.equal(
+				selected.warnings.some(w => w.selector != null),
+				false,
+				'an unconfirmed discovery does not report the selection removed',
+			);
+
+			const page = await manager.listIssueTrackerIssuesPage({ providerId: providerId, itemsPerPage: 2 });
+			assert.deepEqual(page.items, []);
+			assert.equal(page.page.truncated, true);
+			assert.equal(page.fetchFailed, undefined, 'the read answered; it only could not confirm completeness');
+			assert.equal(page.hasMore, false, 'retry-only state cannot drive an automatic loop');
+			assert.ok(page.cursor?.includes('retryPages'), 'the page carries a retry cursor');
+			assert.equal(page.warnings.length, 1);
+			assert.equal(page.warnings[0].kind, 'other');
+			assert.match(page.warnings[0].message, /completeness could not be confirmed/i);
+
+			const callsBeforeRetry = calls;
+			const retried = await manager.listIssueTrackerIssuesPage({
+				providerId: providerId,
+				itemsPerPage: 2,
+				cursor: page.cursor,
+			});
+			assert.equal(retried.page.truncated, true);
+			assert.ok(calls > callsBeforeRetry, 'reusing the cursor repeats the discovery');
+
+			const orgs = await manager.listOrgs({ providerId: providerId });
+			assert.deepEqual(orgs.items, []);
+			assert.equal(orgs.fetchFailed, true);
+			assert.match(orgs.warnings[0]?.message ?? '', /completeness could not be confirmed/i);
+
+			const projects = await manager.listProjects({ providerId: providerId });
+			assert.deepEqual(projects.items, []);
+			assert.equal(projects.fetchFailed, true);
+			assert.match(projects.warnings[0]?.message ?? '', /completeness could not be confirmed/i);
+
+			manager.dispose();
+		});
+
+		test(`a ${providerId} resource discovery answering [] still means no resources`, async () => {
+			const runtime = createFakeRuntime();
+			const manager = createIntegrationManager(runtime);
+			const tracker = await manager.get(providerId);
+			(tracker as unknown as { _session: ProviderAuthenticationSession })._session = primarySession('t');
+			(
+				tracker as unknown as { getProviderResourcesForUser: () => Promise<ResourceDescriptor[]> }
+			).getProviderResourcesForUser = () => Promise.resolve([]);
+
+			const page = await manager.listIssueTrackerIssuesPage({ providerId: providerId, itemsPerPage: 2 });
+			assert.deepEqual(page.items, []);
+			assert.deepEqual(page.warnings, []);
+			assert.equal(page.page.truncated, undefined);
+			assert.equal(page.fetchFailed, undefined);
+			assert.equal(page.cursor, undefined);
+
+			const orgs = await manager.listOrgs({ providerId: providerId });
+			assert.deepEqual(orgs.warnings, []);
+			assert.equal(orgs.fetchFailed, undefined);
+
+			const projects = await manager.listProjects({ providerId: providerId });
+			assert.deepEqual(projects.warnings, []);
+			assert.equal(projects.fetchFailed, undefined);
+
+			manager.dispose();
+		});
+
+		test(`an unconnected ${providerId} still reads as empty`, async () => {
+			const runtime = createFakeRuntime();
+			const manager = createIntegrationManager(runtime);
+			const tracker = await manager.get(providerId);
+			let calls = 0;
+			(
+				tracker as unknown as { getProviderResourcesForUser: () => Promise<undefined> }
+			).getProviderResourcesForUser = () => {
+				calls += 1;
+				return Promise.resolve(undefined);
+			};
+
+			const page = await manager.listIssueTrackerIssuesPage({ providerId: providerId, itemsPerPage: 2 });
+			assert.deepEqual(page.warnings, []);
+			assert.equal(page.page.truncated, undefined);
+			assert.equal(page.fetchFailed, undefined);
+			assert.equal(page.cursor, undefined);
+
+			const orgs = await manager.listOrgs({ providerId: providerId });
+			assert.deepEqual(orgs.warnings, []);
+			assert.equal(orgs.fetchFailed, undefined);
+
+			const projects = await manager.listProjects({ providerId: providerId });
+			assert.deepEqual(projects.warnings, []);
+			assert.equal(projects.fetchFailed, undefined);
+			assert.equal(calls, 0, 'no session resolves, so the provider is never asked');
+
+			manager.dispose();
+		});
+	}
 
 	test('listIssueTrackerIssuesPage rejects git-host providers explicitly', async () => {
 		const manager = createIntegrationManager(createFakeRuntime());
@@ -4029,6 +4271,17 @@ suite('ProviderBackend surface facade (#5438)', () => {
 		(
 			jira as unknown as { getAccountForResourceResult: () => Promise<{ value: { username: string } }> }
 		).getAccountForResourceResult = () => Promise.resolve({ value: { username: 'me' } });
+		// The lists as the provider holds them now, which confirm the filter matches nothing.
+		Object.assign(jira, {
+			getUncachedDiscoveryResult: () =>
+				Promise.resolve({
+					value: {
+						resources: [{ key: 'one', id: 'org-1', name: 'Org One' }],
+						projects: { values: [{ key: 'p1', id: 'p1', name: 'P1' }] },
+					},
+				}),
+			getUncachedAccountForResourceResult: () => Promise.resolve({ value: { username: 'me' } }),
+		});
 		let issueReads = 0;
 		readProjectsOneByOne(jira);
 		(

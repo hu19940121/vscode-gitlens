@@ -14,6 +14,7 @@ import type {
 	GitConfigType,
 	GkConfigKeys,
 } from '@gitlens/git/providers/config.js';
+import { parseBranchMetadataGkConfigKey } from '@gitlens/git/utils/branch.utils.js';
 import { gate } from '@gitlens/utils/decorators/gate.js';
 import { debug, trace } from '@gitlens/utils/decorators/log.js';
 import { first, some } from '@gitlens/utils/iterable.js';
@@ -24,6 +25,7 @@ import { fileUri } from '@gitlens/utils/uri.js';
 import type { CliGitProviderInternal } from '../cliGitProvider.js';
 import { fsExists } from '../exec/exec.js';
 import type { Git } from '../exec/git.js';
+import { KeyedSequencer } from '../exec/indexLock.js';
 
 const mappedAuthorRegex = /(.+)\s<(.+)>/;
 const emptyArray: readonly never[] = Object.freeze([]);
@@ -120,11 +122,19 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	private readonly _gkConfigReconciles = new Map<string, { pending: boolean; paths: Map<string, number> }>();
 
 	/**
-	 * Pending `setGkConfig` writes keyed by `(commonPath, key, value, skip-option)`. Concurrent
-	 * callers writing the same `(key, value)` pair share the in-flight Promise so only one
-	 * `git config --set` subprocess actually runs. Cleared on settle.
+	 * The latest pending `setGkConfig` write of each `commonPath\0key`. A call writing the same value with the same
+	 * skip option joins it; any other call chains after it, so one key's writes land in call order. Cleared on settle.
 	 */
-	private readonly _pendingGkConfigWrites = new Map<string, Promise<void>>();
+	private readonly _pendingGkConfigWrites = new Map<
+		string,
+		{ value: string | undefined; skipKey: string; promise: Promise<void> }
+	>();
+
+	/** Maps from failed bulk reads, which a reconcile must not diff as the file's content */
+	private readonly _failedGkConfigMaps = new WeakSet<Map<string, string>>();
+
+	/** Writes each `.git/gk/config` one at a time — concurrent `git config` writes fail on its lock */
+	private readonly _gkConfigWrites = new KeyedSequencer();
 
 	@trace()
 	getConfig(
@@ -209,6 +219,11 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		// `'config'` reset alone leaves serving the old tracking info.
 		if (repoPath != null && !options?.file && /^branch\..+\.(?:remote|merge)$/i.test(key)) {
 			this.context.hooks?.cache?.onReset?.(repoPath, 'branches');
+		}
+
+		// A `--global` or custom-`file` write isn't this repository's `.git/config`
+		if (repoPath != null && !options?.file && !options?.global) {
+			this.context.hooks?.repository?.onChanged?.(repoPath, ['config']);
 		}
 	}
 
@@ -412,6 +427,7 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 			// and would make the section-cleanup pre-checks skip real work. Only cache a read that happened.
 			if (failed) {
 				cacheable.invalidate();
+				this._failedGkConfigMaps.add(map);
 			}
 			return map;
 		});
@@ -450,23 +466,31 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		value: string | undefined,
 		options?: { skipInvalidation?: readonly GkConfigInvalidationTarget[] },
 	): Promise<void> {
-		// Encode the skip-invalidation option in the dedup key: a self-write (with skip targets)
-		// and a user-driven write of the same `(key, value)` (no skip targets) have different
-		// cache-invalidation semantics, so sharing their Promise would silently let the user-driven
-		// write skip invalidation. Sort the array so callers passing the same targets in different
-		// orders share a single in-flight write.
+		// A self-write (with skip targets) and a user-driven write of the same value have different invalidation
+		// semantics, so only a matching skip option may join: otherwise the user-driven write would skip invalidation.
+		// Sorted, so the same targets in any order match.
 		const commonPath = this.cache.getCommonPath(repoPath);
 		const skipKey = options?.skipInvalidation?.length ? options.skipInvalidation.toSorted().join(',') : '';
-		const dedupKey = `${commonPath}\0${key}\0${value ?? ''}\0${skipKey}`;
+		const pendingKey = `${commonPath}\0${key}`;
 
-		const pending = this._pendingGkConfigWrites.get(dedupKey);
-		if (pending != null) return pending;
+		const previous = this._pendingGkConfigWrites.get(pendingKey);
+		if (previous != null && previous.value === value && previous.skipKey === skipKey) return previous.promise;
 
-		const promise = this.setGkConfigCore(repoPath, key, value, options);
-		this._pendingGkConfigWrites.set(dedupKey, promise);
+		const promise =
+			previous != null
+				? previous.promise.catch(() => {}).then(() => this.setGkConfigCore(repoPath, key, value, options))
+				: this.setGkConfigCore(repoPath, key, value, options);
+		const pending = { value: value, skipKey: skipKey, promise: promise };
+		this._pendingGkConfigWrites.set(pendingKey, pending);
 		// Swallow the cleanup chain's rejection so a failed write doesn't surface as an unhandled
 		// rejection separate from the caller's own handling of the returned promise.
-		void promise.finally(() => this._pendingGkConfigWrites.delete(dedupKey)).catch(() => {});
+		void promise
+			.finally(() => {
+				if (this._pendingGkConfigWrites.get(pendingKey) === pending) {
+					this._pendingGkConfigWrites.delete(pendingKey);
+				}
+			})
+			.catch(() => {});
 		return promise;
 	}
 
@@ -485,19 +509,40 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 
 		if (!(await this.ensureGkConfigFolder(gkConfigFolder, scope))) return;
 
-		await this.setConfigCore(repoPath, key, value, { file: gkConfigPath });
+		// Seed the reconcile snapshot from the pre-write file, so the write below can tell whether it changed the
+		// value (first tracked-key write per repository only; the bulk read is cached for everything else)
+		if (this.cache.needsGkConfigSnapshot(repoPath, key)) {
+			await this.getGkConfigMap(repoPath);
+		}
+
+		await this._gkConfigWrites.run(gkConfigPath, undefined, () =>
+			this.setConfigCore(repoPath, key, value, { file: gkConfigPath }),
+		);
 
 		// Invalidate the bulk map (so the next read re-fetches) and the derived caches for this key's
-		// ref. The `.git/gk/config` file-watcher also fires `'gkConfig'` shortly after, which reconciles
+		// ref, then record the write, which fires `onDidChangeMergeTargets` when it changed a merge key —
+		// except for a self-write (`skipInvalidation` given: an internal save while answering a read), which
+		// nobody awaits; only another process's watcher reports that one.
+		// The `.git/gk/config` file-watcher also fires `'gkConfig'` shortly after, which reconciles
 		// the same change (see `reconcileGkConfig`) — recording our own write here keeps that later
 		// reconcile from re-diffing this key as an external change.
 		this.cache.deleteGkConfig(repoPath, key, options);
-		this.cache.recordGkConfigWrite(repoPath, key, value);
+		this.cache.recordGkConfigWrite(repoPath, key, value, { announce: options?.skipInvalidation == null });
+
+		// The watcher's report of this write can't reach the cached branches: the snapshot already holds the value
+		const metadataKey = parseBranchMetadataGkConfigKey(key);
+		if (metadataKey != null) {
+			this.cache.patchBranchMetadata(repoPath, [
+				{ branch: metadataKey.branch, key: metadataKey.key, value: value },
+			]);
+		}
 	}
 
 	@debug()
 	async removeGkConfigBranchSection(repoPath: string, ref: string): Promise<void> {
-		await this.runGkConfigSectionCommand(repoPath, ref, '--remove-section', `branch.${ref}`);
+		if (await this.runGkConfigSectionCommand(repoPath, ref, '--remove-section', `branch.${ref}`)) {
+			this.cache.recordGkConfigSectionWrite(repoPath, ref);
+		}
 	}
 
 	@debug()
@@ -509,13 +554,17 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		// the source has no gk keys at all, where its pre-check would otherwise skip the whole call and
 		// leave the orphan in place for the renamed branch to inherit.
 		await this.removeGkConfigBranchSection(repoPath, newRef);
-		await this.runGkConfigSectionCommand(
-			repoPath,
-			oldRef,
-			'--rename-section',
-			`branch.${oldRef}`,
-			`branch.${newRef}`,
-		);
+		if (
+			await this.runGkConfigSectionCommand(
+				repoPath,
+				oldRef,
+				'--rename-section',
+				`branch.${oldRef}`,
+				`branch.${newRef}`,
+			)
+		) {
+			this.cache.recordGkConfigSectionWrite(repoPath, oldRef, newRef);
+		}
 	}
 
 	/**
@@ -526,8 +575,11 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	 * Never throws: callers invoke this as bookkeeping after a branch op has already succeeded, so a
 	 * failure here must not be reported as (or roll back) the branch/checkout/worktree operation itself.
 	 * The worst case is metadata that stays behind until the next op on that name.
+	 *
+	 * Returns whether `.git/gk/config` now reflects the command (it ran, or there was nothing to do), so the
+	 * caller can record its own write in the reconcile snapshot only when it actually landed.
 	 */
-	private async runGkConfigSectionCommand(repoPath: string, ref: string, ...args: string[]): Promise<void> {
+	private async runGkConfigSectionCommand(repoPath: string, ref: string, ...args: string[]): Promise<boolean> {
 		const scope = getScopedLogger();
 		try {
 			const prefix = `branch.${ref}.`;
@@ -537,27 +589,30 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 			// read as authoritative would skip the removal entirely, leaving a deleted branch's base,
 			// disposition and issue links behind for the next branch reusing that name. When it's empty, run
 			// the command: worst case is a no-op on a section that isn't there.
-			if (map.size && !some(map.keys(), k => k.startsWith(prefix))) return;
+			if (map.size && !some(map.keys(), k => k.startsWith(prefix))) return true;
 
 			const gkConfigPath = await this.getGkConfigPath(repoPath);
-			if (!gkConfigPath) return;
+			if (!gkConfigPath) return false;
 			// `getGkConfigPath` only joins a path, so check the file: with no `.git/gk/config` there is
 			// genuinely nothing to remove, and running the command would fail with a fatal we'd then warn
 			// about on every branch delete in a repo that has never had gk metadata.
-			if (!(await fsExists(gkConfigPath))) return;
+			if (!(await fsExists(gkConfigPath))) return true;
 
-			const result = await this.git.run(
-				{ cwd: repoPath, runLocally: true, errors: 'ignore' },
-				'config',
-				'-f',
-				gkConfigPath,
-				...args,
+			const result = await this._gkConfigWrites.run(gkConfigPath, undefined, () =>
+				this.git.run(
+					{ cwd: repoPath, runLocally: true, errors: 'ignore' },
+					'config',
+					'-f',
+					gkConfigPath,
+					...args,
+				),
 			);
 			// `errors: 'ignore'` is deliberate — see the note above on why this must never throw — but that
 			// also means the `catch` below never sees a failed write, so without this the metadata silently
 			// stays behind (or, on a rename, stays under the old name) with nothing recorded anywhere.
 			// Reported, not thrown: the branch op it follows has already succeeded.
-			if (result.completion.status !== 'exited' || result.exitCode !== 0) {
+			const succeeded = result.completion.status === 'exited' && result.exitCode === 0;
+			if (!succeeded) {
 				scope?.warn(
 					`Failed to update gk config section for '${ref}' in '${repoPath}': ${
 						result.completion.status === 'exited'
@@ -570,8 +625,10 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 			// Drop the bulk map so the next read hits disk; the derived caches for the affected ref are
 			// evicted by the caller's own `deleteBaseBranchName` plus the `'branches'` cascade it fires.
 			this.cache.deleteGkConfigMap(repoPath);
+			return succeeded;
 		} catch (ex) {
 			scope?.error(ex, `Failed to update gk config section for '${ref}' in '${repoPath}'`);
+			return false;
 		}
 	}
 
@@ -579,7 +636,8 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	 * Reconciles a watcher-observed `'gkConfig'` change — registered with the shared `Cache` as its
 	 * gk-config reconciler (see the constructor). Re-reads the bulk map (hard-evicted by
 	 * `Cache.handleGkConfigChanged`, so this hits disk) and diffs it against `priorSnapshot` to cascade
-	 * `baseBranchName`/`branchOverviews` only for refs whose merge-relevant keys actually changed.
+	 * `baseBranchName`/`branchOverviews` only for refs whose merge-relevant keys actually changed, and to evict the
+	 * branches only when a branch metadata key (another process's activity stamp) changed.
 	 *
 	 * Serialized per commonPath: a reconcile is a read-then-diff against a single shared baseline, so
 	 * two overlapping passes would both diff against the same snapshot and the later change could fall
@@ -647,6 +705,11 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 				// A trailing pass must not reuse the entry the pass before it installed.
 				this.cache.deleteGkConfigMap(readPath);
 				const freshMap = await this.getGkConfigMap(readPath);
+				// A failed read diffed as the file's content would remove every key it missed
+				if (this._failedGkConfigMaps.has(freshMap)) {
+					throw new Error(`Failed to read the gk config through '${readPath}'`);
+				}
+
 				// Paths may have closed while the re-read was in flight; if every one did, there's nothing
 				// left to reconcile against.
 				if (!this.pruneClosedReconcilePaths(entry.paths).size) return 'reconciled';
@@ -654,15 +717,16 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 				if (this.cache.reconcileGkConfigMap(readPath, snapshot, freshMap)) {
 					// Fire a follow-up change: a consumer that re-read on the original event may have done so
 					// before this async cascade landed, so it would otherwise hold a stale derived value with
-					// nothing left to prompt another re-read.
+					// nothing left to prompt another re-read. Only the host hears it: it is not a write of
+					// core's, and announcing it as one would evict the map just reconciled.
 					for (const path of entry.paths.keys()) {
-						this.context.hooks?.repository?.onChanged?.(path, ['gkConfig']);
+						this.provider.notifyHost(path, ['gkConfig']);
 					}
 				}
 
 				// `reconcileGkConfigMap` advanced the stored baseline to what we just read; a trailing pass
 				// diffs its own read against that.
-				snapshot = this.cache.getGkConfigMergeSnapshot(readPath);
+				snapshot = this.cache.getGkConfigSnapshot(readPath);
 			} while (entry.pending);
 
 			return 'reconciled';
@@ -728,28 +792,40 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 	): Promise<void> {
 		const scope = getScopedLogger();
 
+		const entries: [GitConfigKeys, string][] = [];
+		if (config.enabled != null) {
+			entries.push(['commit.gpgsign', config.enabled ? 'true' : 'false']);
+		}
+		if (config.format != null) {
+			entries.push(['gpg.format', config.format]);
+		}
+		if (config.signingKey != null) {
+			entries.push(['user.signingkey', config.signingKey]);
+		}
+		if (config.gpgProgram != null) {
+			entries.push(['gpg.program', config.gpgProgram]);
+		}
+		if (config.sshProgram != null) {
+			entries.push(['gpg.ssh.program', config.sshProgram]);
+		}
+		if (config.allowedSignersFile != null) {
+			entries.push(['gpg.ssh.allowedSignersFile', config.allowedSignersFile]);
+		}
+
+		let wrote = false;
 		try {
-			if (config.enabled != null) {
-				await this.setConfig(repoPath, 'commit.gpgsign', config.enabled ? 'true' : 'false', options);
-			}
-			if (config.format != null) {
-				await this.setConfig(repoPath, 'gpg.format', config.format, options);
-			}
-			if (config.signingKey != null) {
-				await this.setConfig(repoPath, 'user.signingkey', config.signingKey, options);
-			}
-			if (config.gpgProgram != null) {
-				await this.setConfig(repoPath, 'gpg.program', config.gpgProgram, options);
-			}
-			if (config.sshProgram != null) {
-				await this.setConfig(repoPath, 'gpg.ssh.program', config.sshProgram, options);
-			}
-			if (config.allowedSignersFile != null) {
-				await this.setConfig(repoPath, 'gpg.ssh.allowedSignersFile', config.allowedSignersFile, options);
+			for (const [key, value] of entries) {
+				await this.setConfigCore(repoPath, key, value, options);
+				wrote = true;
 			}
 		} catch (ex) {
 			scope?.error(ex);
 			throw ex;
+		} finally {
+			// One `config` announcement for the keys written, rather than one (each fanned out to every worktree) per key
+			if (wrote && !options?.global) {
+				this.context.hooks?.repository?.onChanged?.(repoPath, ['config']);
+			}
 		}
 	}
 
@@ -1000,7 +1076,9 @@ export class ConfigGitSubProvider implements GitConfigSubProvider {
 		// Copy legacy entries to .git/gk/config
 		for (const [key, value] of [...migrateConfig]) {
 			try {
-				await this.setConfigCore(repoPath, key, value, { file: gkConfigPath });
+				await this._gkConfigWrites.run(gkConfigPath, undefined, () =>
+					this.setConfigCore(repoPath, key, value, { file: gkConfigPath }),
+				);
 			} catch (ex) {
 				scope?.error(ex, `Failed to migrate key '${key}' to GK config`);
 				// If we failed to migrate, delete it from the list so we won't try to remove it from git config later

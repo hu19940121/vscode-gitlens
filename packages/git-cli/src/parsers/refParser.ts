@@ -26,11 +26,16 @@ const refMapping = {
 	authorDate: `%(authordate:iso8601)`,
 	subject: `%(subject)`,
 	worktreePath: undefined,
+	upstreamRemote: undefined,
+	upstreamRemoteRef: undefined,
 };
 
 const refMappingSupportsWorktreePath = {
 	...refMapping,
 	worktreePath: '%(worktreepath)',
+	// `%(upstream:remotename)` and `%(upstream:remoteref)` need git 2.16, which the 2.23 `worktreePath` gate already implies
+	upstreamRemote: '%(upstream:remotename)',
+	upstreamRemoteRef: '%(upstream:remoteref)',
 };
 
 type RefParser = Parser<RefRecord>;

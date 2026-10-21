@@ -1,4 +1,4 @@
-import type { IssueShape, IssueSorting } from '@gitlens/git/models/issue.js';
+import type { IssueShape, IssueSorting, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import { mergeAssessmentInto } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
 import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../constants.js';
@@ -39,6 +39,8 @@ import {
 	unsupportedWarning,
 } from './warnings.js';
 
+const issueStateFilters: readonly IssueStateFilter[] = ['open', 'closed', 'all'];
+
 /**
  * Whether a repo-scoped page is assembled from SEVERAL provider queries and merged here — which is what decides
  * whether the requested order can be honored at all.
@@ -78,6 +80,7 @@ function mergesProviderQueries(pagingMode: PagingMode | undefined, repos: Provid
  * inside out, and unreadable at the point where the fields are actually used.
  */
 export interface ListIssuesPageOptions {
+	state?: IssueStateFilter;
 	providerId: IntegrationIds;
 	repos?: ProviderReposInput;
 	/** Narrows the account-wide read to one org/account. Requires a host with a project layer (Azure). */
@@ -179,6 +182,32 @@ export async function listIssuesPage(
 	// reports issues as explicitly unsupported rather than serving a partial/legacy source or a silent empty.
 	if (!integration.supportsIssues) {
 		return refusedPage(page, [issuesUnsupportedWarning(options.providerId, domain, options.connectionId)], true);
+	}
+
+	if (
+		options.state != null &&
+		(!issueStateFilters.includes(options.state) ||
+			(options.state !== 'open' && !providersMetadata[options.providerId]?.supportsIssueStates))
+	) {
+		return refusedPage(
+			page,
+			[
+				issueStateFilters.includes(options.state)
+					? unsupportedWarning(
+							options.providerId,
+							domain,
+							options.connectionId,
+							`Issue state '${options.state}' is not supported by '${options.providerId}'.`,
+						)
+					: otherWarning(
+							options.providerId,
+							domain,
+							options.connectionId,
+							`Unknown issue state; expected one of ${issueStateFilters.join(', ')}.`,
+						),
+			],
+			true,
+		);
 	}
 
 	// `repos` is what selects between the two: with none there is no scope to query per repository, so the
@@ -309,6 +338,7 @@ async function readAccountWideIssuesPage({
 			() =>
 				integration.searchMyIssuesWithTruncationResult(undefined, undefined, options.connectionId, {
 					includeAllAssignees: options.includeAllAssignees,
+					state: options.state,
 					filters: resolvedIssueFilters.filters,
 					cursor: cursor,
 					pageSize: options.itemsPerPage,
@@ -452,10 +482,25 @@ async function readRepoScopedIssuesPage({
 	}
 
 	const issuesPagingMode = metadata?.issuesPagingMode;
-	const ordering = toIssueOrdering(
-		resolvedRepoScopedSort.sort,
-		mergesProviderQueries(issuesPagingMode, options.repos),
-	);
+	// Counted, and read, as the host settles them: a scope can name another project than the one it was parsed with
+	// (see `GitHostIntegration.resolveRepositoryScopes`), which changes how many queries a per-project read makes.
+	let repos = options.repos ?? [];
+	if (issuesPagingMode === PagingMode.Project && repos.length) {
+		const settled = await runCaptured(
+			options.providerId,
+			domain,
+			options.connectionId,
+			() => integration.resolveRepositoryScopes(repos, options.connectionId),
+			{ warnOnMissingSession: warnOnMissingSession },
+		);
+		// No session to read with, or the read's own failure resolving it: answered as that read would, without it.
+		if (settled.value == null) {
+			return refusedPage(page, settled.warning != null ? [settled.warning] : [], settled.warning != null);
+		}
+
+		repos = settled.value;
+	}
+	const ordering = toIssueOrdering(resolvedRepoScopedSort.sort, mergesProviderQueries(issuesPagingMode, repos));
 	// Refused rather than served as concatenated per-scope runs, which would look ordered without being so — and
 	// only where it actually merges, since the same key against the same provider is perfectly answerable for a
 	// single repository or project.
@@ -484,12 +529,13 @@ async function readRepoScopedIssuesPage({
 			// The shapes seam returns normalized IssueShape, and is overridable by a provider whose only issue
 			// client already yields shapes (serving this path without a raw ProviderIssue round-trip).
 			integration.getMyIssuesForReposAsShapesResult(
-				options.repos ?? [],
+				repos,
 				// Forward `page`/`pageSize` alongside the cursor so PagingMode.Repo/Project hosts honor the
 				// requested page and page size rather than ignoring a synthesized page-number cursor.
 				{
 					filters: options.filters,
 					includeAllAssignees: options.includeAllAssignees,
+					state: options.state,
 					cursor: cursor,
 					// The normalized `page`, so the number forwarded to the provider can't disagree with the
 					// page-number cursor beside it — both are built from the same value. Only when the caller asked
@@ -531,10 +577,11 @@ async function readRepoScopedIssuesPage({
 						options.connectionId,
 						() =>
 							integration.getMyIssuesForReposAsShapesResult(
-								options.repos ?? [],
+								repos,
 								{
 									filters: options.filters,
 									includeAllAssignees: options.includeAllAssignees,
+									state: options.state,
 									cursor: cursor,
 									pageSize: options.itemsPerPage,
 									sort: ordering.sort,
