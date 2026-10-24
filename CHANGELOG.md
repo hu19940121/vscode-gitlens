@@ -6,13 +6,26 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## [Unreleased]
 
+### Added
+
+- Adds a reachability check to _Add Remote_ &mdash; the confirm step probes the URL and, when it can't be reached, says why and offers _Add Remote Anyway_, _Change URL_, or a retry; the name defaults to `origin` on a repository with no remotes
+- Adds _Publish Repository_ to branch and worktree rows in the views when their repository has no remotes
+- Adds _Remove Remote_ to the error shown when a push can't reach a remote that has never been fetched from (e.g. one just added with a mistyped URL)
+- Adds a _Publish Repository…_ call to action to the _Commit Graph_'s _Pull Requests_ panel when the repository has no remotes
+
 ### Changed
 
+- Changes _Publish Repository_ in the _Commit Graph_ and views to open the push wizard's chooser (_Publish Repository…_ or _Add Remote…_) with the clicked action pre-selected, rather than handing straight to VS Code's publish flow &mdash; _Add Remote…_ continues into the publish confirm without a fetch step, and a multi-repository push now skips (and names) repositories without remotes instead of failing
 - Changes views and the _Commit Graph_ to keep updating during long-running activity, such as a long rebase or a build writing into the working tree, where they used to wait until it stopped
 - Improves performance when working across several worktrees of one repository &mdash; staging changes, or a merge, rebase or cherry-pick pausing, in one worktree no longer refreshes the views and _Commit Graph_ state of every other worktree
 
 ### Fixed
 
+- Fixes a push to an unreachable HTTPS remote (e.g. a mistyped host) reporting a generic error rather than that the remote could not be reached
+- Fixes the views and the _Commit Graph_'s context menus choosing between _Publish Branch_ and _Publish Repository_ by whether any repository in the workspace has remotes &mdash; each row now follows its own repository, and a remote without a recognized host no longer counts as no remote
+- Fixes _Add Remote and Fetch_ hanging (or closing silently) when the fetch failed, leaving the remote behind &mdash; it now warns and offers _Remove Remote_
+- Fixes pressing Enter on an invalid value in a wizard input (a remote URL, a branch name) navigating away &mdash; the field now stays open with the message until the value is valid
+- Fixes _Don't Ask Again_ appearing on push confirmations it cannot skip &mdash; the no-remotes chooser, the publish step, and the behind-upstream guard
 - Fixes opening the changes of a file that was deleted (or renamed away) and re-added failing with "file not found" &mdash; the comparison now shows an empty previous version ([#5914](https://github.com/gitkraken/vscode-gitlens/issues/5914)) &mdash; thanks to [PR #5930](https://github.com/gitkraken/vscode-gitlens/pull/5930) by Andrés Martínez ([@amartinez1224](https://github.com/amartinez1224))
 - Fixes _Open Blame Prior to this Change_ on a line whose change added the file (including a file that was deleted or renamed away and re-added) opening an empty file picker or a blank document &mdash; it now says the file didn't exist before that change ([#5914](https://github.com/gitkraken/vscode-gitlens/issues/5914))
 - Fixes Azure DevOps issue lists misclassifying Removed work items without closure dates ([#6013](https://github.com/gitkraken/vscode-gitlens/issues/6013))
