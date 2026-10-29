@@ -226,6 +226,7 @@ const commands = [...bundleCmds];
 if (!quick && !watch) {
 	commands.push('oxlint --type-aware --type-check --deny-warnings');
 	commands.push(`node ./scripts/check-deps.mjs`);
+	commands.push(`node ./scripts/check-color-tokens.mjs`);
 	commands.push(`node ./scripts/localization.mjs check`);
 }
 
