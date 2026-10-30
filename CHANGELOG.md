@@ -6,14 +6,30 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## [Unreleased]
 
+### Added
+
+- Adds GitKraken notifications to GitLens for messages about your account and organization
+  - Adds a notifications bell to the _Commit Graph_ header with an unread badge &mdash; shows your newest notifications with quick actions to follow their links and mark them read
+  - Adds a _Notifications_ section to _GitLens Settings_, with an unread count in its navigation &mdash; filter by all, unread, or read, mark notifications read or unread, delete them, and follow their links
+  - Pops up only new security and system notices, and never while notifications are open
+  - Paid plans can opt out of marketing notifications
+
+### Changed
+
+- Changes the Pro feature gates, the feature badge, the _Commit Graph_ account chip, _GitLens Settings_ → _Account_, the Welcome page and the Pro-gated view prompts to offer _Upgrade to Pro_ alongside _Reactivate Pro Trial_, so an account the server won't reactivate isn't left without a path to Pro ([#6010](https://github.com/gitkraken/vscode-gitlens/issues/6010))
+
 ### Fixed
 
+- Fixes [#4950](https://github.com/gitkraken/vscode-gitlens/issues/4950) - _Fetch_ on a remote branch in the _Commit Graph_ runs `git fetch <remote> <remote>` and fails &mdash; it now fetches the branch itself
+- Fixes _Generate Commit Message_ appearing twice in the _Source Control_ title bar &mdash; it now appears only in the GitLens AI (sparkle) menu ([#4396](https://github.com/gitkraken/vscode-gitlens/issues/4396))
+- Fixes _Compose Commits_ appearing in both the _Source Control_ title bar's GitLens AI (sparkle) menu and its overflow menu &mdash; it now appears only in the GitLens AI menu
 - Fixes _Change Merge Target_ suggesting a different branch than the views and _Commit Graph_ measure against &mdash; it now pre-selects the same merge target, including one taken from the branch's pull request
 - Fixes the _Commit Graph_'s _Pull Requests_ panel saying it can't list pull requests for Azure DevOps and Azure DevOps Server repositories &mdash; it now lists the repository's open pull requests
 - Fixes AI conflict resolution sending a request for every remaining file after AI becomes unavailable (e.g. the weekly AI allowance runs out mid-run) &mdash; it now stops starting new files and marks the rest with the same error, and the _Commit Graph_'s _Resolve_ mode now chooses the AI model once per run instead of once per request
 - Fixes the interactive rebase editor reporting _No Conflicts Detected_ for a rebase that conflicts on Git versions before 2.45 &mdash; conflict detection now needs Git 2.45 or later, and when it can't run it says so instead of reporting no conflicts
 - Fixes the interactive rebase editor's commit list borders taking on the scrollbar color whenever the editor is hovered or focused &mdash; they now keep the theme's separator color
 - Fixes the interactive rebase editor cutting off the last commits in the list when the conflict panel is open and the list's pane is short &mdash; the list now fits its pane and scrolls to the end
+- Fixes screen readers announcing popover panels with controls, such as the _Commit Graph_'s account and _Launchpad_ panels, as tooltips &mdash; they're now announced as named dialogs you can Tab into
 
 ## [19.5.0] - 2026-10-27
 
@@ -74,6 +90,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
   - Offers _Add Remote…_ beside _Publish Repository…_ in the push wizard and the _Working Changes_ next steps, for hosts VS Code can't publish to, and hides _Fetch_ while the repository has no remotes
 - Adds configurable branch names for _Start Work_ with `gitlens.startWork.branchNameFormat`, using `${id}` and `${title}` tokens, plus a format editor and live preview in GitLens Settings ([#5925](https://github.com/gitkraken/vscode-gitlens/issues/5925))
 
+- Adds an _Open Session in Kepler_ action to agent sessions in the _Commit Graph_ &mdash; in the _Agents_ sidebar, session cards, the agent status pill and a session's context menu &mdash; which opens the session in Kepler, when Kepler is installed
 - Adds connecting a self-hosted _Jira Data Center_ (or Jira Server) instance from the integrations in _GitLens Settings_ ([#5864](https://github.com/gitkraken/vscode-gitlens/issues/5864)) &mdash; it connects through your GitKraken account like the other self-hosted integrations, with each configured host as its own connection. For now, a connected instance is used only to show the issues associated with a branch; _Start Work_, autolinks, and the _Commit Graph_'s issue tracker picker don't support it yet
   - The _Commit Graph_'s check for whether any issue integration is connected now looks at every configured host of a self-hosted tracker, so disconnecting one host no longer turns off issue enrichment while another is still connected
   - Reads a branch's associated _Jira Data Center_ issues from the instance the association names, never from another configured host that happens to be primary ([#5872](https://github.com/gitkraken/vscode-gitlens/issues/5872))

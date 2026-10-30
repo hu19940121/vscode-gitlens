@@ -216,6 +216,19 @@
 				]
 			}
 		},
+		"gitlens.agents.openSessionInKepler": {
+			"label": "Open Session in Kepler",
+			"icon": "$(gitlens-kepler)",
+			"menus": {
+				"webview/context": [
+					{
+						"when": "webviewItem =~ /gitlens:agent-session\\b(?=.*?\\b\\+kepler\\b)/ && !listMultiSelection && gitlens:agents:enabled && !isWeb && (webview == gitlens.graph || webview == gitlens.views.graph)",
+						"group": "3_open",
+						"order": 3
+					}
+				]
+			}
+		},
 		"gitlens.agents.openSessionWorktreeInNewWindow": {
 			"label": "Open in New Window",
 			"icon": "$(empty-window)",
@@ -702,16 +715,9 @@
 				],
 				"gitlens/scm/title/ai": [
 					{
-						"when": "scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted",
+						"when": "scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && config.gitlens.menus.scmRepository.generateCommitMessage",
 						"group": "1_gitlens",
 						"order": 1
-					}
-				],
-				"scm/title": [
-					{
-						"when": "scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed && config.gitlens.menus.scmRepository.generateCommitMessage",
-						"group": "2_gitlens",
-						"order": 2
 					}
 				]
 			}
@@ -1129,13 +1135,6 @@
 						"order": 1
 					}
 				],
-				"gitlens/scm/title": [
-					{
-						"when": "scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed",
-						"group": "1_gitlens",
-						"order": 1
-					}
-				],
 				"gitlens/scm/title/ai": [
 					{
 						"when": "scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed",
@@ -1147,13 +1146,6 @@
 					{
 						"when": "scmResourceGroup =~ /^(workingTree|index)$/ && scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed",
 						"group": "1_modification_gitlens",
-						"order": 1
-					}
-				],
-				"scm/title": [
-					{
-						"when": "scmProvider == git && gitlens:enabled && !gitlens:readonly && !gitlens:untrusted && gitlens:ai:allowed",
-						"group": "2_gitlens",
 						"order": 1
 					}
 				]
@@ -6677,6 +6669,10 @@
 			"label": "Simulate AI Provider (Debugging)",
 			"commandPalette": "gitlens:enabled && gitlens:debugging"
 		},
+		"gitlens.plus.simulate.notifications": {
+			"label": "Simulate Notifications (Debugging)",
+			"commandPalette": "gitlens:enabled && gitlens:debugging"
+		},
 		"gitlens.plus.simulate.subscription": {
 			"label": "Simulate Subscription (Debugging)",
 			"commandPalette": "gitlens:enabled && gitlens:debugging"
@@ -8283,6 +8279,10 @@
 					}
 				]
 			}
+		},
+		"gitlens.showSettingsPage!notifications": {
+			"label": "Open Notifications",
+			"icon": "$(gear)"
 		},
 		"gitlens.showSettingsPage!remotes-view": {
 			"label": "Open View Settings",
@@ -22036,7 +22036,7 @@
 					"when": "gitlens:launchpad:connected && gitlens:plus:state == 4"
 				},
 				{
-					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22launchpad-view%22%7D)\n\nReactivate your Pro trial and experience Launchpad and all the new Pro features — free for another 14 days!",
+					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22launchpad-view%22%7D)\n\nReactivate your Pro trial and experience Launchpad and all the new Pro features — free for another 14 days! Or [upgrade to Pro](command:gitlens.plus.upgrade?%7B%22source%22%3A%22launchpad-view%22%7D).",
 					"when": "gitlens:launchpad:connected && gitlens:plus:state == 5"
 				}
 			]
@@ -22147,7 +22147,7 @@
 					"when": "!gitlens:views:scm:grouped:loading && gitlens:views:scm:grouped:view == launchpad && gitlens:launchpad:connected && gitlens:plus:state == 4"
 				},
 				{
-					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22launchpad-view%22%7D)\n\nReactivate your Pro trial and experience Launchpad and all the new Pro features — free for another 14 days!",
+					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22launchpad-view%22%7D)\n\nReactivate your Pro trial and experience Launchpad and all the new Pro features — free for another 14 days! Or [upgrade to Pro](command:gitlens.plus.upgrade?%7B%22source%22%3A%22launchpad-view%22%7D).",
 					"when": "!gitlens:views:scm:grouped:loading && gitlens:views:scm:grouped:view == launchpad && gitlens:launchpad:connected && gitlens:plus:state == 5"
 				},
 				{
@@ -22199,7 +22199,7 @@
 					"when": "!gitlens:views:scm:grouped:loading && gitlens:views:scm:grouped:view == worktrees && !gitlens:hasVirtualFolders && gitlens:plus:required && gitlens:plus:state == 4"
 				},
 				{
-					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22worktrees%22%7D)\n\nReactivate your Pro trial and experience Worktrees and all the new Pro features — free for another 14 days!",
+					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22worktrees%22%7D)\n\nReactivate your Pro trial and experience Worktrees and all the new Pro features — free for another 14 days! Or [upgrade to Pro](command:gitlens.plus.upgrade?%7B%22source%22%3A%22worktrees%22%7D).",
 					"when": "!gitlens:views:scm:grouped:loading && gitlens:views:scm:grouped:view == worktrees && !gitlens:hasVirtualFolders && gitlens:plus:required && gitlens:plus:state == 5"
 				},
 				{
@@ -22348,7 +22348,7 @@
 					"when": "gitlens:plus:required && gitlens:plus:state == 4"
 				},
 				{
-					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22worktrees%22%7D)\n\nReactivate your Pro trial and experience Worktrees and all the new Pro features — free for another 14 days!",
+					"contents": "[Continue](command:gitlens.plus.reactivateProTrial?%7B%22source%22%3A%22worktrees%22%7D)\n\nReactivate your Pro trial and experience Worktrees and all the new Pro features — free for another 14 days! Or [upgrade to Pro](command:gitlens.plus.upgrade?%7B%22source%22%3A%22worktrees%22%7D).",
 					"when": "gitlens:plus:required && gitlens:plus:state == 5"
 				},
 				{
