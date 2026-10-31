@@ -954,6 +954,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			container: this.container,
 			host: this.host,
 			getSession: () => this._data.session,
+			getOpenEditorShowOptions: () => this.getOpenEditorShowOptions(),
 			getWipForRepoAndStats: async (repo, signal, options) => {
 				const result = await this._wip.getWipForRepoAndStats(repo, signal, options);
 				// This response goes straight to the client, bypassing the push channel — so the push dedup's
@@ -2241,6 +2242,13 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			// visibility, not window focus), so this re-produce is the only thing that lands.
 			this._wip.flushDeferredWorkingTree();
 			this._wip.recoverDeferredSecondaryWip();
+		}
+	}
+
+	onFocusChanged(focused: boolean): void {
+		// With the graph open twice, the editor's review follows the one the reader last worked in
+		if (focused) {
+			this._inspect.reclaimReview();
 		}
 	}
 

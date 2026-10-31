@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
   - Adds a _Notifications_ section to _GitLens Settings_, with an unread count in its navigation &mdash; filter by all, unread, or read, mark notifications read or unread, delete them, and follow their links
   - Pops up only new security and system notices, and never while notifications are open
   - Paid plans can opt out of marketing notifications
+- Adds review sessions to the _Commit Graph_'s _Review Changes_ mode &mdash; a review is now something you work through rather than a one-off AI report: a checklist of the changed files tracks what you've viewed and brings back a file that changes after, reading controls step through the files in order from the diff editor, and findings and your own comments live as comment threads in the diff, where you can reply to them, dismiss them or hand them to your agent
+- Adds _Orient_ and _Review in Repo_ beside _Review Diff_ &mdash; AI becomes one lens on the review rather than a requirement for it: _Orient_ plans the order to read the files in, _Review Diff_ finds issues in the diff, and _Review in Repo_ hands the changes to your CLI agent, which can build, test and trace call paths in the repository and streams its findings back into the review
 
 ### Changed
 
@@ -25,11 +27,19 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes _Compose Commits_ appearing in both the _Source Control_ title bar's GitLens AI (sparkle) menu and its overflow menu &mdash; it now appears only in the GitLens AI menu
 - Fixes _Change Merge Target_ suggesting a different branch than the views and _Commit Graph_ measure against &mdash; it now pre-selects the same merge target, including one taken from the branch's pull request
 - Fixes the _Commit Graph_'s _Pull Requests_ panel saying it can't list pull requests for Azure DevOps and Azure DevOps Server repositories &mdash; it now lists the repository's open pull requests
-- Fixes AI conflict resolution sending a request for every remaining file after AI becomes unavailable (e.g. the weekly AI allowance runs out mid-run) &mdash; it now stops starting new files and marks the rest with the same error, and the _Commit Graph_'s _Resolve_ mode now chooses the AI model once per run instead of once per request
+- Fixes AI conflict resolution sending a request for every remaining file after AI becomes unavailable (e.g. the weekly AI allowance runs out mid-run) &mdash; it now stops starting new files and also stops when an AI provider rejects its API key, the _Commit Graph_'s _Resolve_ mode now chooses the AI model once per run instead of once per request, and it shows one message explaining why AI is unavailable (with a way to get more AI credits when the allowance runs out) instead of repeating the error on every file
+- Fixes natural language commit search sending a second AI request when the first one fails
+- Fixes AI errors saying "You have exceeded your user token limit" when the weekly AI allowance runs out &mdash; they now say you've reached the weekly AI usage included in your plan
 - Fixes the interactive rebase editor reporting _No Conflicts Detected_ for a rebase that conflicts on Git versions before 2.45 &mdash; conflict detection now needs Git 2.45 or later, and when it can't run it says so instead of reporting no conflicts
 - Fixes the interactive rebase editor's commit list borders taking on the scrollbar color whenever the editor is hovered or focused &mdash; they now keep the theme's separator color
 - Fixes the interactive rebase editor cutting off the last commits in the list when the conflict panel is open and the list's pane is short &mdash; the list now fits its pane and scrolls to the end
+- Fixes the icon buttons in _GitLens Settings_ (e.g. delete and expand on autolinks and custom remotes) showing no hover feedback in high contrast themes
+- Fixes the green success text and checkmarks in _SSH Allowed Signers_ being hard to read in light themes
 - Fixes screen readers announcing popover panels with controls, such as the _Commit Graph_'s account and _Launchpad_ panels, as tooltips &mdash; they're now announced as named dialogs you can Tab into
+- Fixes Jira issues losing their project and silently failing to associate with a branch through _Associate Issue with Branch_ or _Start Work_; unsuccessful associations now show a warning ([#5964](https://github.com/gitkraken/vscode-gitlens/issues/5964))
+- Fixes a focus-area review in the _Commit Graph_'s _Review Changes_ mode ignoring the instructions given for the review, not stopping when its findings are deleted or the review is cancelled, and opening a finding's file without its line range
+- Fixes review findings in the _Commit Graph_'s _Review Changes_ mode pointing at the wrong lines when a review spans staged changes or several commits &mdash; a finding now opens on the line it quotes, or on the file alone when that line is no longer there
+- Fixes _Review Changes_ losing the line numbers of the rest of a hunk after a removed line that starts with `-- ` (such as a SQL or Lua comment) or an added line that starts with `++ `, which left the review's comments on those lines pointing at the wrong place
 
 ## [19.5.0] - 2026-10-27
 

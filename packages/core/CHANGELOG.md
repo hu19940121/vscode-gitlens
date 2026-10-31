@@ -8,12 +8,68 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
+- Adds `Git.rev_parse__work_tree_of_git_dir(gitDir)`, resolving the working tree in `gitDir`'s parent folder that uses `gitDir` as its git dir, or `undefined` when none does (a bare repository) (git-cli)
+- Adds `scopeConcurrency?: number` to `IntegrationManager.listPullRequestsPage` (repo-scoped reads only), `listIssuesPage`, and `sweepPullRequests`/`sweepClosedPullRequests`, setting the most per-repository requests (per-project for Azure DevOps issues) one provider read keeps in flight. Defaults to 6; a value that isn't a finite number of at least 1 falls back to the default, and a fraction is truncated. A sweep runs up to 6 targets at once, each with this bound (plus/integrations)
+- Adds `includeRemoteInfo?: boolean` to `IntegrationManager.listPullRequestsPage` (repo-scoped reads only) and `sweepPullRequests`/`sweepClosedPullRequests` (repo-scoped targets), an opt-out for the Azure DevOps lookup that fills each row's clone URLs. `false` saves one request per repository (and fork source) per page, at the cost of rows carrying no `refs.base.url`/`refs.head.url` (empty) and no `cloneHttps`/`cloneSsh`. Defaults to `true`, the existing behavior; other providers ignore it (plus/integrations)
+- Adds several targets per provider to `IntegrationManager.sweepPullRequests`/`sweepClosedPullRequests`, one per connection (for example two GitHub Enterprise installations, two Bitbucket Data Center servers or two github.com accounts): `targets` now accepts any number of `ProviderSweepTarget`s of one provider as long as each names a `connectionId` or, on a self-managed host, a `domain`, and a repeat (matched by host however its `domain` is spelled) or an unnamed target beside a named one of the same provider throws a `TypeError`. `ProviderSweepTarget.repos` gives each target its own repositories, overriding the sweep-level `repos` (an empty array reads that target account-wide), and `ProviderSweepResult.failedTargets`/`incompleteTargets` (`ProviderSweepTargetRef[]`: `providerId`, `connectionId`, resolved `domain`) attribute failures per connection, with `failedProviderIds` now listing a provider only when every one of its targets failed and `incompleteProviderIds` any provider with a failed or incomplete target beside one that returned. A sweep with one target per provider is unchanged (plus/integrations)
 - Adds the `plus/notifications` subpaths (`context.js`, `errors.js`, `models.js`, `notificationsService.js` and `presentation.js`): a client and state holder for GitKraken `notifications-service-v2` notifications filtered by product, with a host-implemented `NotificationsContext`. See [`docs/notifications.md`](./docs/notifications.md) (plus/notifications)
+
+### Changed
+
+- Bounds the repository and project fan-out of repo-scoped pull request and issue reads (`listPullRequestsPage`, `listIssuesPage` and the pull request sweeps) to 6 requests in flight, instead of one request per repository at once. This applies to the hosts that read repository by repository: pull requests on GitLab, GitLab self-managed, Bitbucket Cloud, Bitbucket Data Center and Azure DevOps, and issues on GitLab, GitLab self-managed and Azure DevOps (per project). Results, ordering and per-repository failure isolation are unchanged; GitHub/GHE already send one query whatever the repo count (plus/integrations)
 
 ### Fixed
 
+- Fixes `getRepositoryInfo` (and `Git.rev_parse__show_toplevel`) resolving a path inside a repository's `.git` folder — `.git/refs`, `.git/rebase-merge` during a rebase — to that `.git` folder as a bare repository when the repo's config has no `core.bare` line, so a host registered it as a second repository named `.git`. Git guesses "bare" from inside a git dir when `core.bare` is unset; a git dir whose parent folder is a working tree using it now resolves to that working tree. Real bare repos, including a bare clone named `.git` beside its worktrees and a `.bare` folder behind a `.git` file, still resolve to themselves (git-cli)
+- Fixes Bitbucket Data Center repo-scoped pull request reads (`listPullRequestsPage` with `repos` and the pull request sweeps with `repos`) reading only the first page of each repository: a repository with more open pull requests than one page (50 by default) came back `page.truncated` and was never continued, and `page: 2` re-read page 1. Bitbucket Data Center now reads repository by repository like the other numbered hosts, with a continuation cursor per repository, `page` honored, the 6-in-flight bound, and a failed repository attributed as its own scope with its cause (plus/integrations)
+- Fixes GitHub GraphQL throttling (HTTP 200 with an `errors` entry of type `RATE_LIMITED` or `RATE_LIMIT`) being reported as `kind: 'other'` instead of `'rate-limit'` on repo-scoped GitHub and GitHub Enterprise pull request and issue reads (`listPullRequestsPage`, `listIssuesPage` and the pull request sweeps with `repos`), which provider-apis serves and throws without a response status. Core's own GitHub reads now also classify a rate limit that isn't the first GraphQL error (plus/integrations, plus/git-github)
+- Fixes one connection's failed requests disconnecting another connection of the same provider: an integration counted the failures that disconnect it after five (a 4xx, a server error or timeout, or a refused token its forced refresh could not recover) in one budget shared by every connection it reads, so a secondary account read by `connectionId` (e.g. a second target of one provider in `sweepPullRequests`) failing five times dropped the primary account's session and announced the disconnect, and a success on any connection wiped every other connection's count. The budget is now per connection: a read naming the primary's `connectionId` shares the primary's, only the primary's limit disconnects, and a secondary that reaches it keeps reporting each failure on its own reads (plus/integrations, git, plus/git-github)
+- Fixes `getIgnoredPaths` throwing for the whole batch when git refuses one path in it, such as a path beyond a symlink (`fatal: pathspec '...' is beyond a symbolic link`), inside a submodule, outside the repository, or empty. Git answers every path before the one it refuses, so only the paths after it are asked again, less the rest of a folder refused for a symlink or submodule: a refused path counts as not ignored, even alone, and each path is answered once, in one `check-ignore` run plus one per refusal. It still rejects, after one run, when git fails for any other reason, and on cancellation (git-cli)
 - Fixes `fetch`, `pull` and `push` with a remote-tracking branch reference that carries an `upstream` (as a host's remote branch refs may, with the remote's own name) using that name as the branch to fetch or push to, e.g. `git fetch upstream upstream`: `getBranchTrackingWithoutRemote` now returns `undefined` for a remote-tracking branch, and `fetch` reads the branch's own name (git, git-cli)
 - Fixes a git command that fails to launch, such as one run in a folder that no longer exists, keeping the Node process alive for the full git timeout (60 seconds by default): Node clears a spawn's timeout timer only when the process exits, which a failed launch never does, so a short-lived host could hang before exiting. The default spawner now also clears it when the process closes, as Node itself does in [nodejs/node#65506](https://github.com/nodejs/node/pull/65506). A custom `spawn` still receives `timeout` and handles it itself ([#6105](https://github.com/gitkraken/vscode-gitlens/pull/6105)) (git-cli)
+
+## [0.24.0] - 2026-10-28
+
+### Changed
+
+- Changes Linear's user-scoped tracker read (`listIssueTrackerIssuesPage` without `includeAllAssignees`, and `IssuesIntegration.getIssuesForProject*` with `options.user`) to also return the GitHub-synced issues the viewer created, not only those assigned to them. Linear's two-way GitHub Issues sync makes the author of a GitHub issue (one who linked their GitHub account to Linear) the creator of its Linear copy but assigns no one the GitHub issue doesn't, so the Linear copy of a GitHub issue the user filed was never read and a host showed only its GitHub copy. Only issues with a GitHub issue attachment and a GitHub sync link (`syncedWith` not `[]`) widen, so the rest of what the viewer created in Linear stays out; a synced row whose link list Linear failed to resolve is kept rather than silently dropped. Asking for `filters: [IssueFilter.Assignee]` by name still reads only assigned issues. Still one query per page; the wider match can take more pages. Requires `@gitkraken/provider-apis` with `LinearGetIssuesInput.githubSyncedCreators`; an older one ignores it and reads assigned issues only ([gitkraken/kepler#4480](https://github.com/gitkraken/kepler/issues/4480)) (plus/integrations)
+
+## [0.23.0] - 2026-10-28
+
+### Added
+
+- Adds `IntegrationManager.listLinearProjects(options?: { connectionId?; forceSync? })`, returning `ProviderResult<ProviderLinearProjectShape>` (`{ id; providerId; name; state; url }`): the Linear workspace's Projects, Linear's own `Project` entity, apart from the teams `listProjects` returns for Linear. Drained across Linear's pages up to 2,000 Projects and cached per connection like the team list; a drain it could not finish keeps what it read and is reported with a warning and `fetchFailed`, and is not cached ([#6100](https://github.com/gitkraken/vscode-gitlens/issues/6100)) (plus/integrations)
+- Adds `linearProjects?: string[]` to `listIssueTrackerIssuesPage`, narrowing a Linear read server-side to issues in any of those Projects (by `listLinearProjects`' `id`). It narrows each team's read rather than replacing the team window, so it combines with `org`/`project`, `includeAllAssignees`, `state` and `sort`, and a narrowed team that hits its backstop still reports `page.truncated`. Other trackers refuse it with a warning and `fetchFailed`, and a cursor minted under other Projects is refused ([#6100](https://github.com/gitkraken/vscode-gitlens/issues/6100)) (plus/integrations)
+
+## [0.22.1] - 2026-10-28
+
+### Fixed
+
+- Reports Jira issue reads against unknown sites or invalid installation paths as failures, preserving genuine missing-issue responses as absences ([#5981](https://github.com/gitkraken/vscode-gitlens/issues/5981)) (plus/integrations)
+
+## [0.22.0] - 2026-10-27
+
+### Added
+
+- Adds Jira Data Center project autolinks for commit messages and branch names, preserving installation context paths and skipping projects without a real key ([#6015](https://github.com/gitkraken/vscode-gitlens/issues/6015)) (plus/integrations)
+- Adds `IntegrationManager.getAutolinkReferences` for connection-scoped Jira Cloud and Data Center references, with awaited cold discovery and `forceSync` invalidation. Match references with the existing `git/utils/autolink.utils.js` helpers (plus/integrations)
+- Adds an optional `maxResults` budget to `getAutolinks` for bounded static-reference materialization, preserving unlimited matching by default (git)
+
+## [0.21.0] - 2026-10-27
+
+### Added
+
+- Adds `syncedWith?: IssueSyncedWith[]` to `IssueShape`/`Issue`: on a Linear row, the GitHub issues Linear's two-way GitHub Issues sync keeps it in sync with, so a host reading both providers can show a synced pair once instead of twice. Each entry is `{ provider: 'github'; id; owner; repo; number }`, where `id` is the GitHub issue's database id (its REST `id`) as Linear stored it, and `owner`, `repo` and `number` are all set, or all absent when Linear reports the link without them or failed to resolve that link's details. A GitHub row's `nodeId` is its GraphQL node ID, not that id, so a host matches a GitHub row on the coordinates, comparing `owner` and `repo` case-insensitively as GitHub does; Linear's link names no host and Linear also syncs with GitHub Enterprise Cloud, so the same coordinates on two hosts can't be told apart from the row alone. `[]` on a Linear row synced with nothing; absent on every other provider, and on a Linear row whose link list Linear failed to resolve, so absence means unknown rather than unsynced. Requires `@gitkraken/provider-apis` with `Issue.syncedWith` (GKDEV-3662) ([gitkraken/kepler#4428](https://github.com/gitkraken/kepler/issues/4428)) (git, plus/integrations)
+
+### Changed
+
+- Changes a Linear row's `getIssuesBatch` etag to list its sync links, each as its GitHub issue id and coordinates, which the cheap check now reads too, so a link added or removed, or its coordinates filled in or changed, is seen even when Linear leaves the update time alone. Every Linear etag a host holds from before misses once and costs one full read. A row without `syncedWith` never compares unchanged, and an issue whose link list Linear failed to resolve on the cheap check falls through to its full read rather than failing its team's check, unless the failure is throttling ([gitkraken/kepler#4428](https://github.com/gitkraken/kepler/issues/4428)) (plus/integrations)
+
+## [0.20.2] - 2026-10-27
+
+### Fixed
+
+- Fixes Jira issues losing their actual project id, name and site resource id when the provider supplies no namespace. The project's `resourceName` stays empty when no site display name is available; no site or project identity is synthesized. Other providers retain their namespace requirement ([#5964](https://github.com/gitkraken/vscode-gitlens/issues/5964)) (plus/integrations)
 
 ## [0.20.1] - 2026-10-26
 
@@ -989,7 +1045,13 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Initial release. Bundles `@gitlens/utils`, `@gitlens/git`, `@gitlens/git-cli`, `@gitlens/ai`, and `@gitlens/git-github` into a single core npm package with subpath exports.
 
-[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.20.1...HEAD
+[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.24.0...HEAD
+[0.24.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.23.0...gitkraken:releases/core/v0.24.0
+[0.23.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.22.1...gitkraken:releases/core/v0.23.0
+[0.22.1]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.22.0...gitkraken:releases/core/v0.22.1
+[0.22.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.21.0...gitkraken:releases/core/v0.22.0
+[0.21.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.20.2...gitkraken:releases/core/v0.21.0
+[0.20.2]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.20.1...gitkraken:releases/core/v0.20.2
 [0.20.1]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.20.0...gitkraken:releases/core/v0.20.1
 [0.20.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.19.0...gitkraken:releases/core/v0.20.0
 [0.19.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.18.0...gitkraken:releases/core/v0.19.0
