@@ -8,16 +8,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
-- Adds `Git.rev_parse__work_tree_of_git_dir(gitDir)`, resolving the working tree in `gitDir`'s parent folder that uses `gitDir` as its git dir, or `undefined` when none does (a bare repository) (git-cli)
-- Adds `scopeConcurrency?: number` to `IntegrationManager.listPullRequestsPage` (repo-scoped reads only), `listIssuesPage`, and `sweepPullRequests`/`sweepClosedPullRequests`, setting the most per-repository requests (per-project for Azure DevOps issues) one provider read keeps in flight. Defaults to 6; a value that isn't a finite number of at least 1 falls back to the default, and a fraction is truncated. A sweep runs up to 6 targets at once, each with this bound (plus/integrations)
-- Adds `includeRemoteInfo?: boolean` to `IntegrationManager.listPullRequestsPage` (repo-scoped reads only) and `sweepPullRequests`/`sweepClosedPullRequests` (repo-scoped targets), an opt-out for the Azure DevOps lookup that fills each row's clone URLs. `false` saves one request per repository (and fork source) per page, at the cost of rows carrying no `refs.base.url`/`refs.head.url` (empty) and no `cloneHttps`/`cloneSsh`. Defaults to `true`, the existing behavior; other providers ignore it (plus/integrations)
-- Adds several targets per provider to `IntegrationManager.sweepPullRequests`/`sweepClosedPullRequests`, one per connection (for example two GitHub Enterprise installations, two Bitbucket Data Center servers or two github.com accounts): `targets` now accepts any number of `ProviderSweepTarget`s of one provider as long as each names a `connectionId` or, on a self-managed host, a `domain`, and a repeat (matched by host however its `domain` is spelled) or an unnamed target beside a named one of the same provider throws a `TypeError`. `ProviderSweepTarget.repos` gives each target its own repositories, overriding the sweep-level `repos` (an empty array reads that target account-wide), and `ProviderSweepResult.failedTargets`/`incompleteTargets` (`ProviderSweepTargetRef[]`: `providerId`, `connectionId`, resolved `domain`) attribute failures per connection, with `failedProviderIds` now listing a provider only when every one of its targets failed and `incompleteProviderIds` any provider with a failed or incomplete target beside one that returned. A sweep with one target per provider is unchanged (plus/integrations)
-- Adds the `plus/notifications` subpaths (`context.js`, `errors.js`, `models.js`, `notificationsService.js` and `presentation.js`): a client and state holder for GitKraken `notifications-service-v2` notifications filtered by product, with a host-implemented `NotificationsContext`. See [`docs/notifications.md`](./docs/notifications.md) (plus/notifications)
 - Adds `trimTrailingSlashes` to `utils/path.js`, trimming every trailing `/` where `trimTrailingSlash` trims one, in a linear scan (utils)
-
-### Changed
-
-- Bounds the repository and project fan-out of repo-scoped pull request and issue reads (`listPullRequestsPage`, `listIssuesPage` and the pull request sweeps) to 6 requests in flight, instead of one request per repository at once. This applies to the hosts that read repository by repository: pull requests on GitLab, GitLab self-managed, Bitbucket Cloud, Bitbucket Data Center and Azure DevOps, and issues on GitLab, GitLab self-managed and Azure DevOps (per project). Results, ordering and per-repository failure isolation are unchanged; GitHub/GHE already send one query whatever the repo count (plus/integrations)
 
 ### Removed
 
@@ -26,6 +17,52 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 ### Fixed
 
 - Fixes trimming trailing slashes in `getIgnoredPaths`/`getIgnoredEntries` path handling and in self-managed host and URL normalization taking quadratic time on a long run of `/` that doesn't end the value; results are unchanged (git-cli, plus/integrations)
+
+## [0.28.0] - 2026-11-02
+
+### Added
+
+- Adds `isFork?: boolean` and `parent?: { owner: string; name: string; project?: string }` to `RepositoryIdentity` (`IntegrationManager.resolveRepository`), the repository a fork was made from, on the same host as the identity (`project` is set only for Azure DevOps). `resolveRepository` reads them from the `isFork` and `parent: { namespace, name, project? }` fields of the `@gitkraken/provider-apis` repository for GitHub, GitHub Enterprise, Bitbucket Cloud, Bitbucket Data Center and Azure DevOps, which the SDK does not return yet: until it does, both stay `undefined`, and a consumer can patch the SDK to return them. `isFork` is `true` for a fork and `false` only when the provider reports the repository is not one; `parent` is set only for a fork whose parent it names (a named parent alone reports a fork). A missing `parent` is never proof of "not a fork" unless `isFork` is `false`, and `undefined` means the provider didn't say (plus/integrations)
+
+## [0.27.0] - 2026-11-02
+
+### Changed
+
+- **Breaking (plus/git-github)** — `GitHubApi.getPullRequestsForBranches` takes one query per base repository and branch, with `headOwners` listing every head owner to answer from it (`undefined` for the base repository), instead of one target per `headOwner`. Each answer's `pullRequests` now holds one list per head owner, in `headOwners` order, and `truncated` is the query's, shared by its owners. A caller passing targets with `headOwner` must group them into queries
+
+### Fixed
+
+- Fixes `getPullRequestsForBranches` on GitHub and GitHub Enterprise sending the same GraphQL query once per target when targets differ only by `headOwner`, since the owner filter runs on the returned rows. One branch in a repository with 12 fork remotes sent 144 aliases where 12 distinct queries would do, draining a user's GraphQL quota in about 20 minutes. Targets naming the same repository (ignoring case) and branch now share one aliased query, so a request carries up to 25 distinct repository-and-branch queries however many owners ask them; results stay one per target, in order. A query that fails now drops every target that shares it, while the other targets still answer (plus/integrations, plus/git-github)
+
+## [0.26.0] - 2026-11-02
+
+### Added
+
+- Adds `refreshIndexAfterWrites?: boolean` to `CliGitProviderOptions` and `createCliGitService`'s options, off by default. When on, `checkout`, `restore`, `merge`, `pull`, `reset`, `cherryPick`, `revert`, `rebase`, `createWorktree`, `clone`, stash apply, pop and push, and abort and continue of a paused operation refresh the checkout's index in the background when the write rewrote it, including one that stops on conflicts. Files written in the index's own second are "racily clean", so every later status or diff re-hashed them (~600 ms on 8,000 files) until something rewrote the index, which core's status reads (run with `GIT_OPTIONAL_LOCKS=0`) never do. Once the clock passes that second, one `git status --porcelain -uno --ignore-submodules=all` with optional locks on and rename detection off writes the refreshed index (~7 ms reads after). A write that left the index alone (already up to date, a soft reset) schedules none; writes to one checkout share one refresh. Each costs a background status of the whole checkout, worth it only where that checkout will be read again, so it is off by default (git-cli)
+- Adds `scheduleIndexRefresh?(repoPath)` to `GitOperationsSubProvider` (`service.forRepo(path).ops?.scheduleIndexRefresh?.()`), for a host that rewrote a checkout through a raw git command: it joins the per-checkout background index refresh core's own writes schedule under `refreshIndexAfterWrites`, and runs whether or not that is on (git, git-cli)
+
+### Changed
+
+- Changes `getGitDir` to read the git dir and common git dir of a main or linked worktree from disk (its `.git` folder or file, `commondir`), instead of spawning `git rev-parse`, with the same answer. It still asks git for any other layout: a submodule, a bare repository, a worktree nested inside another repository's working tree (including its own main checkout), a `.git` file without `commondir`, `core.worktree`, `core.bare` or an `include` in its config, `GIT_DIR`/`GIT_COMMON_DIR`/`GIT_WORK_TREE`/`GIT_CEILING_DIRECTORIES` in git's environment, a folder owned by another user (not checked on Windows, where the process has no uid), or an untrusted workspace. Resolving N sibling worktrees now runs no git process (was N). `onGitDirResolveFailed` fires only when git is asked (git-cli)
+- Changes `WorktreeSummaryService` to check a subscribed worktree's own branch, its upstream and the ahead/behind counts against it as core's cached `getBranch` answers them, and its base tips against core's cached ref list (one `for-each-ref` shared by the repository's checkouts), when a change may have moved them without naming them — a packed-refs rewrite (deleting a packed branch, `git pack-refs`), a ref directory, an overflow or a poll — and to read only the groups whose refs moved. Deleting a packed branch now costs each subscribed worktree no git process of its own (was ~6–8: `diff --quiet HEAD`, `ls-files --others`, `merge-base --fork-point` ×2, `@{u}`, `rev-list --left-right --count`). A base ref the check finds moved is re-measured rather than read in full (git)
+
+## [0.25.0] - 2026-10-30
+
+### Added
+
+- Adds `Git.rev_parse__work_tree_of_git_dir(gitDir)`, resolving the working tree in `gitDir`'s parent folder that uses `gitDir` as its git dir, or `undefined` when none does (a bare repository) (git-cli)
+- Adds `scopeConcurrency?: number` to `IntegrationManager.listPullRequestsPage` (repo-scoped reads only), `listIssuesPage`, and `sweepPullRequests`/`sweepClosedPullRequests`, setting the most per-repository requests (per-project for Azure DevOps issues) one provider read keeps in flight. Defaults to 6; a value that isn't a finite number of at least 1 falls back to the default, and a fraction is truncated. A sweep runs up to 6 targets at once, each with this bound (plus/integrations)
+- Adds `includeRemoteInfo?: boolean` to `IntegrationManager.listPullRequestsPage` (repo-scoped reads only) and `sweepPullRequests`/`sweepClosedPullRequests` (repo-scoped targets), an opt-out for the Azure DevOps lookup that fills each row's clone URLs. `false` saves one request per repository (and fork source) per page, at the cost of rows carrying no `refs.base.url`/`refs.head.url` (empty) and no `cloneHttps`/`cloneSsh`. Defaults to `true`, the existing behavior; other providers ignore it (plus/integrations)
+- Adds several targets per provider to `IntegrationManager.sweepPullRequests`/`sweepClosedPullRequests`, one per connection (for example two GitHub Enterprise installations, two Bitbucket Data Center servers or two github.com accounts): `targets` now accepts any number of `ProviderSweepTarget`s of one provider as long as each names a `connectionId` or, on a self-managed host, a `domain`, and a repeat (matched by host however its `domain` is spelled) or an unnamed target beside a named one of the same provider throws a `TypeError`. `ProviderSweepTarget.repos` gives each target its own repositories, overriding the sweep-level `repos` (an empty array reads that target account-wide), and `ProviderSweepResult.failedTargets`/`incompleteTargets` (`ProviderSweepTargetRef[]`: `providerId`, `connectionId`, resolved `domain`) attribute failures per connection, with `failedProviderIds` now listing a provider only when every one of its targets failed and `incompleteProviderIds` any provider with a failed or incomplete target beside one that returned. A sweep with one target per provider is unchanged (plus/integrations)
+- Adds the `plus/notifications` subpaths (`context.js`, `errors.js`, `models.js`, `notificationsService.js` and `presentation.js`): a client and state holder for GitKraken `notifications-service-v2` notifications filtered by product, with a host-implemented `NotificationsContext`. See [`docs/notifications.md`](./docs/notifications.md) (plus/notifications)
+
+### Changed
+
+- Bounds the repository and project fan-out of repo-scoped pull request and issue reads (`listPullRequestsPage`, `listIssuesPage` and the pull request sweeps) to 6 requests in flight, instead of one request per repository at once. This applies to the hosts that read repository by repository: pull requests on GitLab, GitLab self-managed, Bitbucket Cloud, Bitbucket Data Center and Azure DevOps, and issues on GitLab, GitLab self-managed and Azure DevOps (per project). Results, ordering and per-repository failure isolation are unchanged; GitHub/GHE already send one query whatever the repo count (plus/integrations)
+
+### Fixed
+
+- Fixes self-managed integration reauthentication disconnecting other connections of the same provider: forced reauthentication now validates and disconnects only the selected connection's token (plus/integrations)
 - Fixes `getRepositoryInfo` (and `Git.rev_parse__show_toplevel`) resolving a path inside a repository's `.git` folder — `.git/refs`, `.git/rebase-merge` during a rebase — to that `.git` folder as a bare repository when the repo's config has no `core.bare` line, so a host registered it as a second repository named `.git`. Git guesses "bare" from inside a git dir when `core.bare` is unset; a git dir whose parent folder is a working tree using it now resolves to that working tree. Real bare repos, including a bare clone named `.git` beside its worktrees and a `.bare` folder behind a `.git` file, still resolve to themselves (git-cli)
 - Fixes Bitbucket Data Center repo-scoped pull request reads (`listPullRequestsPage` with `repos` and the pull request sweeps with `repos`) reading only the first page of each repository: a repository with more open pull requests than one page (50 by default) came back `page.truncated` and was never continued, and `page: 2` re-read page 1. Bitbucket Data Center now reads repository by repository like the other numbered hosts, with a continuation cursor per repository, `page` honored, the 6-in-flight bound, and a failed repository attributed as its own scope with its cause (plus/integrations)
 - Fixes GitHub GraphQL throttling (HTTP 200 with an `errors` entry of type `RATE_LIMITED` or `RATE_LIMIT`) being reported as `kind: 'other'` instead of `'rate-limit'` on repo-scoped GitHub and GitHub Enterprise pull request and issue reads (`listPullRequestsPage`, `listIssuesPage` and the pull request sweeps with `repos`), which provider-apis serves and throws without a response status. Core's own GitHub reads now also classify a rate limit that isn't the first GraphQL error (plus/integrations, plus/git-github)
@@ -1051,7 +1088,11 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Initial release. Bundles `@gitlens/utils`, `@gitlens/git`, `@gitlens/git-cli`, `@gitlens/ai`, and `@gitlens/git-github` into a single core npm package with subpath exports.
 
-[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.24.0...HEAD
+[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.28.0...HEAD
+[0.28.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.27.0...gitkraken:releases/core/v0.28.0
+[0.27.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.26.0...gitkraken:releases/core/v0.27.0
+[0.26.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.25.0...gitkraken:releases/core/v0.26.0
+[0.25.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.24.0...gitkraken:releases/core/v0.25.0
 [0.24.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.23.0...gitkraken:releases/core/v0.24.0
 [0.23.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.22.1...gitkraken:releases/core/v0.23.0
 [0.22.1]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.22.0...gitkraken:releases/core/v0.22.1
