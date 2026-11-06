@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 ### Changed
 
 - Changes GitLens webview colors to follow your theme more closely &mdash; banner text uses the theme's text color instead of pure white or black, the _Security_ and _System_ notification chips use the theme's warning colors instead of the Git conflict red, and autocomplete dropdowns use VS Code's suggestion colors
+- Changes the _Commit Graph_ to follow your theme more closely &mdash; the search box uses VS Code's input colors, the amend commit button uses the theme's warning colors, and info, success and warning marks use the theme's colors instead of fixed ones
 - Changes the Pro feature gates, the feature badge, the _Commit Graph_ account chip, _GitLens Settings_ → _Account_, the Welcome page and the Pro-gated view prompts to offer _Upgrade to Pro_ alongside _Reactivate Pro Trial_, so an account the server won't reactivate isn't left without a path to Pro ([#6010](https://github.com/gitkraken/vscode-gitlens/issues/6010))
 
 ### Fixed
@@ -30,6 +31,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes _Change Merge Target_ suggesting a different branch than the views and _Commit Graph_ measure against &mdash; it now pre-selects the same merge target, including one taken from the branch's pull request
 - Fixes the _Commit Graph_'s _Pull Requests_ panel saying it can't list pull requests for Azure DevOps and Azure DevOps Server repositories &mdash; it now lists the repository's open pull requests
 - Fixes AI conflict resolution sending a request for every remaining file after AI becomes unavailable (e.g. the weekly AI allowance runs out mid-run) &mdash; it now stops starting new files and also stops when an AI provider rejects its API key, the _Commit Graph_'s _Resolve_ mode now chooses the AI model once per run instead of once per request, and it shows one message explaining why AI is unavailable (with a way to get more AI credits when the allowance runs out) instead of repeating the error on every file
+- Fixes [#6118](https://github.com/gitkraken/vscode-gitlens/issues/6118) - AI conflict resolution with Copilot kept sending a request for every remaining file after Copilot's usage limit or rate limit was reached &mdash; it now stops and says why, naming Copilot's own limit instead of pointing to GitKraken AI credits, and it also stops when Copilot throttles requests or the selected model is unavailable
 - Fixes natural language commit search sending a second AI request when the first one fails
 - Fixes AI errors saying "You have exceeded your user token limit" when the weekly AI allowance runs out &mdash; they now say you've reached the weekly AI usage included in your plan
 - Fixes the interactive rebase editor reporting _No Conflicts Detected_ for a rebase that conflicts on Git versions before 2.45 &mdash; conflict detection now needs Git 2.45 or later, and when it can't run it says so instead of reporting no conflicts
@@ -43,6 +45,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes the selected suggestion in GitLens autocomplete dropdowns (e.g. the _Commit Graph_ search) being invisible in high contrast themes
 - Fixes the error banner in _Visual File History_, _GitLens Settings_ and _Inspect_ having no visible edge in high contrast themes
 - Fixes links in the Pro feature badge's popup showing as plain text instead of in the link color
+- Fixes buttons across the _Commit Graph_ (e.g. the side bar, header actions, overview, details pane, review mode and sheets) showing no hover feedback in high contrast themes
+- Fixes error banners in the _Commit Graph_ (e.g. _Git Health_, compare and the rebase summary) showing red text on a red background
+- Fixes the _Commit Graph_'s details pane showing bands of the graph's background color when the Graph is open in an editor, and agent markers showing the side bar color behind them when the Graph is in the side bar or panel
 - Fixes screen readers announcing popover panels with controls, such as the _Commit Graph_'s account and _Launchpad_ panels, as tooltips &mdash; they're now announced as named dialogs you can Tab into
 - Fixes Jira issues losing their project and silently failing to associate with a branch through _Associate Issue with Branch_ or _Start Work_; unsuccessful associations now show a warning ([#5964](https://github.com/gitkraken/vscode-gitlens/issues/5964))
 - Fixes a focus-area review in the _Commit Graph_'s _Review Changes_ mode ignoring the instructions given for the review, not stopping when its findings are deleted or the review is cancelled, and opening a finding's file without its line range
