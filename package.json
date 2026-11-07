@@ -6379,6 +6379,16 @@
 				}
 			},
 			{
+				"id": "gitlens.queuedPullRequestIconColor",
+				"description": "%color.gitlens.queuedPullRequestIconColor.description%",
+				"defaults": {
+					"dark": "#d29922",
+					"light": "#9a6700",
+					"highContrast": "#d29922",
+					"highContrastLight": "#9a6700"
+				}
+			},
+			{
 				"id": "gitlens.mergedPullRequestIconColor",
 				"description": "%color.gitlens.mergedPullRequestIconColor.description%",
 				"defaults": {
@@ -13596,6 +13606,13 @@
 				"default": {
 					"fontPath": "dist/glicons.woff2",
 					"fontCharacter": "\\f15c"
+				}
+			},
+			"gitlens-provider-asana": {
+				"description": "provider-asana icon",
+				"default": {
+					"fontPath": "dist/glicons.woff2",
+					"fontCharacter": "\\f15d"
 				}
 			}
 		},

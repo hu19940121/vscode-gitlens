@@ -1224,7 +1224,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server'
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server'
 }
 ```
 
@@ -1235,7 +1235,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server'
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server'
 }
 ```
 
@@ -1246,7 +1246,7 @@ void
 ```typescript
 {
   'issueProvider.key': string,
-  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server'
+  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server'
 }
 ```
 
@@ -1257,7 +1257,7 @@ void
 ```typescript
 {
   'issueProvider.key': string,
-  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server'
+  'issueProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server'
 }
 ```
 
@@ -1291,7 +1291,7 @@ void
 
 ```typescript
 {
-  'integration.id': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server'
+  'integration.id': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server'
 }
 ```
 
@@ -5904,7 +5904,7 @@ void
 {
   'instance': number,
   'items.error': string,
-  'action': 'merge' | 'open' | 'open-changes' | 'open-in-graph' | 'open-worktree' | 'pin' | 'rebase-stack' | 'show-overview' | 'snooze' | 'soft-open' | 'start-review' | 'switch' | 'unpin' | 'unsnooze',
+  'action': 'dequeue' | 'merge' | 'open' | 'open-changes' | 'open-in-graph' | 'open-worktree' | 'pin' | 'rebase-stack' | 'show-overview' | 'snooze' | 'soft-open' | 'start-review' | 'switch' | 'unpin' | 'unsnooze',
   'groups.blocked.collapsed': boolean,
   'groups.blocked.count': number,
   'groups.count': number,
@@ -5914,6 +5914,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -5953,6 +5955,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -5991,6 +5995,8 @@ or
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -6040,7 +6046,7 @@ or
   'instance': number,
   'items.error': string,
   'collapsed': boolean,
-  'group': 'blocked' | 'current-branch' | 'draft' | 'follow-up' | 'mergeable' | 'needs-review' | 'other' | 'pinned' | 'snoozed' | 'waiting-for-review',
+  'group': 'blocked' | 'current-branch' | 'draft' | 'follow-up' | 'merge-queue' | 'mergeable' | 'needs-review' | 'other' | 'pinned' | 'snoozed' | 'waiting-for-review',
   'groups.blocked.collapsed': boolean,
   'groups.blocked.count': number,
   'groups.count': number,
@@ -6050,6 +6056,8 @@ or
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -6116,6 +6124,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -6166,6 +6176,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -6204,6 +6216,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -6243,6 +6257,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -6281,6 +6297,8 @@ void
   'groups.draft.count': number,
   'groups.follow-up.collapsed': boolean,
   'groups.follow-up.count': number,
+  'groups.merge-queue.collapsed': boolean,
+  'groups.merge-queue.count': number,
   'groups.mergeable.collapsed': boolean,
   'groups.mergeable.count': number,
   'groups.needs-review.collapsed': boolean,
@@ -7089,7 +7107,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server',
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server',
   // @deprecated: true
   'remoteProviders.key': string
 }
@@ -7102,7 +7120,7 @@ void
 ```typescript
 {
   'hostingProvider.key': string,
-  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'jira-server',
+  'hostingProvider.provider': 'github' | 'gitlab' | 'bitbucket' | 'azureDevOps' | 'bitbucket-server' | 'cloud-github-enterprise' | 'cloud-gitlab-self-hosted' | 'azure-devops-server' | 'jira' | 'linear' | 'trello' | 'asana' | 'jira-server',
   // @deprecated: true
   'remoteProviders.key': string
 }
