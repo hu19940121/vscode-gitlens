@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Adds review sessions to the _Commit Graph_'s _Review Changes_ mode &mdash; a review is now something you work through, with or without AI, rather than a one-off AI report ([gitkraken/vscode-gitlens-private#100](https://github.com/gitkraken/vscode-gitlens-private/issues/100))
   - Adds a checklist of the changed files that tracks what you've viewed and brings back any file that changes afterward
-  - Adds reading controls to the diff editor that step through the review's files in order
+  - Adds reading controls to the diff editor that step through the review's files not yet viewed (<kbd>Alt</kbd>+click steps in list order)
   - Adds comment threads in the diff for AI findings and your own comments &mdash; reply to them, dismiss them, or hand them to your agent
   - Adds _Orient_ beside _Review Diff_ &mdash; _Orient_ has AI plan the order to read the files in, while _Review Diff_ finds issues in the diff
   - Adds _Review in Repo_ &mdash; hands the changes to your CLI agent, which can build, test and trace call paths in the repository and streams its findings back into the review
@@ -29,15 +29,27 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Adds Asana as an issue integration &mdash; connect your Asana account from _GitLens Home_ to see the Asana tasks associated with your branches on the _Commit Graph_
 - Adds autolinks for _Jira Data Center_ projects &mdash; issue keys in commit messages and branch names now link to issues on your connected Jira Data Center instance ([#6015](https://github.com/gitkraken/vscode-gitlens/issues/6015))
 - Adds _Open Session in Kepler_ to agent sessions in the _Commit Graph_ &mdash; from the _Agents_ sidebar, session cards, the agent status pill, or a session's context menu (when Kepler is installed)
+- Adds installing Kepler right from GitLens, with no admin rights needed &mdash; _Install Kepler_ downloads and verifies the latest Kepler and installs it for you, showing its progress
+  - Adds _Install Kepler_ and _Learn More_ to the _Try Kepler_ banners in _GitLens Settings_ and the _Commit Graph_'s _Agents_ sidebar, and to the Kepler step of the _Welcome_ view walkthrough; adds a _GitLens: Install Kepler_ command
+  - Replaces the "Kepler isn't installed" warning with a picker that offers to install Kepler and then carries on with what you started &mdash; or, for a pull request review, to continue without Kepler; in _Start Work_ and _Start PR Review_ it's the next step, so you can go back
+  - Opens the Kepler download page instead in remote windows (Remote - SSH, WSL, Dev Containers), since Kepler runs on your own machine
+- Adds support for the latest AI models &mdash; Claude Fable 5.2, Opus 5.5, Sonnet 5.5, and Haiku 5.5, GPT-6.1 (Sol and Terra) and GPT-6 (Astra, Sol, and Luna), Gemini 4 Argon and Gemini 3.8 Flash, Grok 4.7, DeepSeek Flash, Mistral Large 4, and GLM 5.3 Flash
+- Adds cleanup actions for branches whose work has already landed ([#3896](https://github.com/gitkraken/vscode-gitlens/issues/3896)) &mdash; when a branch's pull request was merged, or Git shows its work is in the merge target, the merge target status, the _Commit Graph_'s branch details, overview and working changes next steps lead with deleting the branch instead of offering _Publish_, _Rebase_, _Merge_ or _Create Pull Request_
+  - Recognizes a merged pull request even after its branch was deleted on the remote, and pre-selects _Force Delete_ only when a merged pull request proves the work landed
+  - Shows a branch with commits after its merged pull request as having new commits since, with an option to create a pull request for them
+  - Leads with _Delete Local Branch_, with _Publish_ as the fallback, for a branch that is missing from the remote and hasn't landed
 
 ### Changed
 
 - Changes GitLens webviews and the _Commit Graph_ to follow your theme more closely &mdash; banner text, the Graph's search box and amend button, autocomplete dropdowns, and info, success and warning marks now use your theme's colors instead of fixed ones ([#5400](https://github.com/gitkraken/vscode-gitlens/issues/5400))
 - Changes the Pro feature gates, badges, and upgrade prompts to offer _Upgrade to Pro_ alongside _Reactivate Pro Trial_, so an account the server won't reactivate still has a path to Pro ([#6010](https://github.com/gitkraken/vscode-gitlens/issues/6010))
 - Improves starting a task or review in Kepler when using Remote - SSH or WSL &mdash; Kepler now opens on the machine you're working on, so the task lands in the Kepler window connected to it ([#5760](https://github.com/gitkraken/vscode-gitlens/issues/5760))
+- Changes the recommended AI models to Claude Haiku 5.5 and DeepSeek Flash, hides older model generations from the model picker, and removes models their providers have retired
 
 ### Fixed
 
+- Fixes _Review with Agent_ and other prompts sent to the Claude Code extension failing with "Agent 'Claude Code Extension' is no longer available" when sent right after a window opens, before the extension has started &mdash; GitLens now starts it and sends the prompt ([#6140](https://github.com/gitkraken/vscode-gitlens/issues/6140))
+- Fixes the Mistral provider offering GLM 5.2, which Mistral has retired &mdash; replaces it with GLM 5.3 and removes other retired Mistral models ([#6117](https://github.com/gitkraken/vscode-gitlens/issues/6117))
 - Fixes AI conflict resolution with Copilot starting every remaining file after hitting Copilot's usage or rate limit, or when the selected model is no longer available &mdash; it now stops and says why, naming Copilot's own limit or offering to switch models ([#6118](https://github.com/gitkraken/vscode-gitlens/issues/6118), [#6145](https://github.com/gitkraken/vscode-gitlens/issues/6145))
 - Fixes AI conflict resolution sending a request for every remaining file after AI becomes unavailable (e.g. the weekly AI allowance runs out or the provider rejects its API key) &mdash; it now stops and shows one message explaining why, and the _Commit Graph_'s _Resolve_ mode chooses the AI model once per run
 - Fixes _Retry_ and _Refine_ in the _Commit Graph_'s _Resolve_ mode dropping _Apply & Resume with AI_ while an automatic rebase is still paused
@@ -53,14 +65,19 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes _Generate Commit Message_ and _Compose Commits_ appearing twice in the _Source Control_ title bar &mdash; they now appear only in the GitLens AI (sparkle) menu ([#4396](https://github.com/gitkraken/vscode-gitlens/issues/4396))
 - Fixes review findings in the _Commit Graph_'s _Review Changes_ mode pointing at the wrong lines &mdash; when a review spans staged changes or several commits, or after a hunk line starting with `-- ` or `++ ` (such as a SQL or Lua comment); a finding now opens on the line it quotes, or on the file alone when that line is gone
 - Fixes focus-area reviews in _Review Changes_ ignoring the review's instructions, not stopping when the review is cancelled or its findings deleted, and opening a finding's file without its line range
+- Fixes the _Commit Graph_ taking keyboard focus from an editor or the terminal whenever an editor beside it opens or is focused &mdash; what was typed went into the graph instead
+- Fixes the _Commit Graph_'s _Review Changes_ and _Compose_ modes holding on to the old commits after commits in their scope are amended or rebased &mdash; the scope now moves to the rewritten commits as one unbroken range, keeps up with new commits on top when it reaches the branch tip or working changes, a review started from a commit or a comparison moves to the rewritten commits with its marks, findings and comments, and a review's open diff switches to the new changes in place
 - Fixes the interactive rebase editor reporting _No Conflicts Detected_ for a rebase that conflicts on Git versions before 2.45 &mdash; when it can't check, it now says so (conflict detection requires Git 2.45 or later)
 - Fixes the interactive rebase editor cutting off the last commits when the conflict panel is open in a short pane
 - Fixes _Change Merge Target_ suggesting a different branch than the views and _Commit Graph_ measure against &mdash; it now pre-selects the same merge target, including one taken from the branch's pull request
+- Fixes the merge target status reporting a branch whose work was fast-forward merged as behind its merge target, with _Rebase_ and _Merge_ actions &mdash; it is shown as merged again, with an option to delete it, while a newly created branch with no commits of its own still shows as up to date or behind
+- Fixes _Delete Branch_ in the merge target status, the _Commit Graph_'s branch details and its working changes next steps doing nothing when clicked &mdash; it now opens the delete confirmation, and deleting the current branch switches to its merge target first, or explains why it can't when there is no other branch to switch to
 - Fixes a branch's commits disappearing from its details and ahead counts after its base branch was reset off them (e.g. a fast-forwarded pull request undone on `main`)
 - Fixes a repository's `.git` folder showing up as a second repository named `.git` (e.g. during a rebase) when `core.bare` is unset
 - Fixes every Git command failing until the window is reloaded after Git once couldn't be found or started
 - Fixes a repository being skipped, or watched through the wrong `.git` folder, when a Git command timed out while GitLens was discovering it
 - Fixes the _Commit Graph_'s _Pull Requests_ panel not listing pull requests for Azure DevOps and Azure DevOps Server repositories
+- Fixes an _Azure DevOps Server_ connection addressed at the server root reporting a personal access token limited to one collection as invalid or expired, leaving _Launchpad_ and the work item lists empty while reads of a specific repository kept working &mdash; GitLens now finds the token's collection (the one a read names, then any it already found, then the collections of your open repositories, then `DefaultCollection`) and reads there; when none accepts the token, the warning now says it may be limited to a collection and suggests a token for all accessible organizations or opening a repository from that collection ([#6071](https://github.com/gitkraken/vscode-gitlens/issues/6071))
 - Fixes checking out a pull request from a fork in a GitLab subgroup naming the new remote after the subgroup's path (e.g. `contrib/team`), which GitLens then misread &mdash; the remote is now named `contrib-team`
 - Fixes searching _Launchpad_ by a pasted GitLab merge request URL finding nothing when the repository is in a subgroup
 - Fixes _Cloud Workspaces_ matching or adding the wrong GitLab repository when two subgroups hold a repository with the same name

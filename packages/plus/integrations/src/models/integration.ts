@@ -168,6 +168,14 @@ export interface PullRequestEtagFields {
 	 * moves neither its update time nor, at either check, `mergeQueue`.
 	 */
 	mergeQueueRemovedAt?: Date;
+	/**
+	 * The read selected merge-queue data (GitHub.com, for a read that asks for it or a host that opts in), whatever
+	 * that data says. Part of the etag whenever it is set, as a marker: without it a pull request that isn't queued and
+	 * has no removal computes the etag it has without the data, so a host that starts asking for the data would keep a
+	 * held row lacking it as `unchanged`. A full row sets it from its `mergeQueueRequired`, which only a read that
+	 * selected the data carries; a cheap check sets it from the same selection.
+	 */
+	mergeQueueRead?: true;
 }
 
 /**
@@ -726,6 +734,21 @@ export abstract class IntegrationBase<
 		this.invalidateDiscoveryCaches();
 	}
 
+	/**
+	 * The one owner of the drop a forced refresh makes before its sync, so it never serves a discovery list cached
+	 * before it: drops the discovery of `connectionId` (the primary when omitted), whether the sync then succeeds,
+	 * fails transiently and keeps the stored token, or hands back the same token (a PAT always does).
+	 *
+	 * Called once per forced refresh, by the path that runs its sync: an explicit forced re-sync of the primary
+	 * ({@link syncCloudConnection}, run by a primary `forceSync` read and by `refreshConnections`), and a
+	 * per-connection `forceSync` read, whose re-sync goes through the auth provider and never reaches it. An `expired`
+	 * re-sync is not a refresh the caller asked for and keeps its discovery. A strict autolinks refresh also drops at
+	 * completion, a separate drop that retires the reads started while it was pending (see `getAutolinkReferences`).
+	 */
+	beginForcedRefresh(connectionId?: string): void {
+		this.invalidateDiscoveryForConnection(connectionId);
+	}
+
 	getSessionDiscoveryGeneration(_sessionId?: string, _connectionId?: string, _cloud?: boolean): number {
 		return this.discoveryGeneration;
 	}
@@ -900,7 +923,7 @@ export abstract class IntegrationBase<
 					// `GetSessionOptions.refetch`), so a fetch that fails transiently keeps the token it had.
 					if (reason === 'explicit') {
 						this._rejectedTokens.clear();
-						this.invalidateDiscoveryForConnection();
+						this.beginForcedRefresh();
 					}
 					// The cached session is kept while the replacement is fetched (the refetch does not read it): a
 					// transient failure then leaves it as it was, expiry included, and a read meanwhile does not have to

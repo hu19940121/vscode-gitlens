@@ -280,6 +280,16 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 	}
 
 	@debug({ quiet: true })
+	async getTrackedFilesRaw(repoPath: string, cancellation?: AbortSignal): Promise<Uint8Array> {
+		const result = await this.git.run<Buffer>(
+			{ cwd: repoPath, cancellation: cancellation, errors: 'throw', encoding: 'buffer' },
+			'ls-files',
+			'-z',
+		);
+		return result.stdout;
+	}
+
+	@debug({ quiet: true })
 	async getTreeForRevision(
 		repoPath: string,
 		rev: string,
@@ -477,6 +487,13 @@ export class RevisionGitSubProvider implements GitRevisionSubProvider {
 		} else if (isUncommitted(ref)) {
 			// Uncommitted refs depend on index/working-tree state — resolve without caching
 			return this.resolveRevisionCore(repoPath, ref, path);
+		}
+
+		// Kept until a change report clears it, and a ref name resolves to wherever it pointed when first read, so
+		// validated as the refs' reads are (see `Cache.setReadValidator`)
+		const validation = this.cache.validateBeforeRead(repoPath);
+		if (validation != null) {
+			await validation;
 		}
 
 		const key = path != null ? `${ref}|${this.provider.getRelativePath(path, repoPath)}` : ref;

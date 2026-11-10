@@ -924,6 +924,11 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	// failure degrades to a warning instead of failing the whole call. The reads are repo-scoped (they
 	// compose the git-host `*Result` cores); account-scoped fan-out is the adapter's responsibility.
 
+	/** The host's pull request read defaults (`ConfigProvider.getPullRequestReadOptions`), `{}` for a host with none. */
+	getPullRequestReadOptions(): { readonly mergeQueue?: boolean } {
+		return this.ctx.config.getPullRequestReadOptions?.() ?? {};
+	}
+
 	/**
 	 * Warnings for an early-returning read where the integration couldn't be resolved. When a specific
 	 * `connectionId` or self-managed `domain` was requested, a missing integration means that target is
@@ -1088,7 +1093,9 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	 * per-connection (`connectionId`) read syncs that specific connection's session directly through the auth
 	 * provider (the integration's primary-only sync path would never reach a secondary account), while a
 	 * primary read syncs via the integration's own cloud-connection machinery. Either way the integration's cached
-	 * discovery (a tracker's project list) is dropped, so the read sees projects created or deleted since.
+	 * discovery (a tracker's project list) is dropped as the sync starts (see `Integration.beginForcedRefresh`; on the
+	 * primary path, inside its session transition), so the read sees projects created or deleted since, even when the
+	 * sync fails.
 	 * Best-effort by default; strict discovery can require refresh success before trusting the resolved identity.
 	 */
 	async forceRefreshIfRequested(
@@ -1099,16 +1106,15 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 	): Promise<void> {
 		if (forceSync !== true) return;
 
-		// Up front and unconditionally: the per-connection branch below re-syncs through the auth provider, which
-		// never reaches the integration's own re-sync that drops them, and a failed sync still has the read go ahead.
-		integration.invalidateDiscoveryForConnection(connectionId);
-
 		try {
 			if (connectionId != null) {
 				// Refresh the specific connection's session directly; the primary-only sync path below would not
 				// reach a secondary account. `cloud: true` is required for multi-account backend connections.
 				// Refetched rather than deleted first (see `GetSessionOptions.refetch`): a transient failure keeps the
 				// stored token, and only a definitive "no token" drops it.
+				// This re-sync never reaches `syncCloudConnection`, so the refresh is begun here, ahead of the
+				// `await`s that could fail.
+				integration.beginForcedRefresh(connectionId);
 				const authProvider = await this.authenticationService.get(integration.authProvider.id);
 				const descriptor = { ...integration.authProviderDescriptor, connectionId: connectionId, cloud: true };
 				const session = await authProvider?.getSession(descriptor, { sync: true, refetch: true });
@@ -1224,6 +1230,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		scopeConcurrency?: number;
 		/** See {@link IntegrationManager.listPullRequestsPage}. */
 		includeRemoteInfo?: boolean;
+		/** See {@link IntegrationManager.listPullRequestsPage}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderPagedResult<PullRequestShape>> {
 		return listPullRequestsPage(this, options);
 	}
@@ -1242,6 +1250,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		domain?: string;
 		/** See {@link IntegrationManager.searchPullRequestsPage}. */
 		summary?: boolean;
+		/** See {@link IntegrationManager.searchPullRequestsPage}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderPagedResult<PullRequestShape>> {
 		return searchPullRequestsPage(this, options);
 	}
@@ -1356,6 +1366,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		domain?: string;
 		/** Widens every etag to the listed inputs; see {@link IntegrationManager.getPullRequestsBatch}. */
 		etagIncludes?: readonly PullRequestEtagInclude[];
+		/** See {@link IntegrationManager.getPullRequestsBatch}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderResult<PullRequestBatchResult>> {
 		return getPullRequestsBatch(this, options);
 	}
@@ -1369,6 +1381,8 @@ export class IntegrationService implements Disposable, RepositoryResolutionConte
 		 * it must come from the trusted authentication configuration, not repository or remote data.
 		 */
 		domain?: string;
+		/** See {@link IntegrationManager.getPullRequestsForBranches}. */
+		mergeQueue?: boolean;
 	}): Promise<ProviderResult<PullRequestBranchResult>> {
 		return getPullRequestsForBranches(this, options);
 	}

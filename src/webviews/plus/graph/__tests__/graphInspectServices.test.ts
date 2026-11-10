@@ -1,10 +1,10 @@
 import * as assert from 'assert';
 import * as sinon from 'sinon';
 import type { CommentController, CommentThread } from 'vscode';
-import { commands, comments, Uri } from 'vscode';
+import { commands, comments, EventEmitter, TabInputTextDiff, Uri, window } from 'vscode';
 import { AIError, AIErrorReason } from '@gitlens/ai/errors.js';
 import type { AIReviewFinding } from '@gitlens/ai/models/results.js';
-import { uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
+import { deletedOrMissing, uncommitted, uncommittedStaged } from '@gitlens/git/models/revision.js';
 import { LruMap } from '@gitlens/utils/lruMap.js';
 // Side-effect only: `context.js` below pulls in `system/-webview/command.js`, whose first load is re-entered
 // through container.ts's dependency chain before its `registrableCommands` array exists — loading container.ts
@@ -32,9 +32,9 @@ import type {
 	ScopeSelection,
 } from '../graphService.js';
 import type { ReviewReadingOwner } from '../reviewReading.js';
-import { claimReviewFiles, releaseReviewFiles, stepReviewReading } from '../reviewReading.js';
+import { claimReviewFiles, getReviewStepTarget, releaseReviewFiles, stepReviewReading } from '../reviewReading.js';
 import type { ReviewThreadsOwner } from '../reviewThreads.js';
-import { disposeReviewThreads, setReviewThreads } from '../reviewThreads.js';
+import { disposeReviewThreads, getReviewSideUri, setReviewThreads } from '../reviewThreads.js';
 
 // `getDiffForScope` is private and only reaches `this.container.git.getRepositoryService(repoPath)` and
 // `this.buildChangesContext(...)`, so we exercise it against a minimal fake `this` rather than constructing
@@ -1891,7 +1891,7 @@ suite('reviewReading — one graph drives the editor', () => {
 // working-file URIs and fires the reading event; the rest of the instance is left out.
 type ReviewOwnerFake = {
 	setReviewFiles(args: ReviewFilesArgs | undefined): Promise<void>;
-	reviewStep(action: ReviewReadingAction, from?: string): Promise<void>;
+	reviewStep(action: ReviewReadingAction, from?: string, inListOrder?: boolean): Promise<void>;
 	reviewThreadAction(findingId: string, action: ReviewThreadAction, text?: string): void;
 	clearReviewFiles(): void;
 	_reviewFiles?: { paths: string[]; marked: string[] };
@@ -1914,12 +1914,14 @@ function createReviewOwnerFake(): ReviewOwnerFake {
 		_reviewThreadActionsSeq: 0,
 		_reviewMarksMade: 0,
 		_reviewReleased: false,
+		_openedReviewDiffs: new Map(),
+		_reopeningReviewDiffs: new Set(),
 	}) as unknown as ReviewOwnerFake;
 }
 
 // The host doesn't read the anchor — a commit's key over the working tree's diff is enough to tell reviews apart
 function reviewFiles(paths: string[], anchor = 'wip|/repo'): ReviewFilesArgs {
-	return { anchor: anchor, repoPath: '/repo', lhs: 'HEAD', rhs: uncommitted, paths: paths };
+	return { anchor: anchor, repoPath: '/repo', lhs: 'HEAD', rhs: uncommitted, paths: paths, viewed: [] };
 }
 
 suite('graphInspectServices — two graphs, one editor', () => {
@@ -1960,6 +1962,344 @@ suite('graphInspectServices — two graphs, one editor', () => {
 		assert.deepStrictEqual(reclaimed?.marked, ['c.ts']);
 		assert.strictEqual(second._reviewFiles, undefined, 'and the second lets go in turn');
 		assert.strictEqual(second._reviewReadingEvent.fire.lastCall.args[0], undefined);
+	});
+});
+
+// A diff resolves its right-hand commit to the one that last changed the file, so on a range or a compare most
+// files open on a commit other than the review's own ref — the reading commands and the comment gutter go by
+// the side the diff actually opens with.
+suite('graphInspectServices — a review diff opens on the commit that last changed its file', () => {
+	const tip = 'b'.repeat(40);
+	const older = 'a'.repeat(40);
+	const sideOf = (sha: string, path: string) => Uri.parse(`gitlens://${sha}/repo/${path}`).toString();
+	let fake: ReviewOwnerFake & {
+		reviewSideUri(repoPath: string, rhs: string, path: string): Uri;
+		resolveReviewSide(args: { repoPath: string; lhs: string; rhs: string; path: string }, uri: Uri): Promise<void>;
+		_reviewFiles?: { commentable: Map<string, string> };
+	};
+
+	setup(async () => {
+		const { Container: ContainerClass } = await import('../../../../container.js');
+		const git = {
+			getAbsoluteUri: (path: string, repoPath: string) => Uri.file(`${repoPath}/${path}`),
+			getRepositoryService: () => ({
+				getAbsoluteUri: (path: string, repoPath: string) => Uri.file(`${repoPath}/${path}`),
+				revision: {
+					resolveRevision: (_ref: string, uri: Uri) =>
+						Promise.resolve(
+							uri.path.endsWith('gone.ts')
+								? { sha: older, revision: older, status: 'D' }
+								: { sha: older, revision: older },
+						),
+				},
+				// Like the git provider: no revision document for a file the side doesn't have
+				getBestRevisionUri: (uri: Uri, sha: string) =>
+					Promise.resolve(sha === deletedOrMissing ? undefined : Uri.parse(`gitlens://${sha}${uri.path}`)),
+				getRevisionUri: (sha: string, path: string) => Uri.parse(`gitlens://${sha}${path}`),
+			}),
+			getRevisionUriFromGitUri: (uri: { sha?: string; path: string }) =>
+				Uri.parse(`gitlens://${uri.sha}${uri.path}`),
+		};
+		sinon.stub(ContainerClass, 'instance').get(() => ({ git: git }));
+		fake = Object.assign(createReviewOwnerFake(), {
+			context: { container: { git: git } },
+		}) as unknown as typeof fake;
+	});
+
+	teardown(() => {
+		fake.clearReviewFiles();
+		disposeReviewThreads();
+		sinon.restore();
+	});
+
+	test('the review files take the side the diff resolves to once it is opened', async () => {
+		const args: ReviewFilesArgs = {
+			anchor: 'commit',
+			repoPath: '/repo',
+			lhs: `${tip}^`,
+			rhs: tip,
+			paths: ['a.ts'],
+			viewed: [],
+		};
+		await fake.setReviewFiles(args);
+		const ownSide = fake.reviewSideUri('/repo', tip, 'a.ts').toString();
+		assert.strictEqual(fake._reviewFiles?.commentable.get(ownSide), 'a.ts', 'at first, the ref the review is on');
+
+		await fake.resolveReviewSide(
+			{ repoPath: '/repo', lhs: args.lhs, rhs: tip, path: 'a.ts' },
+			Uri.file('/repo/a.ts'),
+		);
+
+		assert.strictEqual(
+			fake._reviewFiles?.commentable.get(sideOf(older, 'a.ts')),
+			'a.ts',
+			'the gutter finds the diff',
+		);
+		const files = getContext('gitlens:review:files')?.map(u => u.toString());
+		assert.ok(files?.includes(sideOf(older, 'a.ts')), 'and so do the title buttons');
+	});
+
+	test('a file the rewritten side deleted takes the placeholder the diff opens it on', async () => {
+		const args: ReviewFilesArgs = {
+			anchor: 'commit',
+			repoPath: '/repo',
+			lhs: `${tip}^`,
+			rhs: tip,
+			paths: ['gone.ts'],
+			viewed: [],
+		};
+		await fake.setReviewFiles(args);
+
+		await fake.resolveReviewSide(
+			{ repoPath: '/repo', lhs: args.lhs, rhs: tip, path: 'gone.ts' },
+			Uri.file('/repo/gone.ts'),
+		);
+
+		assert.strictEqual(fake._reviewFiles?.commentable.get(sideOf(deletedOrMissing, 'gone.ts')), 'gone.ts');
+	});
+});
+
+// The reopen of a review diff left on rewritten commits, end to end: the editor's tabs are faked (groups, the tab
+// change event, close) and `gitlens.diffWith` opens a tab in them the way the editor does — a preview tab replaces
+// the group's preview tab — so what is checked is which tabs the reader ends up with.
+suite('graphInspectServices — a review diff left on rewritten commits reopens on the new ones', () => {
+	type FakeTab = { input: unknown; isActive: boolean; isPreview: boolean; group: FakeGroup };
+	type FakeGroup = { viewColumn: number; tabs: FakeTab[]; activeTab?: FakeTab };
+	type ReopenFake = ReviewOwnerFake & {
+		openReviewFile(args: { repoPath: string; lhs: string; rhs: string; path: string }): Promise<unknown>;
+		moveReview(from: string, to: string, anchor: { kind: string; repoPath: string; sha?: string }): void;
+		_deepReview?: unknown;
+		_openedReviewDiffs: Map<string, { lhs: string; rhs: string }>;
+	};
+
+	const side = (sha: string, path: string) => Uri.parse(`gitlens://${sha}/repo/${path}`);
+	const files = (rhs: string, paths = ['b.ts']): ReviewFilesArgs => ({
+		anchor: 'wip|/repo',
+		repoPath: '/repo',
+		lhs: 'base',
+		rhs: rhs,
+		paths: paths,
+		viewed: [],
+	});
+
+	let group: FakeGroup;
+	let onTabs: EventEmitter<void>;
+	let closed: FakeTab[];
+	let diffs: { rhs: string; path: string }[];
+	/** Paths whose next open the editor drops — an open that fails */
+	let failing: Set<string>;
+	/** The editor reports the new tab after the open returns, rather than before */
+	let lateTabs: boolean;
+	let fake: ReopenFake;
+
+	function show(tab: FakeTab): void {
+		for (const t of group.tabs) {
+			t.isActive = false;
+		}
+		tab.isActive = true;
+		group.activeTab = tab;
+		onTabs.fire();
+	}
+
+	function open(input: unknown, preview: boolean): FakeTab {
+		if (preview) {
+			group.tabs = group.tabs.filter(t => !t.isPreview);
+		}
+		const tab: FakeTab = { input: input, isActive: false, isPreview: preview, group: group };
+		group.tabs.push(tab);
+		show(tab);
+		return tab;
+	}
+
+	const diffTabs = () => group.tabs.filter(t => t.input instanceof TabInputTextDiff);
+	const modifiedOf = (tab: FakeTab) => (tab.input as TabInputTextDiff).modified.toString();
+	const settle = async () => {
+		for (let i = 0; i < 20; i++) {
+			await new Promise<void>(resolve => setTimeout(resolve, 0));
+		}
+	};
+
+	setup(async () => {
+		const { Container: ContainerClass } = await import('../../../../container.js');
+		const git = {
+			getAbsoluteUri: (path: string, repoPath: string) => Uri.file(`${repoPath}/${path}`),
+			getRepositoryService: () => ({
+				getAbsoluteUri: (path: string, repoPath: string) => Uri.file(`${repoPath}/${path}`),
+				revision: {
+					// `gone.ts` is deleted on the rewritten side
+					resolveRevision: (ref: string, uri: Uri) =>
+						Promise.resolve(
+							ref === 'tip2' && uri.path.endsWith('gone.ts')
+								? { sha: ref, revision: ref, status: 'D' }
+								: { sha: ref, revision: ref },
+						),
+				},
+				getBestRevisionUri: (uri: Uri, sha: string) =>
+					Promise.resolve(sha === deletedOrMissing ? undefined : Uri.parse(`gitlens://${sha}${uri.path}`)),
+				getRevisionUri: (sha: string, path: string) => Uri.parse(`gitlens://${sha}${path}`),
+			}),
+			getRevisionUriFromGitUri: (uri: { sha?: string; path: string }) =>
+				Uri.parse(`gitlens://${uri.sha}${uri.path}`),
+		};
+		sinon.stub(ContainerClass, 'instance').get(() => ({ git: git }));
+
+		group = { viewColumn: 1, tabs: [] };
+		onTabs = new EventEmitter<void>();
+		closed = [];
+		diffs = [];
+		failing = new Set();
+		lateTabs = false;
+		sinon.stub(window, 'tabGroups').get(() => ({
+			all: [group],
+			activeTabGroup: group,
+			onDidChangeTabs: onTabs.event,
+			onDidChangeTabGroups: () => ({ dispose: () => {} }),
+			close: (tab: FakeTab) => {
+				group.tabs = group.tabs.filter(t => t !== tab);
+				closed.push(tab);
+				return Promise.resolve(true);
+			},
+		}));
+		sinon.stub(window, 'visibleTextEditors').get(() => []);
+		sinon.stub(commands, 'executeCommand').callsFake((command: string, ...args: unknown[]) => {
+			if (command !== 'gitlens.diffWith') return Promise.resolve(undefined);
+
+			const diff = args[0] as {
+				lhs: { sha: string; uri: Uri };
+				rhs: { sha: string; uri: Uri };
+				showOptions?: { preview?: boolean };
+			};
+			const path = diff.rhs.uri.path.split('/').pop()!;
+			diffs.push({ rhs: diff.rhs.sha, path: path });
+			if (failing.delete(path)) return Promise.resolve(undefined);
+
+			const deleted = diff.rhs.sha === 'tip2' && path === 'gone.ts';
+			const modified = deleted
+				? Uri.parse(`gitlens://${deletedOrMissing}${diff.rhs.uri.path}`)
+				: side(diff.rhs.sha, path);
+			const openTab = () =>
+				open(new TabInputTextDiff(side(diff.lhs.sha, path), modified), diff.showOptions?.preview ?? true);
+			if (lateTabs) {
+				setTimeout(openTab, 0);
+			} else {
+				openTab();
+			}
+			return Promise.resolve(undefined);
+		});
+
+		fake = Object.assign(createReviewOwnerFake(), {
+			context: { container: { git: git }, getOpenEditorShowOptions: () => undefined },
+		}) as unknown as ReopenFake;
+	});
+
+	teardown(() => {
+		fake.clearReviewFiles();
+		disposeReviewThreads();
+		onTabs.dispose();
+		sinon.restore();
+	});
+
+	async function openOnTip1(path = 'b.ts', paths?: string[]): Promise<FakeTab> {
+		await fake.setReviewFiles(files('tip1', paths));
+		await fake.openReviewFile({ repoPath: '/repo', lhs: 'base', rhs: 'tip1', path: path });
+		await settle();
+		return group.activeTab!;
+	}
+
+	test("a commit review's diff is reopened once the panel moved the review onto the rewritten commit", async () => {
+		await openOnTip1();
+
+		const channel = { state: { anchorKey: 'wip|/repo' }, moveTo: sinon.spy() };
+		fake._deepReview = channel;
+		const anchor = { kind: 'commit', repoPath: '/repo', sha: 'tip2' };
+		fake.moveReview('wip|/repo', 'commit|/repo|tip2', anchor);
+		await fake.setReviewFiles({ ...files('tip2'), anchor: 'commit|/repo|tip2' });
+		await settle();
+
+		assert.deepStrictEqual(diffTabs().map(modifiedOf), [side('tip2', 'b.ts').toString()]);
+		assert.deepStrictEqual(
+			channel.moveTo.firstCall.args,
+			[anchor, 'commit|/repo|tip2'],
+			"the agent's channel goes along",
+		);
+	});
+
+	test('a shown preview diff is reopened in place on the rewritten commit', async () => {
+		await openOnTip1();
+
+		await fake.setReviewFiles(files('tip2'));
+		await settle();
+
+		assert.deepStrictEqual(diffTabs().map(modifiedOf), [side('tip2', 'b.ts').toString()]);
+		assert.strictEqual(closed.length, 0, 'the preview tab was replaced, not closed');
+	});
+
+	[false, true].forEach(late => {
+		const when = late ? 'reported after the open returns' : 'reported before the open returns';
+
+		test(`a shown kept diff is replaced: the new one opens kept and the old one closes (tab ${when})`, async () => {
+			lateTabs = late;
+			const tab = await openOnTip1();
+			tab.isPreview = false;
+
+			await fake.setReviewFiles(files('tip2'));
+			await settle();
+
+			assert.deepStrictEqual(diffTabs().map(modifiedOf), [side('tip2', 'b.ts').toString()]);
+			assert.strictEqual(diffTabs()[0].isPreview, false);
+			assert.deepStrictEqual(closed, [tab]);
+		});
+
+		test(`a file the rewrite deleted reopens on the deleted-file placeholder (tab ${when})`, async () => {
+			lateTabs = late;
+			const tab = await openOnTip1('gone.ts', ['gone.ts']);
+			tab.isPreview = false;
+
+			await fake.setReviewFiles(files('tip2', ['gone.ts']));
+			await settle();
+
+			assert.deepStrictEqual(diffTabs().map(modifiedOf), [
+				Uri.parse(`gitlens://${deletedOrMissing}/repo/gone.ts`).toString(),
+			]);
+			assert.deepStrictEqual(closed, [tab], 'the stale kept tab is gone');
+		});
+	});
+
+	test('a diff in the background is left alone until it is shown, then reopened once', async () => {
+		const tab = await openOnTip1();
+		tab.isPreview = false;
+		open({}, false);
+
+		await fake.setReviewFiles(files('tip2'));
+		await settle();
+		assert.strictEqual(diffs.length, 1, 'nothing reopened in the background');
+
+		show(tab);
+		await settle();
+		show(group.tabs.find(t => t.input instanceof TabInputTextDiff)!);
+		await settle();
+
+		assert.deepStrictEqual(diffTabs().map(modifiedOf), [side('tip2', 'b.ts').toString()]);
+		assert.strictEqual(diffs.length, 2, 'reopened exactly once');
+	});
+
+	test('a reopen that opens nothing is not retried on every tab change', async () => {
+		const tab = await openOnTip1();
+		tab.isPreview = false;
+		const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+		try {
+			failing.add('b.ts');
+
+			await fake.setReviewFiles(files('tip2'));
+			await clock.tickAsync(2500);
+			onTabs.fire();
+			await clock.tickAsync(2500);
+
+			assert.strictEqual(diffs.length, 2, 'one attempt only');
+			assert.deepStrictEqual(diffTabs(), [tab], 'the tab it had stays');
+		} finally {
+			clock.restore();
+		}
 	});
 });
 
@@ -2453,7 +2793,11 @@ suite('graphInspectServices — a question to the reviewer waits in its thread',
 				}),
 			},
 		} as unknown as Container;
-		setReviewThreads(container, starter.fakeThis as unknown as ReviewThreadsOwner, {
+		const owner = Object.assign(starter.fakeThis, {
+			reviewSideUri: (repoPath: string, rhs: string, path: string) =>
+				getReviewSideUri(container, repoPath, rhs, path),
+		});
+		setReviewThreads(owner as unknown as ReviewThreadsOwner, {
 			anchor: 'wip',
 			repoPath: '/r',
 			rhs: uncommitted,
@@ -2720,4 +3064,90 @@ suite('graphInspectServices — an Orient too large for the model goes to the ag
 		assert.strictEqual(await o.orient(), undefined);
 		assert.strictEqual(executeCommand.callCount, 0);
 	});
+});
+
+suite('graphInspectServices — reading steps pass viewed files by', () => {
+	let fake: ReviewOwnerFake & { openReviewFile: sinon.SinonStub };
+	const opened = () => (fake.openReviewFile.lastCall.args[0] as { path: string }).path;
+
+	setup(() => {
+		fake = Object.assign(createReviewOwnerFake(), { openReviewFile: sinon.stub().resolves() });
+	});
+
+	teardown(() => {
+		fake.clearReviewFiles();
+	});
+
+	test('the steps skip what the panel has viewed and what the editor marked since', async () => {
+		await fake.setReviewFiles({ ...reviewFiles(['a.ts', 'b.ts', 'c.ts', 'd.ts']), viewed: ['b.ts'] });
+
+		await fake.reviewStep('markViewed', 'a.ts');
+		assert.strictEqual(opened(), 'c.ts', 'past the viewed b');
+
+		await fake.reviewStep('next', 'd.ts');
+		assert.strictEqual(opened(), 'c.ts', 'around the end, past a just marked and the viewed b');
+
+		await fake.reviewStep('next', 'a.ts', true);
+		assert.strictEqual(opened(), 'b.ts', 'in list order when asked');
+
+		// The panel took the mark in, then the reader un-checked everything
+		await fake.setReviewFiles(reviewFiles(['a.ts', 'b.ts', 'c.ts', 'd.ts']));
+		await fake.reviewStep('previous', 'c.ts');
+		assert.strictEqual(opened(), 'b.ts', 'what the panel no longer counts as viewed is stepped onto again');
+	});
+
+	test("the host's own re-apply of the panel's files keeps the editor's marks made since", async () => {
+		const args = reviewFiles(['a.ts', 'b.ts', 'c.ts']);
+		await fake.setReviewFiles(args);
+		await fake.reviewStep('markViewed', 'a.ts');
+
+		// A learned diff side re-applies the panel's last files, sent before the mark — as when the graph is hidden
+		await fake.setReviewFiles(args);
+		await fake.reviewStep('next', 'c.ts');
+		assert.strictEqual(opened(), 'b.ts', 'past a, which the editor marked');
+	});
+});
+
+suite('getReviewStepTarget', () => {
+	const paths = ['a', 'b', 'c', 'd'];
+	const cases: {
+		name: string;
+		paths?: string[];
+		from: string;
+		direction: 1 | -1;
+		viewed: string[];
+		inListOrder?: boolean;
+		expected: string | undefined;
+	}[] = [
+		{ name: 'next passes viewed files by', from: 'a', direction: 1, viewed: ['b'], expected: 'c' },
+		{ name: 'previous passes them by, looping', from: 'a', direction: -1, viewed: ['d'], expected: 'c' },
+		{ name: 'next loops past the end', from: 'd', direction: 1, viewed: ['a'], expected: 'b' },
+		{ name: 'in list order when asked', from: 'a', direction: 1, viewed: ['b'], inListOrder: true, expected: 'b' },
+		{
+			name: 'in list order once every other file is viewed',
+			from: 'a',
+			direction: 1,
+			viewed: ['b', 'c', 'd'],
+			expected: 'b',
+		},
+		{ name: 'in list order once all are viewed', from: 'b', direction: -1, viewed: paths, expected: 'a' },
+		{
+			name: 'nowhere to go from the only file',
+			paths: ['a'],
+			from: 'a',
+			direction: 1,
+			viewed: [],
+			expected: undefined,
+		},
+	];
+
+	for (const c of cases) {
+		test(c.name, () => {
+			const list = c.paths ?? paths;
+			assert.strictEqual(
+				getReviewStepTarget(list, list.indexOf(c.from), c.direction, new Set(c.viewed), c.inListOrder ?? false),
+				c.expected,
+			);
+		});
+	}
 });

@@ -139,6 +139,134 @@ project's `grepInvert`, which wins over `--grep` and would make these unselectab
 Note "insiders" is overloaded: this is the **CLI's** channel. VS Code's own insiders build is a separate
 axis, driven by `VSCODE_VERSION` / `pnpm run test:e2e:insiders`.
 
+### Opt-in specs: signed-in workers (`@signed-in`)
+
+Some scenarios need a GitKraken account with cloud integrations connected (#5682, #5106). The normal sign-in
+can't run under the test host — VS Code refuses the "open external website" dialog in tests — so a worker
+signs itself in (`tests/e2e/fixtures/gkSignIn.ts`): it asks the GitKraken site for a sign-in code with the
+test account's session cookie, hands GitLens the `vscode://eamodio.gitlens/login` deep link through the
+evaluator, and waits for the account and its required integrations. The account's integrations come with it;
+no provider OAuth runs.
+
+A spec opts in with `signIn` on its worker options, the `@signed-in` tag, and a skip when no cookie is set:
+
+```ts
+const test = base.extend({
+	vscodeOptions: [{ vscodeVersion: process.env.VSCODE_VERSION ?? 'stable', signIn: true }, { scope: 'worker' }],
+});
+
+test.skip(!canSignIn(), 'GK_E2E_ACCESS_TOKEN_COOKIE is not set');
+test.use({ trace: 'off', video: 'off', screenshot: 'off' });
+
+test.describe('…', { tag: '@signed-in' }, () => {
+	test.describe.configure({ mode: 'serial', retries: 0 });
+	// …
+});
+```
+
+Without a cookie these specs skip, so the default suite is unaffected. To run them:
+
+```bash
+# Staging test account: the site's session cookie is `stagingAccessToken` (not `accessToken` — that one is
+# production's, also visible on the staging site). The staging site is behind Cloudflare Access, so pass a
+# service token (GK_E2E_CF_ACCESS_CLIENT_ID/_SECRET) or a browser's CF_Authorization. GitLens honours
+# `gitkraken.env` only in a pre-release build, so patch the version before bundling.
+pnpm run patch-pre && pnpm run bundle:e2e
+# read the secrets without echoing them or leaving them in shell history
+read -rsp 'Session cookie: ' GK_E2E_ACCESS_TOKEN_COOKIE && echo && export GK_E2E_ACCESS_TOKEN_COOKIE
+read -rsp 'CF_Authorization: ' GK_E2E_CF_AUTHORIZATION && echo && export GK_E2E_CF_AUTHORIZATION
+GK_E2E_ENV=staging pnpm exec playwright test -c tests/e2e/playwright.config.ts --grep @signed-in --project=vscode
+# patch-pre rewrites the version in package.json (and README.md) — don't commit it
+git checkout -- package.json README.md
+```
+
+| Variable                                                            | Meaning                                                                                                                                                |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GK_E2E_ACCESS_TOKEN_COOKIE`                                        | the backend site's session cookie value (secret)                                                                                                       |
+| `GK_E2E_ENV`                                                        | required: `staging` or `dev` — or `production` together with `GK_E2E_ALLOW_PRODUCTION=1`; picks the site, the cookie name and GitLens' `gitkraken.env` |
+| `GK_E2E_CF_ACCESS_CLIENT_ID` / `_SECRET`, `GK_E2E_CF_AUTHORIZATION` | Cloudflare Access credential, off production only (secret)                                                                                             |
+| `E2E_REQUIRED_INTEGRATIONS`                                         | providers that must show as connected (default: GitHub, GitLab, Bitbucket, Azure DevOps; `none` checks the sign-in only)                               |
+| `E2E_REQUIRE_SIGNIN`                                                | fail instead of skip when the cookie is missing — for CI jobs that must sign in                                                                        |
+| `GK_E2E_ACCESS_TOKEN_COOKIE_NAME`                                   | overrides the session cookie's name (default: the backend's own, e.g. `stagingAccessToken`)                                                            |
+| `GK_E2E_GITHUB_TOKEN`                                               | read-only token for a private GitHub test repository (secret; see below)                                                                               |
+
+The MCP Start Work / Start Review spec (`mcpGitlensWritePathSignedIn.test.ts`) also needs `E2E_GITHUB_REPO_URL`,
+`E2E_GITHUB_ISSUE_URL` and `E2E_GITHUB_PR_URL`: the GitHub test repository, an open issue that belongs to the GitHub
+account bound to the test account (Start Work matches the account's own issues, it doesn't fetch the URL), and an open
+PR whose branch lives in that repository rather than a fork. Give canonical URLs without a trailing slash. They are
+public values — set them as repository variables; the spec skips without them, and fails under `E2E_REQUIRE_SIGNIN`.
+A private test repository also needs `GK_E2E_GITHUB_TOKEN` (a secret): a fine-grained token that can only read that
+repository (Contents: read-only). The spec clones with it through an `http.<repository>/.extraheader` passed in
+`GIT_CONFIG_*` (git 2.31 or later) — never in the remote URL — and keeps it in the clone's own config for the editor's
+fetches; teardown removes it from that config and deletes the clone, also when the worker failed to sign in. Issue and
+PR titles and branch names from that repository can appear in the job log (the spec prints what the tools returned
+and, on failure, GitLens log lines), so keep nothing sensitive in its test data.
+
+Mind what a sign-in costs: every worker sign-in mints a new GitLens token for the test account, and the backend
+neither expires nor revokes those tokens. Sign in only where an account is needed, don't retry signed-in specs
+(a retry starts a new worker), never sign out in a test (it is local-only), and never sign CI in to production.
+The sign-in credentials stay in the Playwright process: the harness strips `GK_E2E_*` from the environment of the
+editor and of the GK CLI the MCP specs spawn, so nothing they start sees the cookie or the Cloudflare credential. The
+test-repository token is the exception: it is readable through the clone's config until teardown. Treat the cookie as a password: keep it out of shell history and logs, and never
+print it — the fixture's diagnostics use fixed vocabularies, and the only account detail they log is its plan labels.
+
+Two side effects to know about:
+
+- After signing in, GitLens logs the GK CLI in with the account's token (`gk auth login`). The harness gives every
+  signed-in worker its own `XDG_DATA_HOME`, so that login lands in the worker's temp dir instead of replacing your
+  machine-wide CLI login — each signed-in worker therefore downloads the CLI core once. It also gets its own home
+  directory (`HOME` / `USERPROFILE`): GitLens' shared GitKraken store prefers a legacy `~/.gk` over `XDG_DATA_HOME`,
+  and a signed-in run also creates files under `~/.claude*` and `~/.copilot`, so without it a local run reads and
+  adds to your real ones — stale repository locations there make MCP Start Work stop on a base-branch picker (#6122).
+- On any test error Playwright writes `error-context.md` with an ARIA snapshot — of a failed `expect` matcher's
+  target, else of the page — and no option turns it off; `trace` / `screenshot` don't affect it. The fixture waits
+  with `locator.waitFor` instead of `expect` so a failed sign-in doesn't snapshot the Account page, but an assertion
+  in a spec can still put the account's name or e-mail into test results, and a snapshot of account UI shows its
+  other items: keep signed-in output out of shared artifacts — the secret scan clears credentials and e-mail
+  addresses, not other account data.
+
+In CI, `@signed-in` specs run only in the `e2e-signed-in` job of `ci.yml`; the regular e2e legs run with
+`--grep-invert @signed-in` and hold no credentials. The job:
+
+- starts only on a manual dispatch from `main`, and only once the repository variable `E2E_SIGNED_IN` is `true` (a
+  repository variable, not an Environment one: the job's `if` is evaluated before the Environment is attached);
+- takes its secrets from the `e2e-staging` Environment, whose deployments are limited to `main`:
+  `GK_E2E_ACCESS_TOKEN_COOKIE` (the staging test account's `stagingAccessToken`), a Cloudflare Access service token
+  (`GK_E2E_CF_ACCESS_CLIENT_ID` / `GK_E2E_CF_ACCESS_CLIENT_SECRET`) and `GK_E2E_GITHUB_TOKEN`, read-only on the
+  private test-data repository. Repository secrets would reach any workflow run from a branch of this repository
+  (forks and their pull requests get none) — a branch that edits `ci.yml` could read them whatever the job's `if`
+  says — while an Environment's secrets reach only a job that deploys to it, from a run whose ref is `main`. That
+  makes the guarantee "only workflow code reviewed into `main`": runs triggered by `schedule`, `issue_comment`,
+  `workflow_run` or `pull_request_target` carry `main` as their ref too, so never reference `e2e-staging` from a job
+  that runs pull-request code. Don't add the secrets back at repository level. Keep the values narrow and
+  replaceable all the same — the session ends when the test account signs out of the staging site, the GitHub token
+  is scoped to the one repository, and the service token can be reissued;
+- reads `E2E_REQUIRED_INTEGRATIONS` and the `E2E_GITHUB_*` URLs from repository variables; a missing cookie or
+  GitHub URL fails the run instead of skipping it (`E2E_REQUIRE_SIGNIN`), while an unset `E2E_REQUIRED_INTEGRATIONS`
+  falls back to its default list;
+- runs with `--retries=0` whatever the config's CI default — a retry starts a new worker, and every worker sign-in
+  mints a token the backend never expires;
+- builds a pre-release bundle (so GitLens honors `gitkraken.env`) and signs in to staging;
+- uploads no artifacts: a failed test's `error-context.md` snapshots account UI (other pull requests' titles and
+  authors in Launchpad), which no scan can tell from fixture data. It still runs `scripts/e2eScanForSecrets.mjs` over
+  its output, so a credential that reaches it fails the job: any output file holding a secret value (verbatim, base64,
+  base64url or URL-encoded, inside trace zips too) or in its path, or one it can't read or mask, is deleted; e-mail
+  addresses and JWT-shaped strings in text files are masked. Don't add an upload of the test results back; any other
+  upload added to the job must also require the scan's complete pass. The scan is best-effort: it can't recognize
+  values it wasn't given, such as the tokens a sign-in mints.
+
+The repository is public, so the job's log is too. The log itself is not scanned: a failed assertion on account UI
+prints the received text there, and so do the diagnostics a spec prints on failure (tool results, GitLens log lines).
+Keep signed-in assertions and diagnostics off account data beyond the test repository's: the account's name and
+e-mail, and other repositories' pull requests and issues.
+
+The session cookie expires after a while without use. When the sign-in step reports the site's login page, sign in
+to the staging site as the test account in a browser and replace the secret with the new `stagingAccessToken`
+value in the `e2e-staging` Environment — `gh secret set --env e2e-staging GK_E2E_ACCESS_TOKEN_COOKIE` (admin access
+needed), reading the value from the prompt or a file, never as an argument. Without `--env` it lands in a repository
+secret instead: that puts the cookie back within reach of every branch, and the Environment's older copy still takes
+precedence, so the job keeps failing.
+
 ### Login-walled forks (Cursor, Kiro)
 
 Some forks hard-gate their entire workbench behind a sign-in wall on a fresh (unauthenticated) profile —
