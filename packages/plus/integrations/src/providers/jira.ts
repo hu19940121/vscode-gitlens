@@ -13,8 +13,7 @@ import type { ProviderAuthenticationSession } from '../authentication/models.js'
 import { toTokenWithInfo } from '../authentication/models.js';
 import type { ProviderRefusal } from '../collectionMetadata.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
-import { IssuesCloudHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
-import type { IssueEtagFields } from '../models/integration.js';
+import { IssuesCloudHostIntegrationId } from '../constants.js';
 import type {
 	AccountWideIssuesResult,
 	IssuesForProjectOptions,
@@ -23,10 +22,12 @@ import type {
 	SearchMyIssuesOptions,
 } from '../models/issueReads.js';
 import { groupProjectIssuesSearches, IssuesIntegration } from '../models/issuesIntegration.js';
+import type { IssueEtagFields } from '../reads/etag.js';
 import type { JiraIssueEtagResponse } from './jiraIssueByKey.js';
 import { jiraBulkFetchMaxKeys, toJiraIssueEtagFields } from './jiraIssueByKey.js';
+import { providersMetadata } from './metadata.js';
 import type { ProviderApiCollectionResult } from './models.js';
-import { providersMetadata, toAccount, toIssueShape, toProviderIssueStates } from './models.js';
+import { toAccount, toIssueShape, toProviderIssueStates } from './models.js';
 import { isJiraMissingProjectError } from './providerErrors.js';
 import { DiscoveryCache, discoveryCacheTtl } from './utils/discoveryCache.js';
 import { createIssueAutolinkReferences } from './utils/issueAutolinks.js';
@@ -38,7 +39,11 @@ import {
 	summarizePageMetadata,
 	toUniqueJiraIssueShapes,
 } from './utils/jiraIssueDrains.js';
-import { collectProviderPagedResult, mergeCollectionMetadata } from './utils/providerPaging.js';
+import {
+	collectProviderPagedResult,
+	mergeCollectionMetadata,
+	providerFanOutConcurrency,
+} from './utils/providerPaging.js';
 
 const metadata = providersMetadata[IssuesCloudHostIntegrationId.Jira];
 const authProvider = Object.freeze({ id: metadata.id, scopes: metadata.scopes });
@@ -115,14 +120,22 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		return cached.autolinks;
 	}
 
-	/** One build per token at a time: concurrent renders share it rather than each re-reading sites and projects. */
+	/**
+	 * One build per token at a time: concurrent renders share it rather than each re-reading sites and projects. A drop
+	 * retires it, so a render after a forced refresh doesn't join a build reading the lists as they were before (#6170).
+	 */
 	private buildAutolinks(
 		session: ProviderAuthenticationSession,
 	): Promise<(AutolinkReference | DynamicAutolinkReference)[]> {
 		const { accessToken } = session;
 		let build = this._autolinksBuilds.get(accessToken);
 		if (build == null) {
-			build = this.buildAutolinksCore(session).finally(() => this._autolinksBuilds.delete(accessToken));
+			build = this.buildAutolinksCore(session).finally(() => {
+				// A drop meanwhile retired this build, and the entry may be a later one's now.
+				if (this._autolinksBuilds.get(accessToken) === build) {
+					this._autolinksBuilds.delete(accessToken);
+				}
+			});
 			this._autolinksBuilds.set(accessToken, build);
 		}
 		return build;
@@ -828,6 +841,7 @@ export class JiraIntegration extends IssuesIntegration<IssuesCloudHostIntegratio
 		this._organizations.clear();
 		this._projects.clear();
 		this._autolinks.clear();
+		this._autolinksBuilds.clear();
 	}
 
 	protected override providerOnDisconnect(): void {

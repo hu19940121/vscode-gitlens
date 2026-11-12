@@ -15,9 +15,8 @@ import type { IntegrationAuthenticationProviderDescriptor } from '../authenticat
 import type { ConnectionResource, ProviderAuthenticationSession } from '../authentication/models.js';
 import { toTokenWithInfo } from '../authentication/models.js';
 import { toCollectionScopeFailure } from '../collectionMetadata.js';
-import { IssuesCloudHostIntegrationId, providerFanOutConcurrency } from '../constants.js';
+import { IssuesCloudHostIntegrationId } from '../constants.js';
 import { IntegrationReadUnavailableError, toError } from '../errors.js';
-import type { IntegrationResult, IssueEtagFields } from '../models/integration.js';
 import { isReadSessionFailure } from '../models/integration.js';
 import type {
 	AccountWideIssuesResult,
@@ -31,19 +30,26 @@ import {
 	IssuesIntegration,
 	splitProjectIssuesSearch,
 } from '../models/issuesIntegration.js';
+import type { IntegrationResult } from '../models/publicIntegration.js';
 import { IssueFilter } from '../providerFilters.js';
+import type { IssueEtagFields } from '../reads/etag.js';
 import type { LinearIssueEtagNode } from './linearIssuesEtag.js';
 import { linearIssuesEtagMaxNumbers, toLinearIssueEtagFields } from './linearIssuesEtag.js';
+import { providersMetadata } from './metadata.js';
 import type {
 	ProviderApiCollectionResult,
 	ProviderHierarchyResult,
 	ProviderIssue,
 	ProviderLinearProject,
 } from './models.js';
-import { fromProviderIssue, providersMetadata, toIssueShape, toProviderIssueStates } from './models.js';
+import { fromProviderIssue, toIssueShape, toProviderIssueStates } from './models.js';
 import { DiscoveryCache, discoveryCacheTtl } from './utils/discoveryCache.js';
 import { createIssueAutolinkReferences } from './utils/issueAutolinks.js';
-import { collectProviderPagedResult, mergeCollectionMetadata } from './utils/providerPaging.js';
+import {
+	collectProviderPagedResult,
+	mergeCollectionMetadata,
+	providerFanOutConcurrency,
+} from './utils/providerPaging.js';
 
 const metadata = providersMetadata[IssuesCloudHostIntegrationId.Linear];
 const authProvider = Object.freeze({ id: metadata.id, scopes: metadata.scopes });
@@ -129,14 +135,22 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		return cached.autolinks;
 	}
 
-	/** One build per token at a time: concurrent renders share it rather than each re-reading the teams. */
+	/**
+	 * One build per token at a time: concurrent renders share it rather than each re-reading the teams. A drop retires
+	 * it, so a render after a forced refresh doesn't join a build reading the teams as they were before (#6170).
+	 */
 	private buildAutolinks(
 		session: ProviderAuthenticationSession,
 	): Promise<(AutolinkReference | DynamicAutolinkReference)[]> {
 		const { accessToken } = session;
 		let build = this._autolinksBuilds.get(accessToken);
 		if (build == null) {
-			build = this.buildAutolinksCore(session).finally(() => this._autolinksBuilds.delete(accessToken));
+			build = this.buildAutolinksCore(session).finally(() => {
+				// A drop meanwhile retired this build, and the entry may be a later one's now.
+				if (this._autolinksBuilds.get(accessToken) === build) {
+					this._autolinksBuilds.delete(accessToken);
+				}
+			});
 			this._autolinksBuilds.set(accessToken, build);
 		}
 		return build;
@@ -177,8 +191,9 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 
 	private _organizations: Map<string, LinearOrganizationDescriptor | undefined> | undefined;
 	/**
-	 * In flight by token. The request can't be aborted (provider-apis takes no signal), so a lookup that outlives its
-	 * caller's timeout is joined by the next one rather than piling another request on top of it.
+	 * In flight by token and discovery generation. The request can't be aborted (provider-apis takes no signal), so a
+	 * lookup that outlives its caller's timeout is joined by the next one rather than piling another request on top of
+	 * it; but not across a drop, since a lookup started before a forced refresh answers as from before it (#6162).
 	 */
 	private readonly _organizationRequests = new Map<string, Promise<LinearOrganizationDescriptor | undefined>>();
 	private async getOrganization(
@@ -192,10 +207,11 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		const cachedResources = organizations.get(accessToken);
 
 		if (cachedResources == null || force) {
-			let request = this._organizationRequests.get(accessToken);
+			const requestKey = `${this.discoveryGeneration}:${accessToken}`;
+			let request = this._organizationRequests.get(requestKey);
 			if (request == null) {
-				request = this.fetchOrganization(session).finally(() => this._organizationRequests.delete(accessToken));
-				this._organizationRequests.set(accessToken, request);
+				request = this.fetchOrganization(session).finally(() => this._organizationRequests.delete(requestKey));
+				this._organizationRequests.set(requestKey, request);
 			}
 
 			const descriptor = await request;
@@ -425,6 +441,7 @@ export class LinearIntegration extends IssuesIntegration<IssuesCloudHostIntegrat
 		this._workspaceProjects.clear();
 		this._workspaceProjectsReads.clear();
 		this._autolinks.clear();
+		this._autolinksBuilds.clear();
 		this._recentAccounts.clear();
 	}
 	readonly authProvider: IntegrationAuthenticationProviderDescriptor = authProvider;

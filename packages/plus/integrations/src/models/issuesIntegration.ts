@@ -9,19 +9,16 @@ import { mapBounded, mapSettledBounded } from '@gitlens/utils/promise.js';
 import type { ProviderAuthenticationSession, SessionPublication } from '../authentication/models.js';
 import { failsEveryScope } from '../collectionMetadata.js';
 import type { IntegrationIds } from '../constants.js';
-import { providerFanOutConcurrency } from '../constants.js';
+import { IssuesCloudHostIntegrationId } from '../constants.js';
 import { toError } from '../errors.js';
+import type { LinearIntegration } from '../providers/linear.js';
 import type { ProviderApiCollectionResult } from '../providers/models.js';
-import type {
-	BatchSlot,
-	Integration,
-	IntegrationResult,
-	IntegrationType,
-	IssueEtagFields,
-	IssueEtagInclude,
-} from './integration.js';
+import { providerFanOutConcurrency } from '../providers/utils/providerPaging.js';
+import type { IssueEtagFields, IssueEtagInclude } from '../reads/etag.js';
+import type { BatchSlot, Integration } from './integration.js';
 import { IntegrationBase, isReadSessionFailure } from './integration.js';
 import type { IssuesForProjectOptions, ProjectIssuesDrain, ProjectIssuesRequest } from './issueReads.js';
+import type { IntegrationResult, IssuesIntegration as IssuesIntegrationView } from './publicIntegration.js';
 
 /**
  * Groups requests into searches of at most `maxPerSearch` projects sharing `searchKey`. Undefined, reading
@@ -75,8 +72,9 @@ export function splitProjectIssuesSearch<I>(
 	return split;
 }
 
-export function isIssuesIntegration(integration: Integration): integration is IssuesIntegration {
-	return integration.type === 'issues';
+/** By id: the provider class is loaded lazily, so it can't be checked with `instanceof` here. */
+export function isLinearIntegration(integration: Integration): integration is LinearIntegration {
+	return integration.id === IssuesCloudHostIntegrationId.Linear;
 }
 
 function sessionPublicationKey(id: string, cloud: boolean | undefined): string {
@@ -86,8 +84,11 @@ function sessionPublicationKey(id: string, cloud: boolean | undefined): string {
 export abstract class IssuesIntegration<
 	ID extends IntegrationIds = IntegrationIds,
 	T extends ResourceDescriptor = ResourceDescriptor,
-> extends IntegrationBase<ID> {
-	readonly type: IntegrationType = 'issues';
+>
+	extends IntegrationBase<ID>
+	implements IssuesIntegrationView
+{
+	readonly type = 'issues';
 	private _discoverySequence = 0;
 	private _globalRetirement = 0;
 	private _primaryPublication = 0;
@@ -387,11 +388,21 @@ export abstract class IssuesIntegration<
 
 	/**
 	 * Result-returning core of {@link getResourcesForUser}. Recovers thrown errors into `{ error }` so callers
-	 * can surface them as warnings rather than silently swallowing them to `undefined`. Gated here (not on the
+	 * can surface them as warnings rather than silently swallowing them to `undefined`. Deduped here (not on the
 	 * wrapper) so direct callers such as the ProviderBackend facade share the same dedup as `getResourcesForUser`.
 	 */
+	getResourcesForUserResult(connectionId?: string): Promise<IntegrationResult<T[] | undefined>> {
+		// Joined only within a discovery generation: a read started after a drop (a forced refresh) must not take the
+		// lookup a read made before it, which answers with the resources as they were then (#6162). An empty
+		// connectionId reads the primary, so it shares the primary's lookup.
+		return this.getResourcesForUserResultCore(connectionId || undefined, this.discoveryGeneration);
+	}
+
 	@gate()
-	async getResourcesForUserResult(connectionId?: string): Promise<IntegrationResult<T[] | undefined>> {
+	private async getResourcesForUserResultCore(
+		connectionId: string | undefined,
+		_discoveryGeneration: number,
+	): Promise<IntegrationResult<T[] | undefined>> {
 		const scope = getScopedLogger();
 		// `connectionId` targets a specific account (multi-account); omitted reads the primary.
 		const session = await this.resolveReadSession(connectionId, scope);

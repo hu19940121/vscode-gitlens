@@ -15,19 +15,77 @@ never leaks `@gitkraken/provider-apis` types, so a consumer depends on this pack
 
 ## 1. Entry points
 
-| Subpath                                              | Use it for                                                                         |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `@gitkraken/core-gitlens/plus/integrations/index.js` | The session-managed facade: manager factory, public types, and connection helpers. |
-| `@gitkraken/core-gitlens/plus/integrations/lite.js`  | Stateless, token-scoped single reads (no storage/auth lifecycle). See §10.         |
-| `@gitkraken/core-gitlens/git/models/*.js`            | The returned models (`PullRequestShape`, `IssueShape`, …).                         |
+| Subpath                                                  | Use it for                                                                                |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `@gitkraken/core-gitlens/plus/integrations/index.js`     | The session-managed facade: manager factory, public types, and connection helpers.        |
+| `@gitkraken/core-gitlens/plus/integrations/lite.js`      | Stateless, token-scoped single reads (no storage/auth lifecycle). See §10.                |
+| `@gitkraken/core-gitlens/plus/integrations/constants.js` | Integration ids and simple checks on them. No runtime imports, so webviews can import it. |
+| `@gitkraken/core-gitlens/git/models/*.js`                | The returned models (`PullRequestShape`, `IssueShape`, …).                                |
 
-Everything else under `plus/integrations/**` is internal. `IntegrationService`, the `GitHostIntegration`
-models, and the provider clients are deliberately **not** on the facade: they change without a semver bump.
+Everything else under `plus/integrations/**` is internal. `IntegrationService`, the integration implementation
+classes, and the provider clients are deliberately **not** on the facade: they change without a semver bump. What
+`manager.get(...)` hands out are interface-only views, `GitHostIntegration`, `IssuesIntegration` and
+`Integration` (their union), with the guards `isIntegration`, `isGitHostIntegration` and `isIssuesIntegration` to
+narrow them; use the guards, not `instanceof`.
 `manager.js` / `results.js` are not published subpaths either — their types are re-exported through
 `index.js`, so import them from there.
 
 > If a type you need to name isn't exported from `index.js`, that's a bug in this package — file it rather
 > than re-declaring the shape downstream, which silently drifts.
+
+### 1.1 Integration objects
+
+A view from `manager.get(...)` has the members below, grouped; the doc comments in `publicIntegration.ts` are the
+contract.
+
+- **Identity and state** (both kinds): `type`, `id`, `name`, `icon`, `domain`, `maybeConnected`.
+- **Connection** (both kinds): `access()`, `connect(source)`, `isConnected()`, `getCredential(source)`, and, on a git
+  host, `disconnect()`.
+- **Issues and links** (both kinds): `getIssue`, `getLinkedIssueOrPullRequest`, `autolinks()`.
+- **Git-host reads** (`GitHostIntegration` only): the current account and an account for a commit, repository
+  metadata and default branch, SSH signing keys, pull requests (by id, branch, commit or URL, the current user's,
+  and free-text search), stacked pull requests (only where the host has a stacks concept), `mergePullRequest`, and
+  the merge-queue actions `enqueuePullRequest` and `dequeuePullRequest` (GitHub.com only; every other host answers
+  `unsupported`), with the optional `getMergeQueueEntriesByPullRequestNumber`.
+
+`getCredential(source)` is the only way to a token. It returns `{ providerId, accessToken }`, refreshed first when it
+has expired, or `undefined` when the integration isn't connected or the refresh failed. An unexpired token is returned
+as is, so one the provider has since revoked still comes back. Session objects and `authProvider` are not exposed.
+`sessionFingerprint` (a hash of the session's token) appears only on `IntegrationCacheDescriptor`, which tells a
+consumer-owned cache when to invalidate.
+
+The manager members added for integration objects:
+
+- `get(id, domain?)`: the view for an id. A cloud id always resolves; a self-managed one needs `domain` and resolves
+  to `undefined` when no connection names that host.
+- `connectCloudIntegrations(options?, source?)`: runs the host's cloud connect flow for the given ids (all when
+  omitted), re-syncs, and resolves whether a requested integration became connected.
+- `manageCloudIntegrations(source?)`: opens the host's cloud integrations management and re-syncs on return.
+- `reset()`: resets every integration's local connection state.
+- `getMyPullRequests(integrationIds?, cancellation?, options?)` and `getMyIssues(integrationIds?, options?)`: the
+  current user's items across integrations, as `IntegrationResult`s.
+- `ignoreSSLErrors(integration)`: the `ignoreSSLErrors` setting of the remote configured for that host, if any.
+- `github`: the shared `GitHubApi` client, for a host running its own GitHub-backed git provider.
+  Host-oriented (it hands out a whole client, not a read), so expect it to narrow.
+
+**Actionable pull requests.** `toActionablePullRequestInput(pr)` turns a `PullRequestShape` into the input
+`getActionablePullRequests(...)` categorizes (Launchpad's categories), adding the entity-identifier `uuid` that keys
+pins and snoozes. The `ActionablePullRequest*` types are GitLens-owned copies, so the provider SDK stays out of your
+types.
+
+**Entity identifiers.** `encodeEntityIdentifier(input)` and `decodeEntityIdentifier(encoded)` are the string form
+Launchpad keys pins and snoozes by. `EntityIdentifierInput` is a union with one arm per provider and entity type the
+codec encodes, each requiring the fields it can't encode without. `encodeEntityIdentifier` and
+`getEntityIdentifierInput(pr)` throw when an arm misses a required field:
+
+- Bitbucket and Bitbucket Server need `repoId`.
+- Azure DevOps and Azure DevOps Server need an organization, a project and, for pull requests, `repoId`.
+- Jira (and Jira Server) issues need a project (`projectId`).
+- Trello issues need an account or organization and a project.
+- GitHub and GitLab (and their self-hosted variants) need nothing extra.
+
+Linear isn't encodable, and Jira and Trello have no pull request arm. `getEntityIdentifierInput(pr)` also throws for
+a pull request from a provider with no arm.
 
 ## 2. Building the runtime
 
@@ -41,7 +99,7 @@ broader `IntegrationServiceContext` is internal and is not part of the published
 | `account`      | yes      | The GitKraken account and the GK-cloud connect/manage round-trips. Return `undefined` from `getAccount` if you don't use GK cloud (see below).                                                                                                  |
 | `config`       | yes      | `getRemoteConfigs()` (self-managed hosts, SSL/protocol overrides), launchpad knobs, optional `getPullRequestReadOptions()` (`{ mergeQueue: true }` opts GitHub.com reads in to merge-queue data, unless a read says otherwise), a change event. |
 | `http`         | yes      | `fetch` + `wrapForForcedInsecureSSL` + `isWeb` + a User-Agent string.                                                                                                                                                                           |
-| `cache`        | no       | `IntegrationManagerCacheProvider`, whose only method is `getCurrentAccount`. Omit it for correct uncached reads; implement it for a long-lived manager to deduplicate provider identity lookups.                                                |
+| `cache`        | no       | `IntegrationManagerCacheProvider`: `getCurrentAccount` is required; the repository, pull-request and issue lookups and `deletePullRequests` are optional (see below). Omit it for correct uncached reads.                                       |
 | `repositories` | yes      | `getOpenRemotes()`; used only by the "across open repos" helpers. `async () => []` is fine.                                                                                                                                                     |
 | `hooks`        | no       | Auth strategy override, reauth/disconnect prompts, outbound behavioral events.                                                                                                                                                                  |
 
@@ -50,10 +108,22 @@ A complete, type-checked, dependency-free example (including the optional-cache 
 It runs against the packed artifact in CI, so it catches missing exports as well as source-level mistakes:
 use that file's `buildRuntime()` as your starting point.
 
-The cache callback receives only `{ id, domain }`, a loader, and cache controls (`connectionId`, `etag`,
-expiry). It never exposes GitLens' internal `IntegrationBase` / `GitHostIntegration` classes or requires
-stubs for unrelated repository, pull-request, or issue caches. The fixture uses the package's public
-`PromiseCache` utility, but any cache with the same behavior is valid.
+Each cache method gets the lookup's arguments, an `IntegrationCacheDescriptor`, a loader (called on a miss), and
+cache controls (`connectionId`, `etag`, expiry). The optional methods are:
+
+- `getRepositoryMetadata`, `getRepositoryDefaultBranch`: repository lookups.
+- `getPullRequestForSha`, `getPullRequestForBranch`, `getPullRequest`: pull-request lookups by commit, branch, or id.
+- `getIssue`, `getIssueOrPullRequest`: issue lookups by id.
+- `deletePullRequests()`: evicts every cached pull request (a merge can change pull requests no caller can name).
+
+A method you omit means no caching for that read: its loader runs on every call (and `deletePullRequests` is a
+no-op). Call a method as `cache.method(...)`; the manager never detaches it, so a class instance works.
+
+The descriptor is `{ id, domain, maybeConnected, sessionFingerprint }`, not the integration class. Its getters read
+through to the live integration each time they are read, so the values are live, not snapshots. Key entries by `id`
+and `domain`, and treat `maybeConnected` and `sessionFingerprint` as the entry's etag: when either changes (a
+reconnect, a token change) the entry must miss. The descriptor is `undefined` for lookups with no integration.
+The fixture uses the package's public `PromiseCache` utility, but any cache with the same behavior is valid.
 
 ### Authentication
 
@@ -451,8 +521,9 @@ The cells that aren't obvious from the projection names:
   summed, divided by 100 and rounded, minimum 1) that is one more request per pull request read: a 30-row full search
   page goes from 121 requests (1 point) to 151 (2 points), a 100-row lite page from 1 to 101 (1 point either way), a
   25-target batch read from 100 to 125 (1 point), and the cheap check's 25 targets from 0 or 25 (with `'checks'`) to 25
-  or 50 (1 point either way). The filtered search's worst case, 15 facets of 30 rows, goes from 1,815 requests (18
-  points) to 2,265 (23).
+  or 50 (1 point either way). The filtered search's pages are bounded per document (20 full rows, 100 lite rows,
+  across all facets), so every page of it costs 1 point either way: its costliest, ten facets of 2 full rows or of 10
+  lite rows, goes from 90 requests to 110 and from 10 to 110.
 
 #### Every other provider
 
@@ -742,8 +813,9 @@ relationship is mandatory. This is deliberately not `involves:@me`: that GitHub 
 `review-requested` but includes `commenter`, so it cannot match the adjacent visible-PR list.
 
 The read is ordered by `criteria.sort`, most-recently-updated-first when omitted; the keys a provider accepts are
-`getSupportedFilters().pullRequestSearch.sorts`. On GitHub/GHE a threaded `cursor` is exactly one upstream request,
-since every active relationship × state facet travels as an alias in one GraphQL document; Bitbucket Data Center
+`getSupportedFilters().pullRequestSearch.sorts`. On GitHub/GHE a threaded `cursor` is one upstream request (two when
+GitHub's gateway times out, see below), since every active relationship × state facet travels as an alias in one
+GraphQL document; Bitbucket Data Center
 has no such batching and spends one request per repository × relationship facet still being read. A page number
 without a cursor walks from page 1. At GitHub's 1,000-result-per-facet ceiling, `page.truncated` is true and
 the warning's `omission` carries `totalCount`, `limit`, and `recovery: 'none'`. `totalCount` is the largest
@@ -763,6 +835,24 @@ per-relationship fan-out, since each facet is its own aliased provider query. A 
 overlap; deduplication does **not** bring the page back to the requested size, since it removes only the rows
 the facets share. As in §5.1: size the list off `page.itemsPerPage`, not off the value you sent; a provider
 may cap the `itemsPerPage` it honors below what you asked for.
+
+On GitHub/GHE what caps it is time. GitHub gives up on a page it can't build in about 11 seconds and answers
+502/504 with an HTML gateway page, and the time grows with how many pull requests the page selects and how much
+each carries. So a page holds at most **20** pull requests across all of its facets in the full shape and
+**100** in the `summary` shape, split evenly across the active facets (a 3-relationship full search gets 6 per
+facet), and `itemsPerPage` can only lower a facet's share. If the gateway gives up anyway, the page is asked for
+once more at half its size (unchanged once it is one row per facet), and the rest of the walk keeps that size; if
+that fails at the gateway too, the read fails (warning + `fetchFailed`) rather than sending the third identical
+request that made a failure take about 35 seconds. Other transient failures (503, a network failure) are retried
+unchanged as before. A smaller page is a successful one: no warning, `page.itemsPerPage` says how many came back,
+and its `cursor` resumes every facet right after the last row it served, so no facet skips or repeats a row. Never
+treat a short page as the last; only `hasMore`/`cursor` say that. Facets that overlap are another matter, on every
+page of this search: a pull request two facets share (authored and assigned, say) can come back once per facet, on
+different pages, so dedupe the accumulated rows by `url`.
+
+Pass `cancellation` to abort the read: the request in flight, a retry waiting to be sent, and any page a
+page-number walk still has to read. The read then rejects with a `CancellationError` rather than resolving, so a
+cancelled read is never mistaken for a failed or an empty one.
 
 ### 5.1 The filtered issue search and its count probe
 
@@ -1304,8 +1394,9 @@ both: only the full projection populates it.
 
 The paginated read that does carry the full projection is `searchPullRequestsPage` with
 `criteria.relationships` on GitHub/GHE (Bitbucket Data Center also exposes the search, with its native row shape):
-its results always include the review projection with `commitOid`, it honors `itemsPerPage`, and one threaded
-cursor page is exactly one upstream request — every relationship × state facet travels in the same query,
+its results always include the review projection with `commitOid`, it honors `itemsPerPage` up to its page budget,
+and one threaded cursor page is one upstream request (two after a gateway timeout) — every relationship × state facet
+travels in the same query,
 unlike the account-wide read, which spends one request per facet per page. So a surface that pages
 incrementally should ask the search read for `Reviewed` (and `ReviewRequested` as its own read) rather than
 reach for `includeReviews`, which only exists on the all-at-once sweep.

@@ -8,8 +8,42 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Added
 
+- Adds `plus/integrations/constants.js` to the published entry points: integration ids, enums and pure id predicates, with no runtime imports, so it is safe in browser bundles (plus/integrations)
+- Expands the `plus/integrations/index.js` facade into the full integrations API GitLens itself now consumes. `IntegrationManager` adds `get` (interface-only `GitHostIntegration`/`IssuesIntegration` views, no provider classes; a git host's view carries `mergePullRequest`, `enqueuePullRequest` and `dequeuePullRequest`, which 0.34.0 left unreachable from the facade, and the optional `getMergeQueueEntriesByPullRequestNumber`), `getIntegrationsForAccountWideRead`, `isConnectedForAccountWideRead`, `connectCloudIntegrations`, `manageCloudIntegrations`, `reset`, `getMyPullRequests`, `getMyIssues`, `ignoreSSLErrors` and `github`. The facade also exports:
+  - the `isIntegration`/`isGitHostIntegration`/`isIssuesIntegration` guards
+  - the integration-id and remote helpers (including `isAzureProviderId`, `getAzureRepositoryIdentity` and `splitOwnerAndRepo`), and provider metadata
+  - a neutral entity-identifier codec (`encodeEntityIdentifier`/`decodeEntityIdentifier` and the git-config helpers)
+  - neutral actionable pull request types with `getActionablePullRequests`
+
+  None of these signatures reference `@gitkraken/provider-apis` types (plus/integrations)
+
+- Adds optional pull request, issue and repository lookups to `IntegrationManagerCacheProvider`. A lookup the cache omits runs uncached. Each one receives an `IntegrationCacheDescriptor`, which adds `maybeConnected` and `sessionFingerprint` to `IntegrationAccountCacheDescriptor` (now an alias of it) so a cache can invalidate on a reconnect or a token change (plus/integrations)
+
+### Changed
+
+- `IssueCountScope.repos` and `PullRequestCountScope.repos` are typed with the package's own `ProviderRepositoriesInput` instead of a provider-apis repository input (plus/integrations)
+
+## [0.37.1] - 2026-11-10
+
+### Fixed
+
+- Fixes GitHub/GHE pull request text searches for exactly open and merged matches filling their ten-result limit with open pull requests before considering merged ones. This combination now selects and combines matches newest-created first, overriding unquoted `sort:` qualifiers in the search text. Other state combinations and the filtered, paged search keep their existing behavior ([#5980](https://github.com/gitkraken/vscode-gitlens/issues/5980)) (plus/git-github)
+
+## [0.37.0] - 2026-11-10
+
+### Added
+
 - Adds `getBranchReflogWork` to `utils/branch.utils.js`: from a local branch's reflog (newest first, as `refs.getReflogEntries` reads it), whether the branch has work authored on it (`'work'`), was created here and never had any (`'none'`), or can't be told (`'unknown'`: an empty or expired reflog, or a branch created from the same-named remote branch). Every entry counts as work except a move that adds none: the branch's creation, a reset or rename, a fast-forward merge or pull, a fetch, a clone, or a rebase that replayed nothing. It tells a branch whose work was fast-forward merged apart from a new one, which `getBranchMergedStatus` reports alike, as merged (git)
 - Adds `getBranchLandedState` to `utils/branchLanded.utils.js`, with the `BranchLandedPullRequestCandidate` and `BranchLandedState` types: from a branch's tip sha and its pull requests, whether its work landed through a merged pull request. The head sha decides, never recency: an open pull request at the tip means the branch is live (`live`), a merged one at the tip means it landed, and otherwise the merged pull request with the fewest new commits decides between landed (none) and a successor (some). A pull request without a head sha never decides (git)
+- Adds `cancellation` to `IntegrationManager.searchPullRequestsPage`: aborting it cancels the request in flight, a retry waiting to be sent and any page a page-number walk still has to read, and the read rejects with a `CancellationError` rather than resolving as a failed or empty page (plus/integrations)
+
+### Changed
+
+- **Breaking (plus/git-github, plus/integrations)** — On GitHub/GHE the filtered pull request search (`searchPullRequestsPage`) holds at most 20 pull requests a page across all of its relationship × state facets in the full shape, and 100 in the `summary` shape, split evenly across the active facets (at least one each), and `itemsPerPage` can only lower a facet's share. The full-shape default was 30 per facet with an explicit maximum of 100, so a single-facet page now holds up to 20 rather than 30 (or 100), a 3-relationship search 6 per facet rather than 30, and an explicit `summary` size of 100 over two states 50 per facet. GitHub gives up on a page it can't build in about 11 seconds, answering 502/504 with an HTML gateway page, and the time grows with the pull requests the page selects: measured on `org:microsoft is:pr is:open`, 20 full rows took 5 to 7 seconds while 30 failed in some runs and 100 in every run. A page with more to read always carries a `cursor`; a smaller page is not the last one and carries no warning, and `page.itemsPerPage` reports what came back. Size a list from `hasMore`/`cursor` and `page.itemsPerPage`, never from the size you asked for ([#5978](https://github.com/gitkraken/vscode-gitlens/issues/5978))
+
+### Fixed
+
+- Fixes the filtered pull request search on GitHub/GHE failing after about 35 seconds whenever GitHub's gateway timed out building a page, by sending the same expensive request three times. A page whose request gets a 502/504 is now asked for once more at half its size (unchanged once it is one row per facet), and a second gateway failure fails the read (warning + `fetchFailed`, as before) instead of a third identical request. A page that recovers is smaller but no facet skips or repeats a row, since every facet resumes from the last row it served, and the rest of the walk keeps the halved size so its later pages don't time out first; the reduced size travels in the cursor. Other transient failures (503, a network failure) retry unchanged as before ([#5978](https://github.com/gitkraken/vscode-gitlens/issues/5978)) (plus/git-github)
 
 ## [0.36.0] - 2026-11-09
 
@@ -1209,7 +1243,9 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 - Initial release. Bundles `@gitlens/utils`, `@gitlens/git`, `@gitlens/git-cli`, `@gitlens/ai`, and `@gitlens/git-github` into a single core npm package with subpath exports.
 
-[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.36.0...HEAD
+[unreleased]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.37.1...HEAD
+[0.37.1]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.37.0...gitkraken:releases/core/v0.37.1
+[0.37.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.36.0...gitkraken:releases/core/v0.37.0
 [0.36.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.35.0...gitkraken:releases/core/v0.36.0
 [0.35.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.34.0...gitkraken:releases/core/v0.35.0
 [0.34.0]: https://github.com/gitkraken/vscode-gitlens/compare/releases/core/v0.33.0...gitkraken:releases/core/v0.34.0

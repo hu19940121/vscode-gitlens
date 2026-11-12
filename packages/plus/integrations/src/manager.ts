@@ -1,6 +1,8 @@
+import type { GitHubApi } from '@gitlens/git-github/api/github.js';
 import type { RefSet } from '@gitlens/git/models/autolink.js';
 import type { IssueSearchCriteria, IssueShape, IssueStateFilter } from '@gitlens/git/models/issue.js';
 import type {
+	PullRequest,
 	PullRequestSearchCriteria,
 	PullRequestShape,
 	PullRequestStateFilter,
@@ -8,22 +10,31 @@ import type {
 import type { Event } from '@gitlens/utils/event.js';
 import type { ConfiguredIntegrationsChangeEvent } from './authentication/configuredIntegrationService.js';
 import type { ConfiguredIntegrationDescriptor } from './authentication/models.js';
-import type { IntegrationIds, IssuesCloudHostIntegrationId, IssuesSelfManagedHostIntegrationId } from './constants.js';
-import type { IssueEtagInclude, PullRequestEtagInclude } from './models/integration.js';
-import type { IssueFilter, IssueSorting, PullRequestFilter } from './providerFilters.js';
 import type {
-	IssueCountResult,
-	IssueCountScope,
-	PullRequestCountResult,
-	PullRequestCountScope,
-} from './reads/counts.js';
-import type { CurrentAccountResult } from './reads/currentAccount.js';
-import type { SupportedFilters } from './reads/filters.js';
-import type { IssueBatchResult, IssueBatchTarget } from './reads/issueBatch.js';
-import type { PullRequestBatchResult, PullRequestBatchTarget } from './reads/pullRequestBatch.js';
-import type { PullRequestBranchResult, PullRequestBranchTarget } from './reads/pullRequestBranches.js';
+	CloudGitSelfManagedHostIntegrationIds,
+	GitCloudHostIntegrationId,
+	GitSelfManagedHostIntegrationId,
+	IntegrationIds,
+	IssuesCloudHostIntegrationId,
+	IssuesSelfManagedHostIntegrationId,
+	SupportedCloudIntegrationIds,
+} from './constants.js';
+import type {
+	GitHostIntegration,
+	IntegrationById,
+	IntegrationResult,
+	IssuesIntegration,
+	SearchMyPullRequestsOptions,
+} from './models/publicIntegration.js';
+import type { IssueFilter, IssueSorting, PullRequestFilter, SupportedFilters } from './providerFilters.js';
+import type { IssueEtagInclude, PullRequestEtagInclude } from './reads/etag.js';
 import type {
 	ConnectionStateChangeEvent,
+	CurrentAccountResult,
+	IssueBatchResult,
+	IssueBatchTarget,
+	IssueCountResult,
+	IssueCountScope,
 	ProviderBroadenResult,
 	ProviderLinearProjectShape,
 	ProviderOrganization,
@@ -31,8 +42,15 @@ import type {
 	ProviderRepositoryShape,
 	ProviderResult,
 	ProviderSweepResult,
+	PullRequestBatchResult,
+	PullRequestBatchTarget,
+	PullRequestBranchResult,
+	PullRequestBranchTarget,
+	PullRequestCountResult,
+	PullRequestCountScope,
 	ResolveRepositoryResult,
 } from './results.js';
+import type { Source } from './telemetry.js';
 
 /** Neutral repository input accepted by repo-scoped provider reads. */
 export interface ProviderRepositoryInput {
@@ -504,6 +522,19 @@ export interface IntegrationManager {
 	 * pre-ceiling facet count, not the reachable or returned row count; this mirrors the per-search ceiling's own
 	 * unit.
 	 *
+	 * **On GitHub/GHE a page is bounded by how long GitHub takes to build it**, not only by `itemsPerPage`: past about
+	 * 11 seconds its gateway gives up with a 502/504. So a page holds at most 20 pull requests across all its facets
+	 * in the full shape and 100 in the `summary` shape, split evenly across the active facets (a 3-facet full search
+	 * gets 6 per facet), and `itemsPerPage` can only lower a facet's share. When the gateway gives up anyway, the
+	 * page is asked for once more at half its size (unchanged once it is one row per facet) and the rest of the walk
+	 * keeps that size; if that fails at the gateway too, the read fails (warning + `fetchFailed`) rather than asking
+	 * a third time. Other transient failures (503, a network failure) are retried unchanged, as on any read. A smaller
+	 * page is not a failure and carries no warning: it reports its real size in
+	 * `page.itemsPerPage`, and its `cursor` resumes every facet exactly after the last row it served, so no facet
+	 * skips or repeats a row. Never read a page shorter than requested as the last one; only `hasMore`/`cursor` say
+	 * that. As on every page of this search, a pull request two facets share (authored AND assigned, say) can come back
+	 * on two different pages, once per facet; dedupe across pages by `url`.
+	 *
 	 * **Azure DevOps Server** differs in how it gets there, because its pull request API can't filter by text, date or
 	 * draft: the first page drains every facet (up to 1,000 rows each) and later pages are served from that drain,
 	 * so a first page can cost many requests and a continuation none. A continuation whose drain expired is refused;
@@ -546,8 +577,9 @@ export interface IntegrationManager {
 		 * 2-state search returns up to `6 × itemsPerPage` items before deduplication, and fewer than that where
 		 * the facets overlap. Deduplication does NOT bring the page back to this size: it removes only the rows the
 		 * facets share. `page.itemsPerPage` reports what actually came back, so size the UI off that rather than
-		 * off this. A provider may also cap it below what is asked for. Azure DevOps Server is the exception: it
-		 * serves one merged page, so there this is the page size (at most 100).
+		 * off this. A provider may also cap it below what is asked for, as GitHub/GHE do to keep a page within the
+		 * time GitHub allows (see above), so omit it unless you need FEWER rows than the default. Azure DevOps Server
+		 * is the exception: it serves one merged page, so there this is the page size (at most 100).
 		 */
 		itemsPerPage?: number;
 		forceSync?: boolean;
@@ -556,9 +588,8 @@ export interface IntegrationManager {
 		domain?: string;
 		/**
 		 * Requests the lightweight row shape: identity, body, author, repository, branch refs and stack info,
-		 * without review, check or diff statistics. It also replaces the flat per-facet default page size with a
-		 * fixed budget shared across the search's ACTIVE facets, so with up to three of them it raises the page
-		 * and from four on it LOWERS it — measured against GitHub, a 100-row budget versus a flat 30 each.
+		 * without review, check or diff statistics. On GitHub/GHE it also raises the page budget shared across the
+		 * search's ACTIVE facets from 20 rows to 100, since the lite rows take GitHub a fraction of the time to build.
 		 *
 		 * A provider without a lightweight projection ignores it and returns its usual shape, so this is a hint
 		 * rather than a contract about which fields are present.
@@ -571,6 +602,12 @@ export interface IntegrationManager {
 		 * rate-limit request per row.
 		 */
 		mergeQueue?: boolean;
+		/**
+		 * Aborts the read: the request in flight, a retry waiting to be sent, and any page a page-number walk still
+		 * has to read. The read then rejects with a `CancellationError` instead of resolving, so a cancelled read is
+		 * never mistaken for a failed or an empty one.
+		 */
+		cancellation?: AbortSignal;
 	}): Promise<ProviderPagedResult<PullRequestShape>>;
 	listIssuesPage(options: {
 		state?: IssueStateFilter;
@@ -1037,4 +1074,58 @@ export interface IntegrationManager {
 		 */
 		domain?: string;
 	}): Promise<CurrentAccountResult>;
+
+	// #region Integration-object surface (connect/manage flows and the live integrations the GitLens host drives)
+
+	/**
+	 * The integration for `id` (and, for a self-managed host, `domain`), as its public view. A cloud id always
+	 * resolves; a self-managed one resolves to `undefined` when no connection names the host.
+	 */
+	get(id: GitCloudHostIntegrationId): Promise<GitHostIntegration>;
+	get(id: IssuesCloudHostIntegrationId): Promise<IssuesIntegration>;
+	get(
+		id: GitCloudHostIntegrationId | CloudGitSelfManagedHostIntegrationIds,
+		domain?: string,
+	): Promise<GitHostIntegration | undefined>;
+	get(id: GitSelfManagedHostIntegrationId, domain: string): Promise<GitHostIntegration | undefined>;
+	get<T extends IntegrationIds>(id: T, domain?: string): Promise<IntegrationById<T> | undefined>;
+	/**
+	 * Every instance of `id` an account-wide read should cover: one per configured host for a self-managed id, else
+	 * the single instance. A lookup that throws is left out.
+	 */
+	getIntegrationsForAccountWideRead<T extends IntegrationIds>(id: T): Promise<IntegrationById<T>[]>;
+	/** Whether any instance {@link getIntegrationsForAccountWideRead} returns is connected (and, with `access`, usable). */
+	isConnectedForAccountWideRead(id: IntegrationIds, options?: { access?: boolean }): Promise<boolean>;
+	/**
+	 * Runs the host's cloud connect flow for `integrationIds` (all cloud integrations when omitted) and re-syncs.
+	 * Resolves whether a requested integration became connected (or, with none requested, whether the flow completed).
+	 */
+	connectCloudIntegrations(
+		options?: { integrationIds: SupportedCloudIntegrationIds[]; skipIfConnected?: boolean; skipPreSync?: boolean },
+		source?: Source,
+	): Promise<boolean>;
+	/** Opens the host's cloud integrations management, re-syncing once the user returns. */
+	manageCloudIntegrations(source?: Source): Promise<void>;
+	/** Resets every integration's local connection state. */
+	reset(): Promise<void>;
+	/** The current user's open pull requests across `integrationIds` (every git host when omitted). */
+	getMyPullRequests(
+		integrationIds?: (GitCloudHostIntegrationId | CloudGitSelfManagedHostIntegrationIds)[],
+		cancellation?: AbortSignal,
+		options?: SearchMyPullRequestsOptions,
+	): Promise<IntegrationResult<PullRequest[] | undefined>>;
+	/** The current user's issues across `integrationIds` (every integration when omitted). */
+	getMyIssues(
+		integrationIds?: IntegrationIds[],
+		options?: { openRepositoriesOnly?: boolean; cancellation?: AbortSignal },
+	): Promise<IntegrationResult<IssueShape[] | undefined>>;
+	/** The `ignoreSSLErrors` setting of the remote configured for the integration's host, if any. */
+	ignoreSSLErrors(integration: { id: IntegrationIds; domain?: string }): boolean | 'force';
+	/**
+	 * The shared `GitHubApi` client, for a host that runs its own GitHub-backed git provider over the same instance.
+	 * Host-oriented: it hands out a whole client rather than a read, so it is a candidate to narrow.
+	 */
+	readonly github: Promise<GitHubApi | undefined>;
+
+	// #endregion
 }
