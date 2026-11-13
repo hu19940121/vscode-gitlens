@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ## [Unreleased]
 
+### Changed
+
+- Adds high contrast light defaults for all of GitLens' theme colors &mdash; blame annotations, branch and file decorations, pull request and issue icons, _Commit Graph_ lanes and markers, and _Launchpad_ indicators now meet high contrast levels instead of reusing the light theme's colors ([#2119](https://github.com/gitkraken/vscode-gitlens/issues/2119))
+- Removes an unused inline script from the _Interactive Rebase Editor_ and _Cloud Patch_ details webviews, so their state is only ever embedded as encoded data ([#6201](https://github.com/gitkraken/vscode-gitlens/issues/6201))
+- Hardens how commit messages and pull request and issue text are rendered in hovers, view tooltips, the _Commit Graph_ and _Inspect_ &mdash; links in that text can only open web or mail addresses, and only GitLens' own actions can run commands ([#6200](https://github.com/gitkraken/vscode-gitlens/issues/6200))
+
+### Fixed
+
+- Fixes _Launchpad_ showing "needs reviewers" for GitHub pull requests on repositories that don't require a review ([#5863](https://github.com/gitkraken/vscode-gitlens/issues/5863))
+- Fixes hard-to-read branch and tag names in the _Commit Graph_ with light themes &mdash; lane-colored names are darkened just enough to stay legible while keeping their lane's hue, and the current branch's pill and marker no longer put white text on a light green ([#4548](https://github.com/gitkraken/vscode-gitlens/issues/4548))
+- Fixes faint inline blame annotations in high contrast dark themes ([#2058](https://github.com/gitkraken/vscode-gitlens/issues/2058))
+- Fixes _Commit Graph_ ref pills keeping highlights that no longer describe them ([#5764](https://github.com/gitkraken/vscode-gitlens/issues/5764))
+  - Stops painting another branch or tag in the current branch's color when the current branch is hidden behind the _+N_ badge
+  - Clears a branch, tag, or worktree's find highlight as soon as the query no longer matches it, instead of when the finder closes
+- Fixes a remote URL with an `@` in its path being recognized as a repository on a different host &mdash; e.g. `https://example.com/x@github.com/owner/repo.git` as GitHub's `owner/repo` ([#6185](https://github.com/gitkraken/vscode-gitlens/issues/6185))
+- Fixes the _Commit Graph_'s branch details offering _Create a Pull Request_ and _Recompose Branch_ for a branch whose work already landed in its merge target ([#6190](https://github.com/gitkraken/vscode-gitlens/issues/6190))
+- Fixes the _Commit Graph_ header hiding _Publish Branch_ for a branch whose pull request merged into a branch other than its merge target, such as a stacked parent ([#6191](https://github.com/gitkraken/vscode-gitlens/issues/6191))
+- Fixes the _Inspect_ view not autolinking issues and pull requests in the first commit it shows, and changes to the `gitlens.views.commitDetails.autolinks.enabled` setting not applying to the commit already shown ([#6204](https://github.com/gitkraken/vscode-gitlens/issues/6204))
+
 ## [19.6.0] - 2026-11-10
 
 ### Added

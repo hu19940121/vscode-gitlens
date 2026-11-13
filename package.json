@@ -6285,6 +6285,7 @@
 				"defaults": {
 					"dark": "#FFFFFF13",
 					"light": "#0000000C",
+					"highContrastLight": "#0000000C",
 					"highContrast": "#FFFFFF13"
 				}
 			},
@@ -6294,6 +6295,7 @@
 				"defaults": {
 					"dark": "#BEBEBE",
 					"light": "#747474",
+					"highContrastLight": "#292929",
 					"highContrast": "#BEBEBE"
 				}
 			},
@@ -6303,6 +6305,7 @@
 				"defaults": {
 					"dark": "#00BCF299",
 					"light": "#00BCF299",
+					"highContrastLight": "#005873",
 					"highContrast": "#00BCF2FF"
 				}
 			},
@@ -6312,6 +6315,7 @@
 				"defaults": {
 					"dark": "#00000000",
 					"light": "#00000000",
+					"highContrastLight": "#00000000",
 					"highContrast": "#00000000"
 				}
 			},
@@ -6321,7 +6325,8 @@
 				"defaults": {
 					"dark": "#99999959",
 					"light": "#99999959",
-					"highContrast": "#99999999"
+					"highContrastLight": "#292929",
+					"highContrast": "#999999"
 				}
 			},
 			{
@@ -6330,6 +6335,7 @@
 				"defaults": {
 					"dark": "#00BCF233",
 					"light": "#00BCF233",
+					"highContrastLight": "#00BCF233",
 					"highContrast": "#00BCF233"
 				}
 			},
@@ -6339,6 +6345,7 @@
 				"defaults": {
 					"dark": "#00BCF299",
 					"light": "#00BCF299",
+					"highContrastLight": "#008db6",
 					"highContrast": "#00BCF299"
 				}
 			},
@@ -6347,6 +6354,7 @@
 				"defaults": {
 					"dark": "#3fb950",
 					"light": "#1a7f37",
+					"highContrastLight": "#374e06",
 					"highContrast": "#68ff79"
 				},
 				"description": "%color.gitlens.openAutolinkedIssueIconColor.description%"
@@ -6356,6 +6364,7 @@
 				"defaults": {
 					"dark": "#a371f7",
 					"light": "#8250df",
+					"highContrastLight": "#652D90",
 					"highContrast": "#8945ff"
 				},
 				"description": "%color.gitlens.closedAutolinkedIssueIconColor.description%"
@@ -6366,6 +6375,7 @@
 				"defaults": {
 					"dark": "#f85149",
 					"light": "#cf222e",
+					"highContrastLight": "#ad0707",
 					"highContrast": "#ff544b"
 				}
 			},
@@ -6375,6 +6385,7 @@
 				"defaults": {
 					"dark": "#3fb950",
 					"light": "#1a7f37",
+					"highContrastLight": "#374e06",
 					"highContrast": "#68ff79"
 				}
 			},
@@ -6394,6 +6405,7 @@
 				"defaults": {
 					"dark": "#a371f7",
 					"light": "#8250df",
+					"highContrastLight": "#652D90",
 					"highContrast": "#8945ff"
 				}
 			},
@@ -6403,6 +6415,7 @@
 				"defaults": {
 					"dark": "#35b15e",
 					"light": "#35b15e",
+					"highContrastLight": "#374e06",
 					"highContrast": "#4dff88"
 				}
 			},
@@ -6412,6 +6425,7 @@
 				"defaults": {
 					"dark": "#35b15e",
 					"light": "#35b15e",
+					"highContrastLight": "#374e06",
 					"highContrast": "#4dff88"
 				}
 			},
@@ -6421,6 +6435,7 @@
 				"defaults": {
 					"dark": "#b15e35",
 					"light": "#b15e35",
+					"highContrastLight": "#783e21",
 					"highContrast": "#ff874c"
 				}
 			},
@@ -6429,6 +6444,7 @@
 				"description": "%color.gitlens.decorations.addedForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.addedResourceForeground",
+					"highContrastLight": "gitDecoration.addedResourceForeground",
 					"dark": "gitDecoration.addedResourceForeground",
 					"highContrast": "gitDecoration.addedResourceForeground"
 				}
@@ -6438,6 +6454,7 @@
 				"description": "%color.gitlens.decorations.copiedForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.renamedResourceForeground",
+					"highContrastLight": "gitDecoration.renamedResourceForeground",
 					"dark": "gitDecoration.renamedResourceForeground",
 					"highContrast": "gitDecoration.renamedResourceForeground"
 				}
@@ -6447,6 +6464,7 @@
 				"description": "%color.gitlens.decorations.deletedForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.deletedResourceForeground",
+					"highContrastLight": "gitDecoration.deletedResourceForeground",
 					"dark": "gitDecoration.deletedResourceForeground",
 					"highContrast": "gitDecoration.deletedResourceForeground"
 				}
@@ -6456,6 +6474,7 @@
 				"description": "%color.gitlens.decorations.ignoredForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.ignoredResourceForeground",
+					"highContrastLight": "gitDecoration.ignoredResourceForeground",
 					"dark": "gitDecoration.ignoredResourceForeground",
 					"highContrast": "gitDecoration.ignoredResourceForeground"
 				}
@@ -6465,6 +6484,7 @@
 				"description": "%color.gitlens.decorations.modifiedForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.modifiedResourceForeground",
+					"highContrastLight": "gitDecoration.modifiedResourceForeground",
 					"dark": "gitDecoration.modifiedResourceForeground",
 					"highContrast": "gitDecoration.modifiedResourceForeground"
 				}
@@ -6474,6 +6494,7 @@
 				"description": "%color.gitlens.decorations.untrackedForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.untrackedResourceForeground",
+					"highContrastLight": "gitDecoration.untrackedResourceForeground",
 					"dark": "gitDecoration.untrackedResourceForeground",
 					"highContrast": "gitDecoration.untrackedResourceForeground"
 				}
@@ -6483,6 +6504,7 @@
 				"description": "%color.gitlens.decorations.renamedForegroundColor.description%",
 				"defaults": {
 					"light": "gitDecoration.renamedResourceForeground",
+					"highContrastLight": "gitDecoration.renamedResourceForeground",
 					"dark": "gitDecoration.renamedResourceForeground",
 					"highContrast": "gitDecoration.renamedResourceForeground"
 				}
@@ -6493,6 +6515,7 @@
 				"defaults": {
 					"dark": "#35b15e",
 					"light": "#35b15e",
+					"highContrastLight": "#374e06",
 					"highContrast": "#4dff88"
 				}
 			},
@@ -6502,6 +6525,7 @@
 				"defaults": {
 					"dark": "#b15e35",
 					"light": "#b15e35",
+					"highContrastLight": "#783e21",
 					"highContrast": "#ff874c"
 				}
 			},
@@ -6511,6 +6535,7 @@
 				"defaults": {
 					"dark": "#D8AF1B",
 					"light": "#D8AF1B",
+					"highContrastLight": "#895503",
 					"highContrast": "#D8AF1B"
 				}
 			},
@@ -6520,6 +6545,7 @@
 				"defaults": {
 					"dark": "sideBar.foreground",
 					"light": "sideBar.foreground",
+					"highContrastLight": "sideBar.foreground",
 					"highContrast": "sideBar.foreground"
 				}
 			},
@@ -6529,6 +6555,7 @@
 				"defaults": {
 					"dark": "sideBar.foreground",
 					"light": "sideBar.foreground",
+					"highContrastLight": "sideBar.foreground",
 					"highContrast": "sideBar.foreground"
 				}
 			},
@@ -6537,6 +6564,7 @@
 				"description": "%color.gitlens.decorations.branchMissingUpstreamForegroundColor.description%",
 				"defaults": {
 					"light": "#ad0707",
+					"highContrastLight": "#ad0707",
 					"dark": "#c74e39",
 					"highContrast": "#c74e39"
 				}
@@ -6546,6 +6574,7 @@
 				"description": "%color.gitlens.decorations.statusMergingOrRebasingConflictForegroundColor.description%",
 				"defaults": {
 					"light": "#ad0707",
+					"highContrastLight": "#ad0707",
 					"dark": "#c74e39",
 					"highContrast": "#c74e39"
 				}
@@ -6556,6 +6585,7 @@
 				"defaults": {
 					"dark": "#D8AF1B",
 					"light": "#D8AF1B",
+					"highContrastLight": "#895503",
 					"highContrast": "#D8AF1B"
 				}
 			},
@@ -6564,7 +6594,7 @@
 				"description": "%color.gitlens.decorations.statusPausedOperationReadyForegroundColor.description%",
 				"defaults": {
 					"light": "#2da44e",
-					"highContrastLight": "#2da44e",
+					"highContrastLight": "#374e06",
 					"dark": "#3fb950",
 					"highContrast": "#3fb950"
 				}
@@ -6575,6 +6605,7 @@
 				"defaults": {
 					"dark": "#909090",
 					"light": "#949494",
+					"highContrastLight": "#595959",
 					"highContrast": "#d3d3d3"
 				}
 			},
@@ -6584,6 +6615,7 @@
 				"defaults": {
 					"dark": "#35b15e",
 					"light": "#35b15e",
+					"highContrastLight": "#374e06",
 					"highContrast": "#4dff88"
 				}
 			},
@@ -6593,6 +6625,7 @@
 				"defaults": {
 					"dark": "#35b15e",
 					"light": "#35b15e",
+					"highContrastLight": "#374e06",
 					"highContrast": "#4dff88"
 				}
 			},
@@ -6601,6 +6634,7 @@
 				"description": "%color.gitlens.decorations.worktreeHasUncommittedChangesForegroundColor.description%",
 				"defaults": {
 					"light": "#895503",
+					"highContrastLight": "#895503",
 					"dark": "#E2C08D",
 					"highContrast": "#E2C08D"
 				}
@@ -6610,6 +6644,7 @@
 				"description": "%color.gitlens.decorations.worktreeMissingForegroundColor.description%",
 				"defaults": {
 					"light": "#ad0707",
+					"highContrastLight": "#ad0707",
 					"dark": "#c74e39",
 					"highContrast": "#c74e39"
 				}
@@ -6619,6 +6654,7 @@
 				"description": "%color.gitlens.graphLane1Color.description%",
 				"defaults": {
 					"light": "#15a0bf",
+					"highContrastLight": "#07596c",
 					"dark": "#18D1D1",
 					"highContrast": "#18D1D1"
 				}
@@ -6628,6 +6664,7 @@
 				"description": "%color.gitlens.graphLane2Color.description%",
 				"defaults": {
 					"light": "#0669f7",
+					"highContrastLight": "#0347ac",
 					"dark": "#45C6FE",
 					"highContrast": "#45C6FE"
 				}
@@ -6637,6 +6674,7 @@
 				"description": "%color.gitlens.graphLane3Color.description%",
 				"defaults": {
 					"light": "#8e00c2",
+					"highContrastLight": "#7600a2",
 					"dark": "#98B5FE",
 					"highContrast": "#98B5FE"
 				}
@@ -6646,6 +6684,7 @@
 				"description": "%color.gitlens.graphLane4Color.description%",
 				"defaults": {
 					"light": "#c517b6",
+					"highContrastLight": "#850c7a",
 					"dark": "#C9A1FE",
 					"highContrast": "#C9A1FE"
 				}
@@ -6655,6 +6694,7 @@
 				"description": "%color.gitlens.graphLane5Color.description%",
 				"defaults": {
 					"light": "#d90171",
+					"highContrastLight": "#93004b",
 					"dark": "#F58FD7",
 					"highContrast": "#F58FD7"
 				}
@@ -6664,6 +6704,7 @@
 				"description": "%color.gitlens.graphLane6Color.description%",
 				"defaults": {
 					"light": "#cd0101",
+					"highContrastLight": "#990101",
 					"dark": "#FE949D",
 					"highContrast": "#FE949D"
 				}
@@ -6673,6 +6714,7 @@
 				"description": "%color.gitlens.graphLane7Color.description%",
 				"defaults": {
 					"light": "#f25d2e",
+					"highContrastLight": "#863015",
 					"dark": "#FE9B5E",
 					"highContrast": "#FE9B5E"
 				}
@@ -6682,6 +6724,7 @@
 				"description": "%color.gitlens.graphLane8Color.description%",
 				"defaults": {
 					"light": "#f2ca33",
+					"highContrastLight": "#5f4e0e",
 					"dark": "#E0B027",
 					"highContrast": "#E0B027"
 				}
@@ -6691,6 +6734,7 @@
 				"description": "%color.gitlens.graphLane9Color.description%",
 				"defaults": {
 					"light": "#7bd938",
+					"highContrastLight": "#315d12",
 					"dark": "#A6C750",
 					"highContrast": "#A6C750"
 				}
@@ -6700,6 +6744,7 @@
 				"description": "%color.gitlens.graphLane10Color.description%",
 				"defaults": {
 					"light": "#2ece9d",
+					"highContrastLight": "#0f5e46",
 					"dark": "#4DD494",
 					"highContrast": "#4DD494"
 				}
@@ -6819,7 +6864,7 @@
 				"description": "%color.gitlens.graphMinimapMarkerHighlightsColor.description%",
 				"defaults": {
 					"light": "#f5cc00",
-					"highContrastLight": "#f5cc00",
+					"highContrastLight": "#987e00",
 					"dark": "#fbff0a",
 					"highContrast": "#fbff0a"
 				}
@@ -6829,7 +6874,7 @@
 				"description": "%color.gitlens.graphScrollMarkerHighlightsColor.description%",
 				"defaults": {
 					"light": "#f5cc00",
-					"highContrastLight": "#f5cc00",
+					"highContrastLight": "#987e00",
 					"dark": "#fbff0a",
 					"highContrast": "#fbff0a"
 				}
@@ -6859,7 +6904,7 @@
 				"description": "%color.gitlens.graphMinimapMarkerPullRequestsColor.description%",
 				"defaults": {
 					"light": "#ff8f18",
-					"highContrastLight": "#ff8f18",
+					"highContrastLight": "#bc680e",
 					"dark": "#c76801",
 					"highContrast": "#c76801"
 				}
@@ -6869,7 +6914,7 @@
 				"description": "%color.gitlens.graphScrollMarkerPullRequestsColor.description%",
 				"defaults": {
 					"light": "#ff8f18",
-					"highContrastLight": "#ff8f18",
+					"highContrastLight": "#bc680e",
 					"dark": "#c76801",
 					"highContrast": "#c76801"
 				}
@@ -6879,7 +6924,7 @@
 				"description": "%color.gitlens.graphMinimapMarkerRemoteBranchesColor.description%",
 				"defaults": {
 					"light": "#67ace4",
-					"highContrastLight": "#67ace4",
+					"highContrastLight": "#4f86b2",
 					"dark": "#2b5e88",
 					"highContrast": "#2b5e88"
 				}
@@ -6889,7 +6934,7 @@
 				"description": "%color.gitlens.graphScrollMarkerRemoteBranchesColor.description%",
 				"defaults": {
 					"light": "#67ace4",
-					"highContrastLight": "#67ace4",
+					"highContrastLight": "#4f86b2",
 					"dark": "#2b5e88",
 					"highContrast": "#2b5e88"
 				}
@@ -6919,7 +6964,7 @@
 				"description": "%color.gitlens.graphMinimapMarkerTagsColor.description%",
 				"defaults": {
 					"light": "#d2a379",
-					"highContrastLight": "#d2a379",
+					"highContrastLight": "#9c7858",
 					"dark": "#6b562e",
 					"highContrast": "#6b562e"
 				}
@@ -6929,7 +6974,7 @@
 				"description": "%color.gitlens.graphScrollMarkerTagsColor.description%",
 				"defaults": {
 					"light": "#d2a379",
-					"highContrastLight": "#d2a379",
+					"highContrastLight": "#9c7858",
 					"dark": "#6b562e",
 					"highContrast": "#6b562e"
 				}
@@ -6949,6 +6994,7 @@
 				"description": "%color.gitlens.launchpadIndicatorMergeableColor.description%",
 				"defaults": {
 					"light": "#42c954",
+					"highContrastLight": "#374e06",
 					"dark": "#3fb950",
 					"highContrast": "#68ff79"
 				}
@@ -6958,6 +7004,7 @@
 				"description": "%color.gitlens.launchpadIndicatorMergeableHoverColor.description%",
 				"defaults": {
 					"light": "#42c954",
+					"highContrastLight": "#374e06",
 					"dark": "#3fb950",
 					"highContrast": "#68ff79"
 				}
@@ -6967,6 +7014,7 @@
 				"description": "%color.gitlens.launchpadIndicatorBlockedColor.description%",
 				"defaults": {
 					"light": "#ad0707",
+					"highContrastLight": "#ad0707",
 					"dark": "#c74e39",
 					"highContrast": "#ff003c"
 				}
@@ -6976,6 +7024,7 @@
 				"description": "%color.gitlens.launchpadIndicatorBlockedHoverColor.description%",
 				"defaults": {
 					"light": "#ad0707",
+					"highContrastLight": "#ad0707",
 					"dark": "#c74e39",
 					"highContrast": "#ff003c"
 				}
@@ -6986,6 +7035,7 @@
 				"defaults": {
 					"dark": "#D8AF1B",
 					"light": "#cc9b15",
+					"highContrastLight": "#895503",
 					"highContrast": "#D8AF1B"
 				}
 			},
@@ -6995,6 +7045,7 @@
 				"defaults": {
 					"dark": "#D8AF1B",
 					"light": "#cc9b15",
+					"highContrastLight": "#895503",
 					"highContrast": "#D8AF1B"
 				}
 			}
