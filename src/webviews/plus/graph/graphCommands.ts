@@ -412,12 +412,10 @@ export class GraphCommands {
 	@command('gitlens.deleteBranchOrWorktree:')
 	@debug()
 	private async deleteBranchOrWorktree(args: DeleteBranchOrWorktreeRefs) {
-		await branchRefCommands.deleteBranchOrWorktree(
-			this.container,
-			args,
-			args.mergeTarget,
-			args.mergedPullRequest != null ? { mergedPullRequest: args.mergedPullRequest } : undefined,
-		);
+		await branchRefCommands.deleteBranchOrWorktree(this.container, args, args.mergeTarget, {
+			mergedPullRequest: args.mergedPullRequest,
+			mergedByGit: args.mergedByGit,
+		});
 	}
 
 	@command('gitlens.fetchRemote:')
@@ -2814,9 +2812,10 @@ export class GraphCommands {
 	@debug()
 	private compareWorkingWith(item?: GraphItemContext | BranchRef) {
 		// Convention: leftRef = Base (the clicked ref we're comparing against), rightRef = Compare
-		// (the current branch, which carries the working tree).
+		// (the current branch, which carries the working tree). Any row ref works (branch, commit, stash,
+		// tag); only the action-link `BranchRef` payload needs resolving to a branch.
 		return this.openCompareModeFor(item, {
-			resolveBranch: true,
+			resolveBranch: item != null && 'branchId' in item,
 			sideWithCurrentBranch: true,
 			includeWorkingTree: true,
 		});
@@ -3559,7 +3558,7 @@ export class GraphCommands {
 		await this.notifyOpenCompareMode({
 			repoPath: currentRepoPath,
 			leftRef: ref.ref,
-			leftRefType: 'branch',
+			leftRefType: this.graphCompareRefType(ref.refType),
 			rightRef: headRef,
 			rightRefType: 'branch',
 			...(options.includeWorkingTree ? { includeWorkingTree: true } : undefined),

@@ -50,9 +50,6 @@ export interface AppState extends State {
 	/** Composed with `loading` at the `gl-graph` render boundary — true while a scope-anchor
 	 *  IPC is in flight past `scopeLoadingDelayMs`. Owned by `GraphStateProvider.setScope`. */
 	scopeLoading: boolean;
-	/** Webview-local: the checked-out branch's tip sha + repo when the WIP merge target says it landed (PR or git
-	 *  evidence). Written by the details panel's enrichment; read by the header to hide Publish. */
-	wipLanded: { repoPath: string; sha: string } | undefined;
 	agentsBannerCollapsed?: boolean | undefined;
 	mcpCanAutoRegister?: boolean | undefined;
 	canInstallHooks?: boolean | undefined;
@@ -121,9 +118,14 @@ export interface AppState extends State {
 	 * Publish a lazily-fetched merge target into `overviewEnrichment` for the given branchId. The graph
 	 * overview's enrichment IPC skips merge-target fetching; the click-to-scope path and the shared branch
 	 * hover (`gl-branch-hover`, backing both the overview card and the graph WIP-bar pills) fetch it and
-	 * call this so the scope-anchor's `reconcileScopeMergeTarget` hook backfills the tip SHA.
+	 * call this so the scope-anchor's `reconcileScopeMergeTarget` hook backfills the tip SHA. Pass the
+	 * `mergeTargetsEpoch` the fetch started at, so an answer a merge-target change has since voided is dropped.
 	 */
-	mergeMergeTargetIntoEnrichment(branchId: string, mergeTarget: OverviewBranchMergeTarget | undefined): void;
+	mergeMergeTargetIntoEnrichment(
+		branchId: string,
+		mergeTarget: OverviewBranchMergeTarget | undefined,
+		fetchedAtEpoch?: number,
+	): void;
 
 	/**
 	 * Fetch enrichment for the overview's active/recent branches. Called lazily by consumers such as

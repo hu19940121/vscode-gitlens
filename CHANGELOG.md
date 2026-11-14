@@ -8,13 +8,19 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Changed
 
+- Improves editing of multi-line settings in the Settings editor &mdash; the AI custom instructions and the commit and stash tooltip formats now use a multi-line text box ([#1586](https://github.com/gitkraken/vscode-gitlens/issues/1586))
 - Adds high contrast light defaults for all of GitLens' theme colors &mdash; blame annotations, branch and file decorations, pull request and issue icons, _Commit Graph_ lanes and markers, and _Launchpad_ indicators now meet high contrast levels instead of reusing the light theme's colors ([#2119](https://github.com/gitkraken/vscode-gitlens/issues/2119))
 - Removes an unused inline script from the _Interactive Rebase Editor_ and _Cloud Patch_ details webviews, so their state is only ever embedded as encoded data ([#6201](https://github.com/gitkraken/vscode-gitlens/issues/6201))
 - Hardens how commit messages and pull request and issue text are rendered in hovers, view tooltips, the _Commit Graph_ and _Inspect_ &mdash; links in that text can only open web or mail addresses, and only GitLens' own actions can run commands ([#6200](https://github.com/gitkraken/vscode-gitlens/issues/6200))
 
 ### Fixed
 
+- Fixes the _Commit Graph_ showing a blank view and editor with a Git version older than 2.17, which lacks worktree support ([#4363](https://github.com/gitkraken/vscode-gitlens/issues/4363))
+- Fixes the _Show Commit Graph_ button in _Source Control_ opening the parent repository's graph for a submodule or nested repository that GitLens hasn't detected yet ([#4566](https://github.com/gitkraken/vscode-gitlens/issues/4566))
+- Fixes the _Commit Graph_ details panel continuing to show the previous repository's commit after switching repositories ([#5362](https://github.com/gitkraken/vscode-gitlens/issues/5362))
+- Fixes _Commit Graph_ branch and tag pills expanding past the graph's right edge on hover when the _Branches / Tags_ column is last &mdash; the expanded pill now grows leftward when that keeps it inside the graph ([#2667](https://github.com/gitkraken/vscode-gitlens/issues/2667))
 - Fixes _Launchpad_ showing "needs reviewers" for GitHub pull requests on repositories that don't require a review ([#5863](https://github.com/gitkraken/vscode-gitlens/issues/5863))
+- Fixes the _Commit Graph_ side bar's _Pull Requests_ panel showing GitHub pull requests that are waiting on code owner or team reviews as needing reviewers or ready to merge ([#6206](https://github.com/gitkraken/vscode-gitlens/issues/6206))
 - Fixes hard-to-read branch and tag names in the _Commit Graph_ with light themes &mdash; lane-colored names are darkened just enough to stay legible while keeping their lane's hue, and the current branch's pill and marker no longer put white text on a light green ([#4548](https://github.com/gitkraken/vscode-gitlens/issues/4548))
 - Fixes faint inline blame annotations in high contrast dark themes ([#2058](https://github.com/gitkraken/vscode-gitlens/issues/2058))
 - Fixes _Commit Graph_ ref pills keeping highlights that no longer describe them ([#5764](https://github.com/gitkraken/vscode-gitlens/issues/5764))
@@ -23,7 +29,26 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes a remote URL with an `@` in its path being recognized as a repository on a different host &mdash; e.g. `https://example.com/x@github.com/owner/repo.git` as GitHub's `owner/repo` ([#6185](https://github.com/gitkraken/vscode-gitlens/issues/6185))
 - Fixes the _Commit Graph_'s branch details offering _Create a Pull Request_ and _Recompose Branch_ for a branch whose work already landed in its merge target ([#6190](https://github.com/gitkraken/vscode-gitlens/issues/6190))
 - Fixes the _Commit Graph_ header hiding _Publish Branch_ for a branch whose pull request merged into a branch other than its merge target, such as a stacked parent ([#6191](https://github.com/gitkraken/vscode-gitlens/issues/6191))
+- Fixes the _Commit Graph_ header's _Publish Branch_ going stale after the branch's merge target changes, and depending on whether _Working Changes_ was selected ([#6205](https://github.com/gitkraken/vscode-gitlens/issues/6205))
+  - Shows or hides _Publish Branch_ as soon as _Change Merge Target_ changes whether the branch's work landed, without reopening the _Commit Graph_
+  - Hides _Publish Branch_ for a branch that landed by squash or fast-forward merge whichever row is selected, not only while _Working Changes_ is
+  - Stops _Publish Branch_ from briefly appearing when a fetch prunes the remote branch of a branch that already landed, or when _Working Changes_ refreshes
+- Fixes the _Commit Graph_'s _Overview_ cards not showing that a branch landed, or offering its cleanup, until hovered &mdash; the current branch's card now offers _Delete Branch_ (or _Delete Worktree_) in place of _Publish_, _Push_ and _Pull_ as soon as its work lands, and a branch's merged state on its card or hover updates when its merge target changes or it gets new commits
+- Fixes the _Commit Graph_'s branch details, merge target popover and _Working Changes_ disagreeing on whether cleaning up a landed branch deletes the branch or its worktree &mdash; each now names what the action actually deletes
+- Fixes the _Commit Graph_'s branch details and _Working Changes_ offering to delete a branch that has new commits since its pull request merged and its remote branch was deleted &mdash; they now lead with _Publish N New Commits_, and _Create a Pull Request_ follows once published ([#6205](https://github.com/gitkraken/vscode-gitlens/issues/6205))
+- Fixes the merge target popover and the _Commit Graph_'s branch details not saying when a branch's pull request merged into a branch other than its merge target ([#6205](https://github.com/gitkraken/vscode-gitlens/issues/6205))
+- Fixes deleting a branch that landed by squash, rebase or fast-forward merge giving no reason why it counts as merged &mdash; the delete confirmation, and git's _not fully merged_ prompt, now say where its work landed, including when the branch's worktree is deleted from another window ([#6205](https://github.com/gitkraken/vscode-gitlens/issues/6205))
+- Fixes the merge target popover offering _Rebase_ and _Merge_ onto the branch's own upstream, which _Pull_ handles, and its compact tooltip saying _Merged_ for a branch that is only likely merged or merged locally ([#6205](https://github.com/gitkraken/vscode-gitlens/issues/6205))
+- Fixes the merge target status chip having no accessible name or role for screen readers ([#6205](https://github.com/gitkraken/vscode-gitlens/issues/6205))
+- Fixes the _Commit Graph_ header and _Overview_ cards offering _Push_ and _Force Push_ for a branch whose pull request is in the merge queue
 - Fixes the _Inspect_ view not autolinking issues and pull requests in the first commit it shows, and changes to the `gitlens.views.commitDetails.autolinks.enabled` setting not applying to the commit already shown ([#6204](https://github.com/gitkraken/vscode-gitlens/issues/6204))
+- Fixes merge, cherry-pick, and revert conflicts &mdash; and _Show conflicts_ in the _Interactive Rebase Editor_ &mdash; opening a _Commit Graph_ that can't show them when it isn't available for the account or repository; the conflict now opens in the _Source Control_ view instead ([#5675](https://github.com/gitkraken/vscode-gitlens/issues/5675))
+- Fixes the _Delay Loading File Details_ setting (`gitlens.advanced.commits.delayLoadingFileDetails`) not being editable from the Settings editor &mdash; it now shows a dropdown again ([#5816](https://github.com/gitkraken/vscode-gitlens/issues/5816))
+- Fixes errors in blame, views, and remote links when a custom remote's (`gitlens.remotes`) `regex` matches the full remote URL without capturing both the domain and the path &mdash; the entry is now skipped for that remote, and the _Settings_ editor explains that full URL matches need two capture groups ([#4852](https://github.com/gitkraken/vscode-gitlens/issues/4852))
+- Fixes _Compare Working Tree to Here_ doing nothing on a commit, stash, or tag in the _Commit Graph_ &mdash; it only worked on branches ([#5352](https://github.com/gitkraken/vscode-gitlens/issues/5352))
+- Fixes the _Commit Graph_'s _Changes_ column opt-in prompt squashing its _Show_ button and cutting off its _Hide_ link when the rows area is short &mdash; the prompt now drops its explanation, then the _Hide_ link, rather than clipping them ([#5607](https://github.com/gitkraken/vscode-gitlens/issues/5607))
+- Fixes the _Commit Graph_'s hidden branches and tags menu running off the screen when many refs are hidden &mdash; the list now scrolls and _Show All_ stays in reach ([#2925](https://github.com/gitkraken/vscode-gitlens/issues/2925))
+- Fixes the _Commit Graph_ button missing from the _Source Control_ view for GitHub repositories opened with _Remote Repositories_ ([#3144](https://github.com/gitkraken/vscode-gitlens/issues/3144))
 
 ## [19.6.0] - 2026-11-10
 

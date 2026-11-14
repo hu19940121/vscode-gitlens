@@ -1,10 +1,9 @@
 import * as assert from 'assert';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as sinon from 'sinon';
 import { BranchError } from '@gitlens/git/errors.js';
@@ -18,7 +17,10 @@ import {
 	createBranch,
 	createBranchAt,
 	createTestRepo,
+	fetch,
 	getHeadSha,
+	makeTempDir,
+	mergeBranch,
 } from './helpers.js';
 
 suite('BranchesSubProvider', () => {
@@ -128,6 +130,65 @@ suite('BranchesSubProvider.getBranchMergedStatus caching', () => {
 	});
 });
 
+suite('BranchesSubProvider.getBranchMergedStatus caching — remote target and its local branch', () => {
+	let origin: TestRepo;
+	let clone: TestRepo;
+
+	suiteSetup(() => {
+		origin = createTestRepo();
+		addCommit(origin.path, 'seed.txt', 'seed', 'Seed commit');
+		clone = cloneTestRepo(origin.path);
+		// `feature` lands in the local `main` only, so it's merged into `main` but not into `origin/main`
+		createBranch(clone.path, 'feature', { checkout: true });
+		addCommit(clone.path, 'feature.txt', 'feature', 'Feature commit');
+		checkout(clone.path, 'main');
+		mergeBranch(clone.path, 'feature', 'Merge feature');
+	});
+
+	suiteTeardown(() => {
+		clone.cleanup();
+		origin.cleanup();
+	});
+
+	function countIsAncestorCalls(spy: sinon.SinonSpy, into: string): number {
+		return spy
+			.getCalls()
+			.filter(c => c.args[1] === 'merge-base' && c.args[2] === '--is-ancestor' && c.args[4] === into).length;
+	}
+
+	test('a move of the remote target rechecks only the remote target', async () => {
+		const runSpy = sinon.spy(clone.provider.git, 'run');
+		try {
+			const feature = await clone.provider.branches.getBranch(clone.path, 'feature');
+			const originMain = await clone.provider.branches.getBranch(clone.path, 'origin/main');
+			assert.ok(feature && originMain);
+
+			const first = await clone.provider.branches.getBranchMergedStatus(clone.path, feature, originMain);
+			assert.strictEqual(first.merged, true);
+			assert.strictEqual(first.localBranchOnly?.name, 'main');
+			assert.strictEqual(first.localBranchOnly.repoPath, clone.path);
+			assert.strictEqual(countIsAncestorCalls(runSpy, 'origin/main'), 1, 'first call should check origin/main');
+			assert.strictEqual(countIsAncestorCalls(runSpy, 'main'), 1, 'first call should check main');
+
+			// Move only `origin/main`, as a fetch would. The harness bypasses GitLens's change hooks, so
+			// refresh the branches cache by hand to pick up the move.
+			addCommit(origin.path, 'origin.txt', 'origin', 'Origin commit');
+			fetch(clone.path);
+			clone.provider.cache.clearCaches(clone.path, 'branches');
+			const originMainAdvanced = await clone.provider.branches.getBranch(clone.path, 'origin/main');
+			assert.ok(originMainAdvanced && originMainAdvanced.sha !== originMain.sha);
+
+			const second = await clone.provider.branches.getBranchMergedStatus(clone.path, feature, originMainAdvanced);
+			assert.strictEqual(second.merged, true);
+			assert.strictEqual(second.localBranchOnly?.name, 'main');
+			assert.strictEqual(countIsAncestorCalls(runSpy, 'origin/main'), 2, 'the moved target should be rechecked');
+			assert.strictEqual(countIsAncestorCalls(runSpy, 'main'), 1, 'the unmoved local branch should be cached');
+		} finally {
+			runSpy.restore();
+		}
+	});
+});
+
 suite('BranchesSubProvider — default branch caching', () => {
 	let origin: TestRepo;
 	let clone: TestRepo;
@@ -197,7 +258,7 @@ suite('BranchesSubProvider.setRemoteHeadIfMissing — never prompts', () => {
 		});
 		await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
 
-		dir = mkdtempSync(join(tmpdir(), 'gitlens-askpass-'));
+		dir = makeTempDir('gitlens-askpass-');
 		marker = join(dir, 'prompted');
 		const script = join(dir, 'askpass.sh');
 		writeFileSync(script, `#!/bin/sh\necho prompted > "${marker}"\necho secret\n`, { mode: 0o755 });

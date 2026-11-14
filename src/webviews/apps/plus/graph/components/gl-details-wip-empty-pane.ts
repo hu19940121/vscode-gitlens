@@ -14,6 +14,10 @@ import type { BranchMergeTargetStatus } from '../../../../rpc/services/branches.
 import type { BranchRef, DeleteBranchOrWorktreeRefs } from '../../../../shared/branchRefs.js';
 import type { WebviewContext } from '../../../shared/contexts/webview.js';
 import { webviewContext } from '../../../shared/contexts/webview.js';
+import {
+	getDeleteBranchOrWorktreeEvidence,
+	getDeleteBranchOrWorktreeLabel,
+} from '../../shared/deleteBranchOrWorktree.utils.js';
 import type { MergeQueueEntryLike } from '../../shared/mergeQueue.utils.js';
 import {
 	formatQueueHandledBehind,
@@ -212,7 +216,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		if (branch.upstream?.missing === true && successor == null) {
 			// The remote branch is gone (usually its PR merged and it was auto-deleted), so Delete leads, as on the
 			// branch sheet's upstream card. Publish stays as the alternative, since unpushed work can't be ruled out
-			// here. A successor keeps the normal Publish step: its new commits exist nowhere else.
+			// here. A successor takes the Publish step below instead: its new commits exist nowhere else.
 			const branchRef: BranchRef = {
 				repoPath: branch.repoPath,
 				branchId: getBranchId(branch.repoPath, false, branch.name),
@@ -223,7 +227,8 @@ export class GlDetailsWipEmptyPane extends LitElement {
 				label: l10n.t('{branch} is missing from the remote', {
 					branch: branch.name,
 				}),
-				actionLabel: l10n.t('Delete Local Branch'),
+				// The branch is the WIP's own repo's HEAD, so a linked worktree's goes with its worktree
+				actionLabel: getDeleteBranchOrWorktreeLabel({ isDefault: this.wip?.repo.isWorktree !== true }, 'local'),
 				href: this._webview.createCommandLink<DeleteBranchOrWorktreeRefs>(
 					'gitlens.deleteBranchOrWorktree:',
 					branchRef,
@@ -253,7 +258,16 @@ export class GlDetailsWipEmptyPane extends LitElement {
 		} else if (upstreamMissing) {
 			steps.push({
 				icon: 'cloud-upload',
-				label: l10n.t('Publish {branch} to {remote}', { branch: branch.name, remote: remoteName }),
+				// A successor's new commits exist only here, so the step names them; Create PR follows once published
+				label:
+					successor != null
+						? formatPlural(
+								l10n.t(
+									'{count, plural, one{Publish {count} New Commit} other{Publish {count} New Commits}}',
+								),
+								{ count: successor.newCommits },
+							)
+						: l10n.t('Publish {branch} to {remote}', { branch: branch.name, remote: remoteName }),
 				actionLabel: l10n.t('Publish'),
 				onClick: () => this.emit('publish-branch'),
 			});
@@ -435,8 +449,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 			branchName: mergeTarget.name,
 		};
 
-		const isWorktree = branch.worktree != null && !branch.worktree.isDefault;
-		const deleteLabel = isWorktree ? l10n.t('Delete Worktree') : l10n.t('Delete Branch');
+		const deleteLabel = getDeleteBranchOrWorktreeLabel(branch.worktree);
 
 		const landed = mergeTarget.landed;
 		const mergedStatus = mergeTarget.mergedStatus;
@@ -467,14 +480,13 @@ export class GlDetailsWipEmptyPane extends LitElement {
 					tooltip: deleteLabel,
 					href: this._webview.createCommandLink<DeleteBranchOrWorktreeRefs>(
 						'gitlens.deleteBranchOrWorktree:',
-						{ ...branchRef, mergeTarget: localTargetRef },
+						{ ...branchRef, mergeTarget: localTargetRef, ...getDeleteBranchOrWorktreeEvidence(landed) },
 					),
 				},
 			};
 		}
 
 		if (landed != null) {
-			// Only PR evidence may pre-select Force Delete — git evidence can't prove the work is safe to drop
 			const mergedPullRequest = landed.via === 'pr' ? landed.pullRequest : undefined;
 			return {
 				icon: 'git-merge',
@@ -496,9 +508,7 @@ export class GlDetailsWipEmptyPane extends LitElement {
 				href: this._webview.createCommandLink<DeleteBranchOrWorktreeRefs>('gitlens.deleteBranchOrWorktree:', {
 					...branchRef,
 					mergeTarget: targetRef,
-					...(mergedPullRequest != null && landed.tipSha != null
-						? { mergedPullRequest: { id: mergedPullRequest.id, sha: landed.tipSha } }
-						: undefined),
+					...getDeleteBranchOrWorktreeEvidence(landed),
 				}),
 			};
 		}

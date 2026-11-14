@@ -2127,6 +2127,7 @@
 					},
 					"gitlens.views.formats.commits.tooltip": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": "${avatar} &nbsp;__${author}__${signature} &nbsp;$(history) ${agoAndDateBothSources} \\\n${link}${' via  'pullRequest}${'&nbsp;&nbsp;'changesDetail} ${message}${\n\n---\n\nfootnotes}\n\n${tips}",
 						"markdownDescription": "%config.views.formats.commits.tooltip.markdownDescription%",
 						"scope": "window",
@@ -2134,6 +2135,7 @@
 					},
 					"gitlens.views.formats.commits.tooltipWithStatus": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": "${avatar} &nbsp;__${author}__${signature} &nbsp;$(history) ${agoAndDateBothSources} \\\n${link}${' via  'pullRequest}&nbsp;&nbsp;•&nbsp;&nbsp;{{slot-status}} ${message}${\n\n---\n\nfootnotes}\n\n${tips}",
 						"markdownDescription": "%config.views.formats.commits.tooltipWithStatus.markdownDescription%",
 						"scope": "window",
@@ -2169,6 +2171,7 @@
 					},
 					"gitlens.views.formats.stashes.tooltip": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": "${link}${' on `'stashOnRef`}${'\\\n&nbsp;&nbsp;'changesDetail} \\\n &nbsp;$(history) ${agoAndDate} ${message}${\n\n---\n\nfootnotes}",
 						"markdownDescription": "%config.views.formats.stashes.tooltip.markdownDescription%",
 						"scope": "window",
@@ -4824,6 +4827,7 @@
 					},
 					"gitlens.ai.explainChanges.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.explainChanges.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4834,6 +4838,7 @@
 					},
 					"gitlens.ai.reviewChanges.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.reviewChanges.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4844,6 +4849,7 @@
 					},
 					"gitlens.ai.generateChangelog.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.generateChangelog.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4854,6 +4860,7 @@
 					},
 					"gitlens.ai.generateCommitMessage.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.generateCommitMessage.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4864,6 +4871,7 @@
 					},
 					"gitlens.ai.generateCommits.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.generateCommits.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4896,6 +4904,7 @@
 					},
 					"gitlens.ai.resolveConflicts.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.resolveConflicts.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4973,6 +4982,7 @@
 					},
 					"gitlens.ai.generateStashMessage.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.generateStashMessage.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4983,6 +4993,7 @@
 					},
 					"gitlens.ai.generateCreateCloudPatch.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.generateCreateCloudPatch.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -4993,6 +5004,7 @@
 					},
 					"gitlens.ai.generateCreatePullRequest.customInstructions": {
 						"type": "string",
+						"editPresentation": "multilineText",
 						"default": null,
 						"markdownDescription": "%config.ai.generateCreatePullRequest.customInstructions.markdownDescription%",
 						"scope": "window",
@@ -6162,6 +6174,16 @@
 							"null"
 						],
 						"default": null,
+						"enum": [
+							null,
+							true,
+							false
+						],
+						"enumDescriptions": [
+							"%config.advanced.commits.delayLoadingFileDetails.enumDescriptions.0%",
+							"%config.advanced.commits.delayLoadingFileDetails.enumDescriptions.1%",
+							"%config.advanced.commits.delayLoadingFileDetails.enumDescriptions.2%"
+						],
 						"markdownDescription": "%config.advanced.commits.delayLoadingFileDetails.markdownDescription%",
 						"scope": "window",
 						"order": 120
@@ -21804,7 +21826,7 @@
 			"scm/sourceControl": [
 				{
 					"command": "gitlens.showGraph",
-					"when": "scmProvider == git && gitlens:enabled && !gitlens:plus:disabled && scmProviderRootUri not in gitlens:plus:disallowedRepos && config.gitlens.menus.scm.graph",
+					"when": "(scmProvider == git || scmProvider == remoteHub:github) && gitlens:enabled && !gitlens:plus:disabled && scmProviderRootUri not in gitlens:plus:disallowedRepos && config.gitlens.menus.scm.graph",
 					"group": "6_gitlens@1"
 				},
 				{
@@ -21831,7 +21853,7 @@
 				},
 				{
 					"command": "gitlens.showGraph",
-					"when": "scmProvider == git && gitlens:enabled && !gitlens:plus:disabled && scmProviderRootUri not in gitlens:plus:disallowedRepos && config.gitlens.menus.scmRepositoryInline.graph",
+					"when": "(scmProvider == git || scmProvider == remoteHub:github) && gitlens:enabled && !gitlens:plus:disabled && scmProviderRootUri not in gitlens:plus:disallowedRepos && config.gitlens.menus.scmRepositoryInline.graph",
 					"group": "navigation@-1"
 				},
 				{
@@ -21846,7 +21868,7 @@
 				},
 				{
 					"command": "gitlens.showGraph",
-					"when": "scmProvider == git && gitlens:enabled && !gitlens:plus:disabled && scmProviderRootUri not in gitlens:plus:disallowedRepos && config.gitlens.menus.scmRepository.graph",
+					"when": "(scmProvider == git || scmProvider == remoteHub:github) && gitlens:enabled && !gitlens:plus:disabled && scmProviderRootUri not in gitlens:plus:disallowedRepos && config.gitlens.menus.scmRepository.graph",
 					"group": "2_z_gitlens@5"
 				},
 				{
