@@ -212,7 +212,9 @@ if (isFullBuild && !watch) {
 		`${baseCmd} --config-name extension:node`,
 		`${baseCmd} --config-name extension:webworker`,
 		`${baseCmd}${analyzeBundle ? ' --env analyzeBundle' : ''}${stats ? ' --env stats' : ''} --config-name webviews:common --config-name webviews`,
-		`${baseCmd} --config-name unit-tests`,
+		// Unit-test bundles are not part of the VSIX. Skip them in low-memory packaging:
+		// esbuild for tests swaps several GB on this machine and can stall the package.
+		...(lowMemory ? [] : [`${baseCmd} --config-name unit-tests`]),
 	];
 } else {
 	bundleCmds = [cmd];
