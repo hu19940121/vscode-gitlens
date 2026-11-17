@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Adds high contrast light defaults for all of GitLens' theme colors &mdash; blame annotations, branch and file decorations, pull request and issue icons, _Commit Graph_ lanes and markers, and _Launchpad_ indicators now meet high contrast levels instead of reusing the light theme's colors ([#2119](https://github.com/gitkraken/vscode-gitlens/issues/2119))
 - Removes an unused inline script from the _Interactive Rebase Editor_ and _Cloud Patch_ details webviews, so their state is only ever embedded as encoded data ([#6201](https://github.com/gitkraken/vscode-gitlens/issues/6201))
 - Hardens how commit messages and pull request and issue text are rendered in hovers, view tooltips, the _Commit Graph_ and _Inspect_ &mdash; links in that text can only open web or mail addresses, and only GitLens' own actions can run commands ([#6200](https://github.com/gitkraken/vscode-gitlens/issues/6200))
+- Changes _Commit Graph_ shortcut overrides (`gitlens.graph.shortcuts.overrides`) to accept modifier and key names in any case, as VS Code keybindings do &mdash; `Alt+KeyM`, `alt+arrowup` and `f3` now work; single characters still match exactly, so `h` and `H` stay distinct
 
 ### Fixed
 
@@ -49,6 +50,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes the _Commit Graph_'s _Changes_ column opt-in prompt squashing its _Show_ button and cutting off its _Hide_ link when the rows area is short &mdash; the prompt now drops its explanation, then the _Hide_ link, rather than clipping them ([#5607](https://github.com/gitkraken/vscode-gitlens/issues/5607))
 - Fixes the _Commit Graph_'s hidden branches and tags menu running off the screen when many refs are hidden &mdash; the list now scrolls and _Show All_ stays in reach ([#2925](https://github.com/gitkraken/vscode-gitlens/issues/2925))
 - Fixes the _Commit Graph_ button missing from the _Source Control_ view for GitHub repositories opened with _Remote Repositories_ ([#3144](https://github.com/gitkraken/vscode-gitlens/issues/3144))
+- Fixes opening and copying remote links for repositories cloned through the SSH hosts for port 443 of Bitbucket (`altssh.bitbucket.org`), GitHub (`ssh.github.com`), and GitLab (`altssh.gitlab.com`) &mdash; Bitbucket and GitHub repositories weren't recognized at all, and GitLab links pointed at the SSH host ([#6174](https://github.com/gitkraken/vscode-gitlens/issues/6174))
+- Fixes a _Commit Graph_ shortcut override (`gitlens.graph.shortcuts.overrides`) with a misspelled or unknown key name (e.g. `alt+Bogus`) silently replacing a working shortcut with one that can never fire &mdash; the override is now ignored and the default shortcut kept, as with an unknown modifier, and the reason is logged to the _GitLens_ output channel ([#5831](https://github.com/gitkraken/vscode-gitlens/issues/5831))
 
 ## [19.6.0] - 2026-11-10
 

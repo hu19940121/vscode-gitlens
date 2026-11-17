@@ -1,6 +1,6 @@
 import * as assert from 'assert';
 import type { Chord, KeyEventLike } from '../chord.js';
-import { formatChord, formatChordParts, matchesChord, parseChord } from '../chord.js';
+import { ChordParseError, formatChord, formatChordParts, matchesChord, parseChord } from '../chord.js';
 
 function event(overrides: Partial<KeyEventLike> = {}): KeyEventLike {
 	return {
@@ -90,8 +90,36 @@ suite('Chord Test Suite', () => {
 			assert.strictEqual(chord.matchOn, 'key');
 		});
 
-		test('named keys are exact-case', () => {
+		test('named keys resolve to their canonical spelling', () => {
 			assert.strictEqual(parseChord('ArrowLeft', false).token, 'ArrowLeft');
+			assert.strictEqual(parseChord('alt+arrowup', false).token, 'ArrowUp');
+			assert.strictEqual(parseChord('f3', false).token, 'F3');
+			assert.strictEqual(parseChord('pageup', false).token, 'PageUp');
+			assert.strictEqual(parseChord('ESCAPE', false).token, 'Escape');
+		});
+
+		test('code tokens are case-insensitive and resolve to canonical spelling', () => {
+			for (const input of ['Alt+KeyM', 'ALT+keym', 'alt+KEYM']) {
+				const chord = parseChord(input, false);
+				assert.strictEqual(chord.token, 'KeyM', input);
+				assert.strictEqual(chord.matchOn, 'code', input);
+				assert.strictEqual(chord.alt, true, input);
+			}
+
+			assert.strictEqual(parseChord('digit1', false).token, 'Digit1');
+			assert.strictEqual(parseChord('DIGIT1', false).matchOn, 'code');
+		});
+
+		test('modifier names are case-insensitive', () => {
+			const chord = parseChord('Mod+c', false);
+			assert.strictEqual(chord.ctrl, true);
+			assert.strictEqual(chord.meta, false);
+			assert.strictEqual(parseChord('MOD+c', true).meta, true);
+		});
+
+		test('single-character tokens stay case-sensitive', () => {
+			assert.strictEqual(parseChord('h', false).token, 'h');
+			assert.strictEqual(parseChord('H', false).token, 'H');
 		});
 
 		test('empty input throws', () => {
@@ -106,8 +134,29 @@ suite('Chord Test Suite', () => {
 			assert.throws(() => parseChord('ctrl+ctrl+c', false), /duplicate modifier 'ctrl'/);
 		});
 
+		test('duplicate modifier throws regardless of case', () => {
+			assert.throws(() => parseChord('ctrl+Ctrl+c', false), /duplicate modifier 'ctrl'/);
+		});
+
 		test('unknown modifier throws', () => {
 			assert.throws(() => parseChord('foo+c', false), /unknown modifier 'foo'/);
+		});
+
+		test('unknown key throws', () => {
+			assert.throws(() => parseChord('alt+Bogus', false), /unknown key 'Bogus'/);
+			// `Space` is not a `KeyboardEvent.key` value (the key is ' ').
+			assert.throws(() => parseChord('alt+Space', false), /unknown key 'Space'/);
+		});
+
+		test('function keys stop at F24', () => {
+			assert.doesNotThrow(() => parseChord('F24', false));
+			assert.throws(() => parseChord('F25', false), /unknown key 'F25'/);
+		});
+
+		test('named keys and single characters parse', () => {
+			for (const input of ['F3', 'shift+F12', 'Delete', ' ', '?', 'alt+[']) {
+				assert.doesNotThrow(() => parseChord(input, false), input);
+			}
 		});
 
 		test('thrown messages name the bad input', () => {
@@ -140,6 +189,11 @@ suite('Chord Test Suite', () => {
 			const chord = parseChord('alt+KeyM', false);
 			assert.strictEqual(matchesChord(chord, event({ code: 'KeyM', key: 'µ', altKey: true })), true);
 			assert.strictEqual(matchesChord(chord, event({ code: 'KeyM', key: 'ß', altKey: true })), true);
+		});
+
+		test('chord parsed from a lowercase name matches the canonical key', () => {
+			const chord = parseChord('alt+arrowup', false);
+			assert.strictEqual(matchesChord(chord, event({ key: 'ArrowUp', altKey: true })), true);
 		});
 
 		test('Digit3 does not match Numpad3', () => {
@@ -312,5 +366,52 @@ suite('Chord Test Suite', () => {
 				}
 			}
 		});
+	});
+});
+
+suite('parseChord — ChordParseError', () => {
+	const cases: [string, string, boolean][] = [
+		['', 'is empty', false],
+		['ctrl+', "ends with '+' (a literal '+' can't be bound)", false],
+		['ctrl++', "ends with '+' (a literal '+' can't be bound)", false],
+		['ctrl+ctrl+c', "repeats the modifier 'ctrl'", false],
+		['Mod+mod+c', "repeats the modifier 'mod'", false],
+		['hyper+KeyS', "has an unknown modifier 'hyper'", false],
+		['mod+ctrl+c', "combines 'mod' with 'ctrl' ('mod' already means Ctrl, or ⌘ on macOS)", false],
+		['mod+meta+c', "combines 'mod' with 'meta' ('mod' already means Ctrl, or ⌘ on macOS)", false],
+		['alt+Bogus', "has an unknown key 'Bogus'", false],
+		['shift+?', "combines shift with a single character (use '?' alone)", false],
+	];
+
+	for (const [input, reason] of cases) {
+		test(`'${input}' throws a ChordParseError with a readable reason`, () => {
+			for (const isMac of [false, true]) {
+				try {
+					parseChord(input, isMac);
+				} catch (ex) {
+					assert.ok(ex instanceof ChordParseError);
+					assert.strictEqual(ex.reason, reason);
+					assert.strictEqual(ex.input, input);
+					assert.strictEqual(ex.name, 'ChordParseError');
+					assert.ok(ex.message.startsWith(`Invalid key chord '${input}': `));
+					continue;
+				}
+				assert.fail(`expected '${input}' to throw`);
+			}
+		});
+	}
+
+	test('isMac never changes whether a chord is valid', () => {
+		for (const input of ['mod+c', 'mod+ctrl+c', 'alt+Bogus', 'hyper+KeyS', 'shift+?', 'F3', 'Alt+keym', 'ctrl+']) {
+			const throws = (isMac: boolean): boolean => {
+				try {
+					parseChord(input, isMac);
+					return false;
+				} catch {
+					return true;
+				}
+			};
+			assert.strictEqual(throws(true), throws(false), input);
+		}
 	});
 });
