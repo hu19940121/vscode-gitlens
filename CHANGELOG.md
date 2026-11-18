@@ -16,6 +16,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 
 ### Fixed
 
+- Fixes the confirmation toggle in _Launchpad_ adding an invalid `launchpad:command` value to `gitlens.gitCommands.skipConfirmations` that made selecting a pull request do nothing &mdash; _Launchpad_, _Start Work_ and _Start PR Review_ no longer offer the toggle, _Stash Apply_ and _Stash Pop_ now honor their documented values, and the setting now accepts the add remote, rename stash and open worktree values ([#5645](https://github.com/gitkraken/vscode-gitlens/issues/5645))
 - Fixes the _Commit Graph_ showing a blank view and editor with a Git version older than 2.17, which lacks worktree support ([#4363](https://github.com/gitkraken/vscode-gitlens/issues/4363))
 - Fixes the _Show Commit Graph_ button in _Source Control_ opening the parent repository's graph for a submodule or nested repository that GitLens hasn't detected yet ([#4566](https://github.com/gitkraken/vscode-gitlens/issues/4566))
 - Fixes the _Commit Graph_ details panel continuing to show the previous repository's commit after switching repositories ([#5362](https://github.com/gitkraken/vscode-gitlens/issues/5362))
@@ -52,6 +53,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes the _Commit Graph_ button missing from the _Source Control_ view for GitHub repositories opened with _Remote Repositories_ ([#3144](https://github.com/gitkraken/vscode-gitlens/issues/3144))
 - Fixes opening and copying remote links for repositories cloned through the SSH hosts for port 443 of Bitbucket (`altssh.bitbucket.org`), GitHub (`ssh.github.com`), and GitLab (`altssh.gitlab.com`) &mdash; Bitbucket and GitHub repositories weren't recognized at all, and GitLab links pointed at the SSH host ([#6174](https://github.com/gitkraken/vscode-gitlens/issues/6174))
 - Fixes a _Commit Graph_ shortcut override (`gitlens.graph.shortcuts.overrides`) with a misspelled or unknown key name (e.g. `alt+Bogus`) silently replacing a working shortcut with one that can never fire &mdash; the override is now ignored and the default shortcut kept, as with an unknown modifier, and the reason is logged to the _GitLens_ output channel ([#5831](https://github.com/gitkraken/vscode-gitlens/issues/5831))
+- Fixes _File History_ and the _Commit Graph_ erroring or skipping a commit whose message or author name contains an ASCII record (0x1E) or group (0x1D) separator character &mdash; also fixes tags and stashes with these characters in their messages ([#5659](https://github.com/gitkraken/vscode-gitlens/issues/5659))
 
 ## [19.6.0] - 2026-11-10
 

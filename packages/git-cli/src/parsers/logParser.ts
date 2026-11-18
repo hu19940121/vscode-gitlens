@@ -2,7 +2,7 @@ import type { GitFileIndexStatus } from '@gitlens/git/models/fileStatus.js';
 import { diffHunkRegex, diffRegex } from '@gitlens/git/parsers/diffParser.js';
 import { joinPaths, normalizePath } from '@gitlens/utils/path.js';
 import { maybeStopWatch } from '@gitlens/utils/stopwatch.js';
-import { flattenString, iterateAsyncByDelimiter, iterateByDelimiter } from '@gitlens/utils/string.js';
+import { flattenString, iterateByDelimiter } from '@gitlens/utils/string.js';
 import type { ExtractAll } from '@gitlens/utils/types.js';
 
 const commitsMapping = {
@@ -293,23 +293,216 @@ interface LogParsedStatsWithFilesStats {
 	deletions: number;
 }
 
-const recordSep = '\x1E'; // ASCII Record Separator character
-const recordFormatSep = '%x1E';
-const fieldSep = '\x1D'; // ASCII Group Separator character
-const fieldFormatSep = '%x1D';
+// KEEP: assumes no `-z` output: a NUL path terminator followed by 0x1E/0x1D would form a sentinel
+// SEE: `git commit -F` with a NUL fails "a NUL byte in commit log message not allowed." (git 2.44.0)
+const recordSep = '\0\x1E';
+const recordFormatSep = '%x00%x1E';
+const fieldSep = '\0\x1D';
+const fieldFormatSep = '%x00%x1D';
 
-// A complete record terminates every mapped field with a field separator — a cancelled/early-closed
-// stream resolves cleanly with a truncated tail missing at least the final terminator.
-function isCompleteRecord(record: string, requiredFields: number): boolean {
-	let count = 0;
-	let index = -1;
-	while (count < requiredFields) {
-		index = record.indexOf(fieldSep, index + 1);
-		if (index === -1) return false;
-
-		count++;
+function indexOfSeparator(s: string, separator: string, from: number): number {
+	const marker = separator[1];
+	let index = s.indexOf(marker, from + 1);
+	while (index !== -1 && s.charCodeAt(index - 1) !== 0) {
+		index = s.indexOf(marker, index + 1);
 	}
-	return true;
+	return index === -1 ? -1 : index - 1;
+}
+
+const flattenSourceThreshold = 128 * 1024;
+
+function readFields<K extends PropertyKey>(record: string, keys: readonly K[], entry: Record<K, string>): number {
+	let start = 0;
+	for (const key of keys) {
+		const end = indexOfSeparator(record, fieldSep, start);
+		if (end === -1) return -1;
+
+		entry[key] = record.substring(start, end);
+		start = end + fieldSep.length;
+	}
+	return start;
+}
+
+function getPayload(record: string, start: number): string {
+	if (record.charCodeAt(start) === 10) {
+		start++;
+		if (record.charCodeAt(start) === 10) {
+			start++;
+		}
+	}
+
+	const end = indexOfSeparator(record, fieldSep, start);
+	return record.substring(start, end === -1 ? record.length : end);
+}
+
+class RecordScanner {
+	// KEEP: never push '' to `pieces`: joining one string with '' returns it (maybe a slice), pinning its chunk
+	// SEE: https://github.com/v8/v8/blob/main/src/builtins/array-join.tq (BufferJoin single-element fast path)
+	private readonly pieces: string[] = [];
+	private chunk = '';
+	private start = 0;
+	private from = 0;
+
+	constructor(private readonly copy = false) {}
+
+	push(chunk: string): void {
+		if (this.start < this.chunk.length) {
+			this.pieces.push(this.start === 0 ? this.chunk : this.chunk.substring(this.start));
+		}
+
+		this.chunk = chunk;
+		this.start = 0;
+		this.from = 0;
+	}
+
+	next(): string | undefined {
+		if (this.from === 0 && this.pieces.length !== 0 && this.chunk.charCodeAt(0) === recordSep.charCodeAt(1)) {
+			const last = this.pieces.length - 1;
+			const piece = this.pieces[last];
+			if (piece.charCodeAt(piece.length - 1) === 0) {
+				if (piece.length === 1) {
+					this.pieces.pop();
+				} else {
+					this.pieces[last] = piece.substring(0, piece.length - 1);
+				}
+
+				this.start = this.from = 1;
+				return this.complete('');
+			}
+		}
+
+		const end = indexOfSeparator(this.chunk, recordSep, this.from);
+		if (end === -1) {
+			this.from = this.chunk.length;
+			return undefined;
+		}
+
+		const record = this.complete(this.chunk.substring(this.start, end));
+		this.start = this.from = end + recordSep.length;
+		return record;
+	}
+
+	end(): string {
+		const record = this.complete(this.chunk.substring(this.start));
+		this.chunk = '';
+		this.start = this.from = 0;
+		return record;
+	}
+
+	private complete(text: string): string {
+		if (text.length) {
+			this.pieces.push(text);
+		}
+
+		let record: string;
+		if (this.pieces.length > 1) {
+			record = this.pieces.join('');
+		} else {
+			record = this.pieces[0] ?? '';
+			if (this.copy) {
+				record = flattenString(record, 1);
+			}
+		}
+
+		this.pieces.length = 0;
+		return record;
+	}
+}
+
+function createRecordParsers<E>(
+	scope: string,
+	parseRecord: (record: string) => E | undefined,
+): Pick<AsyncParser<E>, 'parse' | 'parseAsync'> {
+	const parseScope = `${scope}.parse`;
+	const parseAsyncScope = `${scope}.parseAsync`;
+
+	function* parse(data: string | Iterable<string> | undefined): Generator<E> {
+		using sw = maybeStopWatch(parseScope, { log: { onlyExit: true, level: 'debug' } });
+
+		if (!data) {
+			sw?.stop({ suffix: ` no data` });
+			return;
+		}
+
+		const scanner = new RecordScanner(typeof data === 'string' && data.length > flattenSourceThreshold);
+
+		let count = 0;
+		let dropped = 0;
+		let entry: E | undefined;
+
+		for (const chunk of typeof data === 'string' ? [data] : data) {
+			scanner.push(chunk);
+
+			for (let record = scanner.next(); record != null; record = scanner.next()) {
+				if (!record.length) continue;
+
+				entry = parseRecord(record);
+				if (entry == null) {
+					dropped++;
+					continue;
+				}
+
+				count++;
+				yield entry;
+			}
+		}
+
+		const tail = scanner.end();
+		if (tail.length) {
+			entry = parseRecord(tail);
+			if (entry == null) {
+				dropped++;
+			} else {
+				count++;
+				yield entry;
+			}
+		}
+
+		sw?.stop({ suffix: ` parsed ${count} records${dropped > 0 ? `, dropped ${dropped}` : ''}` });
+	}
+
+	async function* parseAsync(stream: AsyncGenerator<string>): AsyncGenerator<E> {
+		using sw = maybeStopWatch(parseAsyncScope, { log: { onlyExit: true, level: 'debug' } });
+
+		const scanner = new RecordScanner(true);
+
+		let count = 0;
+		let dropped = 0;
+		let entry: E | undefined;
+
+		// KEEP: no `for await` and never close or await the caller's stream: git's stream cleanup waits for git to exit
+		for (let result = await stream.next(); !result.done; result = await stream.next()) {
+			scanner.push(result.value);
+
+			for (let record = scanner.next(); record != null; record = scanner.next()) {
+				if (!record.length) continue;
+
+				entry = parseRecord(record);
+				if (entry == null) {
+					dropped++;
+					continue;
+				}
+
+				count++;
+				yield entry;
+			}
+		}
+
+		const tail = scanner.end();
+		if (tail.length) {
+			entry = parseRecord(tail);
+			if (entry == null) {
+				dropped++;
+			} else {
+				count++;
+				yield entry;
+			}
+		}
+
+		sw?.stop({ suffix: ` parsed ${count} records${dropped > 0 ? `, dropped ${dropped}` : ''}` });
+	}
+
+	return { parse: parse, parseAsync: parseAsync };
 }
 
 export function createLogParser<T extends Record<string, string>>(mapping: ExtractAll<T, string>): LogParser<T> {
@@ -322,134 +515,57 @@ export function createLogParser<T extends Record<string, string>>(mapping: Extra
 
 	const args = [`--format=${format}`];
 
-	function* parse(data: string | Iterable<string> | undefined): Generator<LogParsedEntry<T>> {
-		using sw = maybeStopWatch('Git.LogParser.parse', { log: { onlyExit: true, level: 'debug' } });
-
-		if (!data) {
-			sw?.stop({ suffix: ` no data` });
-			return;
-		}
-
-		const records = iterateByDelimiter(data, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntry<T>;
-		let fields: IterableIterator<string>;
-
-		for (const record of records) {
-			if (!record.length) continue;
-
-			entry = {} as unknown as LogParsedEntry<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-				if (fieldCount >= keys.length) continue;
-
-				count++;
-				entry[keys[fieldCount++]] = field.value as T[keyof T];
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
-	}
-
-	async function* parseAsync(stream: AsyncGenerator<string>): AsyncGenerator<LogParsedEntry<T>> {
-		using sw = maybeStopWatch('Git.LogParser.parseAsync', { log: { onlyExit: true, level: 'debug' } });
-
-		const records = iterateAsyncByDelimiter(stream, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntry<T>;
-		let fields: IterableIterator<string>;
-
-		for await (const record of records) {
-			if (!record.length) continue;
-			// Drop a truncated tail (cancelled/early-closed stream) instead of yielding undefined/partial fields.
-			if (!isCompleteRecord(record, keys.length)) continue;
-
-			entry = {} as unknown as LogParsedEntry<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-				if (fieldCount >= keys.length) continue;
-
-				count++;
-				entry[keys[fieldCount++]] = field.value as T[keyof T];
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
-	}
-
-	// Builds one entry from a complete record with a plain `indexOf` walk. Matches `parseAsync`'s
-	// semantics exactly: fields beyond the mapping are ignored, and every mapped field is
-	// terminated by a field separator (the format string appends one after each field).
-	function parseRecord(record: string): LogParsedEntry<T> {
-		// Fields sliced out of the record become long-lived (graph rows); flatten the record so they
-		// pin a record-sized copy rather than the full walk output the record was sliced from.
-		record = flattenString(record);
+	function parseRecord(record: string): LogParsedEntry<T> | undefined {
 		const entry = {} as unknown as LogParsedEntry<T>;
-		let start = 0;
-		for (const key of keys) {
-			const end = record.indexOf(fieldSep, start);
-			if (end === -1) break;
-
-			entry[key] = record.substring(start, end) as T[keyof T];
-			start = end + 1;
-		}
-		return entry;
+		return readFields(record, keys, entry) === -1 ? undefined : entry;
 	}
 
 	async function* parseAsyncBatched(stream: AsyncGenerator<string>): AsyncGenerator<LogParsedEntry<T>[]> {
 		using sw = maybeStopWatch('Git.LogParser.parseAsyncBatched', { log: { onlyExit: true, level: 'debug' } });
 
+		const scanner = new RecordScanner(true);
+
 		let count = 0;
-		let buffer = '';
+		let dropped = 0;
+		let entry: LogParsedEntry<T> | undefined;
+
 		for await (const chunk of stream) {
-			buffer += chunk;
+			scanner.push(chunk);
 
 			let batch: LogParsedEntry<T>[] | undefined;
-			let start = 0;
-			while (true) {
-				const end = buffer.indexOf(recordSep, start);
-				if (end === -1) break;
+			for (let record = scanner.next(); record != null; record = scanner.next()) {
+				if (!record.length) continue;
 
-				if (end > start) {
-					(batch ??= []).push(parseRecord(buffer.substring(start, end)));
-					count++;
+				entry = parseRecord(record);
+				if (entry == null) {
+					dropped++;
+					continue;
 				}
-				start = end + 1;
+
+				(batch ??= []).push(entry);
+				count++;
 			}
-			if (start > 0) {
-				buffer = buffer.substring(start);
-			}
+
 			if (batch != null) {
 				yield batch;
 			}
 		}
-		// Trailing record (the stream doesn't end with a record separator); a truncated tail from a
-		// cancelled/early-closed stream is missing a field terminator and must be dropped, not parsed.
-		if (buffer.length > 0 && isCompleteRecord(buffer, keys.length)) {
-			count++;
-			yield [parseRecord(buffer)];
+
+		const tail = scanner.end();
+		if (tail.length) {
+			entry = parseRecord(tail);
+			if (entry == null) {
+				dropped++;
+			} else {
+				count++;
+				yield [entry];
+			}
 		}
 
-		sw?.stop({ suffix: ` parsed ${count} records` });
+		sw?.stop({ suffix: ` parsed ${count} records${dropped > 0 ? `, dropped ${dropped}` : ''}` });
 	}
+
+	const { parse, parseAsync } = createRecordParsers('Git.LogParser', parseRecord);
 
 	return {
 		arguments: args,
@@ -613,142 +729,35 @@ function createLogParserWithFilesAndStats<T extends Record<string, string> | voi
 		return files;
 	}
 
-	function* parse(data: string | Iterable<string> | undefined): Generator<LogParsedEntryWithFilesAndStats<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithFilesAndStats.parse', { log: { onlyExit: true, level: 'debug' } });
+	function parseRecord(record: string): LogParsedEntryWithFilesAndStats<T> | undefined {
+		const entry = {} as unknown as LogParsedEntryWithFilesAndStats<T>;
+		const payloadStart = readFields(record, keys, entry);
+		if (payloadStart === -1) return undefined;
 
-		if (!data) {
-			sw?.stop({ suffix: ` no data` });
-			return;
-		}
+		const files = parseFilesAndStats(getPayload(record, payloadStart));
+		entry.files = files;
+		if (files.length) {
+			entry.stats = { additions: 0, deletions: 0, files: { added: 0, deleted: 0, changed: 0 } };
 
-		const records = iterateByDelimiter(data, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFilesAndStats<T>;
-		let files: LogParsedFileWithStats[];
-		let fields: IterableIterator<string>;
-
-		for (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFilesAndStats<T>;
-			files = [];
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFilesAndStats<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commits and files/summary, if any
-					const summary = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					files.push(...parseFilesAndStats(summary));
-				} else {
-					debugger;
-				}
-			}
-
-			entry.files = files;
-			if (files.length) {
-				entry.stats = { additions: 0, deletions: 0, files: { added: 0, deleted: 0, changed: 0 } };
-
-				for (const f of files) {
-					if (f.additions || f.deletions) {
-						entry.stats.additions += f.additions ?? 0;
-						entry.stats.deletions += f.deletions ?? 0;
-						if (f.status === 'A' || f.status === '?') {
-							entry.stats.files.added++;
-						} else if (f.status === 'D') {
-							entry.stats.files.deleted++;
-						} else {
-							entry.stats.files.changed++;
-						}
+			for (const f of files) {
+				if (f.additions || f.deletions) {
+					entry.stats.additions += f.additions ?? 0;
+					entry.stats.deletions += f.deletions ?? 0;
+					if (f.status === 'A' || f.status === '?') {
+						entry.stats.files.added++;
+					} else if (f.status === 'D') {
+						entry.stats.files.deleted++;
+					} else {
+						entry.stats.files.changed++;
 					}
 				}
 			}
-
-			yield entry;
 		}
 
-		sw?.stop({ suffix: ` parsed ${count} records` });
+		return entry;
 	}
 
-	async function* parseAsync(stream: AsyncGenerator<string>): AsyncGenerator<LogParsedEntryWithFilesAndStats<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithFilesAndStats.parseAsync', {
-			log: { onlyExit: true, level: 'debug' },
-		});
-
-		const records = iterateAsyncByDelimiter(stream, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFilesAndStats<T>;
-		let files: LogParsedFileWithStats[];
-		let fields: IterableIterator<string>;
-
-		for await (const record of records) {
-			if (!record.length) continue;
-			// Drop a truncated tail (cancelled/early-closed stream) instead of yielding undefined/partial fields.
-			if (!isCompleteRecord(record, keys.length)) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFilesAndStats<T>;
-			files = [];
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFilesAndStats<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commits and files/summary, if any
-					const summary = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					files.push(...parseFilesAndStats(summary));
-				} else {
-					debugger;
-				}
-			}
-
-			entry.files = files;
-			if (files.length) {
-				entry.stats = { additions: 0, deletions: 0, files: { added: 0, deleted: 0, changed: 0 } };
-
-				for (const f of files) {
-					if (f.additions || f.deletions) {
-						entry.stats.additions += f.additions ?? 0;
-						entry.stats.deletions += f.deletions ?? 0;
-						if (f.status === 'A' || f.status === '?') {
-							entry.stats.files.added++;
-						} else if (f.status === 'D') {
-							entry.stats.files.deleted++;
-						} else {
-							entry.stats.files.changed++;
-						}
-					}
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
-	}
+	const { parse, parseAsync } = createRecordParsers('Git.LogParserWithFilesAndStats', parseRecord);
 
 	return {
 		arguments: args,
@@ -820,57 +829,16 @@ function createLogParserWithFileSummary<T extends Record<string, string> | void>
 		return files;
 	}
 
-	function* parse(data: string | Iterable<string> | undefined): Generator<LogParsedEntryWithFiles<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithFileSummary.parse', { log: { onlyExit: true, level: 'debug' } });
+	function parseRecord(record: string): LogParsedEntryWithFiles<T> | undefined {
+		const entry = {} as unknown as LogParsedEntryWithFiles<T>;
+		const payloadStart = readFields(record, keys, entry);
+		if (payloadStart === -1) return undefined;
 
-		if (!data) {
-			sw?.stop({ suffix: ` no data` });
-			return;
-		}
-
-		const records = iterateByDelimiter(data, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFiles<T>;
-		let files: LogParsedFile[];
-		let fields: IterableIterator<string>;
-
-		for (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFiles<T>;
-			files = [];
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFiles<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commits and files/summary, if any
-					const summary = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					files.push(...parseFileSummary(summary));
-				} else {
-					debugger;
-				}
-			}
-
-			entry.files = files;
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
+		entry.files = parseFileSummary(getPayload(record, payloadStart));
+		return entry;
 	}
+
+	const { parse } = createRecordParsers('Git.LogParserWithFileSummary', parseRecord);
 
 	return {
 		arguments: args,
@@ -939,6 +907,7 @@ function createLogParserSingle(field: string): Parser<string> {
 	return { arguments: args, separators: { record: '\0', field: '\0' }, parse: parse };
 }
 
+// TODO: a NUL+0x1E inside diff content still splits a patch record; needs scanner lookahead across chunks
 function createLogParserWithPatch<T extends Record<string, string>>(
 	mapping: ExtractAll<T, string>,
 ): LogParserWithFiles<T> {
@@ -963,7 +932,7 @@ function createLogParserWithPatch<T extends Record<string, string>>(
 			line = lines.next();
 		}
 
-		const rangeMatch = line.value.match(diffHunkRegex);
+		const rangeMatch = line.done ? undefined : line.value.match(diffHunkRegex);
 
 		let range: LogParsedRange | undefined;
 		let originalRange: LogParsedRange | undefined;
@@ -988,100 +957,19 @@ function createLogParserWithPatch<T extends Record<string, string>>(
 		};
 	}
 
-	function* parse(data: string | Iterable<string> | undefined): Generator<LogParsedEntryWithFiles<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithPatch.parse', { log: { onlyExit: true, level: 'debug' } });
+	function parseRecord(record: string): LogParsedEntryWithFiles<T> | undefined {
+		const entry = { files: [] } as unknown as LogParsedEntryWithFiles<T>;
+		const payloadStart = readFields(record, keys, entry);
+		if (payloadStart === -1) return undefined;
 
-		if (!data) {
-			sw?.stop({ suffix: ` no data` });
-			return;
+		const file = parsePatch(getPayload(record, payloadStart));
+		if (file != null) {
+			entry.files = [file];
 		}
-
-		const records = iterateByDelimiter(data, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFiles<T>;
-		let fields: IterableIterator<string>;
-
-		for (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFiles<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFiles<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commit data and patch, if any
-					const patch = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					const file = parsePatch(patch);
-					entry.files = file != null ? [file] : [];
-				} else {
-					debugger;
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
+		return entry;
 	}
 
-	async function* parseAsync(stream: AsyncGenerator<string>): AsyncGenerator<LogParsedEntryWithFiles<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithPatch.parseAsync', { log: { onlyExit: true, level: 'debug' } });
-
-		const records = iterateAsyncByDelimiter(stream, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFiles<T>;
-		let fields: IterableIterator<string>;
-
-		for await (const record of records) {
-			if (!record.length) continue;
-			// Drop a truncated tail (cancelled/early-closed stream) instead of yielding undefined/partial fields.
-			if (!isCompleteRecord(record, keys.length)) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFiles<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFiles<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commit data and patch, if any
-					const patch = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					const file = parsePatch(patch);
-					entry.files = file != null ? [file] : [];
-				} else {
-					debugger;
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
-	}
+	const { parse, parseAsync } = createRecordParsers('Git.LogParserWithPatch', parseRecord);
 
 	return {
 		arguments: args,
@@ -1148,96 +1036,19 @@ function createLogParserWithStats<T extends Record<string, string>>(
 		return stats;
 	}
 
-	function* parse(data: string | Iterable<string> | undefined): Generator<LogParsedEntryWithStats<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithStats.parse', { log: { onlyExit: true, level: 'debug' } });
+	function parseRecord(record: string): LogParsedEntryWithStats<T> | undefined {
+		const entry = { stats: { files: 0, additions: 0, deletions: 0 } } as unknown as LogParsedEntryWithStats<T>;
+		const payloadStart = readFields(record, keys, entry);
+		if (payloadStart === -1) return undefined;
 
-		if (!data) {
-			sw?.stop({ suffix: ` no data` });
-			return;
+		const payload = getPayload(record, payloadStart);
+		if (payload.length) {
+			entry.stats = parseStats(payload);
 		}
-
-		const records = iterateByDelimiter(data, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithStats<T>;
-		let fields: IterableIterator<string>;
-
-		for (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithStats<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithStats<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commit data and files/summary, if any
-					const summary = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					entry.stats = parseStats(summary);
-				} else {
-					debugger;
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
+		return entry;
 	}
 
-	async function* parseAsync(stream: AsyncGenerator<string>): AsyncGenerator<LogParsedEntryWithStats<T>> {
-		using sw = maybeStopWatch('Git.LogParserWithStats.parseAsync', { log: { onlyExit: true, level: 'debug' } });
-
-		const records = iterateAsyncByDelimiter(stream, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithStats<T>;
-		let fields: IterableIterator<string>;
-
-		for await (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithStats<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithStats<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commit data and files/summary, if any
-					const summary = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					entry.stats = parseStats(summary);
-				} else {
-					debugger;
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
-	}
+	const { parse, parseAsync } = createRecordParsers('Git.LogParserWithStats', parseRecord);
 
 	return {
 		arguments: args,
@@ -1273,98 +1084,16 @@ function createLogParserWithFiles<T extends Record<string, string>>(
 		return files;
 	}
 
-	function* parse(data: string | Iterable<string> | undefined): Generator<LogParsedEntryWithFiles<T>> {
-		using sw = maybeStopWatch('Git.createLogParserWithFiles.parse', { log: { onlyExit: true, level: 'debug' } });
+	function parseRecord(record: string): LogParsedEntryWithFiles<T> | undefined {
+		const entry = { files: [] } as unknown as LogParsedEntryWithFiles<T>;
+		const payloadStart = readFields(record, keys, entry);
+		if (payloadStart === -1) return undefined;
 
-		if (!data) {
-			sw?.stop({ suffix: ` no data` });
-			return;
-		}
-
-		const records = iterateByDelimiter(data, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFiles<T>;
-		let fields: IterableIterator<string>;
-
-		for (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFiles<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFiles<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commit data and files, if any
-					const files = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					entry.files = parseFileNames(files);
-				} else {
-					debugger;
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
+		entry.files = parseFileNames(getPayload(record, payloadStart));
+		return entry;
 	}
 
-	async function* parseAsync(stream: AsyncGenerator<string>): AsyncGenerator<LogParsedEntryWithFiles<T>> {
-		using sw = maybeStopWatch('Git.createLogParserWithFiles.parseAsync', {
-			log: { onlyExit: true, level: 'debug' },
-		});
-
-		const records = iterateAsyncByDelimiter(stream, recordSep);
-
-		let count = 0;
-		let entry: LogParsedEntryWithFiles<T>;
-		let fields: IterableIterator<string>;
-
-		for await (const record of records) {
-			if (!record.length) continue;
-
-			count++;
-			entry = {} as unknown as LogParsedEntryWithFiles<T>;
-			fields = iterateByDelimiter(record, fieldSep);
-
-			let fieldCount = 0;
-			let field;
-			while (true) {
-				field = fields.next();
-				if (field.done) break;
-
-				if (fieldCount < keys.length) {
-					entry[keys[fieldCount++]] = field.value as LogParsedEntryWithFiles<T>[keyof T];
-				} else if (fieldCount === keys.length) {
-					// Slice off the first newlines between the commit data and files, if any
-					const files = field.value.startsWith('\n\n')
-						? field.value.substring(2)
-						: field.value.startsWith('\n')
-							? field.value.substring(1)
-							: field.value;
-					entry.files = parseFileNames(files);
-				} else {
-					debugger;
-				}
-			}
-
-			yield entry;
-		}
-
-		sw?.stop({ suffix: ` parsed ${count} records` });
-	}
+	const { parse, parseAsync } = createRecordParsers('Git.createLogParserWithFiles', parseRecord);
 
 	return {
 		arguments: args,

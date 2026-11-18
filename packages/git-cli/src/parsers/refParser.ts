@@ -55,10 +55,11 @@ export function getRefParser(supportedFeatures: FilteredGitFeatures<'git:for-eac
 	return _refParser;
 }
 
-const recordSep = '\x1E'; // ASCII Record Separator character
-const recordFormatSep = '%1E';
-const fieldSep = '\x1D'; // ASCII Group Separator character
-const fieldFormatSep = '%1D';
+// KEEP: assumes no `-z` output: a NUL terminator followed by 0x1E/0x1D would form a sentinel
+const recordSep = '\0\x1E';
+const recordFormatSep = '%00%1E';
+const fieldSep = '\0\x1D';
+const fieldFormatSep = '%00%1D';
 
 function createRefParser<T extends Record<string, string | undefined>>(
 	mapping: ExtractAll<T, string | undefined>,
