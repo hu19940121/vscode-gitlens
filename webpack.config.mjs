@@ -324,7 +324,12 @@ function getExtensionConfig(target, mode, env) {
 		devtool: mode === 'production' && !env.analyzeBundle ? false : 'cheap-module-source-map',
 		// Webpack's 244 KiB default assumes a conventional web page. Keep a realistic extension
 		// budget so a material bundle-size regression still becomes a warning (and fails one-shot builds).
-		performance: { maxAssetSize: 5 * 1024 * 1024, maxEntrypointSize: 5 * 1024 * 1024 },
+		// KEEP: the webworker bundle carries the whole core (watching layer, provider integrations) in one file,
+		// so its budget is larger than the node bundle's.
+		performance: {
+			maxAssetSize: (target === 'webworker' ? 5 : 5) * 1024 * 1024,
+			maxEntrypointSize: (target === 'webworker' ? 5 : 5) * 1024 * 1024,
+		},
 		output: {
 			chunkFilename: '[name].js',
 			filename: pathData => (pathData.chunk?.name === 'extension' ? 'gitlens.js' : '[name].js'),

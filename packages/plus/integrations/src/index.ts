@@ -222,6 +222,10 @@ export type {
 	ClosedPullRequestSweepOptions,
 	GetAutolinkReferencesOptions,
 	IntegrationManager,
+	IssueDeleteOptions,
+	IssueWriteOptions,
+	IssueWriteTargetOptions,
+	IssueWriteTargetResult,
 	ListLinearProjectsOptions,
 	ListOrgsOptions,
 	ListProjectsOptions,
@@ -233,8 +237,19 @@ export type {
 	ProviderRepositoryInput,
 	ProviderSweepTarget,
 	ProviderSweepTargetEvent,
+	PullRequestCreateCapabilityOptions,
 	PullRequestSweepOptions,
+	PullRequestWriteOptions,
+	PullRequestWriteTargetOptions,
 } from './manager.js';
+export type { IssueWriteResult } from '@gitlens/git-github/api/issueWrites.js';
+export type {
+	PullRequestCreateCapabilityResult,
+	PullRequestWriteFailure,
+	PullRequestWriteResult,
+	PullRequestWriteSnapshot,
+	PullRequestWriteTargetResult,
+} from '@gitlens/git-github/api/pullRequestWrites.js';
 
 /**
  * Construct an `@gitlens/integrations` manager bound to the supplied runtime.
@@ -354,6 +369,16 @@ export type { IssueBatchResult, IssueBatchTarget } from './results.js';
 export type { PullRequestBatchResult, PullRequestBatchTarget } from './results.js';
 export type { IssueEtagInclude, PullRequestEtagInclude } from './reads/etag.js';
 export type { PullRequestBranchResult, PullRequestBranchTarget } from './results.js';
+export type { PullRequestCheckLogResult, PullRequestCheckLogTarget } from './results.js';
+export type { PullRequestActivityResult, PullRequestActivityTarget } from './results.js';
+export type {
+	PullRequestActivityAuthor,
+	PullRequestActivityComment,
+	PullRequestActivityItem,
+	PullRequestActivityReview,
+	PullRequestActivityReviewComment,
+} from '@gitlens/git/models/pullRequestActivity.js';
+export type { PullRequestForCommitResult } from './results.js';
 // The current-account read's result, and the account shape every identity-bearing read already returns.
 export type { CurrentAccountResult } from './results.js';
 export type { Account } from '@gitlens/git/models/author.js';
@@ -398,6 +423,7 @@ export {
 export { getSingleConfiguredDomain } from './utils/domain.utils.js';
 export { getAzureRepositoryIdentity } from './providers/azure/azure.utils.js';
 export { isAzureProviderId } from './providers/providerErrors.js';
+export { LookupBackedOffError } from './errors.js';
 
 // Provider metadata (names, domains, icons, capabilities) and the per-provider feature checks built on it.
 export type { ProviderMetadata } from './providers/metadata.js';

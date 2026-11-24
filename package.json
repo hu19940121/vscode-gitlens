@@ -4319,6 +4319,16 @@
 							"null"
 						],
 						"default": null,
+						"enum": [
+							null,
+							true,
+							false
+						],
+						"enumDescriptions": [
+							"%config.gitCommands.search.showResultsInSideBar.enumDescriptions.0%",
+							"%config.gitCommands.search.showResultsInSideBar.enumDescriptions.1%",
+							"%config.gitCommands.search.showResultsInSideBar.enumDescriptions.2%"
+						],
 						"markdownDescription": "%config.gitCommands.search.showResultsInSideBar.markdownDescription%",
 						"scope": "window",
 						"order": 40
@@ -4637,6 +4647,16 @@
 							"null"
 						],
 						"default": null,
+						"enum": [
+							null,
+							true,
+							false
+						],
+						"enumDescriptions": [
+							"%config.gitkraken.cli.insiders.enabled.enumDescriptions.0%",
+							"%config.gitkraken.cli.insiders.enabled.enumDescriptions.1%",
+							"%config.gitkraken.cli.insiders.enabled.enumDescriptions.2%"
+						],
 						"markdownDescription": "%config.gitkraken.cli.insiders.enabled.markdownDescription%",
 						"scope": "window",
 						"order": 40,
@@ -13718,6 +13738,13 @@
 				"default": {
 					"fontPath": "dist/glicons.woff2",
 					"fontCharacter": "\\f15d"
+				}
+			},
+			"gitlens-pr-queued": {
+				"description": "pr-queued icon",
+				"default": {
+					"fontPath": "dist/glicons.woff2",
+					"fontCharacter": "\\f15e"
 				}
 			}
 		},
@@ -31473,7 +31500,8 @@
 		"check:l10n": "node ./scripts/localization.mjs check",
 		"generate:l10n:pseudo": "node ./scripts/localization.mjs pseudo",
 		"test:localization": "node --test scripts/__tests__/localization.test.mjs scripts/__tests__/require-format-plural.test.mjs",
-		"test:localization:browser": "node --test scripts/__tests__/localization.browser.test.mjs"
+		"test:localization:browser": "node --test scripts/__tests__/localization.browser.test.mjs",
+		"test:scripts": "node --experimental-strip-types --test scripts/__tests__/*.test.mts"
 	},
 	"dependencies": {
 		"@awesome.me/webawesome": "catalog:",
