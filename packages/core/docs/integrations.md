@@ -114,16 +114,24 @@ cache controls (`connectionId`, `etag`, expiry). The optional methods are:
 - `getRepositoryMetadata`, `getRepositoryDefaultBranch`: repository lookups.
 - `getPullRequestForSha`, `getPullRequestForBranch`, `getPullRequest`: pull-request lookups by commit, branch, or id.
 - `getIssue`, `getIssueOrPullRequest`: issue lookups by id.
-- `deletePullRequests()`: evicts every cached pull request (a merge can change pull requests no caller can name).
+- `deletePullRequests(scope?)` evicts cached pull requests for the provided `{ id, domain }` installation origin.
+  Without a scope, evict all pull requests because a merge can change pull requests no caller can name.
 
 A method you omit means no caching for that read: its loader runs on every call (and `deletePullRequests` is a
 no-op). Call a method as `cache.method(...)`; the manager never detaches it, so a class instance works.
 
-The descriptor is `{ id, domain, maybeConnected, sessionFingerprint }`, not the integration class. Its getters read
-through to the live integration each time they are read, so the values are live, not snapshots. Key entries by `id`
-and `domain`, and treat `maybeConnected` and `sessionFingerprint` as the entry's etag: when either changes (a
-reconnect, a token change) the entry must miss. The descriptor is `undefined` for lookups with no integration.
-The fixture uses the package's public `PromiseCache` utility, but any cache with the same behavior is valid.
+The cache descriptor exposes `id`, `domain`, `maybeConnected`, and `sessionFingerprint` without exposing the
+integration instance. Key entries by provider and domain, and treat the connection state and fingerprint as the
+entry's etag. Enterprise pull request descriptors also carry `installationOrigin` and the fingerprint captured for
+the request. Use that origin as the cache namespace so installations that share a hostname stay independent.
+For other reads, the state and fingerprint getters reflect the live integration. A lookup without an integration
+receives an undefined descriptor. The fixture uses the package's public `PromiseCache` utility, but any cache with
+the same behavior is valid.
+
+For a cached-only Enterprise pull request lookup, `GitHostIntegration.getCachedPullRequestScope?(remoteUrl)` accepts
+the fetch remote URL. HTTP(S) remotes must match the selected session's scheme, host, and port. SSH and scp
+remotes must match its hostname, and the scope uses the session's actual API origin. The optional method returns
+`undefined` without a matching established session and makes no authentication or network requests.
 
 ### Authentication
 
@@ -893,16 +901,25 @@ What holds for all of them:
 - An Asana task's tags are its labels and its likes, a thumbs-up on the task, its reactions. Its comments are stories, which a task doesn't
   count, so reading them would cost a request per task. Asana has no batch read.
 
-### GitHub.com issue writes
+### GitHub issue writes
 
 Use the selected GitHub connection ID from `getConfigured()` together with `providerId`, `owner`, and `repo`.
 Core resolves the repository and issue with that account before sending the mutation to GitHub. Issue numbers
 are scoped to their repository. For an existing issue, pass its `number` and the `expectedNodeId` from the
 issue read. Core verifies that the node still belongs to the requested repository and number.
 
+For GitHub Enterprise Server, use `providerId: 'cloud-github-enterprise'` and pass `domain` with the
+selected connection's host and port, or its HTTP(S) origin. Core pins the configured origin before
+contacting the instance. Issue and repository node IDs belong to that installation. The instance's GraphQL schema, the
+repository's settings, and the credentials determine which operations are available. Deletion also requires
+permission under the enterprise and organization policies. Pass `expectedLogin` when the caller has
+selected or confirmed an account by login. Core verifies the viewer with the same credential it uses for
+the operation and returns `no-connection` if the login differs. Core checks that the selected Server
+credential is current again before dispatch.
+
 | Method                    | Operation                                                                                                                                |
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `resolveIssueWriteTarget` | Verify an existing issue and return its canonical `nodeId`. Use it to serialize writes and publication across aliases or transfers.      |
+| `resolveIssueWriteTarget` | Verify an existing issue and return its canonical `nodeId` and current snapshot. Use it to serialize writes across aliases or transfers. |
 | `writeIssue`              | Pass `action: 'create'` with a `title` and an optional `body`.                                                                           |
 | `writeIssue`              | Pass `action: 'edit'` with at least one of `title` or `body`. An empty body clears the description.                                      |
 | `writeIssue`              | Pass `action: 'set-state'`. Use `state: 'open'` to reopen, or `state: 'closed'` with `reason: 'completed'` or `'not_planned'`.           |
@@ -914,11 +931,59 @@ report a different repository if a transfer happened after preflight. In that ca
 `deletedFromDifferentRepository: true` preserves the confirmation. Use the node ID to reconcile deletion
 and refresh affected lists and details. The snapshot still describes the earlier address.
 
+Pass `intent: 'delete'` to `resolveIssueWriteTarget` before asking for deletion confirmation. It checks whether
+the selected account may delete the issue and returns the snapshot to show for confirmation.
+
 An `ok: false` result contains a typed reason. GitHub can report inaccessible private resources as
 `not-found`. Check GitHub before retrying an `unknown` result, since GitHub may have applied the mutation
-before the response was lost.
+before the response was lost. For an Enterprise failure with `mutationDispatched: false`, Core stopped
+before sending a mutation.
 
-### GitHub.com pull request writes
+### Jira Cloud issue writes
+
+Use the tracker methods on `IntegrationManager` from `@gitkraken/core-gitlens/plus/integrations/index.js`.
+Each call takes `providerId: IssuesCloudHostIntegrationId.Jira`, the selected `connectionId` and that
+connection's `resourceId` (the Atlassian cloud ID). The manager looks up the site's URL with the same
+credential used for reads. If you supply `expectedAccountId`, the account returned by Jira's `/myself`
+must match. Use the returned `accountId` for subsequent calls. Issue and project keys can repeat across
+sites, so retain the cloud ID alongside the canonical issue ID.
+
+| Method                                | Additional input                                                                                                   | Success                                                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `getIssueTrackerCreateOptions`        | `project` (key or ID), optional `issueTypeId`                                                                      | Canonical project, its `issueTypes` or the selected type's `fields`, and `truncated`.                                             |
+| `getIssueTrackerIssueWriteOptions`    | `issue` (key or ID), optional `expectedIssueId`                                                                    | Issue receipt, `accountId`, editable `fields`, `transitions`, permission flags and `deleteCapability`.                            |
+| `writeIssueTrackerIssue`              | `action: 'create'`, `project`, `issueTypeId`, `summary`, optional `description` and `fields`                       | Created issue receipt and `accountId`.                                                                                            |
+| `writeIssueTrackerIssue`              | `action: 'edit'`, `issue`, `expectedIssueId`, at least one change in `summary`, `description` or `fields`          | Updated issue receipt and `accountId`.                                                                                            |
+| `writeIssueTrackerIssue`              | `action: 'transition'`, `issue`, `expectedIssueId`, `transitionId`, optional `summary`, `description` and `fields` | Updated issue receipt and `accountId`.                                                                                            |
+| `resolveIssueTrackerIssueWriteTarget` | `issue`, optional `expectedIssueId` and `intent: 'delete'`                                                         | Canonical issue receipt and `accountId` for a confirmation UI. Delete intent also checks the credential, permission and subtasks. |
+| `deleteIssueTrackerIssue`             | `issue`, `expectedIssueId`, `expectedAccountId`                                                                    | Pre-delete issue receipt and `accountId` after Jira acknowledges the delete.                                                      |
+
+Use the metadata for the exact project, issue type or transition you selected. Each field carries its
+ID, operations, required and default flags, and any schema or allowed values Jira sends. Create
+metadata is read in at most 20 requests of up to 50 entries each. Check `truncated` before treating the
+returned list as complete. Pass Jira REST field values as a map keyed by field ID. Use the top-level
+inputs for `summary`, `description`, `project` and `issueTypeId`. A transition takes `summary` and `description` only when
+its screen sets them. Jira REST v2 accepts Jira wiki markup
+strings for rich-text fields. The caller is responsible for converting other formats.
+
+For an existing issue, retain the returned key and canonical ID together. Edit, transition and delete
+resolve the address again and send the mutation by canonical ID. A key Jira resolves to a moved issue
+or an ID that differs from the observed ID returns `conflict`. Each receipt contains the site, canonical ID
+and key, browser URL, project ID and key, issue type, summary, and workflow status ID, name and category.
+
+Before presenting a delete confirmation, resolve with `intent: 'delete'`. Delete checks the same
+site, account and issue on execution. Issues with subtasks are refused. The site grant must include
+the `delete:issue:jira` granular scope or the `write:jira-work` classic scope, and the user also needs
+Jira's Delete Issues permission. The GitKraken Jira grant currently needs an updated scope and
+reconnection before delete is available.
+
+Failures have `ok: false` and a typed `reason`. An `invalid-input` result may include `fieldErrors`
+and `messages` from Jira. A scope mismatch returns `insufficient-scope` without expiring the read
+credential. `mutationDispatched: false` means Core stopped before sending the write. Treat
+`applied: 'maybe'` as uncertain and reconcile the issue state before retrying. A successful delete
+requires Jira's `204` acknowledgement. Jira can also return `404` when visibility changes. [Jira Cloud REST v2 issue operations](https://developer.atlassian.com/cloud/jira/platform/rest/v2/api-group-issues/)
+
+### GitHub and GitHub Enterprise Server pull request writes
 
 Use `providerId: 'github'` and the `connectionId` that read the repository or pull request. Pass the
 repository’s `owner` and `repo`, plus the `number` and `expectedNodeId` for an existing pull request.
@@ -930,6 +995,14 @@ the canonical repository ID. Pass it as `expectedRepositoryId` to prevent select
 repository at the same address. For an active repository, `canCreate` is `true` when GitHub reports
 a repository role for the viewer, and `undefined` when the role is unavailable. GitHub determines
 whether the viewer may create a pull request between the chosen branches when it receives the write.
+
+For GitHub Enterprise Server, pass `providerId: 'cloud-github-enterprise'`, the connection ID,
+the full HTTP(S) installation origin as `domain`, and the expected GitHub login as `expectedLogin`
+to all three methods. The origin includes the scheme and any non-default port. The PR write API
+accepts installations served from the origin root. A path in the requested domain returns `invalid-input`.
+Core accepts `/api` and `/api/v3` as aliases for the root installation on the configured connection
+and selected credential. Any other path on either returns `no-connection` before a provider request.
+Core verifies the credential's live login and requires `expectedRepositoryId` on create.
 
 | Action for `writePullRequest` | Required input and result                                                                                                                                          |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -946,13 +1019,25 @@ write. The write preflight checks the observed base branch. GitHub checks the ex
 for direct merge and enqueue.
 Stacked merge actions can land more than one pull request and are unavailable through this API.
 
+On GitHub Enterprise Server, Core checks the installed mutation schema, active branch rules and
+legacy linear-history policy before offering a merge strategy. It offers enqueue when the branch
+requires a queue and the installation supports the expected-head check. If Core cannot establish the
+merge policy, edit and state capabilities still reflect the viewer's pull request permissions.
+Core checks the base branch again before dispatching a merge or enqueue and verifies that the
+receipt matches the approved base. GitHub exposes the atomic check for the head only.
+
 Every confirmed result carries a canonical snapshot with GitHub’s update time and close or merge
-time when available. An enqueue receipt carries the snapshot verified at dispatch and the `queued`
+time when available. A GitHub.com enqueue receipt carries the snapshot verified at dispatch and the `queued`
 status. Consumers should refresh the item and related views for its latest
 queue position or merge state. `outcome-unknown` means the write may have reached GitHub. Reconcile it
 through a fresh read before retrying. `blocked` means the action was refused by the pull request state or
 branch policy. Inaccessible private resources can appear as `not-found`. After GitHub rejects a credential
 with HTTP 401, the next operation on that connection can recover it. Core never replays the write.
+
+Enterprise snapshots include the canonical origin in `domain`. An Enterprise enqueue returns the
+pull request attached to the queue entry. If the selected credential changes while GitHub processes
+a write, a confirmed result still carries its status and adds `credentialChanged: true`. Use that
+status to refresh by origin and read the snapshot under the current credential.
 
 ## 5. Paging
 

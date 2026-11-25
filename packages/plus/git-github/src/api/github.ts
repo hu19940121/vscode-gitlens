@@ -111,6 +111,7 @@ import {
 } from './checkRuns.js';
 import type { GitHubApiConfig } from './config.js';
 import { githubSearchResultLimit } from './config.js';
+import type { EnterprisePullRequestWriteOptions } from './enterprisePullRequestMergePolicy.js';
 import {
 	gitHubIssueSearchRelationships,
 	toGitHubIssueSearchQualifiers,
@@ -3824,8 +3825,44 @@ export class GitHubApi {
 		provider: Provider,
 		token: GitHubTokenInfo,
 		input: GitHubIssueMutation,
+		options: {
+			baseUrl?: string;
+			isSessionCurrent?: () => Promise<boolean>;
+			onUnauthorized?: () => void;
+		},
 	): Promise<IssueWriteResult> {
-		return mutateGitHubIssue(input, (query, variables) => this.writeGraphql(provider, token, query, variables));
+		const { baseUrl, isSessionCurrent, onUnauthorized } = options;
+		return mutateGitHubIssue(
+			input,
+			(query, variables) => this.writeGraphql(provider, token, query, variables, onUnauthorized, baseUrl),
+			{ origin: baseUrl == null ? undefined : new URL(baseUrl).origin, isSessionCurrent: isSessionCurrent },
+		);
+	}
+
+	async getIssueWriteViewer(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		baseUrl: string | undefined,
+		onUnauthorized: () => void,
+	): Promise<string | undefined> {
+		return this.getWriteViewer(provider, token, baseUrl, onUnauthorized);
+	}
+
+	async getWriteViewer(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		baseUrl: string | undefined,
+		onUnauthorized: () => void,
+	): Promise<string | undefined> {
+		const result = await this.writeGraphql<{ viewer?: { login: string } }>(
+			provider,
+			token,
+			'query WriteViewer { viewer { login } }',
+			{},
+			onUnauthorized,
+			baseUrl,
+		);
+		return result?.viewer?.login;
 	}
 
 	async resolvePullRequestWriteTarget(
@@ -3833,9 +3870,12 @@ export class GitHubApi {
 		token: GitHubTokenInfo,
 		input: GitHubPullRequestWriteTarget,
 		onUnauthorized: () => void,
+		baseUrl?: string,
 	): Promise<PullRequestWriteTargetResult> {
-		return resolveGitHubPullRequestWriteTarget(input, (query, variables) =>
-			this.writeGraphql(provider, token, query, variables, onUnauthorized),
+		return resolveGitHubPullRequestWriteTarget(
+			input,
+			(query, variables) => this.writeGraphql(provider, token, query, variables, onUnauthorized, baseUrl),
+			this.enterprisePullRequestWriteOptions(provider, token, baseUrl, onUnauthorized),
 		);
 	}
 
@@ -3844,9 +3884,10 @@ export class GitHubApi {
 		token: GitHubTokenInfo,
 		input: GitHubPullRequestCreateTarget,
 		onUnauthorized: () => void,
+		baseUrl?: string,
 	): Promise<PullRequestCreateCapabilityResult> {
 		return getGitHubPullRequestCreateCapability(input, (query, variables) =>
-			this.writeGraphql(provider, token, query, variables, onUnauthorized),
+			this.writeGraphql(provider, token, query, variables, onUnauthorized, baseUrl),
 		);
 	}
 
@@ -3856,14 +3897,58 @@ export class GitHubApi {
 		input: GitHubPullRequestWrite,
 		isSessionCurrent: () => Promise<boolean>,
 		onUnauthorized: () => void,
+		baseUrl?: string,
 	): Promise<PullRequestWriteResult> {
 		const request = <T>(query: string, variables: RequestParameters) =>
-			this.writeGraphql<T>(provider, token, query, variables, onUnauthorized);
+			this.writeGraphql<T>(provider, token, query, variables, onUnauthorized, baseUrl);
 		return writeGitHubPullRequest(input, {
 			graphql: request,
+			enterprise: this.enterprisePullRequestWriteOptions(provider, token, baseUrl, onUnauthorized),
 			isSessionCurrent: isSessionCurrent,
 			enqueue: (nodeId, headSha) => this.enqueuePullRequestForWrite(nodeId, headSha, request),
 		});
+	}
+
+	private enterprisePullRequestWriteOptions(
+		provider: Provider,
+		token: GitHubTokenInfo,
+		baseUrl: string | undefined,
+		onUnauthorized: () => void,
+	): EnterprisePullRequestWriteOptions | undefined {
+		if (baseUrl == null) return undefined;
+
+		return {
+			origin: new URL(baseUrl).origin,
+			readBranchRules: async ({ owner, repo }, branch) => {
+				const rules: unknown[] = [];
+				for (let page = 1; page <= 100; page++) {
+					const response = await this.writeRequest(
+						provider,
+						() =>
+							this.getDefaults(token.accessToken, request)(
+								'GET /repos/{owner}/{repo}/rules/branches/{branch}',
+								{
+									baseUrl: baseUrl,
+									owner: owner,
+									repo: repo,
+									branch: branch,
+									page: page,
+									per_page: 100,
+									request: { redirect: 'error' },
+								},
+							),
+						true,
+						onUnauthorized,
+					);
+					if (!Array.isArray(response.data)) return undefined;
+
+					rules.push(...response.data);
+					if (!response.headers.link?.includes('rel="next"')) return rules;
+				}
+
+				return undefined;
+			},
+		};
 	}
 
 	private async writeGraphql<T>(
@@ -3872,17 +3957,32 @@ export class GitHubApi {
 		query: string,
 		variables: RequestParameters,
 		onUnauthorized?: () => void,
+		baseUrl?: string,
+	): Promise<T> {
+		return this.writeRequest(
+			provider,
+			() =>
+				this.getDefaults(token.accessToken, graphql)<T>(query, {
+					...variables,
+					...(baseUrl == null
+						? { headers: { 'x-github-next-global-id': '1' } }
+						: { baseUrl: baseUrl, request: { redirect: 'error' } }),
+				}),
+			graphqlReadQueryRegex.test(query),
+			onUnauthorized,
+		);
+	}
+
+	private async writeRequest<T>(
+		provider: Provider,
+		run: () => Promise<T>,
+		retryable: boolean,
+		onUnauthorized: (() => void) | undefined,
 	): Promise<T> {
 		try {
 			return await this.requestWithRetries(
-				() =>
-					this.config.wrapForForcedInsecureSSL(provider.getIgnoreSSLErrors(), () =>
-						this.getDefaults(token.accessToken, graphql)<T>(query, {
-							...variables,
-							headers: { 'x-github-next-global-id': '1' },
-						}),
-					),
-				graphqlReadQueryRegex.test(query),
+				() => this.config.wrapForForcedInsecureSSL(provider.getIgnoreSSLErrors(), run),
+				retryable,
 				undefined,
 				undefined,
 			);

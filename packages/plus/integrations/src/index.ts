@@ -115,8 +115,8 @@ export interface IntegrationManagerCacheProvider {
 		cacheable: IntegrationManagerCacheLoader<Issue>,
 		options?: IntegrationManagerCacheOptions,
 	): IntegrationManagerCacheResult<Issue>;
-	/** Evicts every cached pull request (a merge can change pull requests no caller can name). */
-	deletePullRequests?(): void;
+	/** Evicts cached pull requests for the given installation origin, or all pull requests when omitted. */
+	deletePullRequests?(scope?: { id: IntegrationCacheDescriptor['id']; domain: string }): void;
 }
 
 function loadUncached<T>(loader: IntegrationManagerCacheLoader<T>): IntegrationManagerCacheResult<T> {
@@ -137,6 +137,7 @@ function toCacheDescriptor(
 	return {
 		id: integration.id,
 		domain: integration.domain,
+		...(integration.installationOrigin != null && { installationOrigin: integration.installationOrigin }),
 		get maybeConnected() {
 			return integration.maybeConnected;
 		},
@@ -198,7 +199,7 @@ function toIntegrationCacheProvider(cache: IntegrationManagerCacheProvider | und
 				: loadUncached(loader),
 		getCurrentAccount: (integration, loader, options) =>
 			cache.getCurrentAccount(toCacheDescriptor(integration), loader, options),
-		deletePullRequests: () => cache.deletePullRequests?.(),
+		deletePullRequests: scope => cache.deletePullRequests?.(scope),
 	};
 }
 
@@ -242,6 +243,23 @@ export type {
 	PullRequestWriteOptions,
 	PullRequestWriteTargetOptions,
 } from './manager.js';
+export type {
+	IssueTrackerCreateOptions,
+	IssueTrackerCreateOptionsResult,
+	IssueTrackerDeleteOptions,
+	IssueTrackerField,
+	IssueTrackerIssueReceipt,
+	IssueTrackerIssueWriteOptions,
+	IssueTrackerIssueWriteOptionsResult,
+	IssueTrackerStatus,
+	IssueTrackerTransition,
+	IssueTrackerWriteConnection,
+	IssueTrackerWriteFailure,
+	IssueTrackerWriteOptions,
+	IssueTrackerWriteResult,
+	IssueTrackerWriteTargetOptions,
+	IssueTrackerWriteTargetResult,
+} from './models/issueTrackerWrites.js';
 export type { IssueWriteResult } from '@gitlens/git-github/api/issueWrites.js';
 export type {
 	PullRequestCreateCapabilityResult,

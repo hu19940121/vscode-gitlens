@@ -29,6 +29,17 @@ import type {
 	SupportedCloudIntegrationIds,
 } from './constants.js';
 import type {
+	IssueTrackerCreateOptions,
+	IssueTrackerCreateOptionsResult,
+	IssueTrackerDeleteOptions,
+	IssueTrackerIssueWriteOptions,
+	IssueTrackerIssueWriteOptionsResult,
+	IssueTrackerWriteOptions,
+	IssueTrackerWriteResult,
+	IssueTrackerWriteTargetOptions,
+	IssueTrackerWriteTargetResult,
+} from './models/issueTrackerWrites.js';
+import type {
 	GitHostIntegration,
 	IntegrationById,
 	IntegrationResult,
@@ -68,21 +79,35 @@ import type { Source } from './telemetry.js';
 
 type WriteConnection = { providerId: IntegrationIds; connectionId: string };
 
-export type IssueWriteOptions = WriteConnection & GitHubIssueWrite;
+type IssueWriteConnection = WriteConnection & {
+	/** Required for GitHub Enterprise Server. Must match the configured connection's host and port. */
+	domain?: string;
+	/** When provided, the exact credential for this operation must authenticate as this GitHub login. */
+	expectedLogin?: string;
+};
+
+export type IssueWriteOptions = IssueWriteConnection & GitHubIssueWrite;
 /**
  * `intent: 'delete'` also requires that the connection may delete the issue, so a host can refuse before asking
  * the user to confirm a deletion GitHub would reject.
  */
-export type IssueWriteTargetOptions = WriteConnection & GitHubIssueDelete & { intent?: 'delete' };
-export type IssueDeleteOptions = WriteConnection & GitHubIssueDelete;
+export type IssueWriteTargetOptions = IssueWriteConnection & GitHubIssueDelete & { intent?: 'delete' };
+export type IssueDeleteOptions = IssueWriteConnection & GitHubIssueDelete;
 /** The canonical node ID, and the issue as GitHub reports it now: where it lives, its URL, title and state. */
 export type IssueWriteTargetResult =
 	| { ok: true; nodeId: string; issue: Extract<IssueWriteResult, { ok: true }>['issue'] }
 	| Extract<IssueWriteResult, { ok: false }>;
 
-export type PullRequestWriteOptions = WriteConnection & GitHubPullRequestWrite;
-export type PullRequestWriteTargetOptions = WriteConnection & GitHubPullRequestWriteTarget;
-export type PullRequestCreateCapabilityOptions = WriteConnection & GitHubPullRequestCreateTarget;
+type PullRequestWriteConnection = WriteConnection & {
+	/** Required for GitHub Enterprise Server. The HTTP(S) origin of the configured installation. */
+	domain?: string;
+	/** Required for GitHub Enterprise Server. The login the selected credential must authenticate as. */
+	expectedLogin?: string;
+};
+
+export type PullRequestWriteOptions = PullRequestWriteConnection & GitHubPullRequestWrite;
+export type PullRequestWriteTargetOptions = PullRequestWriteConnection & GitHubPullRequestWriteTarget;
+export type PullRequestCreateCapabilityOptions = PullRequestWriteConnection & GitHubPullRequestCreateTarget;
 
 /** Neutral repository input accepted by repo-scoped provider reads. */
 export interface ProviderRepositoryInput {
@@ -1215,6 +1240,15 @@ export interface IntegrationManager {
 		 */
 		domain?: string;
 	}): Promise<ProviderPagedResult<IssueShape>>;
+	getIssueTrackerCreateOptions(options: IssueTrackerCreateOptions): Promise<IssueTrackerCreateOptionsResult>;
+	getIssueTrackerIssueWriteOptions(
+		options: IssueTrackerIssueWriteOptions,
+	): Promise<IssueTrackerIssueWriteOptionsResult>;
+	writeIssueTrackerIssue(options: IssueTrackerWriteOptions): Promise<IssueTrackerWriteResult>;
+	deleteIssueTrackerIssue(options: IssueTrackerDeleteOptions): Promise<IssueTrackerWriteResult>;
+	resolveIssueTrackerIssueWriteTarget(
+		options: IssueTrackerWriteTargetOptions,
+	): Promise<IssueTrackerWriteTargetResult>;
 	sweepPullRequests(options?: PullRequestSweepOptions): Promise<ProviderSweepResult<PullRequestShape>>;
 	sweepClosedPullRequests(options?: ClosedPullRequestSweepOptions): Promise<ProviderSweepResult<PullRequestShape>>;
 	broadenIssues(options: {
